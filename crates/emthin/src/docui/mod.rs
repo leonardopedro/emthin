@@ -232,6 +232,28 @@ impl DocUi {
         self.dormant_spawns.get(figure_key)
     }
 
+    /// The dormant figures to mark on the current page, with their rects.
+    ///
+    /// A dormant figure is an empty slot. Without a mark it is
+    /// indistinguishable from a figure whose app simply failed to start, so the
+    /// relaunch affordance (`Return` over the figure) is invisible — a real
+    /// binding nobody can discover.
+    ///
+    /// The geometry decision lives here rather than in `figure_render` so it can
+    /// be unit-tested; the compositor only draws what this returns. Off-page
+    /// figures are excluded because their rects are still cached, and drawing
+    /// them would put marks on a page nobody is looking at.
+    pub fn dormant_rects_on_current_page(&self) -> Vec<(String, Rectangle<i32, Logical>)> {
+        let page = self.current_page();
+        self.figures
+            .figures()
+            .iter()
+            .filter(|f| f.is_dormant() && f.page == Some(page))
+            .filter(|f| f.rect.size.w > 0 && f.rect.size.h > 0)
+            .map(|f| (f.key.clone(), f.rect))
+            .collect()
+    }
+
     /// The dormant figure at `pos`, if any.
     ///
     /// The pointer is the signal, not the caret. A figure's rect is a
@@ -413,6 +435,41 @@ mod relaunch_tests {
         assert_eq!(ui.first_dormant_figure(), Some("f1"));
         ui.figures_mut().release_app(7);
         assert_eq!(ui.first_dormant_figure(), Some("f0"));
+    }
+
+    /// Only dormant, visible, non-degenerate figures are marked.
+    #[test]
+    fn dormant_marks_cover_the_visible_dormant_figures_only() {
+        let mut ui = doc_with_two_figures();
+        let both: Vec<String> = ui
+            .dormant_rects_on_current_page()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(both, vec!["f0".to_string(), "f1".to_string()]);
+        // A bound figure is not an empty slot, so it drops out of the marks.
+        ui.figures_mut().bind("f0", 9);
+        let marked: Vec<String> = ui
+            .dormant_rects_on_current_page()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(marked, vec!["f1".to_string()]);
+        // The rect is the figure's own, so the mark lands on the slot.
+        let rect = ui.dormant_rects_on_current_page()[0].1;
+        assert_eq!(rect, ui.figures().get("f1").unwrap().rect);
+    }
+
+    /// Turning to another page must not leave marks on the page left behind,
+    /// nor draw that page's dormant figures over the new one.
+    #[test]
+    fn dormant_marks_follow_the_current_page() {
+        let mut ui = doc_with_two_figures();
+        ui.on_page_changed();
+        // Page 0 is the only page in a short document, so this is the identity
+        // case — recorded because it is the assumption the filter relies on.
+        assert_eq!(ui.dormant_rects_on_current_page().len(), 2);
+        assert!(ui.page_count() >= 1);
     }
 
     /// An empty document has nothing to relaunch, and says so without

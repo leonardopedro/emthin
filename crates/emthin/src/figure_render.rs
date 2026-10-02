@@ -293,6 +293,39 @@ pub fn build_overlay_elements(state: &EmthinState, scale: f64) -> Vec<CustomElem
         }
     }
 
+    // Dormant figures: an inset mark so an empty slot is visibly an empty slot
+    // and not a figure whose app failed to start. Without it the `Return`
+    // relaunch binding is real but undiscoverable.
+    //
+    // Inset by 1px on every side so it reads as a border *of* the slot rather
+    // than a second box next to it, and namespaced by figure key so editing
+    // the document does not collapse two marks into one damage-tracker id.
+    for (key, rect) in state.doc.dormant_rects_on_current_page() {
+        let inset = 1i32;
+        let x = rect.loc.x + inset;
+        let y = rect.loc.y + inset;
+        let w = rect.size.w - 2 * inset;
+        let h = rect.size.h - 2 * inset;
+        if w <= 0 || h <= 0 {
+            continue;
+        }
+        let stroke = 1i32;
+        let bars = [
+            Rectangle::new((x, y).into(), (w, stroke).into()),
+            Rectangle::new((x, y + h - stroke).into(), (w, stroke).into()),
+            Rectangle::new((x, y).into(), (stroke, h).into()),
+            Rectangle::new((x + w - stroke, y).into(), (stroke, h).into()),
+        ];
+        for (i, bar) in bars.into_iter().enumerate() {
+            out.push(solid(
+                &format!("emthin-dormant-{key}-{i}"),
+                bar,
+                scale,
+                [0.45, 0.50, 0.58, 0.75],
+            ));
+        }
+    }
+
     // Caret last: it is the single most important mark on the page.
     // Only drawn when a Wayland surface does *not* have keyboard focus —
     // otherwise the caret belongs to an app, not to us.
