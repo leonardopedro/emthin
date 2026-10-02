@@ -569,6 +569,48 @@ mod tests {
         );
     }
 
+    /// P7d: the proof DAG viewer is an ordinary figure, not a special pane.
+    ///
+    /// `logos formalize --vis dag.html` writes a self-contained page, so
+    /// hosting it needs nothing from the compositor beyond what any app needs —
+    /// a `\app` figure to show it in, and a remembered command to relaunch it:
+    ///
+    /// ```text
+    /// #1 proof DAG #2 \app(#1, #2, 900, 600, "dag")
+    /// #3 Mary sees Bob #4 \formal(#3, #4, "Mary sees Bob")
+    /// ```
+    ///
+    /// Both kinds of statement coexist in one document and neither disturbs the
+    /// other — which is the whole claim, so it is worth a test rather than a
+    /// sentence in a changelog.
+    #[test]
+    fn the_dag_viewer_and_the_claim_are_figures_in_the_same_document() {
+        let bin = fake_kernel(&reply("See(mary, bob)", true));
+        let mut ui = crate::docui::DocUi::new();
+        ui.formals_mut().set_binary(Some(bin.clone()));
+        ui.set_viewport(smithay::utils::Size::from((1200, 1600)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 proof DAG #2 \\app(#1, #2, 900, 600, \"dag\")\n\
+             #3 Mary sees Bob #4 \\formal(#3, #4, \"Mary sees Bob\")\n",
+        );
+        ui.relayout();
+        assert!(ui.last_error().is_none(), "{:?}", ui.last_error());
+        // The viewer is a figure with the usual `f<index>` key...
+        assert!(
+            ui.figures().get("f0").is_some(),
+            "the \\app figure must survive alongside the \\formal step"
+        );
+        // ...the claim is not a figure at all, and was still verified.
+        assert_eq!(ui.figures().get("g0").is_none(), true);
+        assert_eq!(ui.formals().calls(), 1);
+        // The relaunch command is recorded per figure key, which is what makes
+        // a dormant DAG figure come back.
+        ui.remember_spawn("f0", "foot".into(), vec!["file:///tmp/dag.html".into()]);
+        assert_eq!(ui.spawn_for("f0").unwrap().0, "foot");
+        cleanup(&bin);
+    }
+
     /// The seam against the **real** kernel, not a stand-in.
     ///
     /// `logos unf` is the contract; everything above it in this file is a guess

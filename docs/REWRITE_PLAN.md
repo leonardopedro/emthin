@@ -1191,6 +1191,63 @@ cargo test --workspace                                               ✓ 198 tes
 
 ## Part 2
 
-Not started. Part 2 (ProofFlow → `logos`/ControlledNaturalLanguage, §11–17)
-is an independent adaptation in `unfer/logos` with its own work breakdown;
-the plan's Part 1 and Part 2 share no code, so this log covers Part 1 only.
+Part 2 (§11–17) is the ProofFlow → `logos`/CNL adaptation. It landed in
+`unfer/logos` and is documented in full in `unfer/docs/FORMALIZE.md`; this log
+records only what landed *here*, in emthin and velysterm, and what the plan's
+P7 row actually asked for.
+
+| step | where | commits |
+|---|---|---|
+| P1–P6, P8 | `unfer`, `australVM` | `e8a37c6`, `fdec6e0`, `0dd064d`, `2194f5b`, `cb9b521`, `08c8cd6`, `8234ecd`, `8af9052` |
+| P5 (VM side) | `australVM` | `d719bc7d` |
+| P7a/b (the statement) | velysterm | `4fd1fe4`, `df50318`, `5dae026`, `18dc43e` |
+| P7c (the kernel seam) | emthin | `d401742` |
+
+### P7, as built
+
+The row asked for four things. Three of them turned out differently than the
+row assumed, and the differences are the interesting part.
+
+**NL blocks as lemma units.** Not built. `blocks::split_blocks` was not the
+seam: a proof step in the document is already a `\formal` statement with a
+caption, so the lemma unit *is* the step. Splitting paragraphs into blocks would
+have added a layer between the reader's sentence and the claim, with nothing
+checking whether the two agreed.
+
+**`\model`/`\prob` → `kernel_client`.** Not built, for the same reason the
+architectural note in `AGENTS.md` gives: geometry flows document → compositor →
+client and the *document* is the authority. A `\formal` step states what should
+be true; it does not get to decide it. `kernel_client` remains the compositor's
+subprocess surface, and `docui/formals.rs` calls `logos unf` through it rather
+than growing a second kernel path.
+
+**`\formal` spliced via `annotations`/`block_splices`.** Built, with one
+correction: the *declaration* uses `block_splices` (it is content the reader
+typed and it belongs in the document flow) while the *verdict* uses
+`annotations` (it is a result, and results have their own priority tier). Using
+one tier for both made the verdict either overwrite the claim or hide beneath
+it. A declared hash is not displayed at all — a document must not be able to
+assert an identity it did not check.
+
+**The DAG viewer as an `\app` figure.** Built, and it needed no new code. The
+HTML from `logos formalize --vis` is self-contained — no external `src`, no
+network — so it is an ordinary figure payload. `\formal` being non-visual is
+what makes this work: the claim and the viewer of the whole proof can sit in
+one document without either disturbing the other, which
+`the_dag_viewer_and_the_claim_are_figures_in_the_same_document` now asserts.
+
+### Verification
+
+`cargo test -p emthin` gives 164 lib + 20 integration. Two tests are
+`#[ignore]`d because they need a `logos` build, and both pass against one:
+they are the only checks that the subprocess contract holds, including that the
+kernel's own rejection reason ("words not in the lexicon: Euler") survives to
+the document instead of degrading to a generic failure.
+
+### Still open
+
+- **No manual E2E run** — same limitation as Part 1 (no nested session), and it
+  now also covers the `\formal` badge's rendered appearance in a real page.
+- **Dormant-figure affordance** (W9 partial, above) also bounds P7d: the DAG
+  figure can be reserved and bound, but a closed viewer's relaunch is still a
+  keyboard shortcut rather than a click.
