@@ -1177,11 +1177,19 @@ cargo test --workspace                                               ✓ 198 tes
   everything statically checkable, and the docui/figure/binding logic is
   unit-tested, but the render and input *wiring* has not been exercised
   against a real client.
-- **Dormant-figure affordance** is now complete: `Return` over the figure
+- **Dormant-figure affordance** is complete: `Return` over the figure
   relaunches it, a left click on it relaunches it, the launcher prefers the
   pointed-at figure, and a dormant figure carries an inset border so an empty
-  slot is not indistinguishable from a failed app. Still no `spawn` prompt.
-  (W9 partial — the prompt, not the affordance.)
+  slot is not indistinguishable from a failed app. The launch command is a
+  `launch:` argument on the `\app` statement itself, so nothing outside the
+  document has to be kept in step with it. Still no `spawn` prompt for typing
+  an arbitrary command. (W9 partial — the prompt, not the affordance.)
+- **`session.rs` is unwired.** `SessionFile` has round-trip tests and no
+  callers; `DocUi::load`/`save` use their own path. Its `spawns` table was
+  deleted as superseded by `launch:`; `current_page` (the actual
+  current-page persistence W9 asks for) and `xwayland_display` remain. Either
+  wire it up or delete it — an unwired module with passing tests reads as
+  working.
 - **The launcher** (`Ctrl+Shift+Return`) has no prompt. It relaunches the
   pointed-at dormant figure, which is unambiguous, but a `spawn` prompt needs
   a text input surface of its own — a bigger decision than a key binding.
