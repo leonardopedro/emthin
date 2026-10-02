@@ -602,7 +602,7 @@ mod tests {
             "the \\app figure must survive alongside the \\formal step"
         );
         // ...the claim is not a figure at all, and was still verified.
-        assert_eq!(ui.figures().get("g0").is_none(), true);
+        assert!(ui.figures().get("g0").is_none());
         assert_eq!(ui.formals().calls(), 1);
         // The relaunch command is recorded per figure key, which is what makes
         // a dormant DAG figure come back.
