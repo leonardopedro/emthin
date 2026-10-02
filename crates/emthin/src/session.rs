@@ -28,24 +28,9 @@ pub struct SessionFile {
     pub version: u32,
     /// Page the user was on.
     pub current_page: usize,
-    /// Per-figure launch commands, keyed by figure key (`f<stmt-index>`).
-    ///
-    /// A key that no longer exists in the document is ignored on load;
-    /// a document figure with no entry is simply not relaunchable.
-    #[serde(default)]
-    pub spawns: Vec<SpawnEntry>,
     /// XWayland display number, for diagnostics.
     #[serde(default)]
     pub xwayland_display: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpawnEntry {
-    /// The `\app` statement key this command belongs to.
-    pub figure: String,
-    pub cmd: String,
-    #[serde(default)]
-    pub args: Vec<String>,
 }
 
 impl Default for SessionFile {
@@ -53,36 +38,12 @@ impl Default for SessionFile {
         Self {
             version: SESSION_VERSION,
             current_page: 0,
-            spawns: Vec::new(),
             xwayland_display: None,
         }
     }
 }
 
 impl SessionFile {
-    /// The command recorded for a figure, if any.
-    pub fn spawn_for(&self, figure: &str) -> Option<(&str, &[String])> {
-        self.spawns
-            .iter()
-            .find(|e| e.figure == figure)
-            .map(|e| (e.cmd.as_str(), e.args.as_slice()))
-    }
-
-    /// Record (or replace) a figure's launch command.
-    pub fn set_spawn(&mut self, figure: &str, cmd: String, args: Vec<String>) {
-        match self.spawns.iter_mut().find(|e| e.figure == figure) {
-            Some(entry) => {
-                entry.cmd = cmd;
-                entry.args = args;
-            }
-            None => self.spawns.push(SpawnEntry {
-                figure: figure.to_string(),
-                cmd,
-                args,
-            }),
-        }
-    }
-
     /// Read a session file. A missing or unparseable file yields the
     /// default — losing the session's bookkeeping is always better than
     /// refusing to start.
@@ -155,38 +116,22 @@ mod tests {
     }
 
     #[test]
-    fn spawns_round_trip_and_replace() {
-        let mut s = SessionFile::default();
-        s.set_spawn("f0", "foot".into(), vec!["-T".into()]);
-        assert_eq!(s.spawn_for("f0"), Some(("foot", &["-T".to_string()][..])));
-        // Same figure again replaces rather than duplicates.
-        s.set_spawn("f0", "alacritty".into(), vec![]);
-        assert_eq!(s.spawn_for("f0"), Some(("alacritty", &[][..])));
-        assert_eq!(s.spawns.len(), 1);
-        assert!(s.spawn_for("f9").is_none());
-    }
-
-    #[test]
     fn save_and_load_round_trip() {
         let dir = tmp("roundtrip");
         let path = dir.join("session.json");
-        let mut s = SessionFile {
+        let s = SessionFile {
             current_page: 3,
             ..Default::default()
         };
-        s.set_spawn("f1", "foot".into(), vec!["-x".into()]);
         s.save(&path);
 
-        let loaded = SessionFile::load(&path);
-        assert_eq!(loaded.current_page, 3);
-        assert_eq!(loaded.spawn_for("f1").map(|(c, _)| c), Some("foot"));
+        assert_eq!(SessionFile::load(&path).current_page, 3);
     }
 
     #[test]
     fn missing_file_yields_the_default() {
         let loaded = SessionFile::load(Path::new("/nonexistent/emthin/session.json"));
         assert_eq!(loaded.current_page, 0);
-        assert!(loaded.spawns.is_empty());
     }
 
     #[test]
@@ -194,7 +139,7 @@ mod tests {
         let dir = tmp("garbage");
         let path = dir.join("session.json");
         std::fs::write(&path, b"not json at all").expect("write");
-        assert!(SessionFile::load(&path).spawns.is_empty());
+        assert_eq!(SessionFile::load(&path).current_page, 0);
     }
 
     #[test]

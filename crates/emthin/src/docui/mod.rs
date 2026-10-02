@@ -48,8 +48,6 @@ pub struct DocUi {
     formals: FormalVerifier,
     /// Where the session is persisted (`None` = don't persist).
     session_file: Option<std::path::PathBuf>,
-    /// Spawn commands remembered per figure id for dormant figures.
-    dormant_spawns: std::collections::HashMap<String, (String, Vec<String>)>,
     last_autosave: Instant,
     /// Set when the layout failed (a Typst syntax error mid-typing, say)
     /// so the caller can surface it without losing the document.
@@ -70,7 +68,6 @@ impl DocUi {
             figures: FigureManager::new(),
             formals: FormalVerifier::new(),
             session_file: None,
-            dormant_spawns: std::collections::HashMap::new(),
             last_autosave: Instant::now(),
             last_error: None,
         }
@@ -220,18 +217,6 @@ impl DocUi {
         self.figures.origin_on_page(app_id, self.current_page())
     }
 
-    /// Remember the command that launched an app, so a dormant figure
-    /// can relaunch it.
-    pub fn remember_spawn(&mut self, figure_key: &str, cmd: String, args: Vec<String>) {
-        self.dormant_spawns
-            .insert(figure_key.to_string(), (cmd, args));
-    }
-
-    /// The saved launch command for a figure, if any.
-    pub fn spawn_for(&self, figure_key: &str) -> Option<&(String, Vec<String>)> {
-        self.dormant_spawns.get(figure_key)
-    }
-
     /// The dormant figures to mark on the current page, with their rects.
     ///
     /// A dormant figure is an empty slot. Without a mark it is
@@ -268,18 +253,29 @@ impl DocUi {
         (fig.is_dormant() && fig.page == Some(self.current_page())).then_some(fig.key.as_str())
     }
 
-    /// The command to relaunch for `key`, if it is dormant and has one saved.
+    /// The command that launches `key`'s app, from the `\app` statement itself.
     ///
-    /// Returns the command rather than the key so the caller can spawn without
-    /// re-deriving what "dormant with a command" means. A figure that already
-    /// has an app is refused: relaunching it would put a second client where
-    /// one is already composited.
-    pub fn relaunch_target(&self, key: &str) -> Option<&(String, Vec<String>)> {
+    /// The document is the authority on what an `\app` means, so the launch
+    /// command is a `launch:` argument on the statement rather than compositor
+    /// state. That also means there is no mapping to guess: no pid→app_id
+    /// link exists, and a figure's binding id is a glob over app ids that need
+    /// not resemble the program that produced them.
+    ///
+    /// Split with [`crate::cli::split_command`] — the same splitter `--spawn`
+    /// uses, so a command survives a round trip through the document with the
+    /// quoting rules the user already met on the command line.
+    ///
+    /// `None` when the statement names no command, or when the figure is not
+    /// dormant: a figure that already has a client must not spawn a second one
+    /// over the top of it.
+    pub fn relaunch_target(&self, key: &str) -> Option<(String, Vec<String>)> {
         let fig = self.figures.get(key)?;
         if !fig.is_dormant() {
             return None;
         }
-        self.spawn_for(key)
+        let words = crate::cli::split_command(fig.spec.launch.as_deref()?);
+        let program = words.first()?.clone();
+        Some((program, words[1..].to_vec()))
     }
 
     /// The first dormant figure in document order, as a last resort.
@@ -361,12 +357,10 @@ mod relaunch_tests {
         ui.set_viewport(Size::from((1200, 1600)));
         ui.model_mut().replace(
             0..0,
-            "#1 first #2 \\app(#1, #2, 600, 300, \"first\")\n\
-             #3 second #4 \\app(#3, #4, 600, 300, \"second\")\n",
+            "#1 first #2 \\app(#1, #2, 600, 300, \"first\", launch: \"foot -T\")\n\
+             #3 second #4 \\app(#3, #4, 600, 300, \"second\", launch: \"alacritty\")\n",
         );
         ui.relayout();
-        ui.remember_spawn("f0", "foot".into(), vec!["-T".into()]);
-        ui.remember_spawn("f1", "foot".into(), vec!["-T".into()]);
         ui
     }
 
@@ -407,22 +401,63 @@ mod relaunch_tests {
         assert_eq!(ui.relaunch_target("f0"), None);
     }
 
-    /// `relaunch_target` needs both halves: dormant *and* a saved command. A
-    /// figure with no remembered command must not spawn an empty one.
+    /// The command comes from the document, and is split with the `--spawn`
+    /// splitter. A figure whose statement names no command must not spawn an
+    /// empty one.
     #[test]
-    fn relaunch_needs_a_saved_command() {
+    fn relaunch_needs_a_command_in_the_document() {
         let mut ui = DocUi::new();
         ui.set_viewport(Size::from((1200, 1600)));
         ui.model_mut()
             .replace(0..0, "#1 a #2 \\app(#1, #2, 600, 300, \"a\")");
         ui.relayout();
         assert_eq!(ui.relaunch_target("f0"), None, "dormant but no command");
-        ui.remember_spawn("f0", "foot".into(), vec!["-T".into()]);
+        // Adding the command to the statement is all it takes — no compositor
+        // state to keep in step, and no relaunch to re-derive.
+        let close = ui.model().text().rfind(')').expect("a closing paren");
+        ui.model_mut()
+            .replace(close..close, ", launch: \"foot -T\"");
+        ui.relayout();
         let (cmd, args) = ui.relaunch_target("f0").expect("now launchable");
         assert_eq!(cmd, "foot");
-        assert_eq!(*args, vec!["-T".to_string()]);
+        assert_eq!(args, vec!["-T".to_string()]);
         // A key that names no figure is not an error, just nothing to do.
         assert_eq!(ui.relaunch_target("f9"), None);
+    }
+
+    /// Each figure launches *its own* command. A single remembered command for
+    /// the whole document would relaunch the wrong app for every figure but
+    /// one, and this is the test that would have caught the missing mapping.
+    #[test]
+    fn each_figure_launches_its_own_command() {
+        let ui = doc_with_two_figures();
+        let (cmd0, args0) = ui.relaunch_target("f0").expect("f0 launches");
+        let (cmd1, args1) = ui.relaunch_target("f1").expect("f1 launches");
+        assert_eq!(
+            (cmd0.as_str(), args0.as_slice()),
+            ("foot", ["-T".to_string()].as_slice())
+        );
+        assert_eq!(
+            (cmd1.as_str(), args1.as_slice()),
+            ("alacritty", [].as_slice()),
+            "the second figure must not inherit the first one's command"
+        );
+    }
+
+    /// A quoted argument survives the document round trip, because it is split
+    /// by the same function that parses `--spawn`.
+    #[test]
+    fn a_quoted_argument_survives_the_round_trip() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 1600)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 a #2 \\app(#1, #2, 600, 300, launch: \"foot --app-id 'my app'\")",
+        );
+        ui.relayout();
+        let (cmd, args) = ui.relaunch_target("f0").expect("launchable");
+        assert_eq!(cmd, "foot");
+        assert_eq!(args, vec!["--app-id".to_string(), "my app".to_string()]);
     }
 
     /// The fallback is document order, which is the only ordering available

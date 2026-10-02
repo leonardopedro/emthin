@@ -194,7 +194,12 @@ pub fn default_figure_size() -> (i32, i32) {
 
 /// A figure spec equal to a (w, h) pair with no id.
 pub fn spec_of(w: i32, h: i32) -> FigureSpec {
-    FigureSpec { w, h, id: None }
+    FigureSpec {
+        w,
+        h,
+        id: None,
+        launch: None,
+    }
 }
 
 #[cfg(test)]

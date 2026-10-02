@@ -591,7 +591,7 @@ mod tests {
         ui.set_viewport(smithay::utils::Size::from((1200, 1600)));
         ui.model_mut().replace(
             0..0,
-            "#1 proof DAG #2 \\app(#1, #2, 900, 600, \"dag\")\n\
+            "#1 proof DAG #2 \\app(#1, #2, 900, 600, \"dag\", launch: \"foot file:///tmp/dag.html\")\n\
              #3 Mary sees Bob #4 \\formal(#3, #4, \"Mary sees Bob\")\n",
         );
         ui.relayout();
@@ -604,10 +604,11 @@ mod tests {
         // ...the claim is not a figure at all, and was still verified.
         assert!(ui.figures().get("g0").is_none());
         assert_eq!(ui.formals().calls(), 1);
-        // The relaunch command is recorded per figure key, which is what makes
-        // a dormant DAG figure come back.
-        ui.remember_spawn("f0", "foot".into(), vec!["file:///tmp/dag.html".into()]);
-        assert_eq!(ui.spawn_for("f0").unwrap().0, "foot");
+        // The relaunch command lives in the document, so a dormant DAG figure
+        // comes back without any compositor state having to be kept in step.
+        let (cmd, args) = ui.relaunch_target("f0").expect("the DAG viewer relaunches");
+        assert_eq!(cmd, "foot");
+        assert_eq!(args, vec!["file:///tmp/dag.html".to_string()]);
         cleanup(&bin);
     }
 

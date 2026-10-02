@@ -242,7 +242,12 @@ mod tests {
         Figure {
             key: key.to_string(),
             stmt: 0,
-            spec: FigureSpec { w, h, id: None },
+            spec: FigureSpec {
+                w,
+                h,
+                id: None,
+                launch: None,
+            },
             span: 0..0,
             w_arg: 0..0,
             h_arg: 0..0,

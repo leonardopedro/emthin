@@ -336,7 +336,7 @@ impl EmthinState {
     /// can claim the click. Waiting for a double-click would be inventing a
     /// gesture out of a case where the click is already unclaimed.
     fn relaunch_dormant(&mut self, key: &str) -> bool {
-        let Some((cmd, args)) = self.doc.relaunch_target(key).cloned() else {
+        let Some((cmd, args)) = self.doc.relaunch_target(key) else {
             // Dormant with no saved command: an empty slot with nothing to open.
             // Not an error, and not worth a warning per click.
             tracing::debug!("relaunch: {key} has no saved command");
@@ -425,13 +425,8 @@ impl EmthinState {
             tracing::info!("launcher: no dormant figure to launch into");
             return;
         };
-        match self.doc.relaunch_target(&key).cloned() {
-            Some((cmd, args)) => {
-                tracing::info!("launcher: relaunching {} into {key}", cmd);
-                let display = self.xwayland.display();
-                crate::util::spawn_child(&cmd, &args, display, self);
-            }
-            None => tracing::info!("launcher: {key} has no saved command"),
+        if !self.relaunch_dormant(&key) {
+            tracing::info!("launcher: {key} names no launch command");
         }
     }
 
