@@ -43,48 +43,62 @@ mod tests {
     }
 
     #[test]
-    fn parse_set_geometry() {
-        let wire = br#"{"jsonrpc":"2.0","method":"set_geometry","params":{"window_id":42,"x":0.5,"y":0.3,"w":0.4,"h":0.6}}"#;
+    fn roundtrip_figure_changed_carries_absolute_pixels() {
+        let msg = OutgoingMessage::FigureChanged {
+            figure: "f0".into(),
+            page: 1,
+            rect: IpcRect {
+                x: 10,
+                y: 20,
+                w: 640,
+                h: 400,
+            },
+            bound: true,
+        };
+        let wire = serialize_outgoing(msg).unwrap();
+        let s = String::from_utf8_lossy(&wire);
+        assert!(s.contains(r#""method":"figure_changed""#), "{s}");
+        assert!(s.contains(r#""w":640"#), "{s}");
+    }
+
+    #[test]
+    fn parse_spawn() {
+        let wire = br#"{"jsonrpc":"2.0","method":"spawn","params":{"cmd":"foot","args":["-T"]}}"#;
         let msg = parse_incoming(wire).unwrap();
         assert!(matches!(
             msg,
-            IncomingMessage::SetGeometry {
-                window_id: 42,
-                rect: IpcRect {
-                    x: 0.5,
-                    y: 0.3,
-                    w: 0.4,
-                    h: 0.6
-                }
-            }
+            IncomingMessage::Spawn { ref cmd, ref args } if cmd == "foot" && args == &["-T".to_string()]
         ));
     }
 
     #[test]
-    fn parse_close() {
-        let wire = br#"{"jsonrpc":"2.0","method":"close","params":{"window_id":7}}"#;
+    fn parse_close_by_figure_key() {
+        let wire = br#"{"jsonrpc":"2.0","method":"close","params":{"figure":"f3"}}"#;
         let msg = parse_incoming(wire).unwrap();
-        assert!(matches!(msg, IncomingMessage::Close { window_id: 7 }));
+        assert!(matches!(msg, IncomingMessage::Close { figure } if figure == "f3"));
     }
 
     #[test]
-    fn parse_set_focus_no_window_id() {
-        let wire = br#"{"jsonrpc":"2.0","method":"set_focus","params":{}}"#;
+    fn parse_focus_without_a_figure_means_the_document() {
+        let wire = br#"{"jsonrpc":"2.0","method":"focus","params":{}}"#;
         let msg = parse_incoming(wire).unwrap();
-        assert!(matches!(msg, IncomingMessage::SetFocus { window_id: None }));
+        assert!(matches!(msg, IncomingMessage::Focus { figure: None }));
     }
 
     #[test]
     fn rejects_missing_jsonrpc_field() {
-        let wire = br#"{"method":"close","params":{"window_id":1}}"#;
-        let result = parse_incoming(wire);
-        assert!(result.is_err());
+        let wire = br#"{"method":"close","params":{"figure":"f0"}}"#;
+        assert!(parse_incoming(wire).is_err());
     }
 
     #[test]
     fn rejects_unknown_method() {
         let wire = br#"{"jsonrpc":"2.0","method":"bogus","params":{}}"#;
-        let result = parse_incoming(wire);
-        assert!(result.is_err());
+        assert!(parse_incoming(wire).is_err());
+    }
+
+    #[test]
+    fn rejects_a_malformed_frame() {
+        assert!(parse_incoming(b"not json").is_err());
     }
 }

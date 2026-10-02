@@ -3,6 +3,59 @@
 All notable changes to emthin are documented here.
 Generated from conventional commits via git-cliff.
 
+## [Unreleased]
+
+### ⚠ BREAKING CHANGES
+
+- **The Emacs shell is gone.** emthin's UI is now a mathed document,
+  and Wayland applications appear as figures in it — like images in a
+  PDF. There is no Elisp client, no `emacs` spawn, no IPC-driven layout
+  engine, and no window-management policy in the compositor.
+
+  - The IPC protocol is replaced: `set_geometry`, `set_visibility`,
+    `add_mirror`, `update_mirror_geometry`, `remove_mirror`,
+    `promote_mirror`, `switch_workspace` and `set_migration_policy`
+    are gone; `spawn`, `close`, `focus`, `set_figure_size`,
+    `clone_figure`, `goto_page`, `open_doc`, `save_doc` and
+    `list_state` replace them. See `docs/ipc.md`.
+  - Geometry is reported in absolute logical pixels, not `f64`
+    fractions.
+  - CLI: `--command`/`--arg`/`--standalone` are replaced by
+    `--spawn <CMD>` (repeatable, one command line each), `--doc` and
+    `--session-file`. Nothing is spawned by default.
+  - The `--emacs` optdepends entries are removed from the AUR
+    metadata.
+
+### Features
+
+- `\app(#s, #f, W, H[, "id"])` statements in the document reserve a
+  figure slot. Bound apps are composited over that slot; a third
+  argument is a glob app-binding key, so several `\app` statements can
+  share one app as mirrors.
+- Document editing: caret, selection, undo/redo, word motion, host
+  clipboard copy/cut/paste, and a keymap (page nav, figure clone,
+  Escape/Ctrl+G to leave a figure).
+- Figure resize by dragging its edge, which rewrites the `\app`
+  arguments; the page reflows and the app is reconfigured.
+- Paged, letterboxed document view with PgUp/PgDn and ext-workspace-v1
+  exposing pages as workspaces.
+- Session restore: the document comes back from a Loro snapshot with
+  its figures dormant, and each figure remembers the command that
+  launched it.
+- Control protocol over JSON-RPC, documented in `docs/ipc.md`.
+
+### Refactor
+
+- Delete `elisp/`, `state/emacs.rs`, `state/migration.rs` and the
+  Emacs-specific parts of the IPC message set.
+- Replace `state/workspace.rs` with `state/page.rs` (one `Space`,
+  `current_page`) and `state/emacs.rs` with `state/host.rs`.
+- `mirror_render` generalised into `figure_render`: one render element
+  per figure, namespaced per figure so a mirror's damage regions stay
+  distinct.
+- Figure page raster added to the GPU in `doc_render.rs`, re-imported
+  only when `(page, doc revision)` changes.
+
 ## [0.3.12] - 2026-04-27
 
 ### Bug Fixes

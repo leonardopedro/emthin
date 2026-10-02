@@ -114,7 +114,7 @@ pub fn build_mirror_elements(
             }
 
             for (&view_id, mirror) in &app.mirrors {
-                if mirror.workspace_id != state.workspace.active_id {
+                if mirror.page != state.doc.current_page() {
                     continue;
                 }
                 let Some(ratio) = crate::apps::AppManager::aspect_fit_ratio(

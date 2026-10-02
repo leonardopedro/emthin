@@ -241,3 +241,68 @@ fn register_outgoing_pipe(state: &mut EmthinState, id: u64, read_fd: std::os::fd
     }
     true
 }
+
+// ---------------------------------------------------------------------------
+// Document clipboard
+// ---------------------------------------------------------------------------
+
+/// Put `text` on the **host** clipboard, for the document's own
+/// copy/cut.
+///
+/// Two clipboards coexist here and must not fight:
+///
+/// - `state.selection.clipboard` (`emthin-clipboard`) mirrors selections
+///   between emthin's Wayland clients and the host. It is a *proxy*:
+///   every read and write is a round trip through a pipe.
+/// - this function uses `arboard`, which talks to the host clipboard
+///   directly and synchronously — which is what a keystroke handler
+///   needs. A proxy round trip cannot answer "what is on the clipboard?"
+///   without blocking the event loop.
+///
+/// Setting the host selection makes the `emthin-clipboard` backend
+/// observe a `HostSelectionChanged` echo, which it *should* forward into
+/// the clients: text copied out of the document has to be pasteable in
+/// an app. The origin is recorded as [`SelectionOrigin::Host`] so the
+/// bridge's later `forward_client_selection` treats the data as
+/// already-at-the-host and doesn't try to bounce it back.
+pub fn set_host_clipboard(state: &mut EmthinState, text: &str) {
+    if state.selection.doc_clipboard.is_none() {
+        match arboard::Clipboard::new() {
+            Ok(c) => state.selection.doc_clipboard = Some(c),
+            Err(e) => {
+                tracing::warn!("document clipboard unavailable: {e}");
+                return;
+            }
+        }
+    }
+    let Some(clipboard) = state.selection.doc_clipboard.as_mut() else {
+        return;
+    };
+    match clipboard.set_text(text.to_owned()) {
+        Ok(()) => {
+            state.selection.clipboard_origin = SelectionOrigin::Host;
+            tracing::debug!("document clipboard set ({} bytes)", text.len());
+        }
+        Err(e) => tracing::warn!("document clipboard write failed: {e}"),
+    }
+}
+
+/// Read the host clipboard for the document's paste.
+pub fn host_clipboard(state: &mut EmthinState) -> Option<String> {
+    let clipboard = state.selection.doc_clipboard.as_mut()?;
+    match clipboard.get_text() {
+        Ok(text) => Some(text),
+        Err(e) => {
+            tracing::warn!("document clipboard read failed: {e}");
+            None
+        }
+    }
+}
+
+/// Drop the `arboard` clipboard. Called when the host window loses
+/// focus: X11 clipboards are owned by the focused window, so holding a
+/// handle across a focus change is how you get "clipboard stopped
+/// working after Alt+Tab" bugs.
+pub fn release_doc_clipboard(state: &mut EmthinState) {
+    state.selection.doc_clipboard = None;
+}

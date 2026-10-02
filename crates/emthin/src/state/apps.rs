@@ -10,31 +10,37 @@ use smithay::{
     wayland::seat::WaylandFocus,
 };
 
-/// A mirror view of an embedded app, possibly in a different workspace than
-/// its source. The source texture is accessed via WlSurface directly (not
-/// through Space), so cross-workspace mirrors work naturally.
+/// A second view of an embedded app, on another page of the document.
+///
+/// With the figure metaphor, mirrors are `\app` statements sharing one
+/// binding id rather than compositor-side view entries, so this type
+/// only survives for the client's own `xdg_toplevel` placement. The
+/// compositor drives figure mirrors through
+/// `docui::figures::FigureManager`.
 pub struct MirrorView {
     pub geometry: Rectangle<i32, Logical>,
-    /// Which workspace this mirror is displayed in.
-    pub workspace_id: u64,
+    /// Page this mirror is displayed on.
+    pub page: usize,
 }
 
-/// An embedded application window.
+/// An embedded application window, bound to a document figure.
 pub struct AppWindow {
     pub window_id: u64,
     pub window: Window,
-    /// Which workspace this app's source surface belongs to.
-    pub workspace_id: u64,
-    /// Committed geometry (logical px) — currently used for rendering.
+    /// The page the figure bound to this app lives on. The app keeps
+    /// running (and keeps its surface) on other pages; it simply stops
+    /// receiving frame callbacks there.
+    pub page: usize,
+    /// Committed geometry (logical px) — the size the client actually
+    /// committed at. The figure's rect comes from the document, not
+    /// from here; this is only the source box for the stretch.
     pub geometry: Option<Rectangle<i32, Logical>>,
     /// Pending geometry awaiting the client's next buffer commit.
     pub pending_geometry: Option<Rectangle<i32, Logical>>,
     /// When `pending_geometry` was set (for timeout-based force-commit).
     pub pending_since: Option<Instant>,
     pub visible: bool,
-    /// Mirror views: view_id → MirrorView. Each entry is a scaled copy of the
-    /// source surface, positioned at the given rectangle. Mirrors can be in a
-    /// different workspace than the source.
+    /// Mirror views: view_id → MirrorView.
     pub mirrors: HashMap<u64, MirrorView>,
 }
 
@@ -187,20 +193,19 @@ impl AppManager {
         Some((dst.w / src.w).min(dst.h / src.h))
     }
 
-    /// Check if `pos` falls inside any mirror in the given workspace.
+    /// Check if `pos` falls inside any mirror on the given page.
     /// Returns (window_id, view_id, mapped surface coordinate) with proportional mapping.
-    /// Only checks mirrors whose `workspace_id` matches `active_workspace_id`.
     pub fn mirror_under(
         &self,
         pos: Point<f64, Logical>,
-        active_workspace_id: u64,
+        page: usize,
     ) -> Option<(u64, u64, Point<f64, Logical>)> {
         for app in self.windows.values() {
             let Some(source_geo) = app.geometry else {
                 continue;
             };
             for (&view_id, mirror) in &app.mirrors {
-                if mirror.workspace_id != active_workspace_id {
+                if mirror.page != page {
                     continue;
                 }
                 if let Some(mapped) = Self::mirror_hit_test(pos, source_geo, mirror.geometry) {

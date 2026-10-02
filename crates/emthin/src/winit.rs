@@ -38,11 +38,11 @@ fn make_mode(size: Size<i32, Physical>) -> Mode {
 }
 
 fn apply_pending_state(state: &mut EmthinState, backend: &mut WinitGraphicsBackend<GlesRenderer>) {
-    if let Some(title) = state.emacs.take_title() {
+    if let Some(title) = state.host.take_title() {
         backend.window().set_title(&title);
     }
 
-    if let Some(fullscreen) = state.emacs.take_pending_fullscreen() {
+    if let Some(fullscreen) = state.host.take_pending_fullscreen() {
         if fullscreen {
             backend
                 .window()
@@ -52,7 +52,7 @@ fn apply_pending_state(state: &mut EmthinState, backend: &mut WinitGraphicsBacke
         }
     }
 
-    if let Some(maximize) = state.emacs.take_pending_maximize() {
+    if let Some(maximize) = state.host.take_pending_maximize() {
         backend.window().set_maximized(maximize);
     }
 
@@ -102,8 +102,41 @@ fn render_frame(
         let scale = output.current_scale().fractional_scale();
         let mut extras: Vec<CustomElement<GlesRenderer>> = Vec::new();
 
-        // Software cursor (topmost of extras): used for Surface cursors
-        // (GTK3/Emacs) that can't be forwarded via winit's CursorIcon API.
+        // --- 1. the document page (bottom layer) ---
+        // Everything else composites *over* the page, so the page goes
+        // in first. Re-imported only when the page's pixels changed
+        // (see DocPageTexture's cache key).
+        if let Some(page) = state.doc.layout().page() {
+            let pixels = crate::doc_render::PagePixels {
+                rgba: &page.image.data,
+                width: page.width,
+                height: page.height,
+                page: state.doc.current_page(),
+                revision: state.doc.model().revision(),
+                rect: state.doc.layout().page_rect(),
+                scale,
+            };
+            if let Some(element) = state.doc_page.element(renderer, &pixels) {
+                extras.push(element);
+            }
+        }
+
+        // --- 2. app surfaces over their figure rects ---
+        // Figures live in the document's flow, so they are drawn as
+        // custom elements rather than as `Space` elements: smithay's
+        // `render_output` paints custom elements *above* space elements
+        // and `Space::map_element` re-stacks to the top, so anything in
+        // the `Space` would cover the page and fight the z-order.
+        extras.extend(crate::figure_render::build_figure_elements(
+            state, renderer, scale,
+        ));
+
+        // --- 3. the document's own overlays ---
+        extras.extend(crate::figure_render::build_overlay_elements(state, scale));
+
+        // --- 4. software cursor (topmost) ---
+        // Surface cursors (GTK3/Electron) can't be forwarded via
+        // winit's CursorIcon API, so they're composited here.
         state.cursor.ensure_alive();
         if let CursorImageStatus::Surface(surface) = state.cursor.status() {
             if let Some(pointer) = state.seat.get_pointer() {
@@ -148,17 +181,13 @@ fn render_frame(
             }
         }
 
-        extras.extend(crate::mirror_render::build_mirror_elements(
-            state, renderer, scale,
-        ));
-
         if let Err(e) = render_output::<GlesRenderer, CustomElement<GlesRenderer>, Window, _>(
             output,
             renderer,
             &mut framebuffer,
             1.0,
             0,
-            [&state.workspace.active_space],
+            [&state.page.active_space],
             &extras,
             damage_tracker,
             [0.0, 0.0, 0.0, 0.0],
@@ -174,7 +203,7 @@ fn render_frame(
 }
 
 fn post_render(state: &mut EmthinState, output: &Output) {
-    state.workspace.active_space.elements().for_each(|window| {
+    state.page.active_space.elements().for_each(|window| {
         window.send_frame(
             output,
             state.start_time.elapsed(),
@@ -183,7 +212,7 @@ fn post_render(state: &mut EmthinState, output: &Output) {
         )
     });
 
-    state.workspace.active_space.refresh();
+    state.page.active_space.refresh();
     state.wl.popups.cleanup();
 
     if let Err(e) = state.display_handle.flush_clients() {
@@ -198,7 +227,7 @@ pub fn init_winit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let attributes = winit_crate::window::Window::default_attributes()
         .with_inner_size(winit_crate::dpi::LogicalSize::new(1280.0, 800.0))
-        .with_title("Emacs")
+        .with_title("emthin")
         .with_visible(true)
         .with_name("emthin", "emthin");
     let (mut backend, winit) = winit::init_from_attributes(attributes)?;
@@ -206,7 +235,7 @@ pub fn init_winit(
         backend
             .window()
             .set_fullscreen(Some(winit_crate::window::Fullscreen::Borderless(None)));
-        state.emacs.request_fullscreen(true);
+        state.host.request_fullscreen(true);
     } else {
         backend.window().set_maximized(true);
     }
@@ -232,7 +261,7 @@ pub fn init_winit(
     );
     output.set_preferred(mode);
 
-    state.workspace.active_space.map_output(&output, (0, 0));
+    state.page.active_space.map_output(&output, (0, 0));
 
     init_dmabuf(&mut backend, state);
 
@@ -265,14 +294,10 @@ pub fn init_winit(
                         Some(Scale::Fractional(scale_factor)),
                         None,
                     );
-                    if state.emacs.size_settled() {
-                        // Re-lays out every Emacs frame against the fresh
-                        // output size and broadcasts SurfaceSize — also
-                        // sets needs_redraw.
-                        state.relayout_emacs();
-                    } else {
-                        state.needs_redraw = true;
-                    }
+                    // Re-lay out the document page against the fresh output size
+                    // and re-letterbox the page — also sets
+                    // needs_redraw.
+                    state.relayout_doc();
                 }
 
                 WinitEvent::Input(event) => {

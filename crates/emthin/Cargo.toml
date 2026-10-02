@@ -8,11 +8,21 @@ edition = "2021"
 authors = ["Lee <loyalpartner@163.com>"]
 license = "GPL-3.0"
 repository = "https://github.com/emthin/emthin"
-description = "Embed Wayland applications inside Emacs"
+description = "Render Wayland applications as figures inside a mathed document"
 
 [dependencies]
 emthin-clipboard = { path = "../emthin-clipboard" }
 emthin-dbus = { path = "../emthin-dbus" }
+# Document engine (MIT OR Apache-2.0): the shell UI is a mathed
+# document and Wayland apps are composited over the `\app` figure slots
+# it lays out. Path deps into the sibling velysterm checkout — see
+# docs/REWRITE_PLAN.md (D1).
+mathed_core = { path = "../../../velysterm/crates/mathed_core" }
+# `default-features = false` drops mathed_mini's `gui` feature: emthin
+# renders the document itself (CPU raster → GPU texture) and owns the
+# window, so the winit/softbuffer/accesskit/arboard frontend is dead
+# weight here.
+mathed_mini = { path = "../../../velysterm/crates/mathed_mini", default-features = false }
 smithay.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +36,11 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "server", "staging"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
-include_dir = "0.7"
+unicode-segmentation = "1"
+# Synchronous host clipboard for the document's copy/paste. The
+# emthin-clipboard proxy handles client<->host sync; this handles the
+# document's own keystroke path, which cannot afford a round trip.
+arboard = "3.6"
 
 
 [package.metadata.release]
@@ -54,7 +68,3 @@ exactly = 1
 
 [package.metadata.aur]
 depends = ["wayland", "libxkbcommon", "libxkbcommon-x11", "mesa", "libinput", "seatd", "fontconfig", "freetype2", "ttf-dejavu", "xorg-xwayland", "xwayland-satellite"]
-optdepends = [
-    "emacs-wayland: pgtk Emacs (recommended)",
-    "emacs: X11 Emacs (works via xwayland-satellite)",
-]

@@ -59,17 +59,17 @@ pub fn promote_floating_dialog(
 ///   new_lx = output.x + (output.w - win.w) / 2
 ///   new_ly = output.y + (output.h - win.h) / 2
 pub fn re_center_dialog(state: &mut EmthinState, window: &smithay::desktop::Window) {
-    let Some(output) = state.workspace.active_space.outputs().next().cloned() else {
+    let Some(output) = state.page.active_space.outputs().next().cloned() else {
         return;
     };
-    let Some(output_geo) = state.workspace.active_space.output_geometry(&output) else {
+    let Some(output_geo) = state.page.active_space.output_geometry(&output) else {
         return;
     };
     let win_size = window.geometry().size;
     let new_x = output_geo.loc.x + (output_geo.size.w - win_size.w) / 2;
     let new_y = output_geo.loc.y + (output_geo.size.h - win_size.h) / 2;
     state
-        .workspace
+        .page
         .active_space
         .map_element(window.clone(), (new_x, new_y), false);
 }
@@ -87,29 +87,16 @@ pub fn cleanup_dead_dialogs(state: &mut EmthinState) {
     let mut had_dead = false;
 
     let dead: Vec<smithay::desktop::Window> = state
-        .workspace
+        .page
         .active_space
         .elements()
         .filter(|w| !w.alive())
         .cloned()
         .collect();
     for window in &dead {
-        state.workspace.active_space.unmap_elem(window);
+        state.page.active_space.unmap_elem(window);
     }
     had_dead |= !dead.is_empty();
-
-    for ws in state.workspace.inactive.values_mut() {
-        let dead: Vec<smithay::desktop::Window> = ws
-            .space
-            .elements()
-            .filter(|w| !w.alive())
-            .cloned()
-            .collect();
-        for window in &dead {
-            ws.space.unmap_elem(window);
-        }
-        had_dead |= !dead.is_empty();
-    }
 
     if !had_dead {
         return;
@@ -123,10 +110,12 @@ pub fn cleanup_dead_dialogs(state: &mut EmthinState) {
             _ => false,
         };
         if needs_fallback {
-            let target = state.emacs_focus_target();
+            // A dialog is not a figure, so there's nothing on the page to
+            // fall back to: clear focus and let typing return to the
+            // document caret.
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(state, target, serial);
-            tracing::debug!("focus returned to Emacs after dialog destroy");
+            keyboard.set_focus(state, None, serial);
+            tracing::debug!("focus returned to the document after dialog destroy");
         }
     }
 }

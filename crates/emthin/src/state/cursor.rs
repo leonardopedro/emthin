@@ -84,11 +84,11 @@ impl CursorState {
         }
     }
 
-    /// On workspace switch, drop any Surface cursor that referenced
-    /// the departing workspace's clients so it isn't left rendering
+    /// On page switch, drop any Surface cursor that referenced
+    /// the departing page's clients so it isn't left rendering
     /// against a stale surface tree. Named cursors survive — they're
     /// owned by the host, not the clients.
-    pub fn reset_on_workspace_switch(&mut self) {
+    pub fn reset_on_page_switch(&mut self) {
         if matches!(self.status, CursorImageStatus::Surface(_)) {
             self.status = CursorImageStatus::default_named();
             self.changed = true;
@@ -112,7 +112,7 @@ mod tests {
     use smithay::reexports::winit::window::CursorIcon;
 
     // Surface-path tests (ensure_alive with a dead surface,
-    // reset_on_workspace_switch dropping a Surface) require a live
+    // reset_on_page_switch dropping a Surface) require a live
     // Wayland `Display` + `Client` to instantiate a `WlSurface`, which
     // exceeds the scope of unit tests. Those paths are exercised by the
     // e2e suite under `tests/e2e_*.rs`.
@@ -195,9 +195,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_on_workspace_switch_is_no_op_on_named() {
+    fn reset_on_page_switch_is_no_op_on_named() {
         let mut c = CursorState::default();
-        c.reset_on_workspace_switch();
+        c.reset_on_page_switch();
         assert!(matches!(c.status, CursorImageStatus::Named(_)));
         assert!(
             !c.changed,
@@ -206,11 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_on_workspace_switch_is_no_op_on_hidden() {
+    fn reset_on_page_switch_is_no_op_on_hidden() {
         let mut c = CursorState::default();
         c.set_image(CursorImageStatus::Hidden);
         let _ = c.take_changed();
-        c.reset_on_workspace_switch();
+        c.reset_on_page_switch();
         assert!(matches!(c.status, CursorImageStatus::Hidden));
         assert!(!c.changed);
     }

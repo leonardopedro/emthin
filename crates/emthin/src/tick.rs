@@ -4,42 +4,37 @@ use smithay::utils::IsAlive;
 
 use crate::state::EmthinState;
 
-/// Called once per event loop iteration. Handles workspace lifecycle,
-/// IPC dispatch, clipboard events, and pending geometry timeouts.
+/// Called once per event loop iteration. Handles document/page
+/// lifecycle, IPC dispatch, clipboard events, and pending geometry
+/// timeouts.
 pub fn event_loop_tick(state: &mut EmthinState) {
-    // --- Check if Emacs child process has exited ---
-    if let Some(child) = state.emacs.child_mut() {
-        if let Ok(Some(status)) = child.try_wait() {
-            tracing::info!("Emacs exited with {status}, stopping compositor");
-            state.loop_signal.stop();
-        }
-    }
-
-    // --- Workspace: process deferred Emacs toplevels ---
-    // After dispatch_clients, set_parent has been processed for same-batch
-    // toplevels, so surface.parent() is now accurate.
-    crate::state::workspace::process_pending_toplevels(state);
+    // --- Reap exited apps ---
+    // Unlike the old Emacs shell, an app exiting does **not** stop the
+    // compositor: its figure stays in the document as a dormant
+    // placeholder that the user can relaunch. Only the child-process
+    // bookkeeping needs clearing.
+    state.host.reap_children();
 
     // --- Embedded toplevels: classify dialog vs app, then route ---
-    // Same one-tick defer rationale (parent + min/max are cleared up only
+    // Same one-tick defer rationale (parent + min/max are only accurate
     // after the client's initial dispatch burst completes).
     process_pending_app_toplevels(state);
 
-    // --- Workspace: process ext-workspace-v1 client actions ---
-    crate::state::workspace::process_workspace_actions(state);
+    // --- ext-workspace-v1 client actions → page switches ---
+    crate::state::page::process_page_actions(state);
 
-    // --- Workspace: detect dead Emacs frames ---
-    crate::state::workspace::detect_dead_workspaces(state);
+    // --- Document: autosave the session ---
+    state.doc.tick();
 
-    // --- Workspace: refresh ext-workspace-v1 protocol + bar ---
-    crate::state::workspace::refresh_workspace_state(state);
+    // --- ext-workspace-v1: refresh the page list for the bar ---
+    crate::state::page::refresh_page_state(state);
 
     // --- Clean up destroyed embedded app windows ---
     crate::handlers::apps::cleanup_dead_apps(state);
     // --- Clean up destroyed floating dialogs ---
     crate::handlers::dialogs::cleanup_dead_dialogs(state);
 
-    // --- Dispatch incoming IPC messages from Emacs ---
+    // --- Dispatch incoming IPC messages from the control client ---
     if let Some(msgs) = state.ipc.recv_all() {
         for msg in msgs {
             crate::ipc::dispatch::handle_ipc_message(state, msg);
@@ -86,15 +81,8 @@ pub fn event_loop_tick(state: &mut EmthinState) {
         state.needs_redraw = true;
     }
     for (window_id, window, geo) in timed_out {
-        let ws_id = state
-            .apps
-            .get(window_id)
-            .map(|a| a.workspace_id)
-            .unwrap_or(state.workspace.active_id);
-        if let Some(space) = state.workspace.space_for_mut(ws_id) {
-            space.map_element(window, geo.loc, false);
-        }
-        tracing::debug!("embedded app window_id={window_id} geometry force-committed (timeout)");
+        state.page.active_space.map_element(window, geo.loc, false);
+        tracing::debug!("figure app window_id={window_id} geometry force-committed (timeout)");
     }
 
     // Drain broker-observed fcitx5 events and drive winit IME in
@@ -109,12 +97,12 @@ pub fn event_loop_tick(state: &mut EmthinState) {
     // focus.
     state.ime.poll_tip_freshness(&state.seat, &state.apps);
 
-    // --- Forward DBus router notifications to Emacs ---
+    // --- Forward DBus router notifications to the control client ---
     forward_router_notifications(state);
 }
 
-/// Forward non-fcitx router notifications (rule add/remove/list) to Emacs
-/// via IPC.
+/// Forward non-fcitx router notifications (rule add/remove/list) to the
+/// control client over IPC.
 fn forward_router_notifications(state: &mut EmthinState) {
     let notifications = state.dbus.take_non_fcitx_notifications();
     for n in notifications {
@@ -137,12 +125,12 @@ fn forward_router_notifications(state: &mut EmthinState) {
 /// Drain `pending_app_toplevels`, classify each as either a floating
 /// dialog (login boxes, file pickers, …) or an embedded app, and route
 /// it accordingly. Same one-tick-defer rationale as
-/// `process_pending_toplevels`: by now the client's
+/// `new_toplevel`: by now the client's
 /// `set_parent` / `set_min_size` / `set_max_size` from the same dispatch
 /// burst have been processed, so `wants_floating` returns a stable
 /// answer.
 fn process_pending_app_toplevels(state: &mut EmthinState) {
-    let pending = std::mem::take(&mut state.workspace.pending_app_toplevels);
+    let pending = std::mem::take(&mut state.page.pending_app_toplevels);
     if pending.is_empty() {
         return;
     }

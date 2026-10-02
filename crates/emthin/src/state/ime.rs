@@ -34,7 +34,7 @@
 //!
 //! Per-owner `cursor_cache` (keyed by owner identity) stores the last
 //! client-reported caret in **client-surface-local** coords. Restored
-//! on refocus so e.g. Alacritty → Emacs → Alacritty snaps the popup
+//! on refocus so e.g. Alacritty → a text editor → Alacritty snaps the popup
 //! back to where it was, instead of flashing through the
 //! surface-origin fallback.
 //!
@@ -57,7 +57,7 @@ use crate::apps::AppManager;
 use crate::EmthinState;
 
 /// Debounce window for `CursorRect` events following a DBus `FocusIn`.
-/// pgtk Emacs's GTK IM module fires a burst of `SetCursorRectV2`
+/// GTK's IM module fires a burst of `SetCursorRectV2`
 /// messages on FocusIn, some carrying stale positions before the real
 /// caret coord arrives ~280ms later. The first burst entry is accepted;
 /// the rest are dropped until the settle window closes.
@@ -412,8 +412,8 @@ impl ImeBridge {
 
     // ----- Reset -----
 
-    pub fn reset_on_workspace_switch(&mut self) {
-        tracing::debug!("IME: reset on workspace switch");
+    pub fn reset_on_page_switch(&mut self) {
+        tracing::debug!("IME: reset on page switch");
         self.focused_surface = None;
         self.owner = ImeOwner::None;
         self.cursor = None;
@@ -421,8 +421,8 @@ impl ImeBridge {
         self.tip_snapshot = None;
         self.dbus_focused_at = None;
         self.dbus_cursor_received = false;
-        // Caches reference now-inactive workspace's surfaces; clear
-        // both so a new-workspace FocusIn doesn't replay a rect from
+        // Caches reference surfaces on the page we just left; clear
+        // both so a FocusIn on the new page doesn't replay a rect from
         // an unrelated app.
         self.cursor_cache.clear();
         // Don't reset `last_applied_*` — next sync_to_winit diffs.
@@ -558,7 +558,7 @@ impl ImeBridge {
 // ---------------- helpers ----------------
 
 /// App-space top-left of `surface`, falling back to (0, 0) when not
-/// tracked (e.g. Emacs main surface, which IS the winit window).
+/// tracked (e.g. a dialog the figure manager does not own).
 fn app_loc(surface: Option<&WlSurface>, apps: &AppManager) -> [i32; 2] {
     surface
         .and_then(|s| apps.surface_geometry(s))
@@ -625,7 +625,7 @@ pub(crate) fn drain_fcitx_events(state: &mut crate::EmthinState) {
     }
 }
 
-/// Emthin-space origin of the app whose DBus fcitx5 IC is currently
+/// emthin-space origin of the app whose DBus fcitx5 IC is currently
 /// active. Added to the client-reported caret rect to translate it
 /// into emthin-winit-local coordinates before we hand it to winit IME.
 fn focused_app_origin(state: &crate::EmthinState) -> Option<[i32; 2]> {
@@ -635,11 +635,16 @@ fn focused_app_origin(state: &crate::EmthinState) -> Option<[i32; 2]> {
         crate::state::KeyboardFocusTarget::Window(w) => w,
         _ => return None,
     };
+    // With a figure focused, the caret rect origin is the figure's own
+    // rect on the page (already in winit-local logical pixels), not the
+    // `Space` element location — figures are composited by
+    // `figure_render`, not laid out by `Space`.
     let surface = window.wl_surface()?;
-    if state.emacs.is_main_surface(&surface) {
-        return Some([0, 0]);
+    let app_id_of = |wl: &WlSurface| state.apps.id_for_surface(wl);
+    if let Some(loc) = state.doc.figure_rect_on_page(&surface, app_id_of) {
+        return Some([loc.x, loc.y]);
     }
-    let loc = state.workspace.active_space.element_location(&window)?;
+    let loc = state.page.active_space.element_location(&window)?;
     let geo_offset = window.geometry().loc;
     Some([loc.x - geo_offset.x, loc.y - geo_offset.y])
 }

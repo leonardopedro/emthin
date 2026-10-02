@@ -102,12 +102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state::dbus::DbusBridge::init()
     };
 
-    if !cli.no_spawn {
-        state.xwayland.set_pending_command(state::PendingCommand {
-            command: cli.command.clone(),
-            args: cli.command_args.clone(),
-            standalone: cli.standalone,
-        });
+    if !cli.no_spawn && !cli.spawn.is_empty() {
+        // Park the `--spawn` command lines; they're launched once the
+        // XWayland display is resolved (or immediately, without one).
+        state.xwayland.set_pending_commands(cli.spawn_commands());
     }
 
     start_xwayland_satellite(
@@ -117,28 +115,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cli.xwayland_satellite_bin,
     );
 
-    // Spawn the parked child (Emacs by default) regardless of whether
-    // XWayland came up. Three buckets:
+    // Spawn the parked `--spawn` apps regardless of whether XWayland came
+    // up. Three buckets:
     //
     //   - satellite up → child sees `DISPLAY=:N` (emthin's nested X)
     //   - satellite missing, host has Xwayland → child inherits the
-    //     host `DISPLAY` and X11-only programs (gtk3 Emacs on UOS
-    //     etc.) fall back to the host X server. Windows render
-    //     outside emthin, but at least the child has a GUI instead
-    //     of dropping to TUI.
+    //     host `DISPLAY` and X11-only programs fall back to the host X
+    //     server. Windows render outside emthin, but at least the child
+    //     has a GUI instead of dropping to TUI.
     //   - satellite missing AND host has no DISPLAY → child runs
     //     headless / TUI; nothing we can do without an X server.
-    //
-    // Previously this spawn lived inside `start_xwayland_satellite`'s
-    // success path, which silently dropped the parked command on
-    // systems missing `xwayland-satellite` and left the splash
-    // spinning forever.
-    if let Some(pc) = state.xwayland.take_pending_command() {
+    if let Some(pending) = state.xwayland.take_pending_commands() {
         let display = state.xwayland.display();
         if display.is_none() {
             if let Ok(host) = std::env::var("DISPLAY") {
                 tracing::warn!(
-                    "xwayland-satellite unavailable; child will inherit host \
+                    "xwayland-satellite unavailable; children will inherit host \
                      DISPLAY={host}. X11 windows will render on the host X \
                      server (outside emthin)."
                 );
@@ -149,27 +141,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        util::spawn_child(&pc.command, &pc.args, display, pc.standalone, &mut state);
+        for (command, args) in pending {
+            util::spawn_child(&command, &args, display, &mut state);
+        }
     }
 
-    // Launch the external workspace bar (if configured). Done after the
-    // Wayland socket exists so the child inherits WAYLAND_DISPLAY via the
-    // parent environment.
+    // Load the document: `--doc` wins, then the session's snapshot, then
+    // a fresh empty one. Done after the XWayland handshake so the doc's
+    // first layout already knows the display.
+    state
+        .doc
+        .load(cli.doc.as_deref(), cli.session_file.as_deref());
+
     event_loop.run(None, &mut state, emthin::tick::event_loop_tick)?;
 
-    // Clean up Emacs child process
-    if let Some(mut child) = state.emacs.take_child() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    // emthin-dbus-proxy: send Shutdown then reap so the bus socket gets
-    // unlinked and the session dir is removed.
+    // Graceful shutdown: snapshot the session, then reap children.
+    state.doc.save();
+    state.host.kill_children();
     state.dbus.shutdown();
-
-    // Clean up extracted elisp files
-    if let Some(ref dir) = state.elisp_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
 
     Ok(())
 }

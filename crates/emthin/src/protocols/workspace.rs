@@ -175,8 +175,7 @@ impl WorkspaceProtocolState {
                 handle.coordinates(coords);
                 handle.capabilities(
                     ext_workspace_handle_v1::WorkspaceCapabilities::Activate
-                        | ext_workspace_handle_v1::WorkspaceCapabilities::Deactivate
-                        | ext_workspace_handle_v1::WorkspaceCapabilities::Remove,
+                        | ext_workspace_handle_v1::WorkspaceCapabilities::Deactivate,
                 );
                 handle.state(if ws.active {
                     ext_workspace_handle_v1::State::Active
@@ -227,7 +226,7 @@ impl GlobalDispatch<ExtWorkspaceManagerV1, ()> for EmthinState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let manager = data_init.init(resource, ());
-        state.workspace.protocol.instances.push(ManagerInstance {
+        state.page.protocol.instances.push(ManagerInstance {
             manager,
             group: None,
             workspaces: HashMap::new(),
@@ -254,7 +253,7 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for EmthinState {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         let Some(inst) = state
-            .workspace
+            .page
             .protocol
             .instances
             .iter_mut()
@@ -283,7 +282,7 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for EmthinState {
         _data: &(),
     ) {
         state
-            .workspace
+            .page
             .protocol
             .instances
             .retain(|i| i.manager.id() != resource.id());
@@ -307,7 +306,7 @@ impl Dispatch<ExtWorkspaceGroupHandleV1, ()> for EmthinState {
         match request {
             ext_workspace_group_handle_v1::Request::CreateWorkspace { workspace } => {
                 tracing::info!("ext-workspace-v1: create_workspace({workspace})");
-                if let Some(inst) = state.workspace.protocol.instances.first_mut() {
+                if let Some(inst) = state.page.protocol.instances.first_mut() {
                     inst.actions
                         .push(WorkspaceAction::CreateWorkspace(workspace));
                 }
@@ -334,7 +333,7 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for EmthinState {
     ) {
         // Find workspace_id for this handle by comparing ObjectId.
         let resource_oid = Resource::id(resource);
-        let ws_id = state.workspace.protocol.instances.iter().find_map(|inst| {
+        let ws_id = state.page.protocol.instances.iter().find_map(|inst| {
             inst.workspaces
                 .iter()
                 .find(|(_, h)| Resource::id(*h) == resource_oid)
@@ -342,7 +341,7 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for EmthinState {
         });
         let Some(ws_id) = ws_id else { return };
 
-        let inst = state.workspace.protocol.instances.iter_mut().find(|i| {
+        let inst = state.page.protocol.instances.iter_mut().find(|i| {
             i.workspaces
                 .values()
                 .any(|h| Resource::id(h) == resource_oid)

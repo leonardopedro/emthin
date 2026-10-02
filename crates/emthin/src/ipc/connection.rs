@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 /// Maximum allowed IPC message payload size (1 MiB).
 const MAX_MSG_SIZE: usize = 1024 * 1024;
 
-/// A single active IPC connection (one Emacs client).
+/// A single active IPC connection (one control client).
 pub struct IpcConn {
     pub(super) stream: UnixStream,
     /// Incomplete incoming bytes waiting to form a full message.

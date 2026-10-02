@@ -1,8 +1,4 @@
-use include_dir::{include_dir, Dir};
-
 use crate::EmthinState;
-
-static ELISP_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../elisp");
 
 pub fn runtime_dir() -> String {
     std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string())
@@ -11,27 +7,6 @@ pub fn runtime_dir() -> String {
 pub fn default_ipc_path() -> std::path::PathBuf {
     let pid = std::process::id();
     std::path::PathBuf::from(format!("{}/emthin-{pid}.ipc", runtime_dir()))
-}
-
-pub fn extract_embedded(src: &Dir<'_>, subdir: &str) -> Option<std::path::PathBuf> {
-    let dest = std::path::PathBuf::from(format!(
-        "{}/emthin-{}/{subdir}",
-        runtime_dir(),
-        std::process::id(),
-    ));
-    if let Err(e) = std::fs::create_dir_all(&dest) {
-        tracing::error!("Failed to create {subdir} dir {}: {e}", dest.display());
-        return None;
-    }
-    for file in src.files() {
-        let out = dest.join(file.path());
-        if let Err(e) = std::fs::write(&out, file.contents()) {
-            tracing::error!("Failed to write {}: {e}", out.display());
-            return None;
-        }
-    }
-    tracing::info!("Extracted embedded {subdir} to {}", dest.display());
-    Some(dest)
 }
 
 pub fn init_logging(log_file: Option<&std::path::Path>) {
@@ -71,11 +46,44 @@ pub fn host_wl_surface_ptr(state: &EmthinState) -> Option<*mut std::ffi::c_void>
     }
 }
 
+/// SIGTERM, wait up to 1.5s, then SIGKILL — `Child::kill` sends SIGKILL
+/// outright, which gives apps no chance to flush their own session files.
+pub fn graceful_kill(child: &mut std::process::Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return; // already gone
+    }
+    // SAFETY: `child.id()` is a pid this process owns (it has not been
+    // reaped yet — `try_wait` above returned `Ok(None)`), so the signal
+    // targets exactly that child.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
+/// Spawn a client application onto emthin's own Wayland socket.
+///
+/// Every child gets the same environment contract the Emacs shell used
+/// to get: `WAYLAND_DISPLAY` pointing at emthin's socket, and
+/// `DBUS_SESSION_BUS_ADDRESS` injected by the in-process broker so
+/// fcitx5-speaking clients find a single input context.
 pub fn spawn_child(
     command: &str,
     args: &[String],
     x_display: Option<u32>,
-    standalone: bool,
     state: &mut EmthinState,
 ) {
     let Some(socket_name) = state.socket_name.to_str() else {
@@ -83,29 +91,15 @@ pub fn spawn_child(
         return;
     };
 
-    let mut full_args: Vec<String> = Vec::new();
-
-    if standalone {
-        if let Some(elisp_dir) = extract_embedded(&ELISP_DIR, "elisp") {
-            full_args.push("--directory".to_string());
-            full_args.push(elisp_dir.to_string_lossy().into_owned());
-            full_args.push("-l".to_string());
-            full_args.push("emthin".to_string());
-            state.elisp_dir = Some(elisp_dir);
-        }
-    }
-
-    full_args.extend_from_slice(args);
-
     let display_log = match x_display {
         Some(d) => format!(":{d}"),
         None => std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
     };
     tracing::info!(
-        "Spawning: {command} {full_args:?} (WAYLAND_DISPLAY={socket_name} DISPLAY={display_log})"
+        "Spawning: {command} {args:?} (WAYLAND_DISPLAY={socket_name} DISPLAY={display_log})"
     );
     let mut cmd = std::process::Command::new(command);
-    cmd.args(&full_args)
+    cmd.args(args)
         .env("WAYLAND_DISPLAY", socket_name)
         .env("XDG_SESSION_TYPE", "wayland")
         .env("XDG_SESSION_DESKTOP", "emthin");
@@ -114,7 +108,7 @@ pub fn spawn_child(
     }
     state.dbus.inject_env(&mut cmd);
     match cmd.spawn() {
-        Ok(child) => state.emacs.set_child(child),
+        Ok(child) => state.host.add_child(child),
         Err(e) => tracing::error!("Failed to spawn '{command}': {e}"),
     }
 }

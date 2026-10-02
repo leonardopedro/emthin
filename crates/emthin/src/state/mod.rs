@@ -1,22 +1,21 @@
 pub mod apps;
 pub mod cursor;
 pub mod dbus;
-pub mod emacs;
 pub mod focus;
+pub mod host;
 pub mod ime;
-pub mod migration;
-pub mod workspace;
+pub mod page;
 pub mod xwayland;
 
 // Type re-exports for common shorthands (kept for historical call sites
 // that used `crate::KeyboardFocusTarget` before state/ existed).
 pub use focus::KeyboardFocusTarget;
 
-use std::{collections::HashMap, ffi::OsString, sync::Arc};
+use std::{ffi::OsString, sync::Arc};
 
 use smithay::{
     backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Window, WindowSurfaceType},
     input::{Seat, SeatState},
     reexports::{
         calloop::{
@@ -28,7 +27,7 @@ use smithay::{
             Display, DisplayHandle,
         },
     },
-    utils::{Logical, Point, Rectangle, Size},
+    utils::{Logical, Point, Rectangle},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         cursor_shape::CursorShapeManagerState,
@@ -48,7 +47,6 @@ use smithay::{
     },
 };
 
-use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::seat::WaylandFocus;
 
 /// Tracks where the active selection came from, so paste requests are
@@ -109,13 +107,12 @@ impl FocusState {
     }
 
     /// Clear every saved-focus slot and the last-app focus.
-    /// Called on workspace switch: the saved targets may reference
-    /// surfaces in the departing workspace, which become stale the
-    /// moment `switch_workspace` swaps the active `Space`. Without
-    /// this, an Alt+Tab-away → workspace-switch → Alt+Tab-back
-    /// sequence would restore focus to a surface in the now-inactive
-    /// workspace (sending `wl_keyboard.enter` to an unmapped client).
-    pub fn reset_on_workspace_switch(&mut self) {
+    /// Called on page switch: the saved targets may reference surfaces
+    /// whose figures just left the visible page. Without this, a
+    /// focus-away → page-switch → focus-back sequence would restore
+    /// focus to a surface on a hidden page (sending `wl_keyboard.enter`
+    /// to a client nobody is looking at).
+    pub fn reset_on_page_switch(&mut self) {
         self.saves.clear();
         self.last_app_focus = None;
     }
@@ -126,6 +123,11 @@ impl FocusState {
 pub struct SelectionState {
     /// Clipboard synchronization proxy (Wayland or X11 backend).
     pub clipboard: Option<Box<dyn emthin_clipboard::ClipboardBackend>>,
+    /// Direct handle on the *host* clipboard for the document's own
+    /// copy/paste. Separate from `clipboard` on purpose: see
+    /// `clipboard_bridge::set_host_clipboard`. `None` until first use
+    /// (constructing it acquires the X11 clipboard ownership).
+    pub doc_clipboard: Option<arboard::Clipboard>,
     /// Where the current clipboard selection came from.
     pub clipboard_origin: SelectionOrigin,
     /// Where the current primary selection came from.
@@ -166,10 +168,6 @@ pub struct WaylandState {
     pub popups: PopupManager,
 }
 
-/// Re-export so pre-extraction call sites (main.rs spawning the
-/// `--command` child) keep compiling without qualifying the path.
-pub use xwayland::PendingCommand;
-
 pub struct EmthinState {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -178,8 +176,12 @@ pub struct EmthinState {
     pub ipc: crate::ipc::IpcServer,
     pub apps: crate::apps::AppManager,
 
-    /// Workspace model: active + inactive Emacs frames.
-    pub workspace: crate::workspace::WorkspaceState,
+    /// Workspace model: the document's page state. Pages replace the
+    /// old Emacs-frame workspaces; there is exactly **one** `Space`
+    /// (the compositor never holds a second screenful of app surfaces
+    /// — an app's surface is composited over a figure rect in the
+    /// current page's raster).
+    pub page: crate::page::PageState,
 
     pub loop_signal: LoopSignal,
     pub loop_handle: LoopHandle<'static, EmthinState>,
@@ -198,14 +200,20 @@ pub struct EmthinState {
     pub seat: Seat<Self>,
 
     // --- emthin specific ---
-    /// Emacs host-process state — main surface, child process, title /
-    /// app_id metadata, detection and size-settle latches, plus the
-    /// `request_fullscreen` / `request_maximize` mailboxes the Emacs
-    /// toplevel populates via `xdg_toplevel.set_fullscreen` etc.
-    pub emacs: emacs::EmacsState,
+    /// The emthin host window + spawned child processes.
+    pub host: host::HostState,
 
-    /// Path to extracted elisp dir (for cleanup on exit).
-    pub elisp_dir: Option<std::path::PathBuf>,
+    /// The rendered document: `MathDoc` text, its scan/segments, the
+    /// paged layout (raster + glyph index + figure rects), and the
+    /// figure↔app bindings. The document is the layout authority —
+    /// editing `\app` args reflows figures, which reconfigures app
+    /// toplevels.
+    pub doc: crate::docui::DocUi,
+
+    /// The current page's raster, cached on the GPU. Owned by the
+    /// compositor rather than by `docui` because it needs a live
+    /// `GlesRenderer` to import into, and only the render pass has one.
+    pub doc_page: crate::doc_render::DocPageTexture,
 
     /// Clipboard/selection routing state.
     pub selection: SelectionState,
@@ -221,17 +229,14 @@ pub struct EmthinState {
     pub cursor: cursor::CursorState,
 
     /// Coarse damage flag for structural events (IPC, layer shell, input,
-    /// workspace switch) that smithay's per-element OutputDamageTracker does
+    /// page switch) that smithay's per-element OutputDamageTracker does
     /// not cover.  When true the next Redraw calls render_frame; cleared after.
     pub needs_redraw: bool,
 
-    /// Whether to auto-migrate apps on workspace switch.
-    pub migration_policy: migration::MigrationPolicy,
-
-    /// Bridge to the child `emthin-dbus-proxy` process that rewrites IME
-    /// cursor-position calls for embedded apps. Populated in `main.rs`
-    /// after `init_winit`; stays [`DbusBridge::default`] (inert) if the
-    /// proxy binary is missing or the host has no session bus.
+    /// Bridge to the in-process DBus broker that impersonates fcitx5
+    /// for embedded clients. Populated in `main.rs` after `init_winit`;
+    /// stays [`dbus::DbusBridge::default`] (inert) if the host has no
+    /// session bus.
     pub dbus: dbus::DbusBridge,
 }
 
@@ -279,7 +284,6 @@ impl EmthinState {
             .map_err(|e| format!("failed to initialize keyboard: {e:?}"))?;
         seat.add_pointer();
 
-        let space = Space::default();
         let workspace_protocol = crate::protocols::workspace::WorkspaceProtocolState::new(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop)?;
@@ -293,16 +297,7 @@ impl EmthinState {
             ipc,
             apps: crate::apps::AppManager::default(),
 
-            workspace: crate::workspace::WorkspaceState {
-                active_space: space,
-                inactive: HashMap::new(),
-                active_id: 1,
-                active_name: String::new(),
-                next_id: 2,
-                pending_emacs_toplevels: Vec::new(),
-                pending_app_toplevels: Vec::new(),
-                protocol: workspace_protocol,
-            },
+            page: crate::page::PageState::new(workspace_protocol),
 
             loop_signal,
             loop_handle,
@@ -333,16 +328,14 @@ impl EmthinState {
             seat,
 
             // emthin specific
-            emacs: emacs::EmacsState::new(
-                std::env::var_os("EMTHIN_DISABLE_EMACS_DETECTION").is_none(),
-            ),
-            elisp_dir: None,
+            host: host::HostState::new(),
+            doc: crate::docui::DocUi::new(),
+            doc_page: crate::doc_render::DocPageTexture::new(),
             selection: SelectionState::default(),
             focus: FocusState::default(),
             ime,
             cursor: cursor::CursorState::default(),
             needs_redraw: true,
-            migration_policy: migration::MigrationPolicy::ByWorkspaceAffinity,
             dbus: dbus::DbusBridge::default(),
         })
     }
@@ -403,49 +396,61 @@ impl EmthinState {
 
     /// Fullscreen geometry for the primary output (logical pixels).
     pub fn output_fullscreen_geo(&self) -> Option<Rectangle<i32, Logical>> {
-        let output = self.workspace.active_space.outputs().next()?;
+        let output = self.page.active_space.outputs().next()?;
         let mode = output.current_mode()?;
         let scale = output.current_scale().fractional_scale();
         let logical = mode.size.to_f64().to_logical(scale).to_i32_round();
         Some(Rectangle::new((0, 0).into(), logical))
     }
 
-    /// Convert a fraction rect (0..=1 relative to usable area) into
-    /// canvas pixel coordinates.
-    pub fn fraction_to_canvas(&self, rect: crate::ipc::IpcRect) -> Rectangle<i32, Logical> {
-        let area = self.usable_area();
-        let crate::ipc::IpcRect { x, y, w, h } = rect;
-        Rectangle::new(
-            smithay::utils::Point::from((
-                area.loc.x + (x * area.size.w as f64).round() as i32,
-                area.loc.y + (y * area.size.h as f64).round() as i32,
-            )),
-            smithay::utils::Size::from((
-                (w * area.size.w as f64).round() as i32,
-                (h * area.size.h as f64).round() as i32,
-            )),
-        )
-    }
+    /// Re-letterbox the document page against the current output size.
+    ///
+    /// Called when the host window resizes and when a layer-shell client
+    /// changes the non-exclusive zone: the page is centred in whatever
+    /// space is usable, then every bound app is reconfigured to its (now
+    /// moved and rescaled) figure rect.
+    pub fn relayout_doc(&mut self) {
+        let geo = self.usable_area();
+        tracing::debug!(
+            "relayout_doc: usable area ({},{}) {}x{}",
+            geo.loc.x,
+            geo.loc.y,
+            geo.size.w,
+            geo.size.h,
+        );
+        self.doc
+            .set_viewport(smithay::utils::Size::from((geo.size.w, geo.size.h)));
 
-    /// Convert canvas pixel coordinates back to a fraction rect (0..=1
-    /// relative to usable area). Used by resize-grab to emit IPC.
-    pub fn canvas_to_fraction(
-        &self,
-        loc: Point<i32, Logical>,
-        size: Size<i32, Logical>,
-    ) -> crate::ipc::IpcRect {
-        let area = self.usable_area();
-        crate::ipc::IpcRect {
-            x: (loc.x - area.loc.x) as f64 / area.size.w as f64,
-            y: (loc.y - area.loc.y) as f64 / area.size.h as f64,
-            w: size.w as f64 / area.size.w as f64,
-            h: size.h as f64 / area.size.h as f64,
+        // A resize can move a figure to a different page (Typst's page
+        // model depends on the page size, and the letterbox changes the
+        // scale), so re-run the layout and reconfigure whatever moved.
+        let before: Vec<(String, i32, i32)> = self
+            .doc
+            .figures()
+            .figures()
+            .iter()
+            .map(|f| (f.key.clone(), f.spec.w, f.spec.h))
+            .collect();
+        self.doc.relayout();
+        for (key, w, h) in &before {
+            let changed = self
+                .doc
+                .figures()
+                .get(key)
+                .is_some_and(|f| (f.spec.w, f.spec.h) != (*w, *h));
+            if changed {
+                crate::handlers::apps::reconfigure_after_resize(self, key);
+            }
         }
+        self.needs_redraw = true;
     }
 
-    /// Full output size in logical pixels — Emacs fills the entire window.
+    /// Full output size in logical pixels. Note this ignores the
+    /// layer-shell non-exclusive zone on purpose: the document page is
+    /// letterboxed inside the usable area (see `relayout_doc`), but the
+    /// output itself is what the output's mode describes.
     pub fn usable_area(&self) -> Rectangle<i32, Logical> {
-        let Some(output) = self.workspace.active_space.outputs().next() else {
+        let Some(output) = self.page.active_space.outputs().next() else {
             return Rectangle::default();
         };
         let Some(mode) = output.current_mode() else {
@@ -458,44 +463,21 @@ impl EmthinState {
         )
     }
 
-    /// Geometry for Emacs frame — fills the full output.
-    pub fn emacs_geometry(&self) -> Option<Rectangle<i32, Logical>> {
-        self.workspace.active_space.outputs().next()?;
-        Some(self.usable_area())
-    }
-
-    /// The Emacs toplevel `Window`, looked up by its `wl_surface` in the
-    /// active workspace `Space`. Under xwayland-satellite every client —
-    /// including gtk3 Emacs over XWayland — presents as a Wayland
-    /// toplevel, so there is no separate X11 branch.
-    pub fn emacs_window(&self) -> Option<Window> {
-        let surface = self.emacs.surface()?;
-        self.workspace
-            .active_space
-            .elements()
-            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
-            .cloned()
-    }
-
-    /// The Emacs focus target.
-    pub fn emacs_focus_target(&self) -> Option<crate::KeyboardFocusTarget> {
-        self.emacs_window().map(crate::KeyboardFocusTarget::from)
-    }
-
-    /// Apply the window-manager's auto-focus policy when a new embedded
-    /// toplevel maps: grant keyboard focus + notify Emacs.
+    /// Apply the window-manager's auto-focus policy when a new toplevel
+    /// maps: grant it keyboard focus.
     ///
-    /// Mirrors sway's `view_map()` → `input_manager_set_focus()`
-    /// pipeline. Single entry point for xdg_shell `new_toplevel`.
-    pub fn auto_focus_new_window(&mut self, window: Window, window_id: u64) {
+    /// Single entry point for xdg_shell `new_toplevel`. `_window_id` is
+    /// unused today — focus is reported by the figure click path — but
+    /// kept in the signature so callers don't have to know that.
+    pub fn auto_focus_new_window(&mut self, window: Window, _window_id: u64) {
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, Some(window.into()), serial);
         }
-        self.ipc.send(crate::ipc::OutgoingMessage::FocusView {
-            window_id,
-            view_id: 0,
-        });
+        // Remember it so the WakeUp key can toggle back into whichever
+        // figure the user was last in.
+        self.focus.last_app_focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        self.needs_redraw = true;
     }
 
     /// Resolve a `wl_surface` to the keyboard focus target that owns it.
@@ -505,7 +487,7 @@ impl EmthinState {
         surface: &WlSurface,
     ) -> Option<crate::KeyboardFocusTarget> {
         if let Some(window) = self
-            .workspace
+            .page
             .active_space
             .elements()
             .find(|w| w.wl_surface().as_deref().is_some_and(|s| s == surface))
@@ -519,155 +501,41 @@ impl EmthinState {
         None
     }
 
-    /// Migrate an app to the active workspace if it's in a different one.
-    /// Unmaps from old space, updates workspace_id. Returns true if migrated.
-    pub fn migrate_app_to_active(&mut self, window_id: u64) -> bool {
-        let Some(app) = self.apps.get(window_id) else {
-            return false;
-        };
-        let old_ws = app.workspace_id;
-        if old_ws == self.workspace.active_id {
-            return false;
-        }
-        let window = app.window.clone();
-        tracing::debug!(
-            "app {window_id} migrating workspace {old_ws} → {}",
-            self.workspace.active_id
-        );
-        if let Some(old_space) = self.workspace.space_for_mut(old_ws) {
-            old_space.unmap_elem(&window);
-            // Dismiss popups so the client doesn't keep committing on
-            // orphaned popup surfaces after the toplevel is unmapped.
-            dismiss_popups_for_window(&window);
-        }
-        if let Some(app) = self.apps.get_mut(window_id) {
-            app.workspace_id = self.workspace.active_id;
-            // Reset geometry so the next set_geometry immediately maps the app
-            // instead of going through the pending path (which would deadlock:
-            // app needs frame callbacks to commit, but it's not in any Space).
-            app.geometry = None;
-            app.pending_geometry = None;
-            app.pending_since = None;
-        }
-        true
-    }
-
-    /// Check if a surface belongs to the same Wayland client as the active Emacs.
-    pub fn is_emacs_client(&self, surface: &WlSurface) -> bool {
-        self.emacs
-            .surface()
-            .is_some_and(|emacs| emacs.same_client_as(&surface.id()))
-    }
-
-    /// Check if a surface is any workspace's Emacs surface (active or inactive).
-    pub fn is_any_emacs_surface(&self, surface: &WlSurface) -> bool {
-        if self.emacs.is_main_surface(surface) {
-            return true;
-        }
-        self.workspace
-            .inactive
-            .values()
-            .any(|ws| ws.emacs_surface.as_ref() == Some(surface))
-    }
-
-    /// Switch the active workspace. Returns false if target is already active
-    /// or doesn't exist.
-    pub fn switch_workspace(&mut self, target_id: u64) -> bool {
-        if target_id == self.workspace.active_id {
+    /// Change the visible document page.
+    ///
+    /// Apps bound to figures on other pages keep running but stop
+    /// receiving frame callbacks, so they idle instead of repainting a
+    /// screenful nobody is looking at. Popups of off-page figures are
+    /// dismissed — an orphaned popup surface keeps its client committing
+    /// forever.
+    pub fn goto_page(&mut self, page: usize) -> bool {
+        if page == self.page.current_page {
             return false;
         }
-        let Some(mut target) = self.workspace.inactive.remove(&target_id) else {
+        if page >= self.doc.page_count() {
+            tracing::warn!(
+                "goto_page({page}) out of range ({} pages)",
+                self.doc.page_count()
+            );
             return false;
-        };
+        }
 
-        // Dismiss all popups on the outgoing workspace so clients don't
-        // continue sending commits for orphaned popup surfaces.
-        for window in self.workspace.active_space.elements() {
+        for window in self.page.active_space.elements() {
             dismiss_popups_for_window(window);
         }
 
-        // Swap: current active → inactive, target → active.
-        let old_space = std::mem::take(&mut self.workspace.active_space);
-        let old_emacs = self.emacs.take_surface();
-        let old_name = std::mem::take(&mut self.workspace.active_name);
-        self.workspace.inactive.insert(
-            self.workspace.active_id,
-            crate::workspace::Workspace {
-                space: old_space,
-                emacs_surface: old_emacs,
-                name: old_name,
-            },
-        );
+        self.page.current_page = page;
+        self.focus.reset_on_page_switch();
+        self.ime.reset_on_page_switch();
+        self.cursor.reset_on_page_switch();
+        self.doc.on_page_changed();
 
-        self.workspace.active_space = target.space;
-        self.emacs.set_surface(target.emacs_surface.take());
-        self.workspace.active_name = target.name;
-        self.workspace.active_id = target_id;
-
-        // Auto-migrate: ensure every app is mapped in the right space.
-        if self.migration_policy == migration::MigrationPolicy::ByWorkspaceAffinity {
-            let active_id = self.workspace.active_id;
-            let mut to_map = Vec::new();
-            let mut to_unmap = Vec::new();
-            for app in self.apps.windows() {
-                let in_active = self
-                    .workspace
-                    .active_space
-                    .elements()
-                    .any(|w| w == &app.window);
-                match (app.workspace_id == active_id, in_active) {
-                    (true, false) => to_map.push(app.window.clone()),
-                    (false, true) => to_unmap.push(app.window.clone()),
-                    _ => {}
-                }
-            }
-            for w in &to_unmap {
-                self.workspace.active_space.unmap_elem(w);
-                dismiss_popups_for_window(w);
-            }
-            for w in &to_map {
-                self.workspace
-                    .active_space
-                    .map_element(w.clone(), (1, 1), false);
-            }
-            if !to_map.is_empty() || !to_unmap.is_empty() {
-                tracing::debug!(
-                    "auto-migrated: mapped={} unmapped={}",
-                    to_map.len(),
-                    to_unmap.len()
-                );
-            }
-        }
-
-        // Reset state that references the old workspace's surfaces.
-        // `host_saved_focus` MUST be cleared alongside the prefix/layer
-        // slots — otherwise an Alt+Tab-away → workspace-switch → Alt+Tab-
-        // back sequence restores focus to a surface in the now-inactive
-        // workspace (sending `wl_keyboard.enter` to an unmapped client).
-        // Centralising this in `FocusState::reset_on_workspace_switch`
-        // makes future field additions self-documenting.
-        self.focus.reset_on_workspace_switch();
-        self.ime.reset_on_workspace_switch();
-
-        self.cursor.reset_on_workspace_switch();
-
-        // Notify Emacs BEFORE changing keyboard focus. IPC is flushed
-        // immediately (same syscall), while wl_keyboard.enter is buffered
-        // until the next flush_clients(). This ensures Emacs updates
-        // active-workspace-id before GTK's focus-change hooks fire,
-        // preventing stale sync-all from sending wrong visibility/geometry.
         self.ipc
-            .send(crate::ipc::OutgoingMessage::WorkspaceSwitched {
-                workspace_id: target_id,
-            });
+            .send(crate::ipc::OutgoingMessage::PageChanged { page });
 
-        // Reset keyboard and pointer focus to the new workspace's Emacs.
+        // Clear pointer focus so stale hover events don't reach surfaces
+        // that are now on a hidden page.
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        let emacs_target = self.emacs_focus_target();
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, emacs_target, serial);
-        }
-        // Clear pointer focus so stale hover events don't go to old workspace surfaces.
         if let Some(pointer) = self.seat.get_pointer() {
             pointer.motion(
                 self,
@@ -681,47 +549,25 @@ impl EmthinState {
             pointer.frame(self);
         }
 
-        tracing::info!(
-            "switched to workspace {target_id} (total={})",
-            self.workspace.count()
-        );
+        tracing::info!("switched to page {page}");
+        self.needs_redraw = true;
         true
-    }
-
-    pub fn set_migration_policy(&mut self, policy: migration::MigrationPolicy) {
-        self.migration_policy = policy;
-        tracing::info!("migration policy set to {policy}");
-    }
-
-    /// Remove an inactive workspace and its embedded apps.
-    pub fn destroy_workspace(&mut self, workspace_id: u64) -> Option<crate::workspace::Workspace> {
-        let ws = self.workspace.inactive.remove(&workspace_id)?;
-        // Remove all apps belonging to this workspace.
-        let dead_app_ids: Vec<u64> = self
-            .apps
-            .windows()
-            .filter(|a| a.workspace_id == workspace_id)
-            .map(|a| a.window_id)
-            .collect();
-        for id in dead_app_ids {
-            if let Some(app) = self.apps.remove(id) {
-                self.ipc.send(crate::ipc::OutgoingMessage::WindowDestroyed {
-                    window_id: app.window_id,
-                });
-            }
-        }
-        tracing::info!(
-            "destroyed workspace {workspace_id} (total={})",
-            self.workspace.count()
-        );
-        Some(ws)
     }
 
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.workspace
+        // Figures first. A figure's app is composited over the page by
+        // `figure_render`, not laid out by `Space`, so
+        // `Space::element_under` cannot find it — and worse, it would
+        // return whatever the `Space` happens to have mapped there,
+        // which is often a *different* app. Same ordering as the old
+        // mirror-input path, for the same reason.
+        if let Some((wl, local)) = self.figure_surface_under(pos) {
+            return Some((wl, local));
+        }
+        self.page
             .active_space
             .element_under(pos)
             .and_then(|(window, location)| {
@@ -730,81 +576,35 @@ impl EmthinState {
                     .map(|(s, p)| (s, (p + location).to_f64()))
             })
     }
+
+    /// The client surface under `pos` if `pos` lands inside a figure
+    /// bound to one, and the position mapped into that surface's own
+    /// coordinates.
+    fn figure_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let figure = self.doc.figures().figure_under(pos)?;
+        let rect = crate::handlers::apps::app_figure_rect(self, figure.app_id?)?;
+        let src = self.apps.get(figure.app_id?)?.geometry?;
+        let wl = self.apps.get(figure.app_id?)?.wl_surface()?;
+        // The figure is an aspect-fit box around a surface of the app's
+        // own committed size, so both an offset and a scale apply.
+        let ratio =
+            crate::apps::AppManager::aspect_fit_ratio(src.size.to_f64(), rect.size.to_f64());
+        let origin = Point::new(f64::from(rect.loc.x), f64::from(rect.loc.y));
+        let rel = pos - origin;
+        let local = match ratio {
+            Some(r) => src.loc.to_f64() + rel.downscale(r),
+            None => src.loc.to_f64() + rel,
+        };
+        Some((wl, local))
+    }
 }
 
 impl crate::xwayland_satellite::HasXwls for EmthinState {
     fn xwls_mut(&mut self) -> Option<&mut crate::xwayland_satellite::XwlsIntegration> {
         self.xwayland.integration_mut()
-    }
-}
-
-impl EmthinState {
-    /// Reposition + resize all Emacs frames (active + inactive workspaces) to
-    /// match the current output size, and broadcast the new size to
-    /// elisp.
-    pub fn relayout_emacs(&mut self) {
-        let Some(geo) = self.emacs_geometry() else {
-            return;
-        };
-        tracing::debug!(
-            "relayout_emacs: usable area ({},{}) {}x{}",
-            geo.loc.x,
-            geo.loc.y,
-            geo.size.w,
-            geo.size.h,
-        );
-
-        // Active workspace's Emacs surface lives in self.workspace.active_space.
-        let active_emacs = self.emacs.surface().cloned();
-        resize_emacs_in_space(&mut self.workspace.active_space, &active_emacs, geo);
-
-        // Inactive workspaces each hold their own space + Emacs.
-        for ws in self.workspace.inactive.values_mut() {
-            resize_emacs_in_space(&mut ws.space, &ws.emacs_surface, geo);
-        }
-
-        // Tell Emacs its new surface size so elisp's sync path picks up the
-        // new window-body dimensions. Wire format unchanged — Emacs only
-        // cares about its own window size, not whether a bar sits above.
-        self.ipc.send(crate::ipc::OutgoingMessage::SurfaceSize {
-            width: geo.size.w,
-            height: geo.size.h,
-        });
-
-        self.needs_redraw = true;
-    }
-}
-
-/// Resize and reposition the Emacs window in a given space. Both pgtk
-/// and gtk3 Emacs present as Wayland toplevels (gtk3 goes through
-/// xwayland-satellite which translates X11 into Wayland before emthin
-/// ever sees the client), so there is a single code path here.
-pub fn resize_emacs_in_space(
-    space: &mut Space<Window>,
-    emacs_surface: &Option<WlSurface>,
-    geo: Rectangle<i32, Logical>,
-) {
-    let Some(ref emacs) = emacs_surface else {
-        return;
-    };
-    let win = space
-        .elements()
-        .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == emacs))
-        .cloned();
-    if let Some(window) = win {
-        if let Some(toplevel) = window.toplevel() {
-            toplevel.with_pending_state(|s| {
-                s.size = Some(geo.size);
-            });
-            toplevel.send_pending_configure();
-        }
-        space.map_element(window.clone(), geo.loc, false);
-        // smithay's `map_element` removes + re-appends, pushing Emacs to
-        // the top of the stack every time. Since Emacs is fullscreen host,
-        // that would cover every embedded app (visible as a white screen
-        // on rapid host resize). Keep Emacs at the bottom so apps stay on
-        // top without per-app raise.
-        space.lower_element(&window);
     }
 }
 
@@ -872,7 +672,7 @@ mod focus_state_tests {
         let mut f = FocusState::default();
         f.enter(FocusOverride::Host, None);
         f.last_app_focus = None; // simulate some prior state
-        f.reset_on_workspace_switch();
+        f.reset_on_page_switch();
         assert!(!f.is_active(FocusOverride::Host));
         assert!(f.last_app_focus.is_none());
     }

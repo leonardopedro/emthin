@@ -42,7 +42,7 @@ impl CompositorHandler for EmthinState {
                 root = parent;
             }
             let committed_window = self
-                .workspace
+                .page
                 .active_space
                 .elements()
                 .find(|w| w.wl_surface().map(|s| *s == root).unwrap_or(false))
@@ -79,31 +79,25 @@ impl CompositorHandler for EmthinState {
                 })
             });
             if let Some((window, window_id, geo)) = commit_info {
-                self.workspace
-                    .active_space
-                    .map_element(window, geo.loc, false);
+                self.page.active_space.map_element(window, geo.loc, false);
                 tracing::debug!("embedded app window_id={window_id} geometry committed: {geo:?}");
             }
         };
 
-        xdg_shell::handle_surface_commit(
-            &mut self.wl.popups,
-            &self.workspace.active_space,
-            surface,
-        );
+        xdg_shell::handle_surface_commit(&mut self.wl.popups, &self.page.active_space, surface);
 
         // Fire frame callbacks for surfaces not tracked in space
         // (e.g., temporary Vulkan test surfaces created during GPU init).
         // Without this, Vulkan WSI's vkQueuePresentKHR stalls waiting for
         // wl_surface.frame callbacks that never arrive.
         let is_space_element = self
-            .workspace
+            .page
             .active_space
             .elements()
             .any(|w| w.wl_surface().is_some_and(|s| *s == *surface));
         if !is_space_element {
             tracing::trace!("untracked surface commit: {surface:?}");
-            if let Some(output) = self.workspace.active_space.outputs().next() {
+            if let Some(output) = self.page.active_space.outputs().next() {
                 send_frames_surface_tree(
                     surface,
                     output,

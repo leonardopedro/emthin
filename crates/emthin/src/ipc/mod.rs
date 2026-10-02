@@ -6,14 +6,15 @@ pub mod messages;
 use std::os::unix::net::UnixListener;
 
 use connection::IpcConn;
-pub use messages::{IncomingMessage, IpcRect, OutgoingMessage};
+pub use messages::{IncomingMessage, IpcRect, OutgoingMessage, StateFigure};
 
-/// IPC server: listens for a single Emacs connection and exchanges JSON messages.
+/// IPC server: listens for a single control-client connection and exchanges
+/// JSON messages.
 pub struct IpcServer {
     pub socket_path: std::path::PathBuf,
     listener: UnixListener,
     connection: Option<IpcConn>,
-    /// Messages queued before Emacs connects.
+    /// Messages queued before a control client connects.
     pending: Vec<OutgoingMessage>,
 }
 
@@ -41,7 +42,7 @@ impl IpcServer {
             Ok((stream, _)) => {
                 match IpcConn::new(stream) {
                     Ok(mut conn) => {
-                        tracing::info!("Emacs IPC connected");
+                        tracing::info!("control client connected");
                         // Send handshake + any buffered messages.
                         if let Ok(json) = jsonrpc::serialize_outgoing(OutgoingMessage::Connected {
                             version: "0.1",
@@ -108,7 +109,7 @@ impl IpcServer {
                 return None;
             }
             Ok(true) => {
-                tracing::info!("Emacs IPC disconnected");
+                tracing::info!("control client disconnected");
                 self.connection = None;
                 return None;
             }

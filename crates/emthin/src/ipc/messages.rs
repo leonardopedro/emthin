@@ -1,137 +1,155 @@
-/// Geometry rectangle as fractions of the Emacs frame (0..=1 range).
-/// The compositor converts to/from pixels using `usable_area()`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+//! The emthin control protocol: JSON-RPC 2.0 notifications in and out.
+//!
+//! This replaced the Emacs-driven message set (which existed only to
+//! let an Elisp layout engine drive geometry). The compositor is now
+//! self-contained: it lays out its own document, and this protocol is
+//! an **observation and command** surface — enough to drive it from
+//! outside (a bar, a script, a future external-shell frontend) without
+//! re-deriving its state.
+//!
+//! See `docs/ipc.md` for the wire description.
+//!
+//! ## Wire format
+//!
+//! `Content-Length: N\r\n\r\n` + JSON body, one JSON object per frame,
+//! all notifications (no `id`, no responses). Conversions are written
+//! by hand rather than derived from serde: `OutgoingMessage::method_name`
+//! is the one place that decides the wire spelling of each event, and a
+//! derive would let a Rust rename silently break every client.
+
+/// A rectangle in **output-local logical pixels**, not fractions.
+///
+/// The old protocol spoke `f64` fractions of the Emacs frame because
+/// an external layout engine didn't know the pixel size. The document
+/// now decides geometry in absolute points (Typst's unit), so the
+/// control plane reports absolute pixels too — no lossy round-trip
+/// through a ratio.
+///
+/// [`crate::ipc`]: crate::ipc
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct IpcRect {
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
-/// Emacs → emthin
+/// Control client → emthin.
 #[derive(Debug)]
 pub enum IncomingMessage {
-    SetGeometry {
-        window_id: u64,
-        rect: IpcRect,
-    },
-    Close {
-        window_id: u64,
-    },
-    SetVisibility {
-        window_id: u64,
-        visible: bool,
-    },
-
-    /// Create a mirror view (scaled copy) of the embedded app's surface.
-    AddMirror {
-        window_id: u64,
-        view_id: u64,
-        rect: IpcRect,
-    },
-    /// Update the geometry (position/size) of an existing mirror.
-    UpdateMirrorGeometry {
-        window_id: u64,
-        view_id: u64,
-        rect: IpcRect,
-    },
-    /// Remove a mirror view.
-    RemoveMirror {
-        window_id: u64,
-        view_id: u64,
-    },
-    /// Source was deleted; promote this mirror to become the new source.
-    PromoteMirror {
-        window_id: u64,
-        view_id: u64,
-    },
-    /// Tell the compositor which surface should have keyboard focus.
-    /// `window_id: None` means focus Emacs; `Some(id)` means focus that app.
-    SetFocus {
-        window_id: Option<u64>,
-    },
-    /// Request the compositor to switch to the given workspace.
-    SwitchWorkspace {
-        workspace_id: u64,
-    },
+    /// Launch a program into a (new or existing) figure.
+    Spawn { cmd: String, args: Vec<String> },
+    /// Close the app bound to a figure. The `\app` statement stays, so
+    /// the figure goes dormant rather than disappearing.
+    Close { figure: String },
+    /// Move keyboard focus to a figure (`figure: null` = the document).
+    Focus { figure: Option<String> },
+    /// Rewrite a figure's `\app` width/height arguments.
+    SetFigureSize { figure: String, w: i32, h: i32 },
+    /// Duplicate a figure's statement into a new mirror figure.
+    CloneFigure { figure: String },
+    /// Change the visible page (0-based).
+    GotoPage { page: usize },
+    /// Open a document from disk (replacing the current one).
+    OpenDoc { path: String },
+    /// Snapshot the current document to a path.
+    SaveDoc { path: String },
+    /// Dump the full document + figure state.
+    ListState,
     /// Add a DBus routing rule.
     DbusRouterAddRule {
         rule: emthin_dbus::router::RouteRule,
     },
     /// Remove a DBus routing rule by id.
-    DbusRouterRemoveRule {
-        id: String,
-    },
+    DbusRouterRemoveRule { id: String },
     /// List all current DBus routing rules.
     DbusRouterListRules,
-    /// Set the compositor's app migration policy.
-    SetMigrationPolicy {
-        policy: crate::state::migration::MigrationPolicy,
-    },
 }
 
-/// emthin → Emacs
+/// emthin → control client.
 #[derive(Debug, Clone)]
 pub enum OutgoingMessage {
+    /// Sent once on connect; `version` is the protocol version.
     Connected {
         version: &'static str,
     },
-    WindowCreated {
+    /// A figure changed shape or binding. `bound` is false for a
+    /// dormant figure.
+    FigureChanged {
+        figure: String,
+        page: usize,
+        rect: IpcRect,
+        bound: bool,
+    },
+    /// An app mapped into a figure.
+    FigureBound {
+        figure: String,
         window_id: u64,
         title: String,
     },
-    WindowDestroyed {
+    /// An app unmapped or exited from a figure.
+    FigureUnbound {
+        figure: String,
         window_id: u64,
     },
-    TitleChanged {
+    /// An app's title changed.
+    AppTitleChanged {
         window_id: u64,
         title: String,
     },
-    /// Emacs surface logical size (so Emacs can compute header offset).
-    SurfaceSize {
-        width: i32,
-        height: i32,
+    /// The visible page changed.
+    PageChanged {
+        page: usize,
     },
-    /// User clicked on an embedded app — Emacs should select the corresponding window.
-    /// view_id=0 means the source window; otherwise it's a mirror view_id.
-    FocusView {
-        window_id: u64,
-        view_id: u64,
+    /// Response to `list_state`.
+    State {
+        page: usize,
+        page_count: usize,
+        doc: String,
+        figures: Vec<StateFigure>,
     },
-    /// XWayland is ready — Emacs can set DISPLAY=:<display> for X11 apps.
+    /// The document was written to disk.
+    DocSaved {
+        path: String,
+    },
+    /// XWayland is ready; children can be spawned with `DISPLAY=:<n>`.
     XWaylandReady {
         display: u32,
     },
-    /// A new workspace was created (new Emacs frame detected).
-    WorkspaceCreated {
-        workspace_id: u64,
-    },
-    /// The active workspace changed.
-    WorkspaceSwitched {
-        workspace_id: u64,
-    },
-    /// A workspace was destroyed (Emacs frame closed).
-    WorkspaceDestroyed {
-        workspace_id: u64,
-    },
-    /// Current DBus routing rules (response to ListRules).
+    /// Current DBus routing rules (response to `dbus_router_list_rules`).
     DbusRouterRules {
         rules: Vec<emthin_dbus::router::RouteRule>,
     },
-    /// A rule was added.
     DbusRouterRuleAdded {
         id: String,
         rule: emthin_dbus::router::RouteRule,
     },
-    /// A rule was removed.
     DbusRouterRuleRemoved {
         id: String,
     },
-    /// An embedded app window was resized by the user (mouse resize).
-    WindowResized {
-        window_id: u64,
-        rect: IpcRect,
+    /// A command failed.
+    Error {
+        message: String,
     },
+}
+
+/// One figure as reported by `list_state`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StateFigure {
+    /// The `\app` statement key (`f<stmt-index>`).
+    pub key: String,
+    /// The app binding id from the statement's 3rd argument.
+    pub id: Option<String>,
+    /// The figure's caption text.
+    pub caption: String,
+    /// Placed rect in output-local logical px (zero when off-page).
+    pub rect: IpcRect,
+    /// Page the figure is on.
+    pub page: usize,
+    /// `Some` when an app is bound.
+    pub window_id: Option<u64>,
+    /// The bound app's title.
+    pub title: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,95 +159,60 @@ pub enum OutgoingMessage {
 impl IncomingMessage {
     pub fn from_jsonrpc(method: &str, params: &serde_json::Value) -> Result<Self, String> {
         Ok(match method {
-            "set_geometry" => Self::SetGeometry {
-                window_id: params_get_u64(params, "window_id")?,
-                rect: IpcRect {
-                    x: params_get_f64(params, "x")?,
-                    y: params_get_f64(params, "y")?,
-                    w: params_get_f64(params, "w")?,
-                    h: params_get_f64(params, "h")?,
-                },
+            "spawn" => Self::Spawn {
+                cmd: params_get_string(params, "cmd")?,
+                args: params
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             },
             "close" => Self::Close {
-                window_id: params_get_u64(params, "window_id")?,
+                figure: params_get_string(params, "figure")?,
             },
-            "set_visibility" => Self::SetVisibility {
-                window_id: params_get_u64(params, "window_id")?,
-                visible: params_get_bool(params, "visible")?,
+            "focus" => Self::Focus {
+                // `null` explicitly means "the document".
+                figure: params
+                    .get("figure")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             },
-
-            "add_mirror" => Self::AddMirror {
-                window_id: params_get_u64(params, "window_id")?,
-                view_id: params_get_u64(params, "view_id")?,
-                rect: IpcRect {
-                    x: params_get_f64(params, "x")?,
-                    y: params_get_f64(params, "y")?,
-                    w: params_get_f64(params, "w")?,
-                    h: params_get_f64(params, "h")?,
-                },
+            "set_figure_size" => Self::SetFigureSize {
+                figure: params_get_string(params, "figure")?,
+                w: params_get_i32(params, "w")?,
+                h: params_get_i32(params, "h")?,
             },
-            "update_mirror_geometry" => Self::UpdateMirrorGeometry {
-                window_id: params_get_u64(params, "window_id")?,
-                view_id: params_get_u64(params, "view_id")?,
-                rect: IpcRect {
-                    x: params_get_f64(params, "x")?,
-                    y: params_get_f64(params, "y")?,
-                    w: params_get_f64(params, "w")?,
-                    h: params_get_f64(params, "h")?,
-                },
+            "clone_figure" => Self::CloneFigure {
+                figure: params_get_string(params, "figure")?,
             },
-            "remove_mirror" => Self::RemoveMirror {
-                window_id: params_get_u64(params, "window_id")?,
-                view_id: params_get_u64(params, "view_id")?,
+            "goto_page" => Self::GotoPage {
+                page: params_get_usize(params, "page")?,
             },
-            "promote_mirror" => Self::PromoteMirror {
-                window_id: params_get_u64(params, "window_id")?,
-                view_id: params_get_u64(params, "view_id")?,
+            "open_doc" => Self::OpenDoc {
+                path: params_get_string(params, "path")?,
             },
-            "set_focus" => Self::SetFocus {
-                window_id: params.get("window_id").and_then(|v| v.as_u64()),
+            "save_doc" => Self::SaveDoc {
+                path: params_get_string(params, "path")?,
             },
-            "switch_workspace" => Self::SwitchWorkspace {
-                workspace_id: params_get_u64(params, "workspace_id")?,
-            },
+            "list_state" => Self::ListState,
             "dbus_router_add_rule" => {
-                let rule: emthin_dbus::router::RouteRule =
-                    serde_json::from_value(params["rule"].clone())
-                        .map_err(|e| format!("invalid rule: {e}"))?;
+                let rule: emthin_dbus::router::RouteRule = serde_json::from_value(
+                    params.get("rule").cloned().ok_or("missing field 'rule'")?,
+                )
+                .map_err(|e| format!("invalid rule: {e}"))?;
                 Self::DbusRouterAddRule { rule }
             }
             "dbus_router_remove_rule" => Self::DbusRouterRemoveRule {
                 id: params_get_string(params, "id")?,
             },
             "dbus_router_list_rules" => Self::DbusRouterListRules,
-            "set_migration_policy" => {
-                let policy_str = params_get_string(params, "policy")?;
-                let policy: crate::state::migration::MigrationPolicy = policy_str
-                    .parse()
-                    .map_err(|e: String| format!("invalid policy: {e}"))?;
-                Self::SetMigrationPolicy { policy }
-            }
             other => return Err(format!("unknown IPC method: {other}")),
         })
     }
-}
-
-fn params_get_u64(params: &serde_json::Value, key: &str) -> Result<u64, String> {
-    params[key]
-        .as_u64()
-        .ok_or_else(|| format!("missing/invalid field '{key}'"))
-}
-
-fn params_get_f64(params: &serde_json::Value, key: &str) -> Result<f64, String> {
-    params[key]
-        .as_f64()
-        .ok_or_else(|| format!("missing/invalid field '{key}'"))
-}
-
-fn params_get_bool(params: &serde_json::Value, key: &str) -> Result<bool, String> {
-    params[key]
-        .as_bool()
-        .ok_or_else(|| format!("missing/invalid field '{key}'"))
 }
 
 fn params_get_string(params: &serde_json::Value, key: &str) -> Result<String, String> {
@@ -239,54 +222,88 @@ fn params_get_string(params: &serde_json::Value, key: &str) -> Result<String, St
         .ok_or_else(|| format!("missing/invalid field '{key}'"))
 }
 
+fn params_get_i32(params: &serde_json::Value, key: &str) -> Result<i32, String> {
+    params[key]
+        .as_i64()
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(|| format!("missing/invalid field '{key}'"))
+}
+
+fn params_get_usize(params: &serde_json::Value, key: &str) -> Result<usize, String> {
+    params[key]
+        .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| format!("missing/invalid field '{key}'"))
+}
+
+impl IpcRect {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({"x": self.x, "y": self.y, "w": self.w, "h": self.h})
+    }
+}
+
 impl OutgoingMessage {
     pub fn method_name(&self) -> &'static str {
         match self {
             Self::Connected { .. } => "connected",
-            Self::WindowCreated { .. } => "window_created",
-            Self::WindowDestroyed { .. } => "window_destroyed",
-            Self::TitleChanged { .. } => "title_changed",
-            Self::SurfaceSize { .. } => "surface_size",
-            Self::FocusView { .. } => "focus_view",
+            Self::FigureChanged { .. } => "figure_changed",
+            Self::FigureBound { .. } => "figure_bound",
+            Self::FigureUnbound { .. } => "figure_unbound",
+            Self::AppTitleChanged { .. } => "app_title_changed",
+            Self::PageChanged { .. } => "page_changed",
+            Self::State { .. } => "state",
+            Self::DocSaved { .. } => "doc_saved",
             Self::XWaylandReady { .. } => "x_wayland_ready",
-            Self::WorkspaceCreated { .. } => "workspace_created",
-            Self::WorkspaceSwitched { .. } => "workspace_switched",
-            Self::WorkspaceDestroyed { .. } => "workspace_destroyed",
             Self::DbusRouterRules { .. } => "dbus_router_rules",
             Self::DbusRouterRuleAdded { .. } => "dbus_router_rule_added",
             Self::DbusRouterRuleRemoved { .. } => "dbus_router_rule_removed",
-            Self::WindowResized { .. } => "window_resized",
+            Self::Error { .. } => "error",
         }
     }
 
     pub fn into_params_value(self) -> serde_json::Value {
         match self {
             Self::Connected { version } => serde_json::json!({"version": version}),
-            Self::WindowCreated { window_id, title } => {
+            Self::FigureChanged {
+                figure,
+                page,
+                rect,
+                bound,
+            } => serde_json::json!({
+                "figure": figure,
+                "page": page,
+                "rect": rect.to_json(),
+                "bound": bound,
+            }),
+            Self::FigureBound {
+                figure,
+                window_id,
+                title,
+            } => serde_json::json!({
+                "figure": figure,
+                "window_id": window_id,
+                "title": title,
+            }),
+            Self::FigureUnbound { figure, window_id } => {
+                serde_json::json!({"figure": figure, "window_id": window_id})
+            }
+            Self::AppTitleChanged { window_id, title } => {
                 serde_json::json!({"window_id": window_id, "title": title})
             }
-            Self::WindowDestroyed { window_id } => {
-                serde_json::json!({"window_id": window_id})
-            }
-            Self::TitleChanged { window_id, title } => {
-                serde_json::json!({"window_id": window_id, "title": title})
-            }
-            Self::SurfaceSize { width, height } => {
-                serde_json::json!({"width": width, "height": height})
-            }
-            Self::FocusView { window_id, view_id } => {
-                serde_json::json!({"window_id": window_id, "view_id": view_id})
-            }
+            Self::PageChanged { page } => serde_json::json!({"page": page}),
+            Self::State {
+                page,
+                page_count,
+                doc,
+                figures,
+            } => serde_json::json!({
+                "page": page,
+                "page_count": page_count,
+                "doc": doc,
+                "figures": figures,
+            }),
+            Self::DocSaved { path } => serde_json::json!({"path": path}),
             Self::XWaylandReady { display } => serde_json::json!({"display": display}),
-            Self::WorkspaceCreated { workspace_id } => {
-                serde_json::json!({"workspace_id": workspace_id})
-            }
-            Self::WorkspaceSwitched { workspace_id } => {
-                serde_json::json!({"workspace_id": workspace_id})
-            }
-            Self::WorkspaceDestroyed { workspace_id } => {
-                serde_json::json!({"workspace_id": workspace_id})
-            }
             Self::DbusRouterRules { rules } => {
                 serde_json::json!({"rules": serde_json::to_value(rules).unwrap_or_default()})
             }
@@ -294,19 +311,8 @@ impl OutgoingMessage {
                 "id": id,
                 "rule": serde_json::to_value(rule).unwrap_or_default(),
             }),
-            Self::DbusRouterRuleRemoved { id } => {
-                serde_json::json!({"id": id})
-            }
-            Self::WindowResized {
-                window_id,
-                rect: IpcRect { x, y, w, h },
-            } => serde_json::json!({
-                "window_id": window_id,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-            }),
+            Self::DbusRouterRuleRemoved { id } => serde_json::json!({"id": id}),
+            Self::Error { message } => serde_json::json!({"message": message}),
         }
     }
 }
@@ -316,208 +322,137 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_set_geometry() {
-        let params = serde_json::json!({"window_id":42,"x":0.5,"y":0.3,"w":0.4,"h":0.6});
-        let msg = IncomingMessage::from_jsonrpc("set_geometry", &params).unwrap();
+    fn parses_spawn_with_and_without_args() {
+        let m = IncomingMessage::from_jsonrpc(
+            "spawn",
+            &serde_json::json!({"cmd": "foot", "args": ["-T", "xterm-256color"]}),
+        )
+        .expect("spawn");
+        match m {
+            IncomingMessage::Spawn { cmd, args } => {
+                assert_eq!(cmd, "foot");
+                assert_eq!(args, ["-T", "xterm-256color"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let m = IncomingMessage::from_jsonrpc("spawn", &serde_json::json!({"cmd": "foot"}))
+            .expect("spawn");
+        assert!(matches!(m, IncomingMessage::Spawn { ref args, .. } if args.is_empty()));
+    }
+
+    #[test]
+    fn parses_focus_with_null_as_the_document() {
+        let m = IncomingMessage::from_jsonrpc("focus", &serde_json::json!({"figure": null}))
+            .expect("focus");
+        assert!(matches!(m, IncomingMessage::Focus { figure: None }));
+        let m = IncomingMessage::from_jsonrpc("focus", &serde_json::json!({"figure": "f2"}))
+            .expect("focus");
+        assert!(matches!(m, IncomingMessage::Focus { figure: Some(f) } if f == "f2"));
+    }
+
+    #[test]
+    fn parses_set_figure_size_and_rejects_bad_numbers() {
+        let m = IncomingMessage::from_jsonrpc(
+            "set_figure_size",
+            &serde_json::json!({"figure":"f0","w":320,"h":200}),
+        )
+        .expect("size");
         assert!(matches!(
-            msg,
-            IncomingMessage::SetGeometry {
-                window_id: 42,
+            m,
+            IncomingMessage::SetFigureSize { w: 320, h: 200, .. }
+        ));
+        // A float w is not an i32.
+        assert!(IncomingMessage::from_jsonrpc(
+            "set_figure_size",
+            &serde_json::json!({"figure":"f0","w":1.5,"h":2})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_page_navigation() {
+        let m = IncomingMessage::from_jsonrpc("goto_page", &serde_json::json!({"page": 3}))
+            .expect("goto_page");
+        assert!(matches!(m, IncomingMessage::GotoPage { page: 3 }));
+        assert!(
+            IncomingMessage::from_jsonrpc("goto_page", &serde_json::json!({"page": -1})).is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_method_is_an_error_not_a_panic() {
+        assert!(IncomingMessage::from_jsonrpc("nope", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn every_outgoing_method_name_is_snake_case() {
+        // Guards the manual wire spelling: the one thing a derive
+        // would silently break.
+        let msgs = [
+            OutgoingMessage::Connected { version: "0.1" },
+            OutgoingMessage::FigureChanged {
+                figure: "f0".into(),
+                page: 0,
                 rect: IpcRect {
-                    x: 0.5,
-                    y: 0.3,
-                    w: 0.4,
-                    h: 0.6
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_close() {
-        let params = serde_json::json!({"window_id":7});
-        let msg = IncomingMessage::from_jsonrpc("close", &params).unwrap();
-        assert!(matches!(msg, IncomingMessage::Close { window_id: 7 }));
-    }
-
-    #[test]
-    fn parses_set_visibility() {
-        let params = serde_json::json!({"window_id":3,"visible":false});
-        let msg = IncomingMessage::from_jsonrpc("set_visibility", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::SetVisibility {
-                window_id: 3,
-                visible: false
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_add_mirror() {
-        let params = serde_json::json!({"window_id":1,"view_id":2,"x":0.0,"y":0.0,"w":0.5,"h":0.3});
-        let msg = IncomingMessage::from_jsonrpc("add_mirror", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::AddMirror {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                bound: true,
+            },
+            OutgoingMessage::FigureBound {
+                figure: "f0".into(),
                 window_id: 1,
-                view_id: 2,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_update_mirror_geometry() {
-        let params = serde_json::json!({"window_id":3,"view_id":4,"x":0.1,"y":0.2,"w":0.4,"h":0.6});
-        let msg = IncomingMessage::from_jsonrpc("update_mirror_geometry", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::UpdateMirrorGeometry {
-                window_id: 3,
-                view_id: 4,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_remove_mirror() {
-        let params = serde_json::json!({"window_id":5,"view_id":6});
-        let msg = IncomingMessage::from_jsonrpc("remove_mirror", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::RemoveMirror {
-                window_id: 5,
-                view_id: 6
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_promote_mirror() {
-        let params = serde_json::json!({"window_id":7,"view_id":8});
-        let msg = IncomingMessage::from_jsonrpc("promote_mirror", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::PromoteMirror {
-                window_id: 7,
-                view_id: 8
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_set_focus_with_window_id() {
-        let params = serde_json::json!({"window_id":9});
-        let msg = IncomingMessage::from_jsonrpc("set_focus", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::SetFocus { window_id: Some(9) }
-        ));
-    }
-
-    #[test]
-    fn parses_set_focus_without_window_id() {
-        let params = serde_json::json!({});
-        let msg = IncomingMessage::from_jsonrpc("set_focus", &params).unwrap();
-        assert!(matches!(msg, IncomingMessage::SetFocus { window_id: None }));
-    }
-
-    #[test]
-    fn parses_switch_workspace() {
-        let params = serde_json::json!({"workspace_id":5});
-        let msg = IncomingMessage::from_jsonrpc("switch_workspace", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::SwitchWorkspace { workspace_id: 5 }
-        ));
-    }
-
-    #[test]
-    fn parses_set_migration_policy() {
-        let params = serde_json::json!({"policy":"by_workspace_affinity"});
-        let msg = IncomingMessage::from_jsonrpc("set_migration_policy", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::SetMigrationPolicy {
-                policy: crate::state::migration::MigrationPolicy::ByWorkspaceAffinity,
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_set_migration_policy_manual() {
-        let params = serde_json::json!({"policy":"manual"});
-        let msg = IncomingMessage::from_jsonrpc("set_migration_policy", &params).unwrap();
-        assert!(matches!(
-            msg,
-            IncomingMessage::SetMigrationPolicy {
-                policy: crate::state::migration::MigrationPolicy::Manual,
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_migration_policy() {
-        let params = serde_json::json!({"policy":"auto"});
-        let result = IncomingMessage::from_jsonrpc("set_migration_policy", &params);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_method() {
-        let result = IncomingMessage::from_jsonrpc("unknown_command", &serde_json::json!({}));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn rejects_missing_required_fields() {
-        let params = serde_json::json!({"window_id":1});
-        let result = IncomingMessage::from_jsonrpc("set_geometry", &params);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn outgoing_method_name() {
-        assert_eq!(
-            OutgoingMessage::Connected { version: "0.1" }.method_name(),
-            "connected"
-        );
-        assert_eq!(
-            OutgoingMessage::WindowCreated {
+                title: "t".into(),
+            },
+            OutgoingMessage::FigureUnbound {
+                figure: "f0".into(),
                 window_id: 1,
-                title: "t".into()
-            }
-            .method_name(),
-            "window_created"
-        );
+            },
+            OutgoingMessage::AppTitleChanged {
+                window_id: 1,
+                title: "t".into(),
+            },
+            OutgoingMessage::PageChanged { page: 0 },
+            OutgoingMessage::XWaylandReady { display: 1 },
+            OutgoingMessage::DbusRouterRuleRemoved { id: "i".into() },
+            OutgoingMessage::Error {
+                message: "m".into(),
+            },
+        ];
+        for msg in msgs {
+            let name = msg.method_name();
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{name} must be snake_case"
+            );
+        }
+        // The historical quirk: XWaylandReady's wire name is
+        // "x_wayland_ready", not "xwayland_ready".
         assert_eq!(
-            OutgoingMessage::XWaylandReady { display: 42 }.method_name(),
+            OutgoingMessage::XWaylandReady { display: 1 }.method_name(),
             "x_wayland_ready"
         );
-        assert_eq!(
-            OutgoingMessage::SurfaceSize {
-                width: 1920,
-                height: 1080
-            }
-            .method_name(),
-            "surface_size"
-        );
     }
 
     #[test]
-    fn outgoing_into_params_value() {
-        let v = OutgoingMessage::Connected { version: "0.1" }.into_params_value();
-        assert_eq!(v["version"], "0.1");
-        let v = OutgoingMessage::WindowCreated {
-            window_id: 42,
-            title: "test".into(),
-        }
-        .into_params_value();
-        assert_eq!(v["window_id"], 42);
-        assert_eq!(v["title"], "test");
-        let v = OutgoingMessage::XWaylandReady { display: 99 }.into_params_value();
-        assert_eq!(v["display"], 99);
+    fn rect_round_trips_through_json() {
+        let msg = OutgoingMessage::FigureChanged {
+            figure: "f0".into(),
+            page: 2,
+            rect: IpcRect {
+                x: 10,
+                y: 20,
+                w: 640,
+                h: 400,
+            },
+            bound: false,
+        };
+        let json = msg.into_params_value();
+        assert_eq!(json["rect"]["x"], 10);
+        assert_eq!(json["rect"]["h"], 400);
+        assert_eq!(json["page"], 2);
+        assert_eq!(json["bound"], false);
     }
 }

@@ -9,7 +9,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::{wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
-    utils::{Serial, SERIAL_COUNTER},
+    utils::Serial,
     wayland::{
         compositor::with_states,
         shell::xdg::{
@@ -27,111 +27,40 @@ impl XdgShellHandler for EmthinState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        if self.emacs.should_claim_main() {
-            // First toplevel = Emacs (Wayland/pgtk path only).
-            // X11 Emacs sets initial_size_settled in map_window_request.
-            tracing::info!("Emacs toplevel connected");
-            self.emacs.set_surface(Some(surface.wl_surface().clone()));
-
-            if let Some(output) = self.workspace.active_space.outputs().next() {
-                if let Some(mode) = output.current_mode() {
-                    let scale = output.current_scale().fractional_scale();
-                    let logical = mode.size.to_f64().to_logical(scale).to_i32_round();
-                    surface.with_pending_state(|state| {
-                        state.size = Some(logical);
-                        state.states.set(xdg_toplevel::State::Fullscreen);
-                    });
-                    self.ipc.send(crate::ipc::OutgoingMessage::SurfaceSize {
-                        width: logical.w,
-                        height: logical.h,
-                    });
-                }
-            }
-            self.emacs.mark_size_settled();
-
-            let window = Window::new_wayland_window(surface);
-            self.workspace
-                .active_space
-                .map_element(window.clone(), (0, 0), false);
-            // Emacs is the fullscreen host and must stay at the bottom of
-            // the stack so later app toplevels (and any remap via
-            // resize_emacs_in_space) never cover them.
-            self.workspace.active_space.lower_element(&window);
-
-            // Give Emacs initial keyboard focus.
-            let serial = SERIAL_COUNTER.next_serial();
-            if let Some(keyboard) = self.seat.get_keyboard() {
-                keyboard.set_focus(self, Some(window.into()), serial);
-            }
-        } else if self.is_emacs_client(surface.wl_surface()) {
-            // Same Wayland client as Emacs — could be a new frame (C-x 5 2) or
-            // a child frame (posframe, company-posframe, etc.).
-            //
-            // We can't tell yet: set_parent() hasn't been processed at this point
-            // (GTK sends get_toplevel + set_parent in the same Wayland batch, but
-            // set_parent is processed after new_toplevel). Defer the decision to
-            // the event loop idle callback where surface.parent() is available.
-            //
-            // Configure Fullscreen + output size and send immediately.
-            // Don't wait for handle_surface_commit — sending now ensures GTK
-            // sees Fullscreen as the very first configure (no CSD flash).
-            // GTK ignores Fullscreen on transient (child) windows, so this is
-            // safe even if this turns out to be a child frame.
-            if let Some(geo) = self.output_fullscreen_geo() {
-                surface.with_pending_state(|s| {
-                    s.size = Some(geo.size);
-                    s.states.set(xdg_toplevel::State::Fullscreen);
-                });
-                surface.send_configure();
-            }
-            let window = Window::new_wayland_window(surface.clone());
-            self.workspace
-                .active_space
-                .map_element(window.clone(), (0, 0), false);
-            // Keep Emacs at the bottom while it sits briefly in the active
-            // space before `process_pending_toplevels` decides whether to
-            // move it into a new workspace.
-            self.workspace.active_space.lower_element(&window);
-            self.workspace
-                .pending_emacs_toplevels
-                .push((surface, window));
-            tracing::info!("Emacs client toplevel detected — deferred for parent check");
-        } else {
-            // Subsequent toplevels from other clients = embedded windows.
-            // Defer the dialog-vs-app classification by one tick: at this
-            // point set_parent / set_min_size / set_max_size from the same
-            // Wayland batch may not have been processed yet (mirror of the
-            // Emacs child-frame defer above). `process_pending_toplevels`
-            // re-reads them and routes to either FloatingDialog or
-            // AppManager.
-            //
-            // Crucially, we do NOT pin a size here. A previous version
-            // configured (1, 1) so the initial round-trip would
-            // immediately tell the client "you're tiny" — but
-            // xwayland-satellite faithfully forwards that configure to
-            // the X client and clobbers its natural size. By the time
-            // `promote_floating_dialog` later sends configure(0, 0)
-            // ("client choose"), the client's idea of natural size has
-            // already been wiped out, leaving the dialog at 1×1 / not
-            // rendering. Leaving pending size unset means the initial
-            // configure goes out as (0, 0), which is the "client
-            // choose" semantic in xdg_shell — clients commit at their
-            // natural size and we re-configure once classified.
-            let window = Window::new_wayland_window(surface.clone());
-            // Tag so handle_surface_commit knows to *defer* the initial
-            // configure: until `process_pending_app_toplevels` classifies
-            // this toplevel, we don't know whether to send (0, 0) for a
-            // dialog or (1, 1) for an embedded app, and sending a
-            // half-baked configure now causes some X11 clients (Feishu
-            // via xwayland-satellite) to give up and exit.
-            window
-                .user_data()
-                .insert_if_missing(crate::handlers::dialogs::PendingClassificationTag::default);
-            self.workspace
-                .active_space
-                .map_element(window.clone(), (0, 0), false);
-            self.workspace.pending_app_toplevels.push((surface, window));
-        }
+        // Every toplevel is a document figure. There is no "shell"
+        // client and no special first-toplevel case: `tick` binds this
+        // surface to a figure (an existing one, or one it appends to the
+        // document — see `docui::figures::claim_toplevel`) and
+        // configures the toplevel to that figure's size.
+        //
+        // The classification (floating dialog vs. figure-bound app) is
+        // deferred by one tick: at this point `set_parent` /
+        // `set_min_size` / `set_max_size` from the same Wayland batch
+        // may not have been processed yet (mirroring sway's
+        // `wants_floating`, desktop/xdg_shell.c:228).
+        //
+        // Crucially, we do NOT pin a size here. A previous version
+        // configured (1, 1) so the initial round-trip would
+        // immediately tell the client "you're tiny" — but
+        // xwayland-satellite faithfully forwards that configure to the
+        // X client and clobbers its natural size. Leaving pending size
+        // unset means the initial configure goes out as (0, 0), the
+        // "client choose" semantic in xdg_shell — clients commit at
+        // their natural size and we re-configure once classified.
+        let window = Window::new_wayland_window(surface.clone());
+        // Tag so handle_surface_commit knows to *defer* the initial
+        // configure: until the toplevel is classified we don't know
+        // whether to send (0, 0) for a dialog or the figure's size for
+        // a bound app, and sending a half-baked configure now causes
+        // some X11 clients (Feishu via xwayland-satellite) to give up
+        // and exit.
+        window
+            .user_data()
+            .insert_if_missing(crate::handlers::dialogs::PendingClassificationTag::default);
+        self.page
+            .active_space
+            .map_element(window.clone(), (0, 0), false);
+        self.page.pending_app_toplevels.push((surface, window));
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -161,7 +90,7 @@ impl XdgShellHandler for EmthinState {
         // and embedded apps are positioned by the Emacs IPC layer —
         // letting either be moved would desync the layout.
         let Some(window) = self
-            .workspace
+            .page
             .active_space
             .elements()
             .find(|w| {
@@ -202,8 +131,7 @@ impl XdgShellHandler for EmthinState {
         if !same_client {
             return;
         }
-        let Some(initial_window_location) = self.workspace.active_space.element_location(&window)
-        else {
+        let Some(initial_window_location) = self.page.active_space.element_location(&window) else {
             return;
         };
 
@@ -228,7 +156,7 @@ impl XdgShellHandler for EmthinState {
             return;
         };
         let Some(window) = self
-            .workspace
+            .page
             .active_space
             .elements()
             .find(|w| {
@@ -260,7 +188,7 @@ impl XdgShellHandler for EmthinState {
         if !same_client {
             return;
         }
-        let Some(initial_location) = self.workspace.active_space.element_location(&window) else {
+        let Some(initial_location) = self.page.active_space.element_location(&window) else {
             return;
         };
         let initial_size = window.bbox().size;
@@ -332,91 +260,62 @@ impl XdgShellHandler for EmthinState {
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
-        if self.is_emacs_surface(&surface) {
-            tracing::info!("Emacs requested fullscreen");
-            self.emacs.request_fullscreen(true);
+        // A figure-bound app asking for fullscreen is asking to leave
+        // the figure metaphor: acknowledge the state (so the client
+        // hides its toolbar/chrome) but keep its size pinned to the
+        // figure rect. There is no "host" to fullscreen any more.
+        if self.apps.id_for_surface(surface.wl_surface()).is_some() {
             Self::set_toplevel_state(&surface, xdg_toplevel::State::Fullscreen, true);
-        } else if self.apps.id_for_surface(surface.wl_surface()).is_some() {
-            // Embedded app fullscreen: set state so the client hides its
-            // toolbar/chrome, but keep the window sized to its Emacs buffer.
-            Self::set_toplevel_state(&surface, xdg_toplevel::State::Fullscreen, true);
-            tracing::debug!("embedded app fullscreen request acknowledged");
+            tracing::debug!("figure app fullscreen request acknowledged (size stays figure-bound)");
         }
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        if self.is_any_emacs_surface(surface.wl_surface()) {
-            return;
-        }
         if self.apps.id_for_surface(surface.wl_surface()).is_some() {
             Self::set_toplevel_state(&surface, xdg_toplevel::State::Fullscreen, false);
-            tracing::debug!("embedded app unfullscreen request acknowledged");
+            tracing::debug!("figure app unfullscreen request acknowledged");
         }
     }
 
-    fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if self.is_emacs_surface(&surface) {
-            tracing::info!("Emacs requested maximize");
-            self.emacs.request_maximize(true);
-            Self::set_toplevel_state(&surface, xdg_toplevel::State::Maximized, true);
-        }
+    fn maximize_request(&mut self, _surface: ToplevelSurface) {
+        // No-op by policy: a figure's size is the document's business.
+        // Clients (GTK4/3) send `unmaximize_request` immediately on
+        // connect if Maximized was in the initial configure; the state
+        // is never set, so there is nothing to re-assert.
     }
 
-    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if self.is_emacs_surface(&surface) {
-            tracing::trace!("Emacs requested unmaximize — policy keeps maximized; re-asserting");
-            Self::set_toplevel_state(&surface, xdg_toplevel::State::Maximized, true);
-        }
-    }
+    fn unmaximize_request(&mut self, _surface: ToplevelSurface) {}
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
         let title =
             Self::get_toplevel_data(&surface, |d| d.lock().ok().and_then(|d| d.title.clone()));
-        if self.is_emacs_surface(&surface) {
-            // Active workspace Emacs — forward title to host window + update bar name.
-            if let Some(title) = title {
-                tracing::debug!("Emacs title changed: {title}");
-                self.workspace.active_name = extract_bar_name(&title);
-                self.emacs.set_title(title);
-            }
-        } else if self.is_any_emacs_surface(surface.wl_surface()) {
-            // Inactive workspace Emacs frame — update its workspace name.
-            if let Some(title) = &title {
-                let short = extract_bar_name(title);
-                for ws in self.workspace.inactive.values_mut() {
-                    if ws
-                        .emacs_surface
-                        .as_ref()
-                        .is_some_and(|s| s == surface.wl_surface())
-                    {
-                        ws.name = short;
-                        break;
-                    }
-                }
-            }
-        } else if let Some(window_id) = self.apps.id_for_surface(surface.wl_surface()) {
-            if let Some(title) = title {
-                self.ipc
-                    .send(crate::ipc::OutgoingMessage::TitleChanged { window_id, title });
-            }
-        }
+        let Some(window_id) = self.apps.id_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let Some(title) = title else { return };
+        // The bound app owns the host window's title: it is the only
+        // thing on screen that has a "title" in the ordinary sense.
+        self.host.set_title(Some(&title));
+        self.doc.on_app_title_changed(window_id, &title);
+        self.ipc
+            .send(crate::ipc::OutgoingMessage::AppTitleChanged { window_id, title });
     }
 
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
-        if self.is_emacs_surface(&surface) {
-            let app_id =
-                Self::get_toplevel_data(&surface, |d| d.lock().ok().and_then(|d| d.app_id.clone()));
-            if let Some(app_id) = app_id {
-                tracing::debug!("Emacs app_id changed: {}", app_id);
-                self.emacs.set_app_id(app_id);
-            }
+        let Some(window_id) = self.apps.id_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let app_id =
+            Self::get_toplevel_data(&surface, |d| d.lock().ok().and_then(|d| d.app_id.clone()));
+        if let Some(app_id) = app_id {
+            self.host.set_app_id(Some(&app_id));
+            self.doc.on_app_id_changed(window_id, &app_id);
         }
-        // Inactive workspace Emacs or other surfaces: ignore app_id changes.
     }
 }
 
-/// Whether a toplevel should map as a floating dialog (centered, no
-/// AppManager / no Emacs buffer) instead of an embedded app window.
+/// Whether a toplevel should map as a floating dialog (centered, not
+/// bound to a figure) instead of a figure-bound app.
 ///
 /// Direct port of sway's `wants_floating` (sway/desktop/xdg_shell.c:228):
 ///
@@ -458,18 +357,6 @@ pub fn wants_floating(_state: &EmthinState, surface: &ToplevelSurface) -> bool {
         (current.min_size, current.max_size)
     });
     min.w > 0 && min.h > 0 && (min.w == max.w || min.h == max.h)
-}
-
-/// Extract a short display name from an Emacs frame title for the workspace bar.
-/// Strips " - GNU Emacs ..." suffix.
-/// e.g. "*scratch* - GNU Emacs at home" → "*scratch*"
-fn extract_bar_name(title: &str) -> String {
-    title
-        .split(" - GNU Emacs")
-        .next()
-        .unwrap_or(title)
-        .trim()
-        .to_string()
 }
 
 // Xdg Shell
@@ -555,10 +442,6 @@ pub fn handle_surface_commit(
 }
 
 impl EmthinState {
-    fn is_emacs_surface(&self, surface: &ToplevelSurface) -> bool {
-        self.emacs.is_main_surface(surface.wl_surface())
-    }
-
     fn set_toplevel_state(surface: &ToplevelSurface, state: xdg_toplevel::State, enabled: bool) {
         surface.with_pending_state(|s| {
             if enabled {
@@ -588,7 +471,7 @@ impl EmthinState {
             return;
         };
         let Some(window) = self
-            .workspace
+            .page
             .active_space
             .elements()
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
@@ -596,13 +479,13 @@ impl EmthinState {
             return;
         };
 
-        let Some(output) = self.workspace.active_space.outputs().next() else {
+        let Some(output) = self.page.active_space.outputs().next() else {
             return;
         };
-        let Some(output_geo) = self.workspace.active_space.output_geometry(output) else {
+        let Some(output_geo) = self.page.active_space.output_geometry(output) else {
             return;
         };
-        let Some(window_geo) = self.workspace.active_space.element_geometry(window) else {
+        let Some(window_geo) = self.page.active_space.element_geometry(window) else {
             return;
         };
 

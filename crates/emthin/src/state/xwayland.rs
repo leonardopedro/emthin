@@ -7,35 +7,26 @@
 //! Three orthogonal pieces live here.
 //!
 //! **Display number** (`display`): cached `:N` for convenience —
-//! exported as `DISPLAY` to the Emacs child and sent to elisp via
-//! `XWaylandReady` IPC. Set once and forgotten.
+//! exported as `DISPLAY` to every child emthin spawns and sent over
+//! IPC as `XWaylandReady`. Set once and forgotten.
 //!
 //! **Supervisor** (`integration`): pre-binds `/tmp/.X11-unix/X<N>` +
 //! the abstract socket, arms calloop watches, and lazily spawns
 //! `xwayland-satellite` on first X client connect. See the
 //! `crate::xwayland_satellite` module for the state machine.
 //!
-//! **Pending child command** (`pending_command`): the `--command`
-//! flag's value, parked until XWayland reports Ready so GTK3 /
+//! **Pending child commands** (`pending_commands`): the `--spawn`
+//! command lines, parked until XWayland reports Ready so GTK3 /
 //! Electron children spawn with a valid `DISPLAY` in env. Drained
-//! exactly once by the main-loop hook that observes
-//! `xwayland_satellite::ToMain::Ready`.
+//! exactly once by `main` after the satellite setup settles.
 
 use crate::xwayland_satellite::XwlsIntegration;
-
-/// Child command to spawn once XWayland is ready. None = already
-/// spawned or `--no-spawn` was passed.
-pub struct PendingCommand {
-    pub command: String,
-    pub args: Vec<String>,
-    pub standalone: bool,
-}
 
 #[derive(Default)]
 pub struct XwaylandState {
     display: Option<u32>,
     integration: Option<XwlsIntegration>,
-    pending_command: Option<PendingCommand>,
+    pending_commands: Option<Vec<(String, Vec<String>)>>,
 }
 
 impl XwaylandState {
@@ -74,16 +65,16 @@ impl XwaylandState {
         self.integration = None;
     }
 
-    // -- Pending child command -------------------------------------
+    // -- Pending child commands ------------------------------------
 
-    /// Park a command to be spawned once XWayland reports Ready.
-    pub fn set_pending_command(&mut self, cmd: PendingCommand) {
-        self.pending_command = Some(cmd);
+    /// Park the `--spawn` command lines until XWayland reports Ready.
+    pub fn set_pending_commands(&mut self, cmds: Vec<(String, Vec<String>)>) {
+        self.pending_commands = Some(cmds);
     }
 
-    /// Drain the parked command (exactly once).
-    pub fn take_pending_command(&mut self) -> Option<PendingCommand> {
-        self.pending_command.take()
+    /// Drain the parked commands (exactly once).
+    pub fn take_pending_commands(&mut self) -> Option<Vec<(String, Vec<String>)>> {
+        self.pending_commands.take()
     }
 }
 
@@ -95,21 +86,20 @@ mod tests {
     // `channel::Sender` and has no Default — constructing one in a
     // unit test is out of scope. Its slot (set / integration_mut /
     // clear) is covered by the e2e suite. Everything else (display
-    // cache, pending_command mailbox) is pure logic.
+    // cache, pending-command mailbox) is pure logic.
 
-    fn sample_cmd() -> PendingCommand {
-        PendingCommand {
-            command: "emacs".into(),
-            args: vec!["-nw".into()],
-            standalone: false,
-        }
+    fn sample_cmds() -> Vec<(String, Vec<String>)> {
+        vec![
+            ("foot".into(), vec!["-T".into(), "xterm-256color".into()]),
+            ("firefox".into(), vec![]),
+        ]
     }
 
     #[test]
     fn default_is_empty_on_all_three_slots() {
         let s = XwaylandState::default();
         assert!(s.display.is_none());
-        assert!(s.pending_command.is_none());
+        assert!(s.pending_commands.is_none());
         assert!(s.integration.is_none());
     }
 
@@ -131,77 +121,53 @@ mod tests {
     }
 
     #[test]
-    fn pending_command_set_then_take() {
+    fn pending_commands_set_then_take() {
         let mut s = XwaylandState::default();
-        assert!(s.take_pending_command().is_none());
+        assert!(s.take_pending_commands().is_none());
 
-        s.set_pending_command(sample_cmd());
-        assert!(
-            s.pending_command.is_some(),
-            "set_pending_command parks the value"
+        s.set_pending_commands(sample_cmds());
+        assert!(s.pending_commands.is_some(), "set parks the value");
+
+        let taken = s
+            .take_pending_commands()
+            .expect("take returns what was set");
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].0, "foot");
+        assert_eq!(
+            taken[0].1,
+            vec!["-T".to_string(), "xterm-256color".to_string()]
         );
+        assert_eq!(taken[1].0, "firefox");
 
-        let taken = s.take_pending_command().expect("take returns what was set");
-        assert_eq!(taken.command, "emacs");
-        assert_eq!(taken.args, vec!["-nw".to_string()]);
-        assert!(!taken.standalone);
-
-        assert!(
-            s.pending_command.is_none(),
-            "take drains — second read is None"
-        );
-        assert!(s.take_pending_command().is_none());
+        assert!(s.pending_commands.is_none(), "take drains");
+        assert!(s.take_pending_commands().is_none());
     }
 
     #[test]
-    fn set_pending_command_overwrites_previous() {
-        // If the user somehow re-arms a command before the first is
-        // drained, the second wins. Mirrors the flat-assignment
-        // semantics that existed before extraction.
+    fn set_pending_commands_overwrites_previous() {
+        // Re-arming before the first drain wins with the latest set.
         let mut s = XwaylandState::default();
-        s.set_pending_command(PendingCommand {
-            command: "old".into(),
-            args: vec![],
-            standalone: true,
-        });
-        s.set_pending_command(PendingCommand {
-            command: "new".into(),
-            args: vec!["-flag".into()],
-            standalone: false,
-        });
-        let taken = s.take_pending_command().unwrap();
-        assert_eq!(taken.command, "new");
-        assert_eq!(taken.args, vec!["-flag".to_string()]);
-        assert!(!taken.standalone);
+        s.set_pending_commands(vec![("old".into(), vec![])]);
+        s.set_pending_commands(vec![("new".into(), vec!["-flag".into()])]);
+        let taken = s.take_pending_commands().unwrap();
+        assert_eq!(taken[0].0, "new");
+        assert_eq!(taken[0].1, vec!["-flag".to_string()]);
     }
 
     #[test]
-    fn display_and_pending_command_are_independent() {
+    fn display_and_pending_commands_are_independent() {
         let mut s = XwaylandState::default();
         s.set_display(7);
-        s.set_pending_command(sample_cmd());
+        s.set_pending_commands(sample_cmds());
 
         assert_eq!(s.display, Some(7));
-        assert!(s.pending_command.is_some());
+        assert!(s.pending_commands.is_some());
 
-        let _ = s.take_pending_command();
+        let _ = s.take_pending_commands();
         assert_eq!(
             s.display,
             Some(7),
-            "draining the command must not touch the display cache"
+            "draining the mailbox must not touch the display"
         );
-    }
-
-    #[test]
-    fn integration_mut_none_by_default() {
-        let mut s = XwaylandState::default();
-        assert!(s.integration_mut().is_none());
-    }
-
-    #[test]
-    fn clear_integration_is_no_op_when_already_empty() {
-        let mut s = XwaylandState::default();
-        s.clear_integration();
-        assert!(s.integration_mut().is_none());
     }
 }
