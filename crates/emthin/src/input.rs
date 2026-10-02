@@ -324,7 +324,28 @@ impl EmthinState {
                 window_id: app_id,
                 title: figure.title.clone().unwrap_or_default(),
             });
+        } else if self.relaunch_dormant(&figure.key) {
+            self.needs_redraw = true;
         }
+    }
+
+    /// Spawn `key`'s saved command, if it is dormant and has one.
+    ///
+    /// A single click is enough, and deliberately so: a bound figure's click
+    /// belongs to its app, but a dormant figure has no client, so nothing else
+    /// can claim the click. Waiting for a double-click would be inventing a
+    /// gesture out of a case where the click is already unclaimed.
+    fn relaunch_dormant(&mut self, key: &str) -> bool {
+        let Some((cmd, args)) = self.doc.relaunch_target(key).cloned() else {
+            // Dormant with no saved command: an empty slot with nothing to open.
+            // Not an error, and not worth a warning per click.
+            tracing::debug!("relaunch: {key} has no saved command");
+            return false;
+        };
+        tracing::info!("relaunch: {cmd} into {key} (click)");
+        let display = self.xwayland.display();
+        crate::util::spawn_child(&cmd, &args, display, self);
+        true
     }
 
     /// Apply a global document binding.
@@ -431,14 +452,7 @@ impl EmthinState {
         let Some(key) = self.doc.dormant_figure_at(pointer).map(str::to_string) else {
             return false;
         };
-        let Some((cmd, args)) = self.doc.relaunch_target(&key).cloned() else {
-            tracing::info!("relaunch: {key} has no saved command");
-            return true;
-        };
-        tracing::info!("relaunch: {cmd} into {key}");
-        let display = self.xwayland.display();
-        crate::util::spawn_child(&cmd, &args, display, self);
-        true
+        self.relaunch_dormant(&key)
     }
 
     /// `Ctrl+Shift+M`: duplicate the focused figure's statement, making a
