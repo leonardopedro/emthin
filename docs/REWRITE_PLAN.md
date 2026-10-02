@@ -1177,10 +1177,14 @@ cargo test --workspace                                               ✓ 198 tes
   everything statically checkable, and the docui/figure/binding logic is
   unit-tested, but the render and input *wiring* has not been exercised
   against a real client.
-- **Dormant-figure affordance** is a placeholder box with no overlay or
-  per-figure Enter handling (W9 partial).
-- **The launcher** (`Ctrl+Shift+Return`) relaunches the first dormant
-  figure's saved command instead of showing a prompt.
+- **Dormant-figure affordance** now relaunches with `Return` over the figure
+  (`fe8ca39`), and the launcher prefers the pointed-at figure. The *visual*
+  half is still missing: a dormant figure is a bare placeholder box with no
+  overlay saying it can be relaunched, so the affordance is real but invisible.
+  (W9 partial.)
+- **The launcher** (`Ctrl+Shift+Return`) has no prompt. It relaunches the
+  pointed-at dormant figure, which is unambiguous, but a `spawn` prompt needs
+  a text input surface of its own — a bigger decision than a key binding.
 - **`figure_key`'s doc comment** says "stable for the lifetime of the
   statement", but deleting a statement shifts later statements'
   indices. `FigureManager::sync` releases the deleted figure's app, so
@@ -1249,5 +1253,5 @@ the document instead of degrading to a generic failure.
 - **No manual E2E run** — same limitation as Part 1 (no nested session), and it
   now also covers the `\formal` badge's rendered appearance in a real page.
 - **Dormant-figure affordance** (W9 partial, above) also bounds P7d: the DAG
-  figure can be reserved and bound, but a closed viewer's relaunch is still a
-  keyboard shortcut rather than a click.
+  figure reserves its slot and `Return` over it relaunches the viewer, but
+  nothing on screen says so, and there is still no click target.
