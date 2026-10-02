@@ -17,6 +17,7 @@
 
 pub mod edit;
 pub mod figures;
+pub mod formals;
 pub mod keymap;
 pub mod layout;
 pub mod model;
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 pub use figures::{Figure, FigureManager};
+pub use formals::FormalVerifier;
 pub use layout::{DocLayoutCache, PlacedFigure};
 pub use model::DocModel;
 
@@ -39,6 +41,11 @@ pub struct DocUi {
     model: DocModel,
     layout: DocLayoutCache,
     figures: FigureManager,
+    /// Checks every `\formal` CNL sentence against `logos unf` and feeds the
+    /// verdicts back as annotations. Holds the kernel's answer for the life of
+    /// the document, so a relayout caused by an unrelated edit does not re-run
+    /// the subprocess.
+    formals: FormalVerifier,
     /// Where the session is persisted (`None` = don't persist).
     session_file: Option<std::path::PathBuf>,
     /// Spawn commands remembered per figure id for dormant figures.
@@ -61,6 +68,7 @@ impl DocUi {
             model: DocModel::new(""),
             layout: DocLayoutCache::new(),
             figures: FigureManager::new(),
+            formals: FormalVerifier::new(),
             session_file: None,
             dormant_spawns: std::collections::HashMap::new(),
             last_autosave: Instant::now(),
@@ -74,6 +82,16 @@ impl DocUi {
 
     pub fn model_mut(&mut self) -> &mut DocModel {
         &mut self.model
+    }
+
+    /// The verifier behind every `\formal` verdict in this document.
+    pub fn formals(&self) -> &FormalVerifier {
+        &self.formals
+    }
+
+    /// Pin a kernel, for a test or a deployment that wants a specific binary.
+    pub fn formals_mut(&mut self) -> &mut FormalVerifier {
+        &mut self.formals
     }
 
     pub fn layout(&self) -> &DocLayoutCache {
@@ -142,10 +160,11 @@ impl DocUi {
         if !self.model.is_dirty() {
             return Vec::new();
         }
-        match self
-            .layout
-            .rebuild(self.model.text(), &self.model.transform_options())
-        {
+        // Ask the kernel about every `\formal` before laying out, so the
+        // verdicts ride along with the rest of the annotations.
+        let mut options = self.model.transform_options();
+        self.formals.apply(self.model.text(), &mut options);
+        match self.layout.rebuild(self.model.text(), &options) {
             Ok(()) => {
                 self.last_error = None;
                 self.model.take_dirty();
