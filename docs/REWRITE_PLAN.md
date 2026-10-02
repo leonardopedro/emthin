@@ -1177,11 +1177,11 @@ cargo test --workspace                                               ✓ 198 tes
   everything statically checkable, and the docui/figure/binding logic is
   unit-tested, but the render and input *wiring* has not been exercised
   against a real client.
-- **Dormant-figure affordance** is now both real and visible: `Return` over the
-  figure relaunches it (`fe8ca39`), the launcher prefers the pointed-at figure,
-  and a dormant figure carries an inset border so an empty slot is not
-  indistinguishable from a failed app. Still no click target and no
-  `spawn` prompt. (W9 partial.)
+- **Dormant-figure affordance** is now complete: `Return` over the figure
+  relaunches it, a left click on it relaunches it, the launcher prefers the
+  pointed-at figure, and a dormant figure carries an inset border so an empty
+  slot is not indistinguishable from a failed app. Still no `spawn` prompt.
+  (W9 partial — the prompt, not the affordance.)
 - **The launcher** (`Ctrl+Shift+Return`) has no prompt. It relaunches the
   pointed-at dormant figure, which is unambiguous, but a `spawn` prompt needs
   a text input surface of its own — a bigger decision than a key binding.
@@ -1253,5 +1253,5 @@ the document instead of degrading to a generic failure.
 - **No manual E2E run** — same limitation as Part 1 (no nested session), and it
   now also covers the `\formal` badge's rendered appearance in a real page.
 - **Dormant-figure affordance** (W9 partial, above) also bounds P7d: the DAG
-  figure reserves its slot, `Return` over it relaunches the viewer and the
-  empty slot is marked — but there is still no click target.
+  figure reserves its slot, and both `Return` and a click over it relaunch the
+  viewer.
