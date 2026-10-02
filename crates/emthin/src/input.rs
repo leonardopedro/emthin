@@ -378,25 +378,33 @@ impl EmthinState {
     }
 
     /// `Ctrl+Shift+Return`: spawn the app bound to the focused figure's
-    /// saved command, or focus the document's first dormant figure.
+    /// saved command, or the dormant figure the pointer is over.
     ///
     /// There is no interactive prompt in v1 — a launcher needs a text
     /// input surface of its own, and building one is a bigger decision
     /// than a key binding. This wires the key to the one thing that
     /// unambiguously means "put an app here".
+    ///
+    /// Preference order is the pointed-at figure, then the first dormant one.
+    /// It used to be *only* the first, which meant a document with several
+    /// figures always relaunched whichever came first rather than the one
+    /// under the pointer.
     fn open_launcher(&mut self) {
+        let pointer = self
+            .seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .unwrap_or_default();
         let target = self
             .doc
-            .figures()
-            .figures()
-            .iter()
-            .find(|f| f.is_dormant())
-            .map(|f| f.key.clone());
+            .dormant_figure_at(pointer)
+            .map(str::to_string)
+            .or_else(|| self.doc.first_dormant_figure().map(str::to_string));
         let Some(key) = target else {
             tracing::info!("launcher: no dormant figure to launch into");
             return;
         };
-        match self.doc.spawn_for(&key).cloned() {
+        match self.doc.relaunch_target(&key).cloned() {
             Some((cmd, args)) => {
                 tracing::info!("launcher: relaunching {} into {key}", cmd);
                 let display = self.xwayland.display();
@@ -404,6 +412,33 @@ impl EmthinState {
             }
             None => tracing::info!("launcher: {key} has no saved command"),
         }
+    }
+
+    /// Plain `Return` over a dormant figure relaunches it instead of inserting
+    /// a newline.
+    ///
+    /// The document has no key handler of its own here, so without this a
+    /// dormant figure is unreachable: it has no client to take focus, so
+    /// `Return` would always mean "insert a newline" in the caption beside it.
+    ///
+    /// Returns `true` if the key was consumed by a relaunch.
+    fn relaunch_dormant_under_pointer(&mut self) -> bool {
+        let pointer = self
+            .seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .unwrap_or_default();
+        let Some(key) = self.doc.dormant_figure_at(pointer).map(str::to_string) else {
+            return false;
+        };
+        let Some((cmd, args)) = self.doc.relaunch_target(&key).cloned() else {
+            tracing::info!("relaunch: {key} has no saved command");
+            return true;
+        };
+        tracing::info!("relaunch: {cmd} into {key}");
+        let display = self.xwayland.display();
+        crate::util::spawn_child(&cmd, &args, display, self);
+        true
     }
 
     /// `Ctrl+Shift+M`: duplicate the focused figure's statement, making a
@@ -491,6 +526,14 @@ impl EmthinState {
         let mods = keyboard.modifier_state();
         let ctrl = mods.ctrl;
         let shift = mods.shift;
+
+        // A plain Return over a dormant figure means "relaunch", not "new
+        // paragraph" — checked before the text path so the newline is never
+        // inserted and then undone.
+        if keysym == keysyms::KEY_Return && !ctrl && !shift && self.relaunch_dormant_under_pointer()
+        {
+            return true;
+        }
 
         match keysym {
             keysyms::KEY_BackSpace => {

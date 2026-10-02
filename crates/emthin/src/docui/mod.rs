@@ -232,6 +232,47 @@ impl DocUi {
         self.dormant_spawns.get(figure_key)
     }
 
+    /// The dormant figure at `pos`, if any.
+    ///
+    /// The pointer is the signal, not the caret. A figure's rect is a
+    /// rasterized placeholder, and its caption lays out beside it, so a text
+    /// caret is never inside a figure rect — a caret-based version of this
+    /// function cannot ever fire. The pointer is also what the user is already
+    /// aiming when they press Enter on a dormant figure.
+    pub fn dormant_figure_at(&self, pos: Point<f64, Logical>) -> Option<&str> {
+        let fig = self.figures.figure_under(pos)?;
+        // `figure_under` alone would match a figure on another page: its rect is
+        // still in the cache, just not visible.
+        (fig.is_dormant() && fig.page == Some(self.current_page())).then_some(fig.key.as_str())
+    }
+
+    /// The command to relaunch for `key`, if it is dormant and has one saved.
+    ///
+    /// Returns the command rather than the key so the caller can spawn without
+    /// re-deriving what "dormant with a command" means. A figure that already
+    /// has an app is refused: relaunching it would put a second client where
+    /// one is already composited.
+    pub fn relaunch_target(&self, key: &str) -> Option<&(String, Vec<String>)> {
+        let fig = self.figures.get(key)?;
+        if !fig.is_dormant() {
+            return None;
+        }
+        self.spawn_for(key)
+    }
+
+    /// The first dormant figure in document order, as a last resort.
+    ///
+    /// This is only correct when there is no better signal. Preferring it
+    /// unconditionally — which the launcher used to do — means the key acts on
+    /// whichever figure happens to come first, not the one the user means.
+    pub fn first_dormant_figure(&self) -> Option<&str> {
+        self.figures
+            .figures()
+            .iter()
+            .find(|f| f.is_dormant() && f.page == Some(self.current_page()))
+            .map(|f| f.key.as_str())
+    }
+
     /// Per-tick upkeep: autosave the session on a timer.
     ///
     /// Deliberately does *not* refresh the ext-workspace page list —
@@ -285,4 +326,105 @@ pub fn default_session_file() -> std::path::PathBuf {
 /// Convenience: is `pos` inside any figure?
 pub fn figure_at(figures: &FigureManager, pos: Point<f64, Logical>) -> Option<&Figure> {
     figures.figure_under(pos)
+}
+
+#[cfg(test)]
+mod relaunch_tests {
+    use super::*;
+    use smithay::utils::Size;
+
+    /// Two `\app` figures on page 0, with a remembered command for each.
+    fn doc_with_two_figures() -> DocUi {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 1600)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 first #2 \\app(#1, #2, 600, 300, \"first\")\n\
+             #3 second #4 \\app(#3, #4, 600, 300, \"second\")\n",
+        );
+        ui.relayout();
+        ui.remember_spawn("f0", "foot".into(), vec!["-T".into()]);
+        ui.remember_spawn("f1", "foot".into(), vec!["-T".into()]);
+        ui
+    }
+
+    /// The pointer inside a dormant figure resolves to it, so Enter can be
+    /// figure-scoped. Without this the key acts on whichever figure happens to
+    /// come first, which is the bug this replaces.
+    #[test]
+    fn the_pointer_inside_a_dormant_figure_resolves_to_it() {
+        let ui = doc_with_two_figures();
+        let rect = ui.figures().get("f1").expect("f1").rect;
+        let inside = Point::<f64, Logical>::new(
+            (rect.loc.x + rect.size.w / 2) as f64,
+            (rect.loc.y + rect.size.h / 2) as f64,
+        );
+        assert_eq!(ui.dormant_figure_at(inside), Some("f1"));
+        // And a point in the gutter between the two figures matches neither.
+        let gutter = Point::<f64, Logical>::new(
+            (rect.loc.x + rect.size.w / 2) as f64,
+            (rect.loc.y - 5) as f64,
+        );
+        assert_eq!(ui.dormant_figure_at(gutter), None);
+    }
+
+    /// A bound figure has a client and is not a relaunch target, so pointing at
+    /// it must not offer to spawn a second app over the top of the first.
+    #[test]
+    fn a_bound_figure_is_never_a_relaunch_target() {
+        let mut ui = doc_with_two_figures();
+        assert!(ui.figures().get("f0").unwrap().is_dormant());
+        assert!(ui.figures_mut().bind("f0", 42), "f0 must exist to bind");
+        assert!(!ui.figures().get("f0").unwrap().is_dormant());
+        let rect = ui.figures().get("f0").unwrap().rect;
+        let inside = Point::<f64, Logical>::new(
+            (rect.loc.x + rect.size.w / 2) as f64,
+            (rect.loc.y + rect.size.h / 2) as f64,
+        );
+        assert_eq!(ui.dormant_figure_at(inside), None);
+        assert_eq!(ui.relaunch_target("f0"), None);
+    }
+
+    /// `relaunch_target` needs both halves: dormant *and* a saved command. A
+    /// figure with no remembered command must not spawn an empty one.
+    #[test]
+    fn relaunch_needs_a_saved_command() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 1600)));
+        ui.model_mut()
+            .replace(0..0, "#1 a #2 \\app(#1, #2, 600, 300, \"a\")");
+        ui.relayout();
+        assert_eq!(ui.relaunch_target("f0"), None, "dormant but no command");
+        ui.remember_spawn("f0", "foot".into(), vec!["-T".into()]);
+        let (cmd, args) = ui.relaunch_target("f0").expect("now launchable");
+        assert_eq!(cmd, "foot");
+        assert_eq!(*args, vec!["-T".to_string()]);
+        // A key that names no figure is not an error, just nothing to do.
+        assert_eq!(ui.relaunch_target("f9"), None);
+    }
+
+    /// The fallback is document order, which is the only ordering available
+    /// when neither the pointer nor focus says anything.
+    #[test]
+    fn the_fallback_is_the_first_dormant_figure_in_document_order() {
+        let mut ui = doc_with_two_figures();
+        assert_eq!(ui.first_dormant_figure(), Some("f0"));
+        ui.figures_mut().bind("f0", 7);
+        assert_eq!(ui.first_dormant_figure(), Some("f1"));
+        ui.figures_mut().release_app(7);
+        assert_eq!(ui.first_dormant_figure(), Some("f0"));
+    }
+
+    /// An empty document has nothing to relaunch, and says so without
+    /// panicking — the key press that asks is a normal event, not an error.
+    #[test]
+    fn an_empty_document_offers_nothing() {
+        let ui = DocUi::new();
+        assert_eq!(
+            ui.dormant_figure_at(Point::<f64, Logical>::new(0.0, 0.0)),
+            None
+        );
+        assert_eq!(ui.first_dormant_figure(), None);
+        assert_eq!(ui.relaunch_target("f0"), None);
+    }
 }

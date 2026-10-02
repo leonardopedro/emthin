@@ -18,6 +18,11 @@
 //! Figure-local bindings (resize with `Alt+arrows`) live in
 //! `crate::grabs`' grab state, not here: they only apply while a figure
 //! is focused.
+//!
+//! One binding is deliberately *not* in the table above: plain `Return` over
+//! a dormant figure relaunches it instead of inserting a newline. It is not a
+//! global binding, so it is resolved in `input::edit_document_key` against the
+//! pointer position rather than classified here.
 
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::keysyms;
