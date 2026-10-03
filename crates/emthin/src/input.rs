@@ -517,10 +517,32 @@ impl EmthinState {
 
     /// Apply a key to the document when nothing else has keyboard focus.
     ///
+    /// Returns `true` if the key was consumed, re-laying out the document if the
+    /// keystroke changed it.
+    ///
+    /// The re-layout is not optional and does not belong inside the keystroke
+    /// handler: the page raster, the glyph index the caret is measured against,
+    /// and every figure rect are all products of the layout, and `DocUi::relayout`
+    /// is reached from nowhere else in the input path. Without it a keystroke
+    /// changed the model — and `DocUi::tick` autosaved the new text — while the
+    /// screen went on showing the previous page, so the characters appeared all
+    /// at once whenever something else happened to trigger a re-layout (a window
+    /// resize, `PgDn`, an IPC message).
+    ///
+    /// Gated on `is_dirty` because most keys here are caret motion, which leaves
+    /// the layout valid.
+    fn edit_document_key(&mut self, keysym: u32) -> bool {
+        let consumed = self.edit_document_key_inner(keysym);
+        if consumed && self.doc.model().is_dirty() {
+            self.relayout_document();
+        }
+        consumed
+    }
+
     /// Returns `true` if the key was consumed. This is ordinary text
     /// editing — the same set any editor has — so it lives in one place
     /// rather than being scattered through the input path.
-    fn edit_document_key(&mut self, keysym: u32) -> bool {
+    fn edit_document_key_inner(&mut self, keysym: u32) -> bool {
         // Ctrl+Home/End are in the global table (LineStart/LineEnd); reuse
         // the same implementation rather than spelling them twice.
         if keymap::classify(keysym, KeyState::Pressed, false, false, false)

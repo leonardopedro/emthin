@@ -1155,4 +1155,72 @@ mod page_tests {
         assert_eq!(ui.figures().figures().len(), 1);
         assert_eq!(ui.figures().get("f0").and_then(|f| f.app_id), None);
     }
+
+    /// An edit must reach the layout, not just the model.
+    ///
+    /// `DocUi::tick` autosaves the model, so the text was being persisted while
+    /// the page raster, the glyph index and every figure rect stayed as they were
+    /// — nothing in the input path called `relayout`, so a typed character only
+    /// appeared when something unrelated (a resize, `PgDn`, an IPC message)
+    /// happened to rebuild the layout. The caret is measured against the glyph
+    /// index, so it did not move either.
+    ///
+    /// This is the lower half of that bug: the model must be dirty after an edit,
+    /// and `relayout` must incorporate it. The upper half — that the keystroke
+    /// handler actually calls `relayout` — needs a `Seat` and a live keyboard, so
+    /// it is covered by the wrapper's construction rather than here.
+    #[test]
+    fn an_edit_reaches_the_layout_only_after_a_relayout() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(0..0, "hi");
+        ui.relayout();
+        assert!(
+            ui.model().caret() >= 2,
+            "the caret sits after the inserted text"
+        );
+
+        let caret_before = ui.caret_rect().expect("a caret for the typed text").loc.x;
+
+        ui.model_mut().insert_at_caret("x");
+        assert!(
+            ui.model().is_dirty(),
+            "an edit must mark the model dirty or no relayout can be triggered"
+        );
+
+        // The glyph index still describes "hi", so the caret is measured against
+        // the old page and cannot advance past the new glyph.
+        let caret_stale = ui.caret_rect().expect("a caret").loc.x;
+        assert_eq!(
+            caret_stale, caret_before,
+            "before a re-layout the caret is still measured against the old glyphs"
+        );
+
+        ui.relayout();
+        assert!(!ui.model().is_dirty(), "relayout must clear the dirty flag");
+        let caret_after = ui.caret_rect().expect("a caret").loc.x;
+        assert!(
+            caret_after > caret_before,
+            "the re-laid-out page must place the caret past the new glyph \
+             ({caret_before} -> {caret_after})"
+        );
+    }
+
+    /// A caret-only edit does not dirty the model, so the keystroke wrapper's
+    /// `is_dirty` gate lets it skip the re-layout.
+    #[test]
+    fn caret_motion_does_not_dirty_the_model() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(0..0, "hello world");
+        ui.relayout();
+        let len = ui.model().len();
+        ui.model_mut().set_caret(0);
+        assert!(
+            !ui.model().is_dirty(),
+            "moving the caret must not force a re-layout"
+        );
+        ui.model_mut().set_caret(len);
+        assert!(!ui.model().is_dirty());
+    }
 }
