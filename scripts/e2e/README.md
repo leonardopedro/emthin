@@ -165,11 +165,16 @@ not arrange.
 
 ## Known unresolved
 
-`run.sh` stops emthin with SIGTERM, and under this harness the signal path does
-not fire: the handler is installed (`SigCgt` has TERM), the signal is delivered
-(`SigPnd` empty afterwards), but the shutdown pipe receives no bytes and the loop
-never stops, so the harness escalates to SIGKILL. The graceful shutdown itself
-was verified directly in `a2b393c` — `shutdown signal received`, then
-`shut down cleanly` — and the difference between the two launch paths is not
-isolated. The harness reports the escalation as a real failure rather than
-hiding it.
+None outstanding on the shutdown path. `run.sh` stops emthin with SIGTERM and now
+gets `emthin exited cleanly (graceful shutdown confirmed in the log)`.
+
+Getting there took an actual diagnosis, because the symptom pointed somewhere
+other than the cause. See `crates/emthin/src/shutdown.rs`: the handler ran, the
+self-pipe write *succeeded*, and the calloop source on the read end was registered
+without complaint — and never dispatched. Replacing the pipe with an atomic flag
+the loop checks once per iteration fixed it, and removed a mechanism rather than
+adding one.
+
+The harness reports that class of thing honestly either way: it distinguishes
+"exited cleanly" from "exited without logging a clean shutdown" from "had to be
+SIGKILLed", so a regression here cannot pass unnoticed.

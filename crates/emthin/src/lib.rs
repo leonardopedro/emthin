@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod mirror_render;
 pub mod protocols;
 pub mod session;
+pub mod shutdown;
 pub mod state;
 pub mod tick;
 pub mod util;

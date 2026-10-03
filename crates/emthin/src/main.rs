@@ -165,9 +165,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Found by running the compositor: `goto_page 1` followed by SIGTERM left
     // `session.json` still saying page 0.
-    install_shutdown_signals(event_loop.handle(), state.loop_signal.clone());
+    // SIGTERM/SIGINT must stop the loop, or `run` never returns and the graceful
+    // shutdown below is unreachable. See `emthin::shutdown` for why this is an
+    // atomic flag checked once per iteration rather than a self-pipe.
+    if !emthin::shutdown::install() {
+        tracing::warn!("could not install the shutdown signal handlers; Ctrl+C and");
+        tracing::warn!("SIGTERM will kill the process without saving the session");
+    }
 
-    event_loop.run(None, &mut state, emthin::tick::event_loop_tick)?;
+    // The loop already iterates at least once per frame, so checking the flag
+    // here is prompt while anything at all is happening.
+    // Cloned out of `state` so the closure does not re-borrow it: `LoopSignal`
+    // stops through interior mutability, but reaching it through `state` while
+    // `run` holds `&mut state` will not borrow-check however the method is
+    // declared.
+    let shutdown_signal = state.loop_signal.clone();
+    event_loop.run(None, &mut state, |st| {
+        if emthin::shutdown::requested() {
+            shutdown_signal.stop();
+        }
+        emthin::tick::event_loop_tick(st);
+    })?;
 
     // Graceful shutdown: snapshot the session, then reap children.
     state.doc.save();
@@ -177,81 +195,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
-/// Stop the loop on SIGTERM or SIGINT, via a self-pipe.
-///
-/// A signal handler may only touch async-signal-safe things and `LoopSignal::stop`
-/// is not one of them; `write(2)` is. So the handler writes one byte and a
-/// calloop source on the read end stops the loop on the next iteration.
-///
-/// The first attempt used a `sigwait` thread instead, and the signal never
-/// arrived there: `sigwait` requires the signals blocked process-wide, and with a
-/// handler installed *as well* nothing consumed them — SIGTERM was ignored
-/// outright. `/proc/<pid>/status` showed both `SigBlk` and `SigCgt` set for it,
-/// which is the signature of that arrangement. The self-pipe has no such
-/// ambiguity: no signal is ever blocked, and the disposition is unambiguous.
-fn install_shutdown_signals(
-    handle: smithay::reexports::calloop::LoopHandle<'static, EmthinState>,
-    signal: smithay::reexports::calloop::LoopSignal,
-) {
-    use smithay::reexports::calloop::{generic::Generic, Interest, Mode, PostAction};
-
-    let mut fds = [0 as libc::c_int; 2];
-    // O_CLOEXEC so the pipe does not leak into every spawned app.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        tracing::warn!(
-            "could not create the shutdown pipe ({:?}); Ctrl+C will not save the session",
-            std::io::Error::last_os_error()
-        );
-        return;
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
-
-    extern "C" fn on_signal(_sig: libc::c_int) {
-        // The only async-signal-safe work here. `write` on a pipe with room for
-        // 64 KiB and a one-byte payload cannot block.
-        let byte = 1u8;
-        unsafe {
-            libc::write(
-                SHUTDOWN_PIPE_WRITE.load(std::sync::atomic::Ordering::Relaxed),
-                &byte as *const u8 as *const libc::c_void,
-                1,
-            );
-        }
-    }
-    SHUTDOWN_PIPE_WRITE.store(write_fd, std::sync::atomic::Ordering::SeqCst);
-
-    // Safety: a handler that writes one byte and returns.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_signal as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0;
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-    }
-
-    // Safety: `read_fd` is a fresh owned descriptor we never close elsewhere.
-    let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(read_fd) };
-    let generic = Generic::new(owned, Interest::READ, Mode::Level);
-    handle
-        .insert_source(generic, move |_, _, _| {
-            let mut buf = [0u8; 32];
-            while unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
-                > 0
-            {}
-            tracing::info!("shutdown signal received, stopping the loop");
-            signal.stop();
-            signal.wakeup();
-            Ok(PostAction::Remove)
-        })
-        .map(|_| ())
-        .unwrap_or_else(|e| tracing::warn!("could not register the shutdown source: {e:?}"));
-}
-
-/// Write end of the shutdown pipe, for the signal handler. An atomic rather than
-/// a plain `static mut`, because the handler reads it while it is being set.
-static SHUTDOWN_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn register_ipc_source(
     event_loop: &mut smithay::reexports::calloop::EventLoop<EmthinState>,
