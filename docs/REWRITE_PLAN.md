@@ -688,7 +688,7 @@ pointer/keyboard input, because this machine has no `xdotool`, `wtype`,
 | 4 clone → mirror | **pass** | `clone_figure f0` → `f2` with the same caption `notes` and the same id `foot`; document text `#i notes #o \app(#i, #o, 640, 400, "foot")` — byte-exact, 3 backslashes for 3 `\app`s |
 | 5 page switch | **pass, after a fix** | `goto_page 1` → the visible figure went from the unscaled placeholder 320x240 to a placed 280x210. The unscaled value *was* the bug; see below |
 | 6 quit → relaunch → restored | **pass, after a fix** | `goto_page 1` + `SIGTERM` → `shut down cleanly` and `session.json` `current_page: 1`; relaunch with **no `--doc`** → document restored, came up on page 1, figures dormant (`window=None`) |
-| 7 IME + clipboard | **keyboard verified**, clipboard partly verified | `--config xdotool` under sway on Xvfb: `ok typed text reaches the document`, `ok doc-copy pastes (the marker appears 3 times)`, and both clipboard directions FAIL. IME commit still unexercised: it needs the host's fcitx engaged |
+| 7 IME + clipboard | keyboard verified; clipboard host→client ok, client→host a real gap | `--config xdotool` under sway on Xvfb: `ok typed text reaches the document`, `ok doc-copy pastes (the marker appears 3 times)`, and both clipboard directions FAIL. IME commit still unexercised: it needs the host's fcitx engaged |
 
 Two of the seven were failing before this run and are fixed in `a2b393c`:
 

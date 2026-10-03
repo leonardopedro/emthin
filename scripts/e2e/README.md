@@ -107,18 +107,41 @@ boundaries, and it shared one marker between the legs so a leak read as a pass.
 
 Current state of the two checks in `step7.sh`:
 
-- **host → client passes**, and the log shows why it works:
-  `Host Clipboard changed (5 types)`, then `Wayland paste request`, then
+- **host → client passes**, and the log shows the whole path:
+  `Host Clipboard changed (5 types)` → `Wayland paste request` →
   `selection Clipboard: … age=5.3s`.
-- **client → host fails**, and is order-dependent: the same operation passes in
-  `clip-bisect.sh` when the previous leg has not just run. emthin's log records
-  *no* event for it, so the bridge never sees the client's offer at all. Leading
-  hypothesis: `wl-copy` from wayland-utils creates no surface, and a client's
-  selection offer is per-surface, whereas `wl-paste` is a request and works
-  headless — which would explain the asymmetry exactly. Testing it needs a
-  surface-owning client (an app inside emthin doing a real copy), which the
-  harness does not yet drive. **Left as a failing check rather than skipped**,
-  because "asymmetric" is a bug shape worth keeping an eye on.
+- **client → host fails.** This one took four attempts to pin down, and two
+  plausible explanations died on the way:
+
+  *~~"`wl-copy` maps no surface"~~ — **measured, true, and irrelevant.**
+  `WAYLAND_DEBUG=1` shows `wl-copy` and `wl-paste` both create zero surfaces and
+  issue no `wl_compositor.create_surface` at all. The hypothesis was that a
+  client's selection *offer* is per-surface while a paste *request* is not, which
+  would have explained the asymmetry exactly. So the check was rebuilt around
+  `gnome-text-editor`, a real GTK client with a real surface.
+
+  That attempt first measured the wrong thing twice over: the editor maps inside
+  emthin's canvas (`embedded app window_id=1 geometry committed`) but the document
+  keeps keyboard focus, so `Ctrl+A`/`Ctrl+C` were landing on the document — which
+  owns its selection through `arboard`/X11, a different path that says nothing
+  about the data-control proxy. With the click that actually focuses it, the
+  document no longer receives the copy.
+
+  *Result: with a focused, surface-owning client doing a genuine copy, the host
+  still does not receive it.* So "the test client has no surface" is refuted, and
+  this is a real one-boundary gap in emthin's clipboard proxy — not a harness
+  artefact.
+
+What is still unknown is *where* it breaks: emthin's log records **no event at
+all** for a client's selection change in any of these variants, which is
+consistent with either the proxy never observing the client-side selection or
+failing to publish the host-side one. Telling those apart means reading
+`emthin-clipboard`'s data-control selection handling directly, which is the next
+thing to do.
+
+The check stays **failing**, not skipped. It is now a precise, reproducible
+statement — "host → client works, client → host does not" — instead of the vague
+"clipboard is broken" it started as.
 
 ## Exit codes
 
