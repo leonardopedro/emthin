@@ -11,6 +11,18 @@ use emthin_dbus::FcitxEvent;
 pub struct DbusBridge {
     cmd_tx: Option<mpsc::Sender<BridgeCommand>>,
     notify_rx: Option<mpsc::Receiver<BridgeNotification>>,
+    /// Non-fcitx notifications taken off `notify_rx` by the IME drain but not yet
+    /// claimed by the router forwarder.
+    ///
+    /// There is one channel and two consumers, and an mpsc receiver can only be
+    /// drained destructively — so whichever drains first takes *everything*. The
+    /// IME drain runs first every tick, and its loop discarded anything that was
+    /// not an `FcitxEvent`, so `RuleAdded` / `RuleRemoved` / `RuleList` were
+    /// consumed and dropped before `take_non_fcitx_notifications` could ever see
+    /// them. That made the three `dbus_router_*` IPC notifications dead on every
+    /// path: a documented, advertised control-plane feature that silently never
+    /// fired.
+    deferred_notifications: Vec<BridgeNotification>,
     listen_path: Option<PathBuf>,
     session_dir: Option<PathBuf>,
     isolated_daemon: Option<Child>,
@@ -52,6 +64,7 @@ impl DbusBridge {
         Self {
             cmd_tx: Some(cmd_tx),
             notify_rx: Some(notify_rx),
+            deferred_notifications: Vec::new(),
             listen_path: Some(listen_path),
             session_dir: Some(session_dir),
             isolated_daemon: None,
@@ -96,6 +109,7 @@ impl DbusBridge {
         Self {
             cmd_tx: Some(cmd_tx),
             notify_rx: Some(notify_rx),
+            deferred_notifications: Vec::new(),
             listen_path: Some(listen_path),
             session_dir: Some(session_dir),
             isolated_daemon: Some(daemon),
@@ -116,10 +130,13 @@ impl DbusBridge {
             return vec![];
         };
         let mut events = Vec::new();
+        let mut deferred = std::mem::take(&mut self.deferred_notifications);
         loop {
             match rx.try_recv() {
                 Ok(BridgeNotification::FcitxEvent(e)) => events.push(e),
-                Ok(_) => continue,
+                // Not ours — hand it to the other consumer rather than dropping
+                // it on the floor. See `deferred_notifications`.
+                Ok(other) => deferred.push(other),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.cmd_tx = None;
@@ -128,6 +145,9 @@ impl DbusBridge {
                 }
             }
         }
+        // Put back anything that arrived but was not claimed, so the other
+        // consumer still sees it.
+        self.deferred_notifications = deferred;
         events
     }
 
@@ -138,10 +158,13 @@ impl DbusBridge {
     }
 
     pub fn take_non_fcitx_notifications(&mut self) -> Vec<BridgeNotification> {
+        // Whatever the IME drain handed over, then whatever is still on the
+        // channel. Order within a tick is not meaningful; order across ticks is
+        // preserved, which is what a rule-change stream needs.
+        let mut notifs = std::mem::take(&mut self.deferred_notifications);
         let Some(ref mut rx) = self.notify_rx else {
-            return vec![];
+            return notifs;
         };
-        let mut notifs = Vec::new();
         loop {
             match rx.try_recv() {
                 Ok(BridgeNotification::FcitxEvent(_)) => continue,
@@ -299,5 +322,119 @@ mod tests {
             parse_bus_address("unix:path=/run/user/1000/bus").unwrap(),
             PathBuf::from("/run/user/1000/bus")
         );
+    }
+
+    #[cfg(test)]
+    mod drain_tests {
+        use super::*;
+
+        /// A bridge wired to a plain channel, so notifications can be injected
+        /// without a live broker.
+        fn with_channel() -> (DbusBridge, mpsc::Sender<BridgeNotification>) {
+            let (tx, rx) = mpsc::channel();
+            let bridge = DbusBridge {
+                cmd_tx: None,
+                notify_rx: Some(rx),
+                deferred_notifications: Vec::new(),
+                listen_path: None,
+                session_dir: None,
+                isolated_daemon: None,
+            };
+            (bridge, tx)
+        }
+
+        fn rule_added(id: &str) -> BridgeNotification {
+            BridgeNotification::RuleAdded {
+                id: id.to_string(),
+                rule: emthin_dbus::router::RouteRule {
+                    id: id.to_string(),
+                    priority: 1,
+                    destination: None,
+                    interface: None,
+                    method: None,
+                    target: "host".into(),
+                },
+            }
+        }
+
+        /// The two consumers must not starve each other.
+        ///
+        /// `tick` drains fcitx events first and forwards router notifications second,
+        /// every tick, in that order. Both drained the same `mpsc::Receiver` to
+        /// `Empty` and discarded what they did not want, so the first one consumed the
+        /// other's notifications and the three `dbus_router_*` IPC messages were dead
+        /// on every path.
+        #[test]
+        fn a_router_notification_survives_the_ime_drain() {
+            let (mut bridge, tx) = with_channel();
+            tx.send(rule_added("r1")).expect("send");
+
+            // Exactly what `tick` does, in order.
+            let fcitx = bridge.take_fcitx_events();
+            let router = bridge.take_non_fcitx_notifications();
+
+            assert!(fcitx.is_empty(), "a router rule is not an fcitx event");
+            assert_eq!(
+                router.len(),
+                1,
+                "the rule must reach the router forwarder, not be eaten by the IME drain"
+            );
+        }
+
+        /// And the other way round: an fcitx event is not mistaken for a router
+        /// notification.
+        #[test]
+        fn an_fcitx_event_reaches_the_ime_drain() {
+            let (mut bridge, tx) = with_channel();
+            tx.send(rule_added("r1")).expect("send");
+            tx.send(BridgeNotification::RuleRemoved { id: "r1".into() })
+                .expect("send");
+
+            let _ = bridge.take_fcitx_events();
+            let router = bridge.take_non_fcitx_notifications();
+            assert_eq!(router.len(), 2, "both rule notifications survive, in order");
+        }
+
+        /// A second drain with nothing new yields nothing, rather than replaying
+        /// what the first one already handed over.
+        #[test]
+        fn draining_twice_does_not_replay() {
+            let (mut bridge, tx) = with_channel();
+            tx.send(rule_added("r1")).expect("send");
+            let _ = bridge.take_fcitx_events();
+            assert_eq!(bridge.take_non_fcitx_notifications().len(), 1);
+            assert!(
+                bridge.take_non_fcitx_notifications().is_empty(),
+                "a notification must be delivered once, not on every tick"
+            );
+        }
+
+        /// Notifications that arrive *after* the IME drain in the same tick are
+        /// picked up normally — the handoff buffer is a queue, not a replacement.
+        #[test]
+        fn notifications_arriving_late_are_still_delivered() {
+            let (mut bridge, tx) = with_channel();
+            let _ = bridge.take_fcitx_events();
+            tx.send(rule_added("late")).expect("send");
+            assert_eq!(bridge.take_non_fcitx_notifications().len(), 1);
+        }
+
+        /// Order across a tick boundary is preserved, which is what a rule-change
+        /// stream needs: an add followed by a remove must not arrive reversed.
+        #[test]
+        fn cross_tick_order_is_preserved() {
+            let (mut bridge, tx) = with_channel();
+            tx.send(rule_added("a")).expect("send");
+            let _ = bridge.take_fcitx_events();
+            let first = bridge.take_non_fcitx_notifications();
+            assert_eq!(first.len(), 1);
+
+            tx.send(rule_added("b")).expect("send");
+            let _ = bridge.take_fcitx_events();
+            tx.send(BridgeNotification::RuleRemoved { id: "a".into() })
+                .expect("send");
+            let second = bridge.take_non_fcitx_notifications();
+            assert_eq!(second.len(), 2, "the later pair arrives together");
+        }
     }
 }
