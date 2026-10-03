@@ -42,8 +42,10 @@ pub fn format_lock_body(pid: u32) -> String {
 /// Probe whether a Unix PID still names a live process. Returns `true`
 /// when the kernel confirms the pid exists (running or zombie), `false`
 /// otherwise. Shared helper so both the stale-lock reclaim path here
-/// and the `EmacsState::set_child` zombie-safety tests use one
-/// implementation with one SAFETY comment.
+/// and the child-reaping tests use one implementation with one SAFETY
+/// comment — and so the "is this pid a zombie" question is answered the
+/// same way everywhere, since answering it differently in two places is
+/// how a stale socket outlives its satellite.
 pub fn pid_alive(pid: u32) -> bool {
     // SAFETY: `libc::kill(pid, 0)` sends no signal; it is a documented
     // probe of pid validity. No side effects on the target process.

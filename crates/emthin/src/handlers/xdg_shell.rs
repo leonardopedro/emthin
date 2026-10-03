@@ -86,9 +86,10 @@ impl XdgShellHandler for EmthinState {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
-        // Only floating dialogs are draggable. Emacs is fullscreen
-        // and embedded apps are positioned by the Emacs IPC layer —
-        // letting either be moved would desync the layout.
+        // Only floating dialogs are draggable. A figure's geometry is the
+        // document's — it comes from the `\app` statement's width and
+        // height — so letting a figure be moved would desync the document from
+        // what is on screen.
         let Some(window) = self
             .page
             .active_space
@@ -150,8 +151,9 @@ impl XdgShellHandler for EmthinState {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        // Only embedded apps are resizable. Emacs is always fullscreen
-        // and dialogs have no embedded AppManager entry.
+        // Only figures are resizable, and a resize is a document edit that
+        // rewrites the `\app` statement (see `docui::edit`). Dialogs have no
+        // figure and therefore no AppManager entry.
         let Some(window_id) = self.apps.id_for_surface(surface.wl_surface()) else {
             return;
         };

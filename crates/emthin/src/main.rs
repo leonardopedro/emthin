@@ -277,8 +277,8 @@ fn start_xwayland_satellite(
         return;
     }
 
-    // Socket is ready — export DISPLAY and notify Emacs. First X client
-    // connect will trigger the on-demand satellite spawn automatically.
+    // Socket is ready — export DISPLAY and announce it over IPC. The first X
+    // client connect triggers the on-demand satellite spawn automatically.
     std::env::set_var("DISPLAY", &display_name);
     state.xwayland.set_display(display);
     state

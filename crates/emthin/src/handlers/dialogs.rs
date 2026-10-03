@@ -79,8 +79,9 @@ pub fn re_center_dialog(state: &mut EmthinState, window: &smithay::desktop::Wind
 /// every Space and unmap any element whose underlying surface has
 /// died. Runs *after* `cleanup_dead_apps` so any AppWindow's space
 /// element has already been removed by that pass; everything left
-/// dead in a Space is therefore a dialog (Emacs' Window stays alive
-/// for the compositor's lifetime).
+/// dead in a Space is therefore a dialog. (An `\app` figure outlives its client
+/// — the slot stays in the document when the app quits, which is the whole
+/// point of a dormant figure.)
 pub fn cleanup_dead_dialogs(state: &mut EmthinState) {
     use smithay::utils::IsAlive;
 

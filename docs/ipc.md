@@ -124,7 +124,19 @@ protocol).
 | `state` | reply to `list_state` | `page`, `page_count`, `doc`, `figures` |
 | `doc_saved` | reply to `save_doc` | `path` |
 | `x_wayland_ready` | the XWayland socket is bound | `display` |
+| `dbus_router_rule_added` | a DBus routing rule was added | `id`, `rule` |
+| `dbus_router_rule_removed` | a DBus routing rule was removed | `id` |
+| `dbus_router_rules` | the full routing rule list changed | `rules` |
 | `error` | a command failed | `message` |
+
+The three `dbus_router_*` notifications are **unsolicited**: they are emitted
+from the broker's per-tick drain whenever its rule set changes, so a client
+learns about a rule it did not add. `dbus_router_rules` carries the whole list
+and supersedes any incremental state a client built from the other two.
+
+A `rule` is `{id, priority, destination?, interface?, method?, target}`, where
+`destination` is a glob (`None` is the wildcard) and `target` is `"host"`,
+`"isolated"` or `"deny"`.
 
 `state.figures` is a list of:
 

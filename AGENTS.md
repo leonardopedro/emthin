@@ -102,10 +102,12 @@ crates/emthin/src/
 │   ├── layout.rs        DocLayoutCache: paged rasters + doc↔screen map
 │   ├── figures.rs       FigureManager: one Figure per \app, app↔figure binding
 │   ├── edit.rs          document edits the compositor makes (resize, append, clone)
+│   ├── formals.rs       \formal verification: ask `logos unf`, splice verdicts
 │   └── keymap.rs        the global key bindings
 │
 ├── doc_render.rs        the page raster's trip to the GPU, cached by revision
 ├── figure_render.rs     compositing: app surfaces over figure rects + overlays
+├── dormant_label.rs     rasterized "app name — click or Return" labels, cached
 │
 ├── winit.rs             winit backend, render_frame, post_render, host events
 ├── input.rs             figure-first input routing, document text editing
@@ -113,7 +115,7 @@ crates/emthin/src/
 ├── tick.rs              per-event-loop-iteration work
 ├── element.rs           CustomElement enum + EmthinRenderer trait
 ├── mirror_render.rs     legacy xdg_toplevel-issued mirror views
-├── session.rs           session.json: per-figure launch commands
+├── session.rs           session.json: current page + xwayland display
 │
 ├── ipc/                 JSON-RPC control protocol (docs/ipc.md)
 │   ├── connection.rs    Content-Length framing
@@ -168,13 +170,32 @@ crates/emthin/src/
 
 ## The document model
 
-`\app(#s, #f, W, H[, "id"])` is a property statement like any other:
+`\app(#s, #f, W, H[, "id"][, launch: "cmd"])` is a property statement like
+any other:
 
 - the span between `#s` and `#f` is the **caption** — ordinary
   document prose the user types and edits;
 - `W`, `H` are the figure's size in logical px (== pt at zoom 1);
 - the optional trailing `"id"` is the app binding key, a **glob**
-  (`"foot*"` claims both `foot` and `footclient`).
+  (`"foot*"` claims both `foot` and `footclient`);
+- the optional named `launch: "cmd"` is what runs when the figure holds
+  **no** app. A dormant figure draws as a labelled placeholder, and
+  `Return` over it or a click on it runs `launch:`. It is a named arg
+  rather than a fourth positional to match `lang:` on `\kernel` and
+  `from:` on `\exec`.
+
+`launch:` is in the document rather than in compositor state because there is
+no mapping to reconstruct: nothing links a spawned client's pid to the Wayland
+`app_id` it later binds with, and a binding id is a glob that need not resemble
+the program that started it. `docui::relaunch_target` splits the string with
+`cli::split_command` — the same splitter `--spawn` uses — so quoting rules are
+the ones the user already met.
+
+**Dormancy is compositor state, not document state.** Whether a figure is
+dormant depends on whether a client is bound right now, which no document
+function can see — so the dormant frame and its label are drawn as *overlays*
+in `figure_render`, not spliced by `transform`. The *text* of the label is
+decided in `DocUi::dormant_label` so it can be unit-tested.
 
 `mathed_core::transform` hides the statement's tokens and splices a
 block-level placeholder image (`app:fig/f<stmt-index>`, `fit: "stretch"`,

@@ -10,7 +10,7 @@ document, and each Wayland app appears **as a figure in that document** —
 like an image in a PDF, sized and placed by the text.
 
 ```
-#1 Terminal demo #2 \app(#1, #2, 640, 400)
+#1 Terminal demo #2 \app(#1, #2, 640, 400, "foot", launch: "foot")
 #3 Chat #4 \app(#3, #4, 320, 240, "chat")
 ```
 
@@ -19,6 +19,13 @@ an app is bound to that figure its live surface is composited exactly
 over the slot. Editing the numbers rewrites the document, the page
 reflows, and the app is reconfigured — the document is the layout
 authority, not compositor state.
+
+`launch:` names the command that fills an *empty* slot. A figure with no
+app bound to it is drawn as a labelled placeholder, and `Return` over it —
+or a click — runs `launch:` to start the app there. It lives in the
+document rather than being remembered by the compositor for the same reason
+the geometry does: the document is the authority on what an `\app` means.
+Omit it and the slot still reserves space, it just has nothing to start.
 
 ---
 
