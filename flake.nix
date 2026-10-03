@@ -101,6 +101,28 @@
               # a figure to look at and an IME consumer.
               gnome-console
               gnome-text-editor
+
+              # ── E2E: clipboard, verifiable with no keys at all ────────
+              # Step 7's clipboard half does not need synthetic input.
+              # `wl-copy` on the *host* session and `wl-paste` inside the
+              # nested one exercises host->client through emthin's proxy, and
+              # the reverse exercises client->host. That is the whole of
+              # "clipboard host<->client" with no keyboard involved.
+              wayland-utils
+
+              # ── E2E: the XTEST configuration needs an X server ───────
+              # Xvfb for the non-headless nested compositor that `xdotool`
+              # can target. See scripts/e2e/README.md for when that is
+              # reachable at all.
+              xorgserver
+              xclip
+
+              # ── E2E: the harness itself is python + coreutils ────────
+              # scripts/e2e/ipc.py speaks the control protocol and state.py
+              # pretty-prints the reply. Found the hard way: the clipboard
+              # checks passed without it because they do not use python, so the
+              # gap only shows up on the keyboard path.
+              python3
             ];
 
           shellHook = ''
@@ -109,10 +131,12 @@
             }/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
             export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.libglvnd}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
-            # winit dlopens libwayland at runtime rather than linking it, so the
-            # client library has to be findable when `emthin` *runs*, not just
-            # when it links.
-            export LD_LIBRARY_PATH="${pkgs.wayland}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # Both of these are dlopened at runtime rather than linked, so both
+            # have to be findable when `emthin` *runs*, not just when it links:
+            # winit opens libwayland, and smithay's EGL backend opens libEGL.
+            # Found the hard way — without libEGL emthin gets as far as creating
+            # the window and then panics in smithay's ffi.
+            export LD_LIBRARY_PATH="${pkgs.wayland}/lib:${pkgs.libglvnd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
             cat <<'EOF'
             emthin dev shell. Sibling checkouts are path dependencies:
