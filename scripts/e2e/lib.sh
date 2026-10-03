@@ -17,7 +17,8 @@
 set -uo pipefail
 
 : "${E2E_ROOT:=$PWD/.e2e}"
-: "${E2E_DISPLAY:=e2e}"
+: "${E2E_DISPLAY:=e2e}"          # the host compositor's socket (discovered)
+: "${E2E_CLIENT_DISPLAY:=e2e-c}"  # emthin's own socket, for its clients
 : "${E2E_XVFB_DISPLAY:=:99}"
 : "${E2E_VIEWPORT:=1280x800}"
 E2E_XDG="$E2E_ROOT/xdg"
@@ -229,12 +230,17 @@ start_emthin() {
   fi
 
   log "starting emthin ($E2E_EMTHIN)"
-  ( setsid "$E2E_EMTHIN" --session-file "$E2E_DOC" --ipc-path "$E2E_IPC" "$@" \
+  # --wayland-socket pins emthin's own socket, so a client of emthin and the host
+  # compositor are two clearly different Wayland displays. emthin picks
+  # wayland-N by default, which lands in the same directory as sway's and is
+  # indistinguishable from it without reading the log.
+  ( setsid "$E2E_EMTHIN" --wayland-socket "$E2E_CLIENT_DISPLAY" \
+      --session-file "$E2E_DOC" --ipc-path "$E2E_IPC" "$@" \
       </dev/null >>"$E2E_ROOT/emthin.log" 2>&1 & )
   local pid=""
   for _ in $(seq 1 60); do
     pid="$(emthin_pid)"
-    if [ -n "$pid" ] && [ -S "$E2E_IPC" ]; then
+    if [ -n "$pid" ] && [ -S "$E2E_IPC" ] && [ -S "$E2E_XDG/$E2E_CLIENT_DISPLAY" ]; then
       # The socket appearing is not emthin being up. Ask it something: a run
       # whose emthin died a moment after mapping went on to "verify" every
       # check against a corpse, and reported `document: ` empty for each one,

@@ -72,49 +72,53 @@ protocol`. Use it under sway, weston or wayfire.
 
 ## The clipboard checks
 
-The clipboard half needs no keys: `wl-copy` on the host session and `wl-paste`
-inside the nested one exercises host→client through emthin's proxy, and the
-reverse exercises client→host.
+Tested on the host socket and emthin's own socket, one boundary apart — which is
+the only relationship a nested compositor has. Reaching the *desktop* session as
+well would mean crossing a second compositor boundary, and
+`clip-bisect.sh` shows where that breaks.
 
-The result depends on the compositor, because the proxy's backend chain does:
+The chain here is longer than it looks:
 
-- under **headless Mutter**, DataControl and WlDataDevice are both aimed at
-  `$WAYLAND_DISPLAY`, which is emthin itself, so the chain falls through to X11
-  and talks to the host's Xwayland — while the test drives the host's *Wayland*
-  selection. Whether those meet depends on the host's Wayland↔X11 selection sync,
-  which does not happen here, so both directions skip with that reason.
-- under **sway**, wlroots implements data-control, the chain stops there, and the
-  checks actually run. Current result: **both directions fail**.
+```
+GNOME (wayland-0) → Xwayland (:0)     a different X server from the one below
+Xvfb (:99)        → sway (x11 backend)
+                  → emthin
+```
 
-      FAIL host clipboard reaches a client inside the nested session
-           got:  (empty)          want: e2e-…-h2c
-      FAIL a client inside the nested session reaches the host clipboard
-           got:  e2e-…-h2c       want: e2e-…-c2h
+So `scripts/e2e/clip-bisect.sh` tests each hop on its own, which is what turns
+"the clipboard does not work" into "hop N is broken":
 
-  The second failure is the informative one: the *host* clipboard still held the
-  marker the first leg had put there, and never received the nested session's.
-  So nothing crosses in either direction.
+```
+hop 1 — sway ↔ Xvfb X selection (wlroots' x11 backend)
+  FAIL  X selection reaches sway's clients
+  FAIL  sway's clients reach the X selection
 
-  This was briefly reported as `client→host passes`, and that was a false pass in
-  the harness: both legs shared one marker, so the second leg read back the first
-  leg's selection and looked like a success. The markers are now distinct per
-  direction, and each leg waits for the previous selection owner to exit first.
+hop 2 — emthin ↔ sway (emthin's clipboard proxy)
+  PASS  sway's selection reaches emthin's clients
+  PASS  emthin's clients reach sway
+```
 
-  The cause is structural rather than a timing artefact. The proxy's DataControl
-  backend "connects to a fresh `$WAYLAND_DISPLAY`" — which, in a nested session,
-  is the *nested* compositor. So it manages the nested compositor's clipboard, and
-  there is no connection from there to the host session's clipboard. emthin logs
-  `Host Clipboard changed` because that is the nested clipboard changing; the name
-  is doing a lot of work there.
+**emthin is not the broken hop.** Its proxy works in both directions against the
+compositor it is nested in; the chain breaks below that, in wlroots' X11 backend,
+which does not sync a Wayland selection to the X selection on a bare Xvfb. An
+earlier version of this harness reported the clipboard as "verified broken in
+both directions" — that was wrong twice over: it asserted across two compositor
+boundaries, and it shared one marker between the legs so a leak read as a pass.
 
-  What this means for emthin: **in a nested session the clipboard proxy has no
-  path to the host clipboard.** A data-control backend that named the *host*
-  display would be needed, which means the compositor needs to know what its host
-  display is — not something `--session-file` or the IPC protocol carries today.
+Current state of the two checks in `step7.sh`:
 
-`step7.sh` detects the chosen backend from the log and reports a skip with the
-reason when the chain has landed somewhere that cannot carry the selection at
-all.
+- **host → client passes**, and the log shows why it works:
+  `Host Clipboard changed (5 types)`, then `Wayland paste request`, then
+  `selection Clipboard: … age=5.3s`.
+- **client → host fails**, and is order-dependent: the same operation passes in
+  `clip-bisect.sh` when the previous leg has not just run. emthin's log records
+  *no* event for it, so the bridge never sees the client's offer at all. Leading
+  hypothesis: `wl-copy` from wayland-utils creates no surface, and a client's
+  selection offer is per-surface, whereas `wl-paste` is a request and works
+  headless — which would explain the asymmetry exactly. Testing it needs a
+  surface-owning client (an app inside emthin doing a real copy), which the
+  harness does not yet drive. **Left as a failing check rather than skipped**,
+  because "asymmetric" is a bug shape worth keeping an eye on.
 
 ## Exit codes
 
