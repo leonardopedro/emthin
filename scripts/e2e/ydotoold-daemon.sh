@@ -17,6 +17,32 @@
 
 set -euo pipefail
 
+# `sudo` does not inherit the caller's environment, so this cannot rely on being
+# inside `nix develop`: find ydotoold from the flake if it is not already on
+# PATH. Run as root, so only read the store paths — nothing here needs privilege
+# beyond holding /dev/uinput.
+if ! command -v ydotoold >/dev/null 2>&1; then
+  # Resolve through the flake rather than assuming the caller is inside it:
+  # `sudo` does not inherit the caller environment, so "run it from nix develop"
+  # is not something this script can rely on. Asking the flake is slower than a
+  # PATH lookup but it is the thing that is actually guaranteed to be right.
+  _here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  _repo="$(cd "$_here/../.." && pwd)"
+  # `tail -1` because the flake shellHook prints a banner on stdout, so the
+  # capture would otherwise be the banner plus the path.
+  _ydotoold="$(nix develop "$_repo" --command bash -c 'command -v ydotoold' 2>/dev/null | tail -1 || true)"
+  if [ -n "$_ydotoold" ] && [ -x "$_ydotoold" ]; then
+    PATH="$(dirname "$_ydotoold"):$PATH"
+    export PATH
+    echo "resolved ydotoold from the flake: $_ydotoold" >&2
+  else
+    echo "could not find ydotoold, on PATH or in the flake." >&2
+    echo "Run the whole test under the flake instead, which keeps the PATH:" >&2
+    echo "  sudo -E $_repo/scripts/e2e/run.sh --config ydotool" >&2
+    exit 1
+  fi
+fi
+
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCKET="$XDG_RUNTIME_DIR/.ydotool_socket"
 PIDFILE="$XDG_RUNTIME_DIR/.ydotoold.pid"

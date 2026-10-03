@@ -25,11 +25,36 @@ warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m ok \033[0m %s\n' "$*" >&2; }
 
+# Re-enter the flake unless we are already inside it.
+#
+# Not a convenience: `nix develop` starts an *interactive* shell, so a pasted
+# multi-line block that begins with it hands the remaining lines to the nested
+# shell as its input. The commands run, but not as a sequence you can see or
+# stop, and a `sudo` line in the middle of one is a bad time for that. Making
+# the entry point self-sufficient means the documented invocation is just
+#
+#     ./scripts/e2e/run.sh --config ydotool
+#
+# with no wrapper at all. The flake's shellHook exports EMTHEIN_DEVSHELL=1, so
+# this is a no-op when the caller did enter the shell deliberately.
+ensure_devshell() {
+  [ "${EMTHEIN_DEVSHELL:-}" = 1 ] && return 0
+  [ "${E2E_NO_REEXEC:-0}" = 1 ] && return 0
+  command -v nix >/dev/null 2>&1 || {
+    warn "not inside the dev shell and nix is not available; some tools will be missing"
+    return 0
+  }
+  log "not inside the dev shell; re-entering via nix develop"
+  export E2E_NO_REEXEC=1
+  # `bash -c 'exec "$@"' _ "$0" "$@"` keeps the argument list intact, including
+  # anything with spaces in it.
+  exec nix develop --command bash -c 'exec "$@"' _ "$0" "$@"
+}
+
 # Run a command inside the flake, so every path below resolves the same way
-# `cargo` does. `NIX_ENTER` can be set to 1 to skip (if the caller is already
-# inside `nix develop`).
+# `cargo` does.
 in_shell() {
-  if [ "${NIX_ENTER:-0}" = 1 ]; then
+  if [ "${EMTHEIN_DEVSHELL:-}" = 1 ]; then
     bash -c "$*"
   else
     nix develop --command bash -c "$*"

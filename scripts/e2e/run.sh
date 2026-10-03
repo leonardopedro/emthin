@@ -32,6 +32,9 @@ cd "$REPO"
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
 
+# Re-enter the flake if needed. Must come before anything that touches a tool.
+ensure_devshell "$@"
+
 CONFIG=""
 LIST=0
 while [ $# -gt 0 ]; do

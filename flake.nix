@@ -138,6 +138,13 @@
             # the window and then panics in smithay's ffi.
             export LD_LIBRARY_PATH="${pkgs.wayland}/lib:${pkgs.libglvnd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+            # So scripts/e2e/* can tell whether they are already inside the
+            # flake and re-enter it if not, rather than the caller having to
+            # remember to wrap every invocation. `nix develop` is interactive,
+            # so pasting a multi-line block that starts with it swallows the rest
+            # of the block.
+            export EMTHEIN_DEVSHELL=1
+
             cat <<'EOF'
             emthin dev shell. Sibling checkouts are path dependencies:
               ../velysterm/crates/mathed_core   (the document engine)
