@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use emthin_dbus::router::{BridgeCommand, BridgeNotification};
-use emthin_dbus::FcitxEvent;
+use emthin_dbus::ImeEvent;
 
 #[derive(Default)]
 pub struct DbusBridge {
@@ -17,7 +17,7 @@ pub struct DbusBridge {
     /// There is one channel and two consumers, and an mpsc receiver can only be
     /// drained destructively — so whichever drains first takes *everything*. The
     /// IME drain runs first every tick, and its loop discarded anything that was
-    /// not an `FcitxEvent`, so `RuleAdded` / `RuleRemoved` / `RuleList` were
+    /// not an `ImeEvent`, so `RuleAdded` / `RuleRemoved` / `RuleList` were
     /// consumed and dropped before `take_non_fcitx_notifications` could ever see
     /// them. That made the three `dbus_router_*` IPC notifications dead on every
     /// path: a documented, advertised control-plane feature that silently never
@@ -125,7 +125,7 @@ impl DbusBridge {
         }
     }
 
-    pub fn take_fcitx_events(&mut self) -> Vec<FcitxEvent> {
+    pub fn take_fcitx_events(&mut self) -> Vec<ImeEvent> {
         let Some(ref mut rx) = self.notify_rx else {
             return vec![];
         };
@@ -133,7 +133,7 @@ impl DbusBridge {
         let mut deferred = std::mem::take(&mut self.deferred_notifications);
         loop {
             match rx.try_recv() {
-                Ok(BridgeNotification::FcitxEvent(e)) => events.push(e),
+                Ok(BridgeNotification::ImeEvent(e)) => events.push(e),
                 // Not ours — hand it to the other consumer rather than dropping
                 // it on the floor. See `deferred_notifications`.
                 Ok(other) => deferred.push(other),
@@ -167,7 +167,7 @@ impl DbusBridge {
         };
         loop {
             match rx.try_recv() {
-                Ok(BridgeNotification::FcitxEvent(_)) => continue,
+                Ok(BridgeNotification::ImeEvent(_)) => continue,
                 Ok(n) => notifs.push(n),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {

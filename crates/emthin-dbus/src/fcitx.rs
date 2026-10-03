@@ -1,6 +1,8 @@
 use gio::prelude::ToVariant;
 use gio::DBusMessage;
 
+use crate::ime::ImeEvent;
+
 pub const INPUT_METHOD_INTERFACE: &str = "org.fcitx.Fcitx.InputMethod1";
 pub const INPUT_CONTEXT_INTERFACE: &str = "org.fcitx.Fcitx.InputContext1";
 pub const INPUT_CONTEXT_INTERFACE_FCITX4: &str = "org.fcitx.Fcitx.InputContext";
@@ -24,20 +26,13 @@ pub fn is_fcitx_well_known(name: &str) -> bool {
     FCITX5_WELL_KNOWN_NAMES.contains(&name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FcitxEvent {
-    FocusChanged { ic_path: String, focused: bool },
-    CursorRect { ic_path: String, rect: [i32; 4] },
-    IcDestroyed { ic_path: String },
-}
-
-pub fn method_call_to_event(method: &Fcitx5MethodCall) -> Option<FcitxEvent> {
+pub fn method_call_to_event(method: &Fcitx5MethodCall) -> Option<ImeEvent> {
     match method {
-        Fcitx5MethodCall::FocusIn { input_context_path } => Some(FcitxEvent::FocusChanged {
+        Fcitx5MethodCall::FocusIn { input_context_path } => Some(ImeEvent::FocusChanged {
             ic_path: input_context_path.clone(),
             focused: true,
         }),
-        Fcitx5MethodCall::FocusOut { input_context_path } => Some(FcitxEvent::FocusChanged {
+        Fcitx5MethodCall::FocusOut { input_context_path } => Some(ImeEvent::FocusChanged {
             ic_path: input_context_path.clone(),
             focused: false,
         }),
@@ -47,7 +42,7 @@ pub fn method_call_to_event(method: &Fcitx5MethodCall) -> Option<FcitxEvent> {
             y,
             w,
             h,
-        } => Some(FcitxEvent::CursorRect {
+        } => Some(ImeEvent::CursorRect {
             ic_path: input_context_path.clone(),
             rect: [*x, *y, *w, *h],
         }),
@@ -61,7 +56,7 @@ pub fn method_call_to_event(method: &Fcitx5MethodCall) -> Option<FcitxEvent> {
         } => {
             let s = if *scale > 0.0 { *scale } else { 1.0 };
             let tl = |v: i32| (v as f64 / s).round() as i32;
-            Some(FcitxEvent::CursorRect {
+            Some(ImeEvent::CursorRect {
                 ic_path: input_context_path.clone(),
                 rect: [tl(*x), tl(*y), tl(*w), tl(*h)],
             })
@@ -70,11 +65,11 @@ pub fn method_call_to_event(method: &Fcitx5MethodCall) -> Option<FcitxEvent> {
             input_context_path,
             x,
             y,
-        } => Some(FcitxEvent::CursorRect {
+        } => Some(ImeEvent::CursorRect {
             ic_path: input_context_path.clone(),
             rect: [*x, *y, 0, 0],
         }),
-        Fcitx5MethodCall::DestroyIC { input_context_path } => Some(FcitxEvent::IcDestroyed {
+        Fcitx5MethodCall::DestroyIC { input_context_path } => Some(ImeEvent::IcDestroyed {
             ic_path: input_context_path.clone(),
         }),
         _ => None,

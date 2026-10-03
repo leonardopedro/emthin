@@ -433,15 +433,15 @@ impl ImeBridge {
     /// Process a fcitx event from the DBus broker.
     pub fn on_fcitx_event(
         &mut self,
-        event: emthin_dbus::FcitxEvent,
+        event: emthin_dbus::ImeEvent,
         app_origin: Option<[i32; 2]>,
         seat: &Seat<EmthinState>,
         apps: &AppManager,
     ) {
-        use emthin_dbus::FcitxEvent;
+        use emthin_dbus::ImeEvent;
 
         match event {
-            FcitxEvent::FocusChanged {
+            ImeEvent::FocusChanged {
                 ic_path,
                 focused: true,
             } => {
@@ -450,7 +450,7 @@ impl ImeBridge {
                 let ti = seat.text_input();
                 self.set_owner(ImeOwner::Dbus { ic_path, origin }, ti, apps);
             }
-            FcitxEvent::FocusChanged {
+            ImeEvent::FocusChanged {
                 ic_path,
                 focused: false,
             } => {
@@ -461,10 +461,10 @@ impl ImeBridge {
                     }
                 }
             }
-            FcitxEvent::CursorRect { ic_path, rect } => {
+            ImeEvent::CursorRect { ic_path, rect } => {
                 self.report_dbus_cursor(&ic_path, rect);
             }
-            FcitxEvent::IcDestroyed { ic_path } => {
+            ImeEvent::IcDestroyed { ic_path } => {
                 if let ImeOwner::Dbus { ic_path: oi, .. } = &self.owner {
                     if oi == &ic_path {
                         self.clear_owner();
@@ -477,7 +477,7 @@ impl ImeBridge {
 
     /// Bridge keyboard focus change. Updates `focused_surface` for
     /// text_input enter/leave plumbing. The DBus owner is independent
-    /// of keyboard focus (driven by FcitxEvent::FocusChanged); we
+    /// of keyboard focus (driven by ImeEvent::FocusChanged); we
     /// only update Tip ownership here.
     pub fn on_focus_changed(
         &mut self,
@@ -491,7 +491,7 @@ impl ImeBridge {
         self.focused_surface = new_focus.clone();
 
         // Decide Tip ownership based on the new focus. DBus ownership
-        // is independent (driven by FcitxEvent::FocusChanged); the
+        // is independent (driven by ImeEvent::FocusChanged); the
         // embedded client's GTK IM module sends FocusOut over DBus
         // when keyboard focus moves away, which clears the DBus owner
         // separately.

@@ -8,7 +8,9 @@ use gio::{
     DBusConnection, DBusMessage, DBusMessageType, DBusSendMessageFlags, DBusServer, DBusServerFlags,
 };
 
-use crate::fcitx::{self, Fcitx5MethodCall, FcitxEvent, InputContextAllocator};
+use crate::fcitx::{self, Fcitx5MethodCall, InputContextAllocator};
+use crate::ibus;
+use crate::ime::ImeEvent;
 use crate::router::rule::{RouteRule, RoutingTable};
 
 #[derive(Debug)]
@@ -31,7 +33,7 @@ pub enum BridgeCommand {
 
 #[derive(Debug)]
 pub enum BridgeNotification {
-    FcitxEvent(FcitxEvent),
+    ImeEvent(ImeEvent),
     RuleAdded { id: String, rule: RouteRule },
     RuleRemoved { id: String },
     RuleList { rules: Vec<RouteRule> },
@@ -184,6 +186,13 @@ fn handle_client_message(
     }
 
     if let Some(ref iface) = iface {
+        // Two input methods, one shape. Each frontend owns its names and its
+        // signatures; both lower into `ImeEvent`, so nothing downstream can tell
+        // which daemon it came from — and neither can the code that consumes it.
+        //
+        // IBus is not optional in practice: it is what GNOME ships, so without
+        // this arm the IME feature is dead on the most common desktop. See
+        // `ibus.rs`.
         if fcitx::is_fcitx_interface(iface) {
             if let Some(method) = fcitx::classify(msg) {
                 let mut alloc = InputContextAllocator::new();
@@ -200,7 +209,28 @@ fn handle_client_message(
                     let _ = _conn.send_message(&reply, DBusSendMessageFlags::NONE);
                 }
                 if let Some(event) = fcitx::method_call_to_event(&method) {
-                    let _ = notify.send(BridgeNotification::FcitxEvent(event));
+                    let _ = notify.send(BridgeNotification::ImeEvent(event));
+                }
+                return None;
+            }
+        }
+
+        if ibus::is_ibus_interface(iface) {
+            if let Some(method) = ibus::classify(msg) {
+                if let Some(reply) = ibus::build_reply(msg, &method) {
+                    if let ibus::IbusMethodCall::CreateInputContext { .. } = &method {
+                        let path = reply
+                            .body()
+                            .map(|b| b.child_value(0))
+                            .and_then(|v: glib::Variant| v.get::<String>());
+                        if let Some(p) = path {
+                            ic_fds.lock().unwrap().insert(p, upstream.clone());
+                        }
+                    }
+                    let _ = _conn.send_message(&reply, DBusSendMessageFlags::NONE);
+                }
+                if let Some(event) = ibus::method_call_to_event(&method) {
+                    let _ = notify.send(BridgeNotification::ImeEvent(event));
                 }
                 return None;
             }
