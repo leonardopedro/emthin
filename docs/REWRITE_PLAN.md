@@ -1108,7 +1108,7 @@ cargo test --workspace                                               ✓ 198 tes
 | W6 | done | Figure-first input routing, document text editing, `FigureResizeGrab`, `docui/keymap.rs`. |
 | W7 | done | New CLI and IPC set, auto-append figure binding with glob ids, `docs/ipc.md`. |
 | W8 | done | `state/page.rs` replaces `state/workspace.rs`; ext-workspace-v1 re-pointed at pages (ids are page index + 1). |
-| W9 | partial | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is framed, labelled with the app name and both relaunch gestures, and `Return` or a click over it runs its `\app`'s `launch:` command. That is §5.10's stand-in. Still missing: the `spawn` prompt for typing an *arbitrary* command into a slot — the last item, and it needs a text input surface of its own. |
+| W9 | done | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is framed, labelled with the app name and both relaunch gestures, and `Return` or a click over it runs its `\app`'s `launch:` command. That is §5.10's stand-in and this row's whole ask. The check (kill and relaunch → doc returns, figures dormant, `Return` launches into the same figure) runs headlessly except for the client appearing. The `spawn` **prompt** is *not* required here: §9 lists the spawn-launcher UX as a deliberate placeholder and nothing in §5.10 asks for one. |
 | W10 | done | `AGENTS.md` rewritten, `README.md` + `README_cn.md`, `docs/ipc.md`, `docs/build-notes.md`, CHANGELOG entry, stale migration-policy docs deleted. |
 | W11 | done | Gate above. Manual E2E under a host compositor is **not** run — no nested-compositor session was available in this environment. |
 
@@ -1203,21 +1203,26 @@ literal*; `mathed_core`/`mathed_mini` green and Bevy `mathed` builds.
   against a real client.
 - **Dormant-figure affordance** is complete: `Return` over the figure
   relaunches it, a left click on it relaunches it, the launcher prefers the
-  pointed-at figure, and a dormant figure carries an inset border so an empty
-  slot is not indistinguishable from a failed app. The launch command is a
-  `launch:` argument on the `\app` statement itself, so nothing outside the
-  document has to be kept in step with it. Still no `spawn` prompt for typing
-  an arbitrary command, and no label on the figure (`6bd91c8` closed the
-  session half of W9).
+  pointed-at figure, and a dormant figure is framed and labelled with the app
+  name and both gestures. The launch command is a `launch:` argument on the
+  `\app` statement, so nothing outside the document has to be kept in step
+  with it.
+
+  I previously recorded a missing `spawn` prompt as W9's last item. It is
+  not one: §9 lists the spawn-launcher UX as a deliberate placeholder, and
+  neither §5.10 nor W9's text asks for a prompt. The claim came from the
+  keymap table's own doc comment, which had promised one. That comment is
+  fixed.
 - **`session.json` no longer has a `figures` array.** §5.10 sketched
   `{key, app_id, spawn, bound_size}` per figure. Three of those four are now
   wrong rather than missing: `spawn` lives in the statement as `launch:`,
   `bound_size` is the `\app` width and height (the document owns geometry),
   and `app_id` is a Wayland id from a previous process, meaningless on
   restore. `xwayland_display` is still carried for diagnostics only.
-- **The launcher** (`Ctrl+Shift+Return`) has no prompt. It relaunches the
-  pointed-at dormant figure, which is unambiguous, but a `spawn` prompt needs
-  a text input surface of its own — a bigger decision than a key binding.
+- **The launcher** (`Ctrl+Shift+Return`) has no prompt, which §9 sanctions.
+  It relaunches the pointed-at dormant figure. If a prompt is ever wanted it
+  needs a text input surface of its own — a bigger decision than a key binding,
+  and out of scope here rather than outstanding.
 - **`figure_key`'s doc comment** says "stable for the lifetime of the
   statement", but deleting a statement shifts later statements'
   indices. `FigureManager::sync` releases the deleted figure's app, so

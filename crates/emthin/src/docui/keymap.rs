@@ -8,7 +8,7 @@
 //!
 //! | Binding | Action |
 //! |---|---|
-//! | `Ctrl+Shift+Return` | open the app launcher (`spawn` prompt) |
+//! | `Ctrl+Shift+Return` | relaunch a dormant figure (the pointed-at one) |
 //! | `PgUp` / `PgDn` | previous / next document page |
 //! | `Home` / `End` | start / end of the document |
 //! | `Ctrl+Home` / `Ctrl+End` | start / end of the line |
@@ -23,6 +23,12 @@
 //! a dormant figure relaunches it instead of inserting a newline. It is not a
 //! global binding, so it is resolved in `input::edit_document_key` against the
 //! pointer position rather than classified here.
+//!
+//! The table used to describe `Ctrl+Shift+Return` as opening "the app launcher
+//! (`spawn` prompt)". There is no prompt and never was: REWRITE_PLAN §9 lists
+//! the spawn-launcher UX as a deliberate placeholder, and §5.10 requires only
+//! that a dormant figure be relaunchable. What it needs `\app`'s `launch:`
+//! argument for, which is a document concern, not a launcher's.
 
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::keysyms;
