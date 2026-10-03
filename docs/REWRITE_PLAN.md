@@ -1169,6 +1169,30 @@ cargo test --workspace                                               ✓ 198 tes
    strictly emthin's business, but it made the build noisy for anyone
    who takes the workspace gate literally.
 
+## §10 audit
+
+Re-checked against the tree rather than assumed. Four items had drifted, all
+now fixed (`cfbfb33`):
+
+- **Emacs/Elisp strings.** Five comments stated *current* behaviour in terms of
+  the old shell — "positioned by the Emacs IPC layer", "Emacs is fullscreen",
+  a pointer to `EmacsState::set_child` tests that no longer exist. Three were
+  false. The other 13 mentions stay: they explain why the design differs, or
+  name Emacs as a live Wayland client (PGTK in the IME path, GTK/Emacs in the
+  clipboard path). §10 reads "no Emacs/Elisp strings remain"; the honest reading
+  is no live Emacs *coupling*, and no comment may assert Emacs behaviour.
+- **`launch:` was undocumented.** Added to `\app` in `2b2ee90` and written
+  up in neither README nor `AGENTS.md`. Both, plus `README_cn.md`, now cover
+  it.
+- **Module map.** Predated `docui/formals.rs` and `dormant_label.rs`, and
+  still described `session.rs` as holding the deleted per-figure spawns.
+- **`docs/ipc.md`.** `tick.rs` emits `dbus_router_rule_added`,
+  `dbus_router_rule_removed` and `dbus_router_rules`; none were documented.
+
+Unchanged and verified: GPL-3.0 `LICENSE` untouched since `78d2bab`;
+xdg-decoration still forces `ServerSide`; no Emacs strings in any *string
+literal*; `mathed_core`/`mathed_mini` green and Bevy `mathed` builds.
+
 ## Known gaps
 
 - **No manual E2E run.** §6/W11's seven-step manual test (spawn, edit,
