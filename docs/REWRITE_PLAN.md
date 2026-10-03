@@ -1108,7 +1108,7 @@ cargo test --workspace                                               ✓ 198 tes
 | W6 | done | Figure-first input routing, document text editing, `FigureResizeGrab`, `docui/keymap.rs`. |
 | W7 | done | New CLI and IPC set, auto-append figure binding with glob ids, `docs/ipc.md`. |
 | W8 | done | `state/page.rs` replaces `state/workspace.rs`; ext-workspace-v1 re-pointed at pages (ids are page index + 1). |
-| W9 | partial | Session save/load of the document + per-figure launch commands works. The **dormant-figure overlay** ("▶ click to start") is not drawn — a dormant figure is just the placeholder box from the page raster. Enter-to-relaunch is wired to the launcher key rather than a per-figure prompt. |
+| W9 | partial | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is marked, and `Return` or a click over it runs its `\app`'s `launch:` command. Still missing: the **dormant stand-in label** — §5.10 asks for "app name + Enter to launch" on the figure, and overlays are `SolidColor` only, so no text is drawn; and the `spawn` prompt for typing an arbitrary command. |
 | W10 | done | `AGENTS.md` rewritten, `README.md` + `README_cn.md`, `docs/ipc.md`, `docs/build-notes.md`, CHANGELOG entry, stale migration-policy docs deleted. |
 | W11 | done | Gate above. Manual E2E under a host compositor is **not** run — no nested-compositor session was available in this environment. |
 
@@ -1183,13 +1183,14 @@ cargo test --workspace                                               ✓ 198 tes
   slot is not indistinguishable from a failed app. The launch command is a
   `launch:` argument on the `\app` statement itself, so nothing outside the
   document has to be kept in step with it. Still no `spawn` prompt for typing
-  an arbitrary command. (W9 partial — the prompt, not the affordance.)
-- **`session.rs` is unwired.** `SessionFile` has round-trip tests and no
-  callers; `DocUi::load`/`save` use their own path. Its `spawns` table was
-  deleted as superseded by `launch:`; `current_page` (the actual
-  current-page persistence W9 asks for) and `xwayland_display` remain. Either
-  wire it up or delete it — an unwired module with passing tests reads as
-  working.
+  an arbitrary command, and no label on the figure (`6bd91c8` closed the
+  session half of W9).
+- **`session.json` no longer has a `figures` array.** §5.10 sketched
+  `{key, app_id, spawn, bound_size}` per figure. Three of those four are now
+  wrong rather than missing: `spawn` lives in the statement as `launch:`,
+  `bound_size` is the `\app` width and height (the document owns geometry),
+  and `app_id` is a Wayland id from a previous process, meaningless on
+  restore. `xwayland_display` is still carried for diagnostics only.
 - **The launcher** (`Ctrl+Shift+Return`) has no prompt. It relaunches the
   pointed-at dormant figure, which is unambiguous, but a `spawn` prompt needs
   a text input surface of its own — a bigger decision than a key binding.
