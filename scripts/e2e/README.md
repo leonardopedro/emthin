@@ -84,16 +84,33 @@ The result depends on the compositor, because the proxy's backend chain does:
   selection. Whether those meet depends on the host's Wayland↔X11 selection sync,
   which does not happen here, so both directions skip with that reason.
 - under **sway**, wlroots implements data-control, the chain stops there, and the
-  checks actually run. Current result: **client→host passes**, **host→client
-  fails**.
+  checks actually run. Current result: **both directions fail**.
 
-  client→host is the direction that matters — "text copied out of the document has
-  to be pasteable in an app" is what the bridge's `HostSelectionChanged` echo and
-  its `SelectionOrigin::Host` bookkeeping exist for.
+      FAIL host clipboard reaches a client inside the nested session
+           got:  (empty)          want: e2e-…-h2c
+      FAIL a client inside the nested session reaches the host clipboard
+           got:  e2e-…-h2c       want: e2e-…-c2h
 
-  host→client failing means the proxy is not tracking the *host's* selection, even
-  though the log shows it receiving `Host Clipboard changed`. That is a real gap
-  and is reported as a failure, not skipped.
+  The second failure is the informative one: the *host* clipboard still held the
+  marker the first leg had put there, and never received the nested session's.
+  So nothing crosses in either direction.
+
+  This was briefly reported as `client→host passes`, and that was a false pass in
+  the harness: both legs shared one marker, so the second leg read back the first
+  leg's selection and looked like a success. The markers are now distinct per
+  direction, and each leg waits for the previous selection owner to exit first.
+
+  The cause is structural rather than a timing artefact. The proxy's DataControl
+  backend "connects to a fresh `$WAYLAND_DISPLAY`" — which, in a nested session,
+  is the *nested* compositor. So it manages the nested compositor's clipboard, and
+  there is no connection from there to the host session's clipboard. emthin logs
+  `Host Clipboard changed` because that is the nested clipboard changing; the name
+  is doing a lot of work there.
+
+  What this means for emthin: **in a nested session the clipboard proxy has no
+  path to the host clipboard.** A data-control backend that named the *host*
+  display would be needed, which means the compositor needs to know what its host
+  display is — not something `--session-file` or the IPC protocol carries today.
 
 `step7.sh` detects the chosen backend from the log and reports a skip with the
 reason when the chain has landed somewhere that cannot carry the selection at
@@ -130,17 +147,21 @@ Run on this machine, `--config xdotool`, sway on Xvfb, emthin inside it:
 ```
  ok  typed text reaches the document
  ok  doc-copy pastes (the marker appears 3 times)
- ok  a client inside the nested session reaches the host clipboard
 FAIL host clipboard reaches a client inside the nested session
+FAIL a client inside the nested session reaches the host clipboard
 
 4 ran, 0 skipped
-1 check(s) failed
+2 check(s) failed
 ```
 
 So §6 step 7's keyboard half is **verified**: keys reach the document, and
 Ctrl+A / Ctrl+C / Ctrl+V round-trips through `arboard` — which is the
-`1a79b38` path, live. The IME commit is still not exercised: it needs the host's
-fcitx engaged, which `fcitx5` being installed does not arrange.
+`1a79b38` path, live.
+
+The clipboard half is **verified as broken**, in both directions, and the cause
+is structural rather than a flake (see above). The IME commit is still not
+exercised: it needs the host's fcitx engaged, which `fcitx5` being installed does
+not arrange.
 
 ## Known unresolved
 

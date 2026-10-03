@@ -116,12 +116,17 @@ clipboard_checks() {
     SKIP_CLIPBOARD=1
   fi
 
-  local marker="e2e-$$-clipboard"
+  # A *different* marker per direction. Sharing one made a leak between the two
+  # legs indistinguishable from success: the client->host leg could read back the
+  # host selection the host->client leg had just left there, and pass without
+  # anything having crossed the bridge.
+  local marker_h2c="e2e-$$-h2c"
+  local marker_c2h="e2e-$$-c2h"
 
   # ── host -> client ───────────────────────────────────────────────────────
   if [ -S "$host_socket" ]; then
     ( XDG_RUNTIME_DIR="$host_runtime" WAYLAND_DISPLAY="$HOST_WAYLAND" \
-        wl-copy --type text/plain -- "$marker" </dev/null >/dev/null 2>&1 &
+        wl-copy --type text/plain -- "$marker_h2c" </dev/null >/dev/null 2>&1 &
       echo $! > "$E2E_ROOT/wlcopy.pid" )
     sleep 1.5
     local got
@@ -130,7 +135,7 @@ clipboard_checks() {
     if [ "${SKIP_CLIPBOARD:-0}" = 1 ]; then
       skip "host->client clipboard" "the bridge backend cannot carry a Wayland selection"
     else
-      check "host clipboard reaches a client inside the nested session" "$got" "$marker"
+      check "host clipboard reaches a client inside the nested session" "$got" "$marker_h2c"
     fi
     kill "$(cat "$E2E_ROOT/wlcopy.pid" 2>/dev/null)" 2>/dev/null || true
     rm -f "$E2E_ROOT/wlcopy.pid"
@@ -143,8 +148,13 @@ clipboard_checks() {
   # document has to be pasteable in an app, which is what the bridge's
   # HostSelectionChanged echo and its `SelectionOrigin::Host` bookkeeping exist
   # for. A client inside the session owns the selection; the host must read it.
+  # Wait for the previous owner to go before taking the selection ourselves, so
+  # the host is not still holding the other direction's marker.
+  kill "$(cat "$E2E_ROOT/wlcopy.pid" 2>/dev/null)" 2>/dev/null || true
+  rm -f "$E2E_ROOT/wlcopy.pid"
+  sleep 0.7
   ( XDG_RUNTIME_DIR="$E2E_XDG" WAYLAND_DISPLAY="$E2E_DISPLAY" \
-      wl-copy --type text/plain -- "$marker" </dev/null >/dev/null 2>&1 &
+      wl-copy --type text/plain -- "$marker_c2h" </dev/null >/dev/null 2>&1 &
     echo $! > "$E2E_ROOT/wlcopy.pid" )
   sleep 1.5
   if [ -S "$host_socket" ]; then
@@ -155,7 +165,7 @@ clipboard_checks() {
       skip "client->host clipboard" "the bridge backend cannot carry a Wayland selection"
     else
       check "a client inside the nested session reaches the host clipboard" \
-        "$back" "$marker"
+        "$back" "$marker_c2h"
     fi
   else
     # No host session: the best that can be asserted is that the selection is
@@ -164,7 +174,7 @@ clipboard_checks() {
     inside="$(XDG_RUNTIME_DIR="$E2E_XDG" WAYLAND_DISPLAY="$E2E_DISPLAY" \
               timeout 4 wl-paste --no-newline 2>/dev/null || true)"
     check_contains "a client can own a selection in the nested session" \
-      "$inside" "$marker"
+      "$inside" "$marker_c2h"
     warn "client->host NOT verified: no host session to bridge to"
   fi
   kill "$(cat "$E2E_ROOT/wlcopy.pid" 2>/dev/null)" 2>/dev/null || true
