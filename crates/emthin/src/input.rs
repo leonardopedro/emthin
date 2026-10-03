@@ -274,7 +274,7 @@ impl EmthinState {
     /// `\app` args); its interior focuses its app; anywhere else on the
     /// page places the caret.
     fn handle_left_click(&mut self, pos: Point<f64, Logical>) {
-        let Some(figure) = self.doc.figures().figure_under(pos).cloned() else {
+        let Some(figure) = self.doc.figure_at(pos).cloned() else {
             // The document. Place the caret where the user clicked so the
             // next keystroke lands where they expected.
             let hit = self.doc.layout().screen_to_doc(pos).and_then(|p| {
@@ -466,9 +466,10 @@ impl EmthinState {
                     .map(|f| f.key.clone())
             })
             .or_else(|| {
+                // Page-aware: an off-page figure has a placeholder rect at the
+                // origin, so matching it here would clone the wrong statement.
                 self.doc
-                    .figures()
-                    .figure_under(
+                    .figure_at(
                         self.seat
                             .get_pointer()
                             .map(|p| p.current_location())

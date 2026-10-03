@@ -396,6 +396,26 @@ impl DocUi {
         self.layout.caret_rect(self.model.caret())
     }
 
+    /// The figure at `pos` **on the visible page**, or `None`.
+    ///
+    /// Not the same as `FigureManager::figure_under`. An off-page figure has no
+    /// meaningful screen rect — `page_rect_for` hands it the origin and the page size
+    /// as a placeholder — so that rect overlaps the visible page's top-left corner.
+    /// Matching on it meant a click there could hit a figure the user cannot see:
+    /// relaunching the wrong one, starting a resize grab against a statement that is
+    /// not on screen (whose `commit` then rewrites *that* statement's `\app` args), or
+    /// mapping the click into an unrelated surface.
+    ///
+    /// The compositor must never treat an off-page figure as present. Three call
+    /// sites did; `dormant_figure_at` already re-checked `page` itself, which is how
+    /// the hazard was known and not applied.
+    pub fn figure_at(&self, pos: Point<f64, Logical>) -> Option<&Figure> {
+        let page = self.current_page();
+        self.figures
+            .figure_under(pos)
+            .filter(|f| f.page == Some(page))
+    }
+
     /// The last layout error, if the document currently fails to lay
     /// out.
     pub fn last_error(&self) -> Option<&str> {
@@ -411,11 +431,6 @@ impl DocUi {
 pub fn session_json_path(snapshot: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = snapshot.parent()?;
     Some(dir.join("session.json"))
-}
-
-/// Convenience: is `pos` inside any figure?
-pub fn figure_at(figures: &FigureManager, pos: Point<f64, Logical>) -> Option<&Figure> {
-    figures.figure_under(pos)
 }
 
 #[cfg(test)]
@@ -931,5 +946,89 @@ mod page_tests {
             "session.json must record the visible page, got {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hit test must never return a figure from another page.
+    ///
+    /// `page_rect_for` hands an off-page figure the origin and the page size as a
+    /// placeholder rect, so that rect sits on top of the visible page's top-left
+    /// corner. `FigureManager::figure_under` matched on it, which meant a click in
+    /// that corner could relaunch a figure the user cannot see, start a resize
+    /// grab against a statement that is not on screen — whose `commit` then
+    /// rewrites *that* statement's `\app` args — or map the click into an
+    /// unrelated surface.
+    #[test]
+    fn a_hit_test_never_returns_a_figure_from_another_page() {
+        /// Centre of a screen rect, in the `f64` space `figure_under` wants.
+        fn centre(r: Rectangle<i32, Logical>) -> Point<f64, Logical> {
+            Point::new(
+                f64::from(r.loc.x) + f64::from(r.size.w) / 2.0,
+                f64::from(r.loc.y) + f64::from(r.size.h) / 2.0,
+            )
+        }
+
+        let mut ui = paged();
+        assert!(ui.page_count() > 1, "the fixture must paginate");
+
+        // A figure far past the end of the document, so it lands on a later page.
+        let end = ui.model().text().len();
+        ui.model_mut().replace(
+            end..end,
+            "\n\n#1 late #2 \\app(#1, #2, 200, 150, \"late\")\n",
+        );
+        ui.relayout();
+
+        let off_page = ui
+            .figures()
+            .figures()
+            .iter()
+            .find(|f| f.page != Some(0))
+            .expect("a figure on a page other than 0")
+            .clone();
+        let at = centre(off_page.rect);
+
+        // The raw manager *does* match it — the placeholder rect is real.
+        assert!(
+            ui.figures().figure_under(at).is_some(),
+            "FigureManager::figure_under matches the placeholder rect, \
+             which is the hazard this test pins"
+        );
+        // The page-aware lookup must not.
+        assert!(
+            ui.figure_at(at).is_none(),
+            "figure {} from page {:?} must not be hit-testable on page 0",
+            off_page.key,
+            off_page.page
+        );
+    }
+
+    /// The page-aware hit test still finds a figure that *is* on the page.
+    #[test]
+    fn the_page_aware_hit_test_still_finds_a_visible_figure() {
+        fn centre(r: Rectangle<i32, Logical>) -> Point<f64, Logical> {
+            Point::new(
+                f64::from(r.loc.x) + f64::from(r.size.w) / 2.0,
+                f64::from(r.loc.y) + f64::from(r.size.h) / 2.0,
+            )
+        }
+
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut()
+            .replace(0..0, "#1 a #2 \\app(#1, #2, 200, 150, \"a\")");
+        ui.relayout();
+
+        let visible = ui
+            .figures()
+            .figures()
+            .iter()
+            .find(|f| f.page == Some(ui.current_page()) && f.rect.size.w > 0)
+            .expect("a figure on the visible page")
+            .clone();
+        assert_eq!(
+            ui.figure_at(centre(visible.rect)).map(|f| f.key.as_str()),
+            Some(visible.key.as_str()),
+            "a figure on the visible page must remain hittable"
+        );
     }
 }

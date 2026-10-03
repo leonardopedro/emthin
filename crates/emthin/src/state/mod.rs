@@ -635,7 +635,7 @@ impl EmthinState {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let figure = self.doc.figures().figure_under(pos)?;
+        let figure = self.doc.figure_at(pos)?;
         let rect = crate::handlers::apps::app_figure_rect(self, figure.app_id?)?;
         let src = self.apps.get(figure.app_id?)?.geometry?;
         let wl = self.apps.get(figure.app_id?)?.wl_surface()?;
