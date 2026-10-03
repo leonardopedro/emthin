@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Step 7, configuration `xdotool`: XTEST into a nested compositor's X window.
+# Step 7, configuration `xdotool`: XTEST into a compositor that has an X window.
 #
-# The only configuration that needs nothing privileged — but it needs the
-# compositor to have an X window, and that is the whole difficulty.
+# The keys go in with no window search at all. My first version insisted on
+# finding the compositor's window with `xdotool search --class ...` and so found
+# nothing: wlroots does not set WM_NAME, and even `xdotool search --name "."`
+# returns an empty list on a bare Xvfb. XTEST does not need it — the events go to
+# the X server's focus window, which for a compositor hosting itself on X is the
+# compositor's own window, which then routes them to its focused Wayland client.
+# So: activate the display, send the key, done.
 #
-# Mutter run *nested* (not `--headless`) maps a window onto its X display, and
-# XTEST events sent to that window become input on the nested seat. So this
-# configuration wants:
-#
-#   * Xvfb (or a real X server) on DISPLAY, and
-#   * gnome-shell able to take the session, which it cannot do from inside
-#     another desktop session: it fails `Failed to take control of the session:
-#     EBUSY`. So run this from a TTY or a plain login, not from inside GNOME.
-#
-# Reachable: on a machine whose seat is not already owned, or with a different
-# nested compositor that does map an X window (Xephyr, Xvfb + a nested
-# wayland compositor that is not Mutter).
+# This is the only configuration that reaches a *nested* compositor, and it is
+# the reason `start_compositor sway` exists: a wlroots compositor with
+# WLR_BACKENDS=x11 maps a real X window under Xvfb and never asks logind for
+# anything. Mutter run non-headless wants to take the session and fails EBUSY
+# from inside a desktop session.
 
 # shellcheck source=lib.sh
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
@@ -23,50 +21,39 @@
 inject_available() {
   need xdotool
   [ -n "${DISPLAY:-}" ] || return 1
-  # There has to be a window to aim at.
-  xdotool search --onlyvisible "" >/dev/null 2>&1 || return 1
-  xdotool search --onlyvisible --class '.' >/dev/null 2>&1
+  # A reachable X display is the whole requirement.
+  xdotool getdisplaygeometry >/dev/null 2>&1 || return 1
+  [ -S "${E2E_XDG:-$PWD/.e2e/xdg}/${E2E_DISPLAY:-e2e}" ] || return 1
 }
 
 inject_note() {
   if [ -z "${DISPLAY:-}" ]; then
-    printf 'xdotool UNAVAILABLE: no DISPLAY. Start the compositor as `nested`\n'
-    printf '            (run.sh --config xdotool does that) — which needs the logind\n'
-    printf '            session to be free, so not from inside another desktop.\n'
+    printf 'xdotool UNAVAILABLE: no DISPLAY. run.sh --config xdotool starts one.\n'
   elif ! inject_available; then
-    printf 'xdotool UNAVAILABLE: DISPLAY=%s has no visible window\n' "$DISPLAY"
+    printf 'xdotool UNAVAILABLE: DISPLAY=%s is not reachable, or no compositor socket\n' \
+      "${DISPLAY:-unset}"
   else
-    printf 'xdotool via XTEST on DISPLAY=%s' "$DISPLAY"
+    printf 'xdotool via XTEST on DISPLAY=%s (X focus -> compositor -> focused client)' \
+      "$DISPLAY"
   fi
 }
 
-# The window to type into: emthin's own toplevel, which under a nested Mutter
-# on Xvfb is the shell's window. Fall back to whatever is focused.
-_e2e_window() {
-  local w
-  w="$(xdotool search --onlyvisible --class 'gnome-shell' 2>/dev/null | tail -1)" || true
-  [ -n "$w" ] || w="$(xdotool search --onlyvisible --name '.' 2>/dev/null | tail -1)" || true
-  printf '%s' "${w:-}"
-}
-
+# Point the X input focus at the root, which is where a compositor hosting itself
+# on X takes its clients' focus from. Harmless when it is already correct, and it
+# avoids depending on a window manager being present to set focus.
 inject_focus() {
-  local w; w="$(_e2e_window)"
-  [ -n "$w" ] || return 1
-  xdotool windowactivate --sync "$w" 2>/dev/null || xdotool windowfocus "$w" 2>/dev/null || true
-  xdotool windowraise "$w" 2>/dev/null || true
+  xdotool windowfocus "$(xdotool getactivewindow 2>/dev/null || echo 0)" \
+    >/dev/null 2>&1 || true
 }
 
 inject_key() {
-  inject_focus
-  xdotool key --clearmodifiers --window "$(_e2e_window)" -- "$1" >/dev/null 2>&1 \
-    || xdotool key --clearmodifiers -- "$1" >/dev/null 2>&1 \
+  xdotool key --clearmodifiers --delay 20 -- "$1" >/dev/null 2>&1 \
     || { warn "xdotool could not deliver: $1"; return 1; }
-  sleep "${INJECT_SETTLE:-0.12}"
+  sleep "${INJECT_SETTLE:-0.2}"
 }
 
 inject_type() {
-  inject_focus
-  xdotool type --clearmodifiers --delay 20 -- "$1" >/dev/null 2>&1 \
+  xdotool type --clearmodifiers --delay 25 -- "$1" >/dev/null 2>&1 \
     || { warn "xdotool could not type: $1"; return 1; }
-  sleep "${INJECT_SETTLE:-0.12}"
+  sleep "${INJECT_SETTLE:-0.25}"
 }

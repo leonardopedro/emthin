@@ -70,26 +70,34 @@ Log out, or switch to a VT:
 `zwp_virtual_keyboard_v1` — it answers `does not support the virtual keyboard
 protocol`. Use it under sway, weston or wayfire.
 
-## The clipboard checks, and why they skip here
+## The clipboard checks
 
 The clipboard half needs no keys: `wl-copy` on the host session and `wl-paste`
 inside the nested one exercises host→client through emthin's proxy, and the
 reverse exercises client→host.
 
-They skip on this machine, with the reason, because emthin's proxy walks
-DataControl → WlDataDevice → X11 and in a nested session the first two are aimed
-at `$WAYLAND_DISPLAY` — which is emthin itself:
+The result depends on the compositor, because the proxy's backend chain does:
 
-```
-Host supports neither ext_data_control_v1 nor zwlr_data_control_v1
-wl_data_device roundtrip failed
-X11 clipboard sync initialized
-```
+- under **headless Mutter**, DataControl and WlDataDevice are both aimed at
+  `$WAYLAND_DISPLAY`, which is emthin itself, so the chain falls through to X11
+  and talks to the host's Xwayland — while the test drives the host's *Wayland*
+  selection. Whether those meet depends on the host's Wayland↔X11 selection sync,
+  which does not happen here, so both directions skip with that reason.
+- under **sway**, wlroots implements data-control, the chain stops there, and the
+  checks actually run. Current result: **client→host passes**, **host→client
+  fails**.
 
-So the bridge settles on X11, talking to the host's Xwayland, while the test
-drives the host's *Wayland* selection. Whether those meet depends on the host's
-Wayland↔X11 selection sync. `step7.sh` detects the chosen backend and reports a
-skip with that reason rather than a bare failure.
+  client→host is the direction that matters — "text copied out of the document has
+  to be pasteable in an app" is what the bridge's `HostSelectionChanged` echo and
+  its `SelectionOrigin::Host` bookkeeping exist for.
+
+  host→client failing means the proxy is not tracking the *host's* selection, even
+  though the log shows it receiving `Host Clipboard changed`. That is a real gap
+  and is reported as a failure, not skipped.
+
+`step7.sh` detects the chosen backend from the log and reports a skip with the
+reason when the chain has landed somewhere that cannot carry the selection at
+all.
 
 ## Exit codes
 
@@ -114,6 +122,25 @@ harness.
 | `ydotoold-daemon.sh` | the privileged half of the uinput route, and socket diagnostics |
 | `step7-ydotool.sh` | the whole uinput route as one command |
 | `ipc.py`, `state.py` | the control protocol, and a readable dump of `state` |
+
+## What passes today
+
+Run on this machine, `--config xdotool`, sway on Xvfb, emthin inside it:
+
+```
+ ok  typed text reaches the document
+ ok  doc-copy pastes (the marker appears 3 times)
+ ok  a client inside the nested session reaches the host clipboard
+FAIL host clipboard reaches a client inside the nested session
+
+4 ran, 0 skipped
+1 check(s) failed
+```
+
+So §6 step 7's keyboard half is **verified**: keys reach the document, and
+Ctrl+A / Ctrl+C / Ctrl+V round-trips through `arboard` — which is the
+`1a79b38` path, live. The IME commit is still not exercised: it needs the host's
+fcitx engaged, which `fcitx5` being installed does not arrange.
 
 ## Known unresolved
 

@@ -123,6 +123,21 @@
               xorgserver
               xclip
 
+              # ── E2E: a nested compositor that maps an X window ────────
+              # Weston's x11 backend gives a full Wayland session on top of an X
+              # window, under Xvfb, with no logind session involved. That matters:
+              # Mutter will only run non-headless when nothing else owns the
+              # session (`Failed to take control of the session: EBUSY`), which
+              # would mean logging out of the desktop to run the test. Weston does
+              # not care, so the xdotool configuration becomes reachable without
+              # touching the live session.
+              weston
+
+              # ...and one that has an X11 backend: weston 16 in nixpkgs ships
+              # without x11.so, but sway's wlroots build does. WLR_BACKENDS=x11
+              # makes it map a real X window, which is what XTEST needs.
+              sway
+
               # ── E2E: the harness itself is python + coreutils ────────
               # scripts/e2e/ipc.py speaks the control protocol and state.py
               # pretty-prints the reply. Found the hard way: the clipboard

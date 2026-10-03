@@ -47,13 +47,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# The compositor follows the configuration: xdotool needs one with an X window,
+# everything else is happy with headless Mutter.
 COMPOSITOR_MODE=headless
-case "$CONFIG" in
-  xdotool) COMPOSITOR_MODE=nested ;;
-  "")      : ;;
-  none)    : ;;
-  *)       : ;;
-esac
+[ "$CONFIG" = xdotool ] && COMPOSITOR_MODE=sway
 
 export E2E_ROOT="${E2E_ROOT:-$REPO/.e2e}"
 mkdir -p "$E2E_ROOT"
@@ -83,8 +80,8 @@ if [ "$LIST" = 1 ]; then
   done
   printf '\n'
   log "compositor: gnome-shell --headless --wayland --no-x11"
-  printf '  xdotool additionally needs a non-headless nested compositor, which\n'
-  printf '  Mutter only provides when the logind session is not already owned.\n'
+  printf '  --config xdotool uses sway with WLR_BACKENDS=x11 on Xvfb instead,\n'
+  printf '  which maps a real X window and needs no logind session.\n'
   exit 0
 fi
 
@@ -109,8 +106,6 @@ if [ -z "$CONFIG" ]; then
 else
   load_inject "$CONFIG"
 fi
-
-[ "$COMPOSITOR_MODE" = nested ] || [ "$CONFIG" = xdotool ] || COMPOSITOR_MODE=headless
 
 # ── bring the session up ────────────────────────────────────────────────────
 echo >&2

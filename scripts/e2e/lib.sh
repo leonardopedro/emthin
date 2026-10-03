@@ -83,6 +83,53 @@ start_compositor() {
   chmod 700 "$E2E_XDG"
   rm -f "$E2E_XDG/$E2E_DISPLAY" "$E2E_XDG/$E2E_DISPLAY.lock" 2>/dev/null || true
 
+  case "$mode" in
+  sway)
+    # The one that makes `xdotool` reachable, and the reason it is here rather
+    # than Mutter: a wlroots compositor with WLR_BACKENDS=x11 maps a real X
+    # window on Xvfb, and it never asks logind for anything. Mutter run
+    # non-headless wants to take the session and fails EBUSY from inside a
+    # desktop, which would mean logging out of GNOME to run a test.
+    start_xvfb
+    export DISPLAY="$E2E_XVFB_DISPLAY"
+    export XDG_RUNTIME_DIR="$E2E_XDG"
+    need sway
+    cat > "$E2E_ROOT/sway.conf" <<-EOF
+		output * mode $E2E_VIEWPORT
+		exec_always true
+	EOF
+    log "starting sway (wlroots, x11 backend) on $DISPLAY"
+    ( setsid env DISPLAY="$DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        WLR_BACKENDS=x11 WLR_LIBINPUT_NO_DEVICES=1 \
+        sway -c "$E2E_ROOT/sway.conf" \
+        </dev/null >>"$E2E_ROOT/sway.log" 2>&1 & )
+    # `WAYLAND_DISPLAY` names a socket for *clients*; sway picks its own name and
+    # always calls it `wayland-N`. So rather than dictate the name, discover it:
+    # pick the socket sway actually created, and use that from here on. Picking
+    # it by globbing is safe because XDG_RUNTIME_DIR is this run's own directory
+    # and the stale ones were removed on the way in.
+    for _ in $(seq 1 60); do
+      local sock
+      for sock in "$E2E_XDG"/wayland-*; do
+        case "$sock" in
+          *.lock) continue ;;
+        esac
+        [ -S "$sock" ] || continue
+        E2E_DISPLAY="$(basename "$sock")"
+        break 2
+      done
+      sleep 0.5
+    done
+    if [ "$E2E_DISPLAY" = "${E2E_DISPLAY_DEFAULT:-e2e}" ]; then
+      die "sway created no wayland socket in $E2E_XDG (see $E2E_ROOT/sway.log)"
+    fi
+    log "sway is serving on $XDG_RUNTIME_DIR/$E2E_DISPLAY"
+    return 0
+    ;;
+
+  headless|nested)
+  mkdir -p "$E2E_XDG" "$E2E_RUN"
+  chmod 700 "$E2E_XDG"
   local -a args=(--wayland "--wayland-display=$E2E_DISPLAY" --no-x11)
   [ "$mode" = headless ] && args+=(--headless "--virtual-monitor=$E2E_VIEWPORT")
 
@@ -101,22 +148,49 @@ start_compositor() {
     sleep 0.5
   done
   die "compositor did not create $E2E_XDG/$E2E_DISPLAY; see $E2E_ROOT/gnome-shell.log"
+  ;;
+  esac
 }
 
 start_xvfb() {
-  if [ -e "/tmp/.X11-unix/${E2E_XVFB_DISPLAY#:}" ]; then
-    log "Xvfb already on $E2E_XVFB_DISPLAY"
+  need Xvfb
+  need xdotool   # the liveness probe below
+  local sock="/tmp/.X11-unix/${E2E_XVFB_DISPLAY#:}"
+  local lock="/tmp/.${E2E_XVFB_DISPLAY#:}-lock"
+  # Ask the display whether it is alive, rather than looking for its socket.
+  #
+  # The probe is `xdotool`, not `xdpyinfo`: nixpkgs has no `xorg.xorgutil`, so
+  # xdpyinfo is simply absent and the check silently failed every time.
+  #
+  # The socket file is not proof: Xvfb creates it early, and it survives a
+  # SIGKILL long enough to be misleading in both directions. An earlier version
+  # raced with a server that was still starting — the socket was not there yet,
+  # so the harness removed its lock and launched a second Xvfb, which then died
+  # with "Server is already active for display 99" while the first one carried on.
+  if DISPLAY="$E2E_XVFB_DISPLAY" xdotool getdisplaygeometry >/dev/null 2>&1; then
+    log "Xvfb already serving $E2E_XVFB_DISPLAY"
     return 0
   fi
-  need Xvfb
+  # Nothing is answering, so any lock is stale by definition.
+  [ -e "$lock" ] && { log "removing stale X lock $lock"; rm -f "$lock"; }
+  [ -e "$sock" ] && { log "removing stale X socket $sock"; rm -f "$sock"; }
   log "starting Xvfb on $E2E_XVFB_DISPLAY"
   ( setsid Xvfb "$E2E_XVFB_DISPLAY" -screen 0 1600x1000x24 \
       </dev/null >>"$E2E_ROOT/xvfb.log" 2>&1 & )
   for _ in $(seq 1 40); do
-    [ -e "/tmp/.X11-unix/${E2E_XVFB_DISPLAY#:}" ] && return 0
+    DISPLAY="$E2E_XVFB_DISPLAY" xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
     sleep 0.25
   done
-  die "Xvfb did not come up on $E2E_XVFB_DISPLAY"
+  # Something may still hold the display without serving it: a SIGKILLed server
+  # leaves a process that Xorg still counts as "already active" through its
+  # abstract socket, so the replacement refuses to start. Name it, rather than
+  # leaving "did not come up" with nothing to act on.
+  local holder
+  holder="$(pgrep -x Xvfb | tr '\n' ' ')"
+  if [ -n "$holder" ]; then
+    die "Xvfb did not come up on $E2E_XVFB_DISPLAY, and these still hold it: ${holder% } -- kill them if nothing is serving that display (see $E2E_ROOT/xvfb.log)"
+  fi
+  die "Xvfb did not come up on $E2E_XVFB_DISPLAY (see $E2E_ROOT/xvfb.log)"
 }
 
 # Headless Mutter exits when its last client disconnects; nothing else keeps it
