@@ -105,7 +105,31 @@ case "${1:-}" in
     fi
     echo "starting ydotoold (holding /dev/uinput)"
     echo "  socket: $SOCKET"
-    setsid ydotoold -b -s "$SOCKET" </dev/null >/dev/null 2>&1 &
+    # Flags, which I had wrong and which made the daemon exit before doing
+    # anything:
+    #
+    #   -p  --socket-path   the socket. There is no `-s`.
+    #   -P  --socket-perm   socket mode.
+    #   -o  --socket-own    socket owner.
+    #   (no -b: ydotoold has no such flag. It runs in the foreground, which is
+    #    what the `setsid ... &` below is for.)
+    #
+    # Verified without root by watching it reject the old invocation:
+    #   $ ydotoold -b -s /tmp/probe.sock
+    #   ydotoold: invalid option -- 'b'
+    #   ydotoold: invalid option -- 's'
+    #   $ ydotoold -p /tmp/probe.sock
+    #   failed to open uinput device: Permission denied     <- flags accepted
+    #
+    # -o matters as much as -p: the daemon runs as root, and it creates the
+    # socket 0600 root-owned by default, so the unprivileged test would find the
+    # socket present and then be refused by it. Hand it to the invoking user.
+    _own=""
+    if [ -n "$_target_user" ] && id -u "$_target_user" >/dev/null 2>&1; then
+      _own="-o $(id -u "$_target_user"):$(id -g "$_target_user")"
+    fi
+    # shellcheck disable=SC2086 # _own is deliberately two words
+    setsid ydotoold -p "$SOCKET" -P 0600 $_own </dev/null >/dev/null 2>&1 &
     # The pidfile is only a convenience for `stop`. If it cannot be written the
     # daemon is still fine, and under `set -e` an unguarded write aborted the
     # script *after* the daemon had started -- leaving it running with nothing
@@ -120,7 +144,7 @@ case "${1:-}" in
     done
     echo "ydotoold did not create $SOCKET" >&2
     echo "it may have exited; run it in the foreground to see why:" >&2
-    echo "  sudo ydotoold -s $SOCKET" >&2
+    echo "  sudo ydotoold -p $SOCKET -P 0600" >&2
     exit 1
     ;;
 
@@ -177,7 +201,14 @@ case "${1:-}" in
 
   status)
     if [ -S "$SOCKET" ]; then
-      echo "ydotoold running on $SOCKET"
+      echo "ydotoold running on $SOCKET ($(stat -c '%A %U:%G' "$SOCKET"))"
+      # A root-owned 0600 socket is present but unusable by the test, which is
+      # the failure mode -o exists to prevent.
+      if [ "$(id -u)" != 0 ] && [ ! -r "$SOCKET" ]; then
+        echo "WARNING: not readable by uid $(id -u); the daemon was started"
+        echo "without --socket-own, so the test cannot connect to it."
+        echo "stop it and start it again as: sudo $0 start"
+      fi
       exit 0
     fi
     echo "ydotoold not running"

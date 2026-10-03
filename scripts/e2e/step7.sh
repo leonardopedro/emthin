@@ -222,7 +222,7 @@ keyboard_checks() {
     printf '\033[1;31mFAIL\033[0m doc-copy: the marker appears %s time(s), want >= 2\n' \
       "${count:-0}" >&2
     printf '      document: %s\n' "$doc2" >&2
-    FAILED=1
+    FAILED=$(( FAILED + 1 ))
   fi
 
   # IME commit into the document caret: with fcitx5 running under the nested

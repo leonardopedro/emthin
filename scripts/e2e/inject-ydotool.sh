@@ -41,19 +41,20 @@
 
 # ── the injection seam ──────────────────────────────────────────────────────
 
-# The socket is always in the *invoking user's* runtime directory, derived from
-# uid and never from $XDG_RUNTIME_DIR.
+# Where the daemon's socket is: the *invoking user's* runtime directory, derived
+# from uid.
 #
-# This is not a detail: `run.sh` exports XDG_RUNTIME_DIR to point at the nested
-# compositor's runtime dir before any key is injected, so a lookup that trusted
-# $XDG_RUNTIME_DIR would look for the socket next to the compositor's socket and
-# conclude, correctly but uselessly, that no daemon was running. `ydotool(1)`
-# has the same default, so the calls below have to override it too.
+# Two things make this necessary rather than cosmetic. `run.sh` exports
+# XDG_RUNTIME_DIR to point at the nested compositor's runtime dir before anything
+# is injected, so anything trusting it would look beside the compositor's socket.
+# And `ydotool(1)` in 1.0.4 does not consult XDG_RUNTIME_DIR at all — `ydotool
+# --help` says "Use environment variable YDOTOOL_SOCKET to specify daemon
+# socket" — so the path is passed explicitly below.
 _socket_dir() { echo "${E2E_YDOTOOL_SOCKET_DIR:-/run/user/$(id -u)}"; }
 _socket() { echo "$(_socket_dir)/.ydotool_socket"; }
 
-# Run ydotool against the real user's socket, not the compositor's runtime dir.
-_yd() { XDG_RUNTIME_DIR="$(_socket_dir)" ydotool "$@"; }
+# Run the client against that socket, by the variable it actually reads.
+_yd() { YDOTOOL_SOCKET="$(_socket)" ydotool "$@"; }
 
 inject_available() {
   need ydotool
@@ -100,11 +101,15 @@ ydotool_keycode() {
     ctrl)        echo 29 ;;
     shift)       echo 42 ;;
     Return_L)    echo 28 ;;
-    # Letters and digits are the ASCII rows of the default keymap, which is
-    # what `setxkbmap`/libinput assume: 1..26 = a..z, 30..38 = 1..9, 39 = 0.
+    # Letters: KEY_A..KEY_Z are 30..55, and ASCII 'a' is 97.
     [a-z])       echo $(( $(printf '%d' "'${1}") - 96 )) ;;
-    [1-9])       echo $(( $(printf '%d' "'$1") - 19 )) ;;
-    0)           echo 39 ;;
+    # Digits are the *second* evdev row, KEY_1..KEY_9 = 2..10 and KEY_0 = 11 —
+    # not an offset from the ASCII code. The arithmetic was `ascii - 19`, which
+    # for '1' gives 49 - 19 = 30 = KEY_A: pressing a digit would have typed a
+    # letter. Only reached by a digit passed as a *key name*, since `type` below
+    # handles digits in text.
+    [1-9])       echo $(( $(printf '%d' "'${1}") - 47 )) ;;
+    0)           echo 11 ;;
     *)           return 1 ;;
   esac
 }
@@ -139,17 +144,13 @@ inject_key() {
 }
 
 inject_type() {
-  local text="$1" i ch
-  for (( i = 0; i < ${#text}; i++ )); do
-    ch="${text:i:1}"
-    case "$ch" in
-      ' ') inject_key space ;;
-      *)   ydotool_keycode "$ch" >/dev/null || {
-              warn "no evdev code for '$ch'; skipping"; continue; }
-           _yd key "$(ydotool_keycode "$ch"):1" "$(ydotool_keycode "$ch"):0" >/dev/null
-           sleep "${INJECT_TYPE_DELAY:-0.02}" ;;
-    esac
-  done
+  # `ydotool type` rather than a per-character loop over evdev codes.
+  #
+  # The loop only knew a-z, 0-9 and space, so every other printable character was
+  # dropped with a warning -- punctuation, capitals, anything non-ASCII. `type`
+  # does the keymap translation itself (`ydotool type [-D ms] [-d ms] "text"`),
+  # which is both simpler and correct for the whole printable range.
+  _yd type "$1" >/dev/null
 }
 
 export -f inject_available inject_note inject_type inject_key 2>/dev/null || true

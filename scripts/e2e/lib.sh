@@ -215,7 +215,7 @@ state() { python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | python3 "$PW
 # The concrete implementations live in inject-*.sh.
 
 # ── assertions ──────────────────────────────────────────────────────────────
-FAILED=0
+FAILED=0   # a count, not a flag: two failures must not report as one
 CHECKS_RAN=0
 CHECKS_SKIPPED=0
 
@@ -227,7 +227,7 @@ check() {
   else
     printf '\033[1;31mFAIL\033[0m %s\n      got:  %s\n      want: %s\n' \
       "$what" "$got" "$want" >&2
-    FAILED=1
+    FAILED=$(( FAILED + 1 ))
   fi
 }
 
@@ -248,7 +248,7 @@ check_contains() {
     *"$needle"*) ok "$what" ;;
     *) printf '\033[1;31mFAIL\033[0m %s\n      %s\n      does not contain: %s\n' \
          "$what" "$hay" "$needle" >&2
-       FAILED=1 ;;
+       FAILED=$(( FAILED + 1 )) ;;
   esac
 }
 
@@ -258,7 +258,7 @@ check_not_contains() {
   case "$hay" in
     *"$needle"*) printf '\033[1;31mFAIL\033[0m %s\n      %s\n      unexpectedly contains: %s\n' \
          "$what" "$hay" "$needle" >&2
-       FAILED=1 ;;
+       FAILED=$(( FAILED + 1 )) ;;
     *) ok "$what" ;;
   esac
 }
@@ -274,7 +274,7 @@ finish() {
       "$CHECKS_SKIPPED" >&2
     exit 2
   fi
-  if [ "$FAILED" = 0 ]; then
+  if [ "$FAILED" -eq 0 ]; then
     ok "all $CHECKS_RAN executed check(s) passed ($CHECKS_SKIPPED skipped)"
     [ "$CHECKS_SKIPPED" -gt 0 ] && warn "some checks did not run; see above"
     exit 0
