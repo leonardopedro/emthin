@@ -224,7 +224,7 @@ fn install_shutdown_signals(
     // Safety: a handler that writes one byte and returns.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_signal as usize;
+        sa.sa_sigaction = on_signal as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());

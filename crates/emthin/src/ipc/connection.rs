@@ -315,7 +315,7 @@ mod tests {
         loop {
             peer.read_exact(&mut tmp).unwrap();
             buf.push(tmp[0]);
-            if buf.len() >= 4 && buf[buf.len() - 4..] == [b'\r', b'\n', b'\r', b'\n'] {
+            if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
                 break;
             }
         }

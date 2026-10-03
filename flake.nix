@@ -1,0 +1,129 @@
+{
+  description = "emthin — render Wayland applications as figures inside a mathed document";
+
+  # nixos-unstable, matching ../velysterm/flake.nix so `mathed_core`/`mathed_mini`
+  # (which emthin path-depends on) and emthin itself resolve the same glib,
+  # wayland and xkbcommon store paths rather than two copies.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+  outputs =
+    { self, nixpkgs }:
+    let
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      forAllSystems =
+        fn:
+        nixpkgs.lib.genAttrs systems (
+          system: fn nixpkgs.legacyPackages.${system}
+        );
+    in
+    {
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          # The NixOS-specific gaps this box has, which `cargo build` and
+          # `cargo test` run into without help:
+          #
+          #  1. pkg-config and glib-2.0's .pc files are on no default path, and
+          #     emthin-dbus -> gio -> glib-sys needs them in glib-sys's build
+          #     script.
+          #  2. -lxkbcommon (smithay's Wayland frontend) has no default search
+          #     path, so linking the test binaries fails. LIBRARY_PATH is read
+          #     by the gcc driver, which is what rustc shells out to.
+          #  3. calloop's libudev-sys has the same problem via a different
+          #     package: udev's .pc comes from systemd, not from a `libudev`
+          #     attribute.
+          #
+          # This shell replaces an ad-hoc `env.sh` that hardcoded four /nix/store
+          # paths, which is not reproducible and breaks on any nixpkgs bump.
+          packages =
+            with pkgs;
+            [
+              # ── toolchain ──────────────────────────────────────────────
+              rustc
+              cargo
+              clippy
+              rustfmt
+              pkg-config
+
+              # ── what the -sys crates and the linker need ───────────────
+              glib
+              glib.dev
+              libxkbcommon
+              libglvnd
+              wayland
+              libdrm
+              libinput
+              systemd # libudev's .pc, for calloop's libudev-sys
+
+              # ── document-model path deps' build needs ─────────────────
+              # mathed_mini embeds fonts and rasterises with tiny-skia; no
+              # system font discovery, so nothing to provide here, but its
+              # `gui` feature is off and winit/softbuffer stay out of the graph.
+
+              # ── E2E: input injection, for docs/REWRITE_PLAN.md §6 ─────
+              # Step 7 (IME commit into an app figure and into the doc caret,
+              # clipboard host<->client and doc-copy) is the one manual step
+              # still unverified, precisely because there was no way to type at
+              # it. Four different mechanisms, because no single one covers
+              # everything here:
+              #
+              #  xdotool   X11 + XTEST. Works against the nested compositor when
+              #            it is run *non-headless* under Xvfb, because Mutter
+              #            then has a real window on the X display for XTEST to
+              #            target. Not usable while Mutter is --headless, which
+              #            draws to no X window at all.
+              #  wtype     zwp_virtual_keyboard_v1. The only injection that
+              #            speaks Wayland, so it is the one that can reach a
+              #            headless compositor — if Mutter implements the
+              #            protocol. Unverified; see docs/build-notes.md.
+              #  ydotool   uinput, kernel-level. Needs write access to
+              #  dotool    /dev/uinput, which is root:root 0600 on this box, so
+              #            neither can run as an ordinary user here. Installed
+              #            anyway: on a host where uinput is group-writable they
+              #            are the fallback that needs no compositor support.
+              xdotool
+              wtype
+              ydotool
+              dotool
+
+              # ── E2E: IME, for the same step ────────────────────────────
+              # emthin reaches the input method through its own DBus bridge
+              # (crates/emthin-dbus: an InputMethod1 frontend that intercepts
+              # the bus), so a real fcitx5 here is what makes the IME path
+              # exercisable rather than only its stubs.
+              fcitx5
+              fcitx5-rime
+
+              # ── E2E: a Wayland client that accepts text input ──────────
+              # kgx is a GTK4 terminal: it takes text-input-v3, so it is both
+              # a figure to look at and an IME consumer.
+              gnome-console
+              gnome-text-editor
+            ];
+
+          shellHook = ''
+            export PKG_CONFIG_PATH="${pkgs.glib.dev}/lib/pkgconfig:${
+              pkgs.systemd
+            }/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            export LIBRARY_PATH="${pkgs.libxkbcommon}/lib:${pkgs.libglvnd}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+            # winit dlopens libwayland at runtime rather than linking it, so the
+            # client library has to be findable when `emthin` *runs*, not just
+            # when it links.
+            export LD_LIBRARY_PATH="${pkgs.wayland}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+            cat <<'EOF'
+            emthin dev shell. Sibling checkouts are path dependencies:
+              ../velysterm/crates/mathed_core   (the document engine)
+              ../velysterm/crates/mathed_mini   (the paged rasteriser)
+            A change to the document model must be verified in both:
+              cd ../velysterm && cargo test -p mathed_core -p mathed_mini
+              cd -            && cargo test -p emthin
+            EOF
+          '';
+        };
+      });
+    };
+}

@@ -13,16 +13,46 @@ found by default outside a distribution-provided build environment.
 
 ## NixOS
 
+Use the flake:
+
 ```sh
-# Pick the store paths your system actually has; these are examples.
-export PATH="/nix/store/<pkg-config-wrapper>/bin:$PATH"
-export PKG_CONFIG_PATH="/nix/store/<glib-dev>/lib/pkgconfig"
-export LIBRARY_PATH="/nix/store/<libxkbcommon>/lib:/nix/store/<libglvnd>/lib:$LIBRARY_PATH"
+nix develop            # everything below, already on PATH
+cargo test -p emthin
 ```
 
-`PKG_CONFIG_PATH` is read by the `pkg-config` wrapper for the build
-scripts; `LIBRARY_PATH` is read by the `cc` driver that `rustc` shells
-out to for the final link.
+It sets `PKG_CONFIG_PATH` for glib (the `pkg-config` wrapper reads it, and
+glib-sys's build script needs it), `LIBRARY_PATH` for `-lxkbcommon` and
+libglvnd (read by the `cc` driver `rustc` shells out to for the final
+link), `PKG_CONFIG_PATH` for udev (calloop's libudev-sys, whose `.pc`
+comes from systemd rather than a `libudev` attribute), and
+`LD_LIBRARY_PATH` for libwayland — winit `dlopen`s that one at runtime
+rather than linking it, so it has to be findable when `emthin` *runs*,
+not only when it links.
+
+What that replaces: an `env.sh` that hardcoded four `/nix/store` paths.
+It was not reproducible and broke on any nixpkgs bump. `nixpkgs` is
+pinned to `nixos-unstable` to match `../velysterm/flake.nix`, so
+`mathed_core`/`mathed_mini` and emthin share one glib/wayland/xkbcommon
+rather than two copies.
+
+### Input injection, and why §6 step 7 is still unverified
+
+The shell also carries `xdotool`, `wtype`, `ydotool`, `dotool` and
+`fcitx5`, so the manual E2E's last step has the tools it needs. On
+*this* machine none of the four injection mechanisms can reach emthin,
+each for a different and checked reason:
+
+| Tool | Mechanism | Why it does not work here |
+|---|---|---|
+| `wtype` | `zwp_virtual_keyboard_v1` | Mutter does not implement the protocol, so there is no keyboard to bind. `wtype` reports `Wayland connection failed` against the nested compositor, with both a bare and an absolute `WAYLAND_DISPLAY`. |
+| `ydotool`, `dotool` | `uinput`, kernel-level | Needs write access to `/dev/uinput`, which is `root:root` mode 0600; `ydotoold` fails `failed to open uinput device: Permission denied`, and there is no sudo. Injected events would reach the *host* input stack, not a nested compositor's, anyway. |
+| `xdotool` | X11 + XTEST | Needs a window on an X display. Mutter can only run `--headless` here: run non-headless it tries to take the logind session and fails `Failed to take control of the session: EBUSY`, because the real session already owns it. Headless Mutter draws to no X window, so there is nothing for XTEST to target. |
+
+So the E2E drives what it can over the IPC control socket, and §6 step 7
+stays open. On a host where `/dev/uinput` is group-writable, `ydotool`
+is the one to reach for: it needs no compositor support at all. Where
+the compositor implements `zwp_virtual_keyboard_v1`, `wtype` is the
+least invasive.
 
 ## Toolchain
 
