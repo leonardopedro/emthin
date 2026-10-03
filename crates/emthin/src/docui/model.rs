@@ -299,6 +299,14 @@ impl DocModel {
         self.dirty
     }
 
+    /// Force the next  to do work, without a text change.
+    ///
+    /// For changes that invalidate the layout but not the text — today, a
+    /// viewport change, which re-letterboxes every placed rect.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Consume the dirty flag (the layout cache calls this after a
     /// successful re-layout).
     pub fn take_dirty(&mut self) -> bool {

@@ -196,8 +196,21 @@ impl DocUi {
     }
 
     /// Recompute the letterbox against a new output size.
+    /// Changing the viewport re-lays out and forces a figure re-sync.
+    ///
+    /// `relayout` returns early when the model is clean, and the only caller of
+    /// `set_viewport` is `relayout_doc`, which then calls `relayout`. So a resize
+    /// with an otherwise-unchanged document re-letterboxed the page raster — which
+    /// is placed from `page_rect()`, recomputed every frame — while every figure
+    /// rect kept its old scale and origin. That left stale hit-tests, a stale
+    /// focus border, stale dormant marks and a stale IME origin until the next
+    /// text edit. `figure_render` and the input path read `Figure::rect`.
+    ///
+    /// Marking the model dirty is blunt but correct: the alternative is a second
+    /// dirty flag for "the geometry changed", which is the same bit.
     pub fn set_viewport(&mut self, size: Size<i32, Logical>) {
         self.layout.set_viewport(size);
+        self.model.mark_dirty();
     }
 
     /// Called by `EmthinState::goto_page`.
@@ -1222,5 +1235,90 @@ mod page_tests {
         );
         ui.model_mut().set_caret(len);
         assert!(!ui.model().is_dirty());
+    }
+
+    /// Two statements sharing a marker pair must not both claim one app.
+    ///
+    /// Pasting a bound figure's line duplicates its `\app(#3, #4, …)` verbatim,
+    /// and `stable_id` is that pair. The carry matched with `find` over the
+    /// previous list without removing what it found, so both copies read the same
+    /// binding: the app was composited twice, and `release_app` returned both
+    /// keys.
+    #[test]
+    fn a_duplicated_statement_does_not_claim_one_app_twice() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut()
+            .replace(0..0, "#3 t #4 \\app(#3, #4, 200, 150, \"t\")\n");
+        ui.relayout();
+        ui.figures_mut().get_mut("f0").expect("f0").app_id = Some(7);
+
+        // Paste the very same line again: identical markers, identical id.
+        let text = ui.model().text().to_string();
+        let end = ui.model().text().len();
+        ui.model_mut().replace(end..end, &text);
+        ui.relayout();
+
+        let bound: Vec<_> = ui
+            .figures()
+            .figures()
+            .iter()
+            .filter(|f| f.app_id == Some(7))
+            .map(|f| f.key.clone())
+            .collect();
+        assert_eq!(
+            bound.len(),
+            1,
+            "app 7 must be claimed by exactly one figure, not {:?}",
+            bound
+        );
+    }
+
+    /// A viewport change must re-place the figure rects.
+    ///
+    /// `relayout` returns early when the model is clean, so resizing the window
+    /// re-letterboxed the page raster — placed from `page_rect()`, recomputed
+    /// every frame — while every figure rect kept its old scale and origin. The
+    /// stale rect then drove hit-testing, the focus border, dormant marks and the
+    /// IME origin.
+    #[test]
+    fn a_viewport_change_re_places_the_figure_rects() {
+        let mut ui = DocUi::new();
+        // Small viewport first: the A4 page is downscaled into it.
+        ui.set_viewport(Size::from((700, 700)));
+        // A figure that fits the page, so containment is a meaningful assertion.
+        ui.model_mut()
+            .replace(0..0, "#1 a #2 \\app(#1, #2, 300, 200, \"a\")\n");
+        ui.relayout();
+        let before = ui.figures().figures().first().expect("a figure").rect;
+        assert!(
+            before.size.w < 300,
+            "the fixture must start downscaled, got {before:?}"
+        );
+
+        // Grow the window past the page size: the scale goes to 1.0.
+        ui.set_viewport(Size::from((4000, 4000)));
+        assert!(
+            ui.model().is_dirty(),
+            "a viewport change must force the next relayout to do work"
+        );
+        ui.relayout();
+
+        let after = ui.figures().figures().first().expect("a figure").rect;
+        assert_ne!(
+            before.size, after.size,
+            "the figure rect must follow the letterbox, not keep its old scale"
+        );
+        assert_eq!(
+            (after.size.w, after.size.h),
+            (300, 200),
+            "a page smaller than the viewport is mapped 1:1, so the figure is \
+             back to its declared size: {after:?}"
+        );
+        let page = ui.layout().page_rect();
+        assert!(
+            after.loc.x >= page.loc.x && after.loc.x + after.size.w <= page.loc.x + page.size.w,
+            "the re-placed figure {after:?} must sit inside the new page {page:?}"
+        );
     }
 }

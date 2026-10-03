@@ -177,6 +177,13 @@ impl FigureManager {
         let mut figures = Vec::new();
         let mut released = Vec::new();
 
+        // Consumed as they are matched, so two statements that happen to share a
+        // marker pair cannot both inherit one binding. Pasting a bound figure's
+        // line duplicates its `pp(#3, #4, ...)` verbatim, and both copies then
+        // claimed the same app — drawn twice by `figure_render`, and released
+        // twice by `release_app`.
+        let mut unmatched: Vec<&Figure> = self.figures.iter().collect();
+
         for seg in model.segments() {
             if !seg.kind.is_app() {
                 continue;
@@ -190,7 +197,10 @@ impl FigureManager {
             // read the *wrong* figure's binding, and the displaced app was
             // reported as gone and released. One edit above a figure could
             // therefore unmap a live app and hand its surface to another one.
-            let carried = self.by_stable_id(&figure.stable_id);
+            let carried = unmatched
+                .iter()
+                .position(|f| f.stable_id == figure.stable_id)
+                .map(|i| unmatched.remove(i));
             figures.push(Figure {
                 page: None,
                 rect: Rectangle::default(),
