@@ -244,15 +244,22 @@ fn note_figure_geometry(state: &mut EmthinState, app_id: u64, figure_key: &str, 
         .set_pending_geometry(app_id, Rectangle::new(loc, Size::from((w, h))));
 }
 
-/// Reconfigure the app bound to `figure_key` to the figure's current
+/// Reconfigure the app bound to `figure_stable_id` to the figure's current
 /// size, and report the new geometry to the control plane.
 ///
 /// Used by the figure resize grab after it has rewritten the `\app`
 /// arguments and re-laid out the document.
-pub fn reconfigure_after_resize(state: &mut EmthinState, figure_key: &str) {
-    let Some(figure) = state.doc.figures().get(figure_key).cloned() else {
+///
+/// Takes the statement's marker pair rather than its layout key: a grab spans a
+/// whole pointer drag, and an IPC append or a newly bound app can insert an
+/// `\app` in that window, renumbering every figure below it. Keying off the
+/// layout index meant a release could rewrite a different statement's `\app`
+/// arguments than the one the user dragged.
+pub fn reconfigure_after_resize(state: &mut EmthinState, figure_stable_id: &str) {
+    let Some(figure) = state.doc.figures().by_stable_id(figure_stable_id).cloned() else {
         return;
     };
+    let figure_key = figure.key.clone();
     let (w, h) = (figure.spec.w, figure.spec.h);
     let page = figure.page.unwrap_or(0);
     let rect = figure.rect;
@@ -263,7 +270,7 @@ pub fn reconfigure_after_resize(state: &mut EmthinState, figure_key: &str) {
                 configure_to_figure(toplevel, w, h);
             }
         }
-        note_figure_geometry(state, app_id, figure_key, w, h);
+        note_figure_geometry(state, app_id, &figure_key, w, h);
     }
     // Keep the app mapped at the figure's rect so it keeps receiving
     // frame callbacks; `figure_render` does the actual compositing.
@@ -278,7 +285,7 @@ pub fn reconfigure_after_resize(state: &mut EmthinState, figure_key: &str) {
     }
 
     state.ipc.send(crate::ipc::OutgoingMessage::FigureChanged {
-        figure: figure_key.to_string(),
+        figure: figure_key,
         page,
         // The *placed* rect, both origin and size. `rect.loc` is letterboxed but
         // `w`/`h` were the declared size, so after `d8f889c` this reported a 640

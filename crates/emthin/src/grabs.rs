@@ -410,8 +410,19 @@ pub const FIGURE_SNAP_PX: i32 = 8;
 /// drag is one CRDT op, not four hundred.
 pub struct FigureResizeGrab {
     pub start_data: GrabStartData<EmthinState>,
-    /// The figure being resized (`f<stmt-index>`).
+    /// The figure being resized, by its layout key (`f<stmt-index>`).
+    ///
+    /// Reported in logs and IPC. **Not** used to find the figure: see
+    /// `figure_stable_id`.
     pub figure_key: String,
+    /// The statement's marker pair — what the figure is looked up by.
+    ///
+    /// A grab spans a whole pointer drag. Any `\app` inserted during that window
+    /// — an IPC append, an app binding with no free figure — renumbers every
+    /// figure below it, so the key captured at press time points at a different
+    /// statement by release time, and the commit rewrote *that* statement's
+    /// `\app` arguments.
+    pub figure_stable_id: String,
     /// The figure's rect when the drag started.
     pub initial_rect: Rectangle<i32, Logical>,
     /// Live preview rect during the drag.
@@ -426,12 +437,14 @@ impl FigureResizeGrab {
     pub fn new(
         start_data: GrabStartData<EmthinState>,
         figure_key: String,
+        figure_stable_id: String,
         initial_rect: Rectangle<i32, Logical>,
         edges: ResizeEdge,
     ) -> Self {
         Self {
             start_data,
             figure_key,
+            figure_stable_id,
             initial_rect,
             current_rect: initial_rect,
             edges,
@@ -535,7 +548,12 @@ impl FigureResizeGrab {
         }
         self.committed = true;
         let (w, h) = (self.current_rect.size.w, self.current_rect.size.h);
-        let Some(figure) = data.doc.figures().get(&self.figure_key).cloned() else {
+        let Some(figure) = data
+            .doc
+            .figures()
+            .by_stable_id(&self.figure_stable_id)
+            .cloned()
+        else {
             return;
         };
         if crate::docui::edit::set_figure_size(data.doc.model_mut(), &figure, w, h) {
@@ -547,7 +565,7 @@ impl FigureResizeGrab {
         }
         // Reflow has settled: reconfigure the app and report the new
         // geometry to any control client.
-        crate::handlers::apps::reconfigure_after_resize(data, &self.figure_key);
+        crate::handlers::apps::reconfigure_after_resize(data, &self.figure_stable_id);
     }
 }
 
@@ -568,7 +586,11 @@ impl PointerGrab<EmthinState> for FigureResizeGrab {
         // Live preview: paint the preview rect straight into the figure
         // manager so the render pass picks it up, without touching the
         // document.
-        if let Some(figure) = data.doc.figures_mut().get_mut(&self.figure_key) {
+        if let Some(figure) = data
+            .doc
+            .figures_mut()
+            .by_stable_id_mut(&self.figure_stable_id)
+        {
             figure.rect = self.current_rect;
         }
         data.needs_redraw = true;

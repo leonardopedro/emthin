@@ -306,6 +306,7 @@ impl EmthinState {
         let grab = crate::grabs::FigureResizeGrab::new(
             start_data,
             figure.key.clone(),
+            figure.stable_id.clone(),
             figure.rect,
             edge,
         );

@@ -114,6 +114,11 @@ impl FigureManager {
         self.figures.iter().find(|f| f.stable_id == stable_id)
     }
 
+    /// Mutable form of [`FigureManager::by_stable_id`].
+    pub fn by_stable_id_mut(&mut self, stable_id: &str) -> Option<&mut Figure> {
+        self.figures.iter_mut().find(|f| f.stable_id == stable_id)
+    }
+
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Figure> {
         self.figures.iter_mut().find(|f| f.key == key)
     }

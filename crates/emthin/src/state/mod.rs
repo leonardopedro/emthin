@@ -472,12 +472,15 @@ impl EmthinState {
         // A resize can move a figure to a different page (Typst's page
         // model depends on the page size, and the letterbox changes the
         // scale), so re-run the layout and reconfigure whatever moved.
+        // Keyed by the statement's marker pair, not its layout index: the
+        // reconfigure path takes a stable id, and an index would be the wrong
+        // thing to compare across a re-layout.
         let before: Vec<(String, i32, i32)> = self
             .doc
             .figures()
             .figures()
             .iter()
-            .map(|f| (f.key.clone(), f.spec.w, f.spec.h))
+            .map(|f| (f.stable_id.clone(), f.spec.w, f.spec.h))
             .collect();
         let released = self.doc.relayout();
         self.close_apps_whose_figure_is_gone(&released);
@@ -485,7 +488,7 @@ impl EmthinState {
             let changed = self
                 .doc
                 .figures()
-                .get(key)
+                .by_stable_id(key)
                 .is_some_and(|f| (f.spec.w, f.spec.h) != (*w, *h));
             if changed {
                 crate::handlers::apps::reconfigure_after_resize(self, key);
