@@ -15,8 +15,14 @@
 //! - **page space** — the placed page's rect in output-local logical px.
 //! - **output space** — the host window, 0,0 at the top-left.
 //!
-//! Zoom is fixed at 1.0 in v1; the map is written so adding it is a
-//! scale factor on `doc_to_screen` and nothing else.
+//! **scale space** — between page and output. The page is scaled to fit the
+//! viewport (the letterbox), and that factor applies to *everything* mapped from
+//! page space to output space: figures, caret, selection boxes, and click
+//! hit-testing. It used to apply to the page raster alone, so every mapping
+//! disagreed with what was drawn whenever the window was smaller than the page.
+//!
+//! Zoom is fixed at 1.0 in v1; this letterbox factor is not zoom — it is the
+//! fit-to-window scale, and it is already accounted for.
 
 use mathed_core::figures::FigureRect;
 use mathed_mini::{layout_doc_paged, PageLayout, RenderError};
@@ -131,7 +137,7 @@ impl DocLayoutCache {
             .expect("position() found the key in this page");
         Some(PlacedFigure {
             page,
-            rect: translate(fr, rect.loc),
+            rect: translate(fr, rect.loc, page_scale(self.page_size, rect.size) as f32),
         })
     }
 
@@ -153,9 +159,10 @@ impl DocLayoutCache {
     /// output-local logical px.
     pub fn doc_to_screen(&self, doc: Point<f64, Logical>) -> Point<i32, Logical> {
         let page = self.page_rect();
+        let scale = page_scale(self.page_size, page.size);
         Point::from((
-            page.loc.x + doc.x.round() as i32,
-            page.loc.y + doc.y.round() as i32,
+            page.loc.x + (doc.x * scale).round() as i32,
+            page.loc.y + (doc.y * scale).round() as i32,
         ))
     }
 
@@ -172,7 +179,10 @@ impl DocLayoutCache {
         if x < 0.0 || y < 0.0 || x >= f64::from(page.size.w) || y >= f64::from(page.size.h) {
             return None;
         }
-        Some(Point::new(x, y))
+        // Back into page-local px. Without this a click landed at the wrong
+        // glyph as soon as the window was smaller than the page.
+        let scale = page_scale(self.page_size, page.size);
+        Some(Point::new(x / scale, y / scale))
     }
 
     /// The caret rect for a doc byte, in output-local logical px.
@@ -216,6 +226,18 @@ impl DocLayoutCache {
 }
 
 /// Fit `content` inside `viewport`, centred — the letterbox.
+/// The letterbox factor between the page's own size and its placed rect.
+///
+/// Derived from the same `letterbox` that produced the placed rect, so the
+/// factor and the rect it came from cannot drift apart. Returns 1.0 for a
+/// degenerate page rather than dividing by zero.
+fn page_scale(content: Size<i32, Logical>, placed: Size<i32, Logical>) -> f64 {
+    if content.w <= 0 || content.h <= 0 || placed.w <= 0 || placed.h <= 0 {
+        return 1.0;
+    }
+    f64::from(placed.w) / f64::from(content.w)
+}
+
 fn letterbox(content: Size<i32, Logical>, viewport: Size<i32, Logical>) -> Rectangle<i32, Logical> {
     if content.w <= 0 || content.h <= 0 || viewport.w <= 0 || viewport.h <= 0 {
         return Rectangle::new((0, 0).into(), content);
@@ -233,15 +255,30 @@ fn letterbox(content: Size<i32, Logical>, viewport: Size<i32, Logical>) -> Recta
     )
 }
 
-fn translate(r: &mathed_core::RectF, origin: Point<i32, Logical>) -> Rectangle<i32, Logical> {
+/// Map a page-local rect to output-local logical px.
+///
+/// `scale` is the letterbox factor, **not** 1.0. The page raster is drawn scaled
+/// down to fit the viewport — an A4 page in the default 1280x800 window gets
+/// about 0.95 — so a pure translation here placed every figure, caret, selection
+/// box and dormant mark at unscaled doc coordinates while the page underneath was
+/// scaled. At scale 0.95 a figure at doc x=600 was off by ~30 px and 5% too large,
+/// and click hit-testing disagreed with what was on screen.
+///
+/// Every caller goes through `page_rect_for`, which derives the scale from the
+/// same `letterbox` the page rect comes from, so the two cannot disagree.
+fn translate(
+    r: &mathed_core::RectF,
+    origin: Point<i32, Logical>,
+    scale: f32,
+) -> Rectangle<i32, Logical> {
     Rectangle::new(
         Point::from((
-            origin.x + r.x0.round() as i32,
-            origin.y + r.y0.round() as i32,
+            origin.x + (r.x0 * scale).round() as i32,
+            origin.y + (r.y0 * scale).round() as i32,
         )),
         Size::from((
-            (r.x1 - r.x0).round().max(1.0) as i32,
-            (r.y1 - r.y0).round().max(1.0) as i32,
+            ((r.x1 - r.x0) * scale).round().max(1.0) as i32,
+            ((r.y1 - r.y0) * scale).round().max(1.0) as i32,
         )),
     )
 }
@@ -311,5 +348,111 @@ mod tests {
         let mut cache = DocLayoutCache::new();
         cache.set_current_page(99);
         assert_eq!(cache.current_page(), 0);
+    }
+
+    /// Every page→output mapping must apply the letterbox factor, because the
+    /// page raster is drawn scaled.
+    ///
+    /// The page is scaled to fit the viewport, and the factor used to reach only
+    /// `page_rect` — so a figure, the caret, a selection box and a click all
+    /// disagreed with the page underneath as soon as the window was smaller than
+    /// the page. The default 1280x800 window against an A4 page is already a
+    /// ~0.95 scale, so this was the default configuration, not an edge case.
+    ///
+    /// The round trip is the property: mapping a doc point to the screen and
+    /// back must return the point it started from.
+    #[test]
+    fn doc_and_screen_round_trip_through_the_letterbox_scale() {
+        let mut cache = DocLayoutCache::new();
+        cache.set_viewport(Size::from((1280, 800)));
+        cache
+            .rebuild("Hello, world", &mathed_core::TransformOptions::default())
+            .expect("layout");
+
+        // Force a non-1:1 fit: a page taller than the viewport.
+        let scale = page_scale(cache.page_size, cache.page_rect().size);
+        assert!(
+            scale < 1.0,
+            "the fixture must actually downscale, got scale {scale} \
+             (page {:?} in a 1280x800 viewport)",
+            cache.page_size
+        );
+
+        for doc in [
+            Point::new(10.0f64, 10.0),
+            Point::new(200.0, 300.0),
+            Point::new(
+                cache.page_size.w as f64 - 1.0,
+                cache.page_size.h as f64 - 1.0,
+            ),
+        ] {
+            let screen = cache.doc_to_screen(doc);
+            let back = cache
+                .screen_to_doc(Point::new(f64::from(screen.x), f64::from(screen.y)))
+                .unwrap_or_else(|| panic!("{doc:?} mapped to {screen:?}, outside the page"));
+            assert!(
+                (back.x - doc.x).abs() <= 1.0 && (back.y - doc.y).abs() <= 1.0,
+                "round trip drifted: {doc:?} -> {screen:?} -> {back:?} (scale {scale})"
+            );
+        }
+    }
+
+    /// A figure's placed rect must fit inside the placed page, scaled with it.
+    /// Before the fix it was placed at unscaled doc coordinates while the page
+    /// was drawn scaled, so a figure near the right edge landed past the page
+    /// boundary that the raster was actually drawn to.
+    #[test]
+    fn a_figure_stays_inside_the_scaled_page() {
+        let mut cache = DocLayoutCache::new();
+        cache.set_viewport(Size::from((1280, 800)));
+        // A figure that fits the page: a 600pt figure would overflow a595pt page
+        // even at 1:1, which would be the document asking for the impossible
+        // rather than a mapping bug.
+        let doc = "#1 app #2 \\app(#1, #2, 300, 200, \"a\")";
+        cache
+            .rebuild(doc, &mathed_core::TransformOptions::default())
+            .expect("layout");
+        let scale = page_scale(cache.page_size, cache.page_rect().size);
+        assert!(scale < 1.0, "the fixture must downscale, got {scale}");
+
+        let page = cache.page_rect();
+        let placed = cache
+            .place_figure("f0")
+            .expect("the figure is in the layout");
+        let fig = placed.rect;
+        assert!(
+            fig.loc.x >= page.loc.x && fig.loc.y >= page.loc.y,
+            "figure {:?} starts before the page {page:?}",
+            fig
+        );
+        assert!(
+            fig.loc.x + fig.size.w <= page.loc.x + page.size.w
+                && fig.loc.y + fig.size.h <= page.loc.y + page.size.h,
+            "figure {:?} overflows the scaled page {page:?} (scale {scale})",
+            fig
+        );
+    }
+
+    /// A page that fits is still mapped 1:1 — the fix must not shrink a page
+    /// that did not need it.
+    #[test]
+    fn a_page_that_fits_is_mapped_one_to_one() {
+        let mut cache = DocLayoutCache::new();
+        cache.set_viewport(Size::from((4000, 4000)));
+        cache
+            .rebuild("Hello", &mathed_core::TransformOptions::default())
+            .expect("layout");
+        assert_eq!(
+            page_scale(cache.page_size, cache.page_rect().size),
+            1.0,
+            "a page smaller than the viewport must not be scaled"
+        );
+    }
+
+    /// `page_scale` must not divide by zero on a degenerate page.
+    #[test]
+    fn a_degenerate_page_scales_by_one() {
+        assert_eq!(page_scale(Size::from((0, 0)), Size::from((100, 100))), 1.0);
+        assert_eq!(page_scale(Size::from((100, 100)), Size::from((0, 0))), 1.0);
     }
 }
