@@ -140,6 +140,7 @@ impl DocUi {
                     self.model = model;
                     self.session_file = Some(file.to_path_buf());
                     self.relayout();
+                    self.restore_page_beside(file);
                     return;
                 }
             }
@@ -147,6 +148,23 @@ impl DocUi {
         self.session_file = session_file.map(std::path::Path::to_path_buf);
         self.model = DocModel::new("");
         self.relayout();
+    }
+
+    /// Restore the current page from the `session.json` beside `snapshot`.
+    ///
+    /// Best-effort by design: a missing or unreadable file leaves the page at 0
+    /// rather than refusing to open the document.
+    ///
+    /// Called *after* the document has been laid out, because the page count is
+    /// what the stored page is clamped against — the snapshot and the JSON are
+    /// written separately, so a document edited between the two can be shorter
+    /// now than it was then. `set_current_page` does the clamping.
+    fn restore_page_beside(&mut self, snapshot: &std::path::Path) {
+        let Some(json) = session_json_path(snapshot) else {
+            return;
+        };
+        let page = crate::session::SessionFile::load(&json).current_page;
+        self.layout.set_current_page(page);
     }
 
     /// Re-run layout if the document changed, then reconcile figures.
@@ -306,6 +324,9 @@ impl DocUi {
     /// Persist the document snapshot, if a session file is configured.
     pub fn save(&mut self) {
         let Some(path) = self.session_file.clone() else {
+            // A nested session with no `--session-file` keeps nothing, per the
+            // driftwm rule in §5.10: only a primary session would have a state
+            // dir it could own unconditionally.
             return;
         };
         if let Some(dir) = path.parent() {
@@ -314,6 +335,16 @@ impl DocUi {
         match std::fs::write(&path, self.model.snapshot()) {
             Ok(()) => tracing::debug!("session saved to {}", path.display()),
             Err(e) => tracing::warn!("session save failed {}: {e}", path.display()),
+        }
+        // The snapshot is the document; this is the rest — currently just which
+        // page the user was on. Written after the document so a crash between
+        // the two leaves stale bookkeeping rather than a stale document.
+        let session = crate::session::SessionFile {
+            current_page: self.current_page(),
+            ..Default::default()
+        };
+        if let Some(json) = session_json_path(&path) {
+            session.save(&json);
         }
     }
 
@@ -329,16 +360,14 @@ impl DocUi {
     }
 }
 
-/// The default session path, `$XDG_STATE_HOME/emthin/session.loro`.
-pub fn default_session_file() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".local/state"))
-                .unwrap_or_else(std::env::temp_dir)
-        });
-    base.join("emthin").join("session.loro")
+/// The `session.json` beside a given document snapshot.
+///
+/// §5.10 puts both files in one state dir, so the JSON path is derived from
+/// the `.loro` path rather than being configured separately — one flag, one
+/// directory, and no way to point them at different places by accident.
+pub fn session_json_path(snapshot: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = snapshot.parent()?;
+    Some(dir.join("session.json"))
 }
 
 /// Convenience: is `pos` inside any figure?
@@ -518,5 +547,149 @@ mod relaunch_tests {
         );
         assert_eq!(ui.first_dormant_figure(), None);
         assert_eq!(ui.relaunch_target("f0"), None);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::session::SessionFile;
+    use smithay::utils::Size;
+
+    /// A temp dir unique to one test, removed on drop.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "emthin-session-{}-{}-{}",
+                std::process::id(),
+                format!("{:?}", std::thread::current().id()),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TmpDir(path)
+        }
+        fn snapshot(&self) -> std::path::PathBuf {
+            self.0.join("doc.loro")
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A document long enough to paginate, so `current_page` can move off 0.
+    fn paged_doc() -> String {
+        let para = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+        format!("{}{}", para.repeat(60), para)
+    }
+
+    /// §5.10's check, in the part that can be tested headlessly: the document
+    /// comes back from the snapshot, and so does the page.
+    #[test]
+    fn the_document_and_the_page_come_back_after_a_restart() {
+        let tmp = TmpDir::new("roundtrip");
+        let snapshot = tmp.snapshot();
+
+        let mut first = DocUi::new();
+        first.set_viewport(Size::from((1200, 900)));
+        first.load(None, Some(&snapshot));
+        first.model_mut().replace(0..0, &paged_doc());
+        first.relayout();
+        assert!(first.page_count() > 1, "the fixture must paginate");
+        first.layout.set_current_page(first.page_count() - 1);
+        let expected = first.current_page();
+        first.save();
+
+        // A fresh UI is a relaunch: nothing carried over in memory.
+        let mut second = DocUi::new();
+        second.load(None, Some(&snapshot));
+        assert_eq!(
+            second.current_page(),
+            expected,
+            "the page must come back from session.json"
+        );
+    }
+
+    /// Without `--session-file` nothing is written at all — §5.10's nested rule.
+    /// Asserted by absence, so the drift check cannot tell a stale file from a
+    /// fresh one.
+    #[test]
+    fn no_session_file_means_nothing_is_written() {
+        let tmp = TmpDir::new("nosession");
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(None, None);
+        ui.model_mut().replace(0..0, "hello");
+        ui.relayout();
+        ui.save();
+        assert_eq!(
+            std::fs::read_dir(&tmp.0).unwrap().count(),
+            0,
+            "a nested session with no --session-file must leave no files behind"
+        );
+    }
+
+    /// A stored page past the end of a shorter document is clamped, not honoured
+    /// and not fatal. The snapshot and the JSON are written separately, so this
+    /// is reachable by deleting paragraphs between two saves.
+    #[test]
+    fn a_stored_page_beyond_the_document_is_clamped() {
+        let tmp = TmpDir::new("clamp");
+        let snapshot = tmp.snapshot();
+        SessionFile {
+            current_page: 99,
+            ..Default::default()
+        }
+        .save(&session_json_path(&snapshot).expect("a json path"));
+
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(None, Some(&snapshot));
+        assert_eq!(ui.current_page(), 0, "one page, so page 0");
+        assert!(ui.last_error().is_none(), "{:?}", ui.last_error());
+    }
+
+    /// A corrupt or foreign `session.json` must not stop the document opening.
+    #[test]
+    fn a_broken_session_json_still_opens_the_document() {
+        let tmp = TmpDir::new("broken");
+        let snapshot = tmp.snapshot();
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(None, Some(&snapshot));
+        ui.model_mut().replace(0..0, "the document text");
+        ui.relayout();
+        ui.save();
+        std::fs::write(session_json_path(&snapshot).unwrap(), b"{ not json").expect("write");
+
+        let mut reopened = DocUi::new();
+        reopened.load(None, Some(&snapshot));
+        assert!(
+            reopened.model().text().contains("the document text"),
+            "the document is the session; broken bookkeeping must not lose it"
+        );
+        assert_eq!(reopened.current_page(), 0);
+    }
+
+    /// The JSON lives *beside* the snapshot, per §5.10 — one flag, one
+    /// directory, and no way to point the two at different places.
+    #[test]
+    fn the_json_sits_beside_the_snapshot() {
+        let tmp = TmpDir::new("beside");
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(None, Some(&tmp.snapshot()));
+        ui.save();
+        assert!(tmp.snapshot().exists(), "the snapshot is written");
+        assert!(
+            tmp.0.join("session.json").exists(),
+            "and the bookkeeping beside it, not somewhere else"
+        );
     }
 }

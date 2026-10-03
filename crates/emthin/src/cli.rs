@@ -18,9 +18,14 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub doc: Option<std::path::PathBuf>,
 
-    /// Nested-session state file. Without it emthin keeps its session
-    /// in `$XDG_STATE_HOME/emthin/` only when it is the primary session
-    /// (see `session.rs`).
+    /// Nested-session state file. The document snapshot is written here and a
+    /// `session.json` beside it holds the rest of the session (currently the
+    /// current page).
+    ///
+    /// There is deliberately no default. emthin is always a *nested* session,
+    /// and §5.10's driftwm rule is that nested sessions keep nothing unless
+    /// they are told where — only a primary session may assume it owns its
+    /// state directory.
     #[arg(long, value_name = "PATH")]
     pub session_file: Option<std::path::PathBuf>,
 
