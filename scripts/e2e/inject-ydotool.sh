@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 # Step 7, configuration `ydotool`: keyboard-level injection via /dev/uinput.
 #
-# This is the only configuration that works against a *headless* compositor,
-# because it injects below Wayland entirely — the kernel hands the events to
-# whatever has the input device, and Mutter's seat picks them up like any other.
-# That also makes it the configuration that survives the compositor's own
-# key-binding machinery, which is why it is the one to reach for when you
-# actually need a key to land.
+# The daemon and the delivery path both work: `ydotoold` starts, creates a socket
+# the unprivileged side finds, and `ydotool key`/`type` deliver to it.
+#
+# **It still cannot reach emthin in a nested session, and I was wrong to claim it
+# could.** I asserted this was "the only configuration that works against a
+# headless compositor, because it injects below Wayland entirely". Measured on
+# this machine while the keys were visibly landing in a terminal:
+#
+#   nested gnome-shell (--headless): 0 fds on /dev/input/event*
+#   host gnome-shell:              14 fds on /dev/input/event*
+#
+# A nested compositor is not a display server: it never opens input devices, so
+# there is nothing for a uinput device to attach to. The host compositor owns
+# evdev, sees the new device, and routes the keys to *its* focused client -- the
+# terminal. That is exactly what happened.
+#
+# So `ydotool` is the right tool when emthin owns the seat (a spare VT, or not
+# nested at all), and cannot be the answer for a nested session. For that, see
+# `inject-xdotool.sh`: XTEST enters through the nested compositor's own X window,
+# which is the only path that does not require owning the input devices.
 #
 # It needs write access to /dev/uinput, which is root:root 0600 on a stock
 # NixOS box, so it needs sudo. There are two ways to run it, and they differ in

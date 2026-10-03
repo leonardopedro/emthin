@@ -49,10 +49,39 @@ each for a different and checked reason:
 | `xdotool` | X11 + XTEST | Needs a window on an X display. Mutter can only run `--headless` here: run non-headless it tries to take the logind session and fails `Failed to take control of the session: EBUSY`, because the real session already owns it. Headless Mutter draws to no X window, so there is nothing for XTEST to target. |
 
 So the E2E drives what it can over the IPC control socket, and §6 step 7
-stays open. On a host where `/dev/uinput` is group-writable, `ydotool`
-is the one to reach for: it needs no compositor support at all. Where
-the compositor implements `zwp_virtual_keyboard_v1`, `wtype` is the
-least invasive.
+stays open.
+
+### The one that cannot work nested, measured
+
+`ydotool` deserves its own note, because it is the intuitive answer and it
+is the wrong one. The daemon starts, creates a socket, and `ydotool key`
+delivers to it — measured on this machine, with the injected characters
+appearing in a terminal:
+
+```
+nested gnome-shell (--headless):  0 fds on /dev/input/event*
+host gnome-shell:               14 fds on /dev/input/event*
+```
+
+A nested compositor is not a display server. It never opens input devices,
+so a uinput device has nothing to attach to: the *host* compositor owns evdev,
+notices the new device, and routes the keys to its own focused client. The
+nesting boundary is below the input stack, not above it.
+
+So the working configurations are:
+
+- **`xdotool`, from a TTY.** The nested compositor is run non-headless, which
+  makes it map a real X window; XTEST into that window enters the nested seat
+  through the compositor's own window rather than through the input devices. It
+  needs the logind session to be unowned, which is why it fails with `EBUSY`
+  from inside a desktop session. Log out, or switch to a VT.
+- **`ydotool`, when emthin owns the seat.** Not nested, or on a spare VT: then
+  emthin's compositor *is* the display server, opens the devices, and a uinput
+  device is just another keyboard to it.
+- **`wtype`**, under a compositor that implements
+  `zwp_virtual_keyboard_v1` — not Mutter.
+
+The clipboard half of step 7 needs none of these; see `scripts/e2e/README.md`.
 
 ## Toolchain
 

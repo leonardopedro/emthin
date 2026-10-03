@@ -80,9 +80,15 @@
               #            protocol. Unverified; see docs/build-notes.md.
               #  ydotool   uinput, kernel-level. Needs write access to
               #  dotool    /dev/uinput, which is root:root 0600 on this box, so
-              #            neither can run as an ordinary user here. Installed
-              #            anyway: on a host where uinput is group-writable they
-              #            are the fallback that needs no compositor support.
+              #            neither can run as an ordinary user without the
+              #            daemon in scripts/e2e/ydotoold-daemon.sh.
+              #
+              #            They deliver keys, and on this machine the keys went to
+              #            the *host* GNOME Shell, not into the nested session --
+              #            see the correction in inject-ydotool.sh. A nested
+              #            compositor has no input devices of its own, so uinput
+              #            cannot reach one; these are here for the case where
+              #            emthin owns the seat.
               xdotool
               wtype
               ydotool
