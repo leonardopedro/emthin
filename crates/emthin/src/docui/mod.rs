@@ -1031,4 +1031,128 @@ mod page_tests {
             "a figure on the visible page must remain hittable"
         );
     }
+
+    /// An app bound to a figure must survive an edit *above* that figure.
+    ///
+    /// A figure's layout key is `f<stmt-index>`, so inserting an `\app` above a
+    /// running app's figure renumbers it. `sync` used to carry bindings over by
+    /// that key: the carry read whichever figure had taken the old index, and the
+    /// displaced app was reported as gone and released. So typing one new
+    /// statement above a live terminal unmapped the terminal and could hand its
+    /// surface to an unrelated figure.
+    ///
+    /// The binding is remembered against the statement's marker pair instead,
+    /// which is the document's own identity and does not renumber.
+    #[test]
+    fn an_app_binding_survives_an_insertion_above_its_figure() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut()
+            .replace(0..0, "#1 a #2 \\app(#1, #2, 200, 150, \"a\")\n");
+        ui.relayout();
+
+        let key = ui
+            .figures()
+            .figures()
+            .first()
+            .expect("one figure")
+            .key
+            .clone();
+        assert_eq!(key, "f0", "the fixture starts with a single figure");
+        ui.figures_mut().get_mut("f0").expect("f0").app_id = Some(7);
+
+        // Insert a whole new figure *above* it: the old statement becomes f1.
+        ui.model_mut()
+            .replace(0..0, "#3 new #4 \\app(#3, #4, 100, 100, \"new\")\n");
+        let released = ui.relayout();
+
+        assert!(
+            released.is_empty(),
+            "no app should be released by an insertion above it, got {released:?}"
+        );
+        assert_eq!(
+            ui.figures().get("f1").and_then(|f| f.app_id),
+            Some(7),
+            "the displaced figure lost its binding"
+        );
+        assert_eq!(
+            ui.figures().get("f0").and_then(|f| f.app_id),
+            None,
+            "the newly inserted figure must not inherit app 7"
+        );
+        // And the binding belongs to the right statement, not to the index.
+        assert_eq!(ui.figures().get("f1").unwrap().stable_id, "1>2");
+        assert_eq!(ui.figures().get("f0").unwrap().stable_id, "3>4");
+    }
+
+    /// Renumbering must not cross-assign between two bound figures.
+    #[test]
+    fn renumbering_does_not_swap_two_apps_bindings() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 a #2 \\app(#1, #2, 200, 150, \"a\")\n#3 b #4 \\app(#3, #4, 200, 150, \"b\")\n",
+        );
+        ui.relayout();
+        ui.figures_mut().get_mut("f0").expect("f0").app_id = Some(11);
+        ui.figures_mut().get_mut("f1").expect("f1").app_id = Some(22);
+
+        // Push a new figure to the very top: f0 -> f1, f1 -> f2.
+        ui.model_mut()
+            .replace(0..0, "#5 c #6 \\app(#5, #6, 100, 100, \"c\")\n");
+        let released = ui.relayout();
+
+        assert!(
+            released.is_empty(),
+            "nothing should be released: {released:?}"
+        );
+        let ids: Vec<_> = ui
+            .figures()
+            .figures()
+            .iter()
+            .map(|f| (f.key.as_str(), f.stable_id.as_str(), f.app_id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("f0", "5>6", None),
+                ("f1", "1>2", Some(11)),
+                ("f2", "3>4", Some(22)),
+            ],
+            "each app must stay with its own statement across a renumbering"
+        );
+    }
+
+    /// Deleting a figure must still release its app — matching on the marker pair
+    /// must not make bindings immortal.
+    #[test]
+    fn deleting_a_figure_still_releases_its_app() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 a #2 \\app(#1, #2, 200, 150, \"a\")\n#3 b #4 \\app(#3, #4, 200, 150, \"b\")\n",
+        );
+        ui.relayout();
+        ui.figures_mut().get_mut("f1").expect("f1").app_id = Some(22);
+
+        // Delete the second figure outright.
+        let text = ui.model().text().to_string();
+        let cut = text.find("#3 b").expect("the second figure's caption");
+        let end = text[cut..]
+            .find('\n')
+            .map(|n| cut + n + 1)
+            .unwrap_or(text.len());
+        ui.model_mut().replace(cut..end, "");
+        let released = ui.relayout();
+
+        assert_eq!(
+            released,
+            vec![22],
+            "the deleted figure's app must be released"
+        );
+        assert_eq!(ui.figures().figures().len(), 1);
+        assert_eq!(ui.figures().get("f0").and_then(|f| f.app_id), None);
+    }
 }

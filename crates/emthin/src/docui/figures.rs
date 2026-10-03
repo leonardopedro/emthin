@@ -21,8 +21,22 @@ use crate::docui::model::DocModel;
 /// One `\app` statement in the document, as a placed figure.
 #[derive(Debug, Clone)]
 pub struct Figure {
-    /// `f<stmt-index>` — stable for the lifetime of the statement.
+    /// `f<stmt-index>` — the key `mathed_core` mints for this pass.
+    ///
+    /// Layout-addressed and **not** stable: it is the statement's index, so
+    /// inserting an `\app` above this one renumbers it. Fine for addressing the
+    /// frame that was just laid out, which is all `place_figure` does with it.
+    /// Never use it to remember anything across a `sync` — see
+    /// [`Figure::stable_id`].
     pub key: String,
+    /// The statement's own marker pair (`#3`/`#7`), as `"3>7"`.
+    ///
+    /// This is the figure's identity *between* layouts, and the thing app
+    /// bindings must be remembered against. Markers are the document's own
+    /// identity scheme and first-occurrence-wins, so a statement keeps its pair
+    /// however the text above it is edited — inserting a figure above renumbers
+    /// `key` and leaves `stable_id` alone.
+    pub stable_id: String,
     /// Index of the `\app` statement in `MarkerScan::stmts`.
     pub stmt: usize,
     /// The statement's parsed arguments (declared size + binding id).
@@ -95,6 +109,11 @@ impl FigureManager {
         self.figures.iter().find(|f| f.key == key)
     }
 
+    /// The figure for a statement's marker pair — see [`Figure::stable_id`].
+    pub fn by_stable_id(&self, stable_id: &str) -> Option<&Figure> {
+        self.figures.iter().find(|f| f.stable_id == stable_id)
+    }
+
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Figure> {
         self.figures.iter_mut().find(|f| f.key == key)
     }
@@ -165,8 +184,13 @@ impl FigureManager {
             let Some(figure) = crate::docui::edit::figure_from_segment(seg) else {
                 continue;
             };
-            // Carry over the binding this statement had last time.
-            let carried = self.get(&figure.key);
+            // Carry over the binding this statement had last time — matched on
+            // `stable_id`, not `key`. `key` is the statement's index, so typing
+            // an `\app` above a running app's figure renumbered it: the carry
+            // read the *wrong* figure's binding, and the displaced app was
+            // reported as gone and released. One edit above a figure could
+            // therefore unmap a live app and hand its surface to another one.
+            let carried = self.by_stable_id(&figure.stable_id);
             figures.push(Figure {
                 page: None,
                 rect: Rectangle::default(),
@@ -177,12 +201,13 @@ impl FigureManager {
         }
 
         // Drop the figures whose statements went away, reporting the
-        // apps that no longer have a home.
-        let live: Vec<&str> = figures.iter().map(|f| f.key.as_str()).collect();
+        // apps that no longer have a home. Matched on `stable_id` for the
+        // same reason as the carry above.
+        let live: Vec<&str> = figures.iter().map(|f| f.stable_id.as_str()).collect();
         for gone in self
             .figures
             .iter()
-            .filter(|f| !live.contains(&f.key.as_str()))
+            .filter(|f| !live.contains(&f.stable_id.as_str()))
         {
             if let Some(app_id) = gone.app_id {
                 released.push(app_id);
@@ -241,6 +266,7 @@ mod tests {
     fn figure(key: &str, x: i32, y: i32, w: i32, h: i32) -> Figure {
         Figure {
             key: key.to_string(),
+            stable_id: key.to_string(),
             stmt: 0,
             spec: FigureSpec {
                 w,

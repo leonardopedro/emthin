@@ -25,6 +25,7 @@ pub fn figure_from_segment(seg: &Segment) -> Option<Figure> {
     let (w_arg, h_arg) = arg_ranges(&seg.extra_args)?;
     Some(Figure {
         key: resolved.key,
+        stable_id: stable_figure_id(seg),
         stmt: seg.stmt,
         spec: resolved.spec,
         span: resolved.span,
@@ -35,6 +36,20 @@ pub fn figure_from_segment(seg: &Segment) -> Option<Figure> {
         app_id: None,
         title: None,
     })
+}
+
+/// A figure's identity across layouts: its marker pair, `"3>7"`.
+///
+/// The layout key (`f<stmt-index>`) is minted fresh per pass and renumbers when
+/// the document is edited above the statement, so it cannot carry state. The
+/// marker pair can: markers resolve first-occurrence-wins, so a statement's `#3`
+/// and `#7` are the same text however much is inserted above them.
+pub fn stable_figure_id(seg: &Segment) -> String {
+    format!(
+        "{}>{}",
+        seg.start_id.trim_start_matches('#'),
+        seg.end_id.trim_start_matches('#')
+    )
 }
 
 /// The doc byte ranges of the first two literal args (`w`, `h`).
