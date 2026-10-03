@@ -123,12 +123,15 @@ pub fn set_figure_id(model: &mut DocModel, figure: &Figure, id: Option<&str>) ->
     let stmt = &model.scan().stmts[figure.stmt];
     match id {
         Some(id) => {
+            // Escaped like `append_figure`: a `"` here closes the argument list
+            // and renames the figure's binding behind the caller's back.
+            let quoted = format!("\"{}\"", escape_arg(id));
             if let Some(range) = seg.extra_args.get(2).and_then(literal_range) {
-                model.replace_keeping_caret(range, &format!("\"{id}\""));
+                model.replace_keeping_caret(range, &quoted);
             } else {
                 // No id arg yet: insert one before the closing paren.
                 let at = stmt.range.end.saturating_sub(1);
-                model.replace_keeping_caret(at..at, &format!(", \"{id}\""));
+                model.replace_keeping_caret(at..at, &format!(", {quoted}"));
             }
         }
         None => {
@@ -172,16 +175,29 @@ pub fn set_figure_id(model: &mut DocModel, figure: &Figure, id: Option<&str>) ->
 ///
 /// The result is client-triggered corruption of the user's persisted document,
 /// which autosaves every five seconds.
+/// A newline cannot survive either slot: `\\app` starts a statement anywhere it
+/// appears, and a blank line ends a paragraph, so both are ways out of the
+/// string being escaped. A newline in `set_title` is entirely legal.
 fn escape_arg(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], " ")
 }
 
 /// Escape a client-supplied caption for the document body.
 ///
 /// Backslash-escaping is the document's own convention, so a `\` the user meant
 /// literally round-trips rather than becoming a Typst escape.
+///
+/// A newline becomes a space: the caption is spliced into the document body
+/// immediately before the closing marker, so an embedded `\n` lets a client
+/// write its own statement — with its own `w`/`h` and its own binding id — into
+/// the user's document. The escape scanner treats `\n` as an ordinary character,
+/// so escaping it as text would not help; the character itself has to go.
 fn escape_caption(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('#', "\\#")
+    s.replace('\\', "\\\\")
+        .replace('#', "\\#")
+        .replace(['\n', '\r'], " ")
 }
 
 pub fn append_figure(
@@ -190,6 +206,33 @@ pub fn append_figure(
     w: i32,
     h: i32,
     id: Option<&str>,
+) -> String {
+    append_figure_source(
+        model,
+        &escape_caption(caption),
+        w,
+        h,
+        id.map(escape_arg).as_deref(),
+    )
+}
+
+/// Append a figure statement whose caption and id are already **document
+/// source**, written through verbatim.
+///
+/// `append_figure` escapes, because its inputs are a client's `set_title` and
+/// `set_app_id`. `clone_figure` must not: it reads the caption back out of the
+/// document and hands it here, so the text is already escaped. Routing it
+/// through the escaping writer double-escaped it — every `Ctrl+Shift+M` added a
+/// visible backslash per `\` and per `#`, in a document that autosaves every five
+/// seconds. The id was worse: `app_figure_spec` unquotes the literal but never
+/// unescapes it, so `spec.id` still holds the escaped form and re-escaping made
+/// the clone's binding id differ from the original's, leaving the mirror dormant.
+fn append_figure_source(
+    model: &mut DocModel,
+    caption_source: &str,
+    w: i32,
+    h: i32,
+    id_source: Option<&str>,
 ) -> String {
     let ids = lowest_free_marker_numbers(model.scan(), 2);
     let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
@@ -201,11 +244,9 @@ pub fn append_figure(
     // is that word behind a `#`.
     let start = format!("#{}", auto_marker_id(a));
     let end = format!("#{}", auto_marker_id(b));
-    let id_arg = id.map_or_else(String::new, |id| format!(", \"{}\"", escape_arg(id)));
-    let statement = format!(
-        "{start} {} {end} \\app({start}, {end}, {w}, {h}{id_arg})\n",
-        escape_caption(caption)
-    );
+    let id_arg = id_source.map_or_else(String::new, |id| format!(", \"{id}\""));
+    let statement =
+        format!("{start} {caption_source} {end} \\app({start}, {end}, {w}, {h}{id_arg})\n");
     // A statement is a block: never glue it onto the tail of the last
     // line, or it lands inside the previous statement's argument list.
     let at = model.text().len();
@@ -225,9 +266,11 @@ pub fn append_figure(
 ///
 /// Returns the appended text.
 pub fn clone_figure(model: &mut DocModel, figure: &Figure) -> String {
+    // Both values are document source already: the caption is a slice of the
+    // text, and `spec.id` is the literal as written (unquoted, not unescaped).
     let caption = model.text()[figure.span.clone()].trim().to_string();
     let id = figure.spec.id.clone();
-    append_figure(model, &caption, figure.spec.w, figure.spec.h, id.as_deref())
+    append_figure_source(model, &caption, figure.spec.w, figure.spec.h, id.as_deref())
 }
 
 /// The default size a new app should get: the size of the first
@@ -505,5 +548,184 @@ mod tests {
             text.contains(r#""alacritty""#),
             "nor an ordinary id: {text}"
         );
+    }
+
+    /// Cloning must be byte-exact: the caption read back out of the document is
+    /// already escaped source.
+    ///
+    /// `clone_figure` feeds a slice of the document text into `append_figure`,
+    /// which escapes client strings. Escaping already-escaped source added a
+    /// visible backslash per `\` and per `#` on every `Ctrl+Shift+M`, in a
+    /// document that autosaves every five seconds.
+    #[test]
+    fn cloning_a_figure_whose_caption_needs_escaping_is_byte_exact() {
+        let mut model = DocModel::new("");
+        const CAPTION: &str = "C# notes — see D:\\draft \"quoted\"";
+        append_figure(&mut model, CAPTION, 640, 400, Some("term"));
+        let after_append = model.text().to_string();
+
+        let figure = crate::docui::edit::figure_from_segment(
+            model
+                .segments()
+                .iter()
+                .find(|s| s.kind.is_app())
+                .expect("the appended figure"),
+        )
+        .expect("a figure");
+
+        clone_figure(&mut model, &figure);
+        let text = model.text().to_string();
+
+        // The marker ids are *meant* to differ — a clone gets fresh ones so it
+        // cannot collide with the original. The caption, though, must be
+        // identical text, so the escaped caption appears exactly twice.
+        let escaped = escape_caption(CAPTION);
+        assert_eq!(
+            after_append.matches(escaped.as_str()).count(),
+            1,
+            "the fixture must contain the escaped caption once: {after_append:?}"
+        );
+        assert_eq!(
+            text.matches(escaped.as_str()).count(),
+            2,
+            "the clone must reproduce the caption verbatim: {text:?}"
+        );
+        // The double-escaped forms are what a second trip through
+        // `append_figure` would leave behind.
+        assert!(
+            !text.contains(r"\\#"),
+            "the `#` was escaped twice: {text:?}"
+        );
+        assert!(
+            !text.contains(r"\\\\draft"),
+            "the `\\` was escaped twice: {text:?}"
+        );
+    }
+
+    /// The clone's binding id must be the original's, or the mirror never binds.
+    ///
+    /// `app_figure_spec` unquotes a literal but never unescapes it, so `spec.id`
+    /// still holds the escaped form. Re-escaping it produced a different id, and
+    /// `matches_id` never matched the clone — the mirror stayed dormant and was
+    /// offered to the next app that arrived.
+    #[test]
+    fn a_clones_binding_id_matches_the_originals() {
+        let mut model = DocModel::new("");
+        // An id with a quote and a backslash: exactly what re-escaping broke.
+        append_figure(&mut model, "t", 640, 400, Some(r#"a"b\c"#));
+        let seg = model
+            .segments()
+            .iter()
+            .find(|s| s.kind.is_app())
+            .expect("a figure")
+            .clone();
+        let figure = crate::docui::edit::figure_from_segment(&seg).expect("a resolvable figure");
+
+        clone_figure(&mut model, &figure);
+        model.take_dirty();
+        model.scan();
+
+        let ids: Vec<_> = model
+            .segments()
+            .iter()
+            .filter(|s| s.kind.is_app())
+            .map(|s| {
+                mathed_core::figures::app_figure_spec(&s.extra_args)
+                    .and_then(|spec| spec.id)
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "two figures after a clone: {ids:?}");
+        assert_eq!(
+            ids[0], ids[1],
+            "the clone's binding id must equal the original's"
+        );
+    }
+
+    /// A newline in a client title must not break the statement's line.
+    ///
+    /// The caption is spliced into the document body immediately before the
+    /// closing marker, so an embedded newline puts the rest of the statement on
+    /// a second line — and a client sending `\n\n` splits the caption into a new
+    /// paragraph, moving the figure's label out from under it. Newlines are legal
+    /// in `set_title`.
+    ///
+    /// Note this could not inject a *statement*: `escape_caption` escapes `\`
+    /// before anything else, so the attacker's `\app` arrives as `\\app` and the
+    /// scanner never sees a backslash. What the newline did do was break the
+    /// line, which is what this pins.
+    #[test]
+    fn a_newline_in_a_title_does_not_break_the_statements_line() {
+        let mut model = DocModel::new("");
+        append_figure(&mut model, "x\n\ny", 640, 400, Some("real"));
+        let text = model.text();
+        assert_eq!(
+            text.trim_end().lines().count(),
+            1,
+            "the title split the statement across lines: {text:?}"
+        );
+        assert!(
+            text.contains("x  y"),
+            "the newlines should read as spaces: {text:?}"
+        );
+    }
+
+    /// The same for a newline in a binding id.
+    #[test]
+    fn a_newline_in_an_id_does_not_break_the_statements_line() {
+        let mut model = DocModel::new("");
+        append_figure(&mut model, "t", 640, 400, Some("a\nb"));
+        let text = model.text().to_string();
+        assert_eq!(
+            text.trim_end().lines().count(),
+            1,
+            "the id split the statement across lines: {text}"
+        );
+        model.take_dirty();
+        model.scan();
+        let apps: Vec<_> = model
+            .segments()
+            .iter()
+            .filter(|s| s.kind.is_app())
+            .collect();
+        assert_eq!(apps.len(), 1, "{text}");
+        let spec = mathed_core::figures::app_figure_spec(&apps[0].extra_args).expect("spec");
+        assert_eq!((spec.w, spec.h), (640, 400));
+    }
+
+    /// `set_figure_id` writes into the same argument list and must escape too.
+    #[test]
+    fn setting_a_hostile_id_cannot_close_the_argument_list() {
+        let mut model = DocModel::new("");
+        append_figure(&mut model, "t", 640, 400, None);
+        model.take_dirty();
+        model.scan();
+        let seg = model
+            .segments()
+            .iter()
+            .find(|s| s.kind.is_app())
+            .cloned()
+            .expect("a figure");
+        let mut figure =
+            crate::docui::edit::figure_from_segment(&seg).expect("a resolvable figure");
+
+        assert!(set_figure_id(&mut model, &figure, Some(r#"x", 1, 1, "y"#)));
+        model.take_dirty();
+        model.scan();
+
+        let apps: Vec<_> = model
+            .segments()
+            .iter()
+            .filter(|s| s.kind.is_app())
+            .collect();
+        assert_eq!(apps.len(), 1, "{:?}", model.text());
+        let spec = mathed_core::figures::app_figure_spec(&apps[0].extra_args).expect("spec");
+        assert_eq!(
+            (spec.w, spec.h),
+            (640, 400),
+            "a quote in the id must not be able to rewrite w/h"
+        );
+        assert!(spec.id.as_deref().unwrap_or_default().contains('\\'));
+        figure.app_id = None;
     }
 }
