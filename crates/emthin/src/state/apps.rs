@@ -146,6 +146,34 @@ impl AppManager {
             .and_then(|w| w.geometry)
     }
 
+    /// Record the geometry a figure-bound app is being configured into.
+    ///
+    /// `geometry` is the app's *source box* — the size the client is being asked
+    /// to commit at — and `figure_render` reads only its size, to decide whether
+    /// the client honoured the configure. It is deliberately not written on the
+    /// spot: the buffer has to arrive first, or the compositor would composite a
+    /// size the client never produced. The commit handler in `handlers/compositor`
+    /// promotes pending to committed, and `collect_timed_out` force-commits an
+    /// app whose client never answers.
+    ///
+    /// Nothing ever assigned `pending_geometry`, so the promotion could not
+    /// happen and `geometry` stayed `None` for every app for the life of the
+    /// process. `figure_render` skips a figure whose app has no geometry, which
+    /// made the whole per-figure path — surface-tree walk, aspect-fit stretch,
+    /// per-figure damage ids — unreachable, and `figure_surface_under` always
+    /// returned `None` so clicks never mapped into a figure.
+    pub fn set_pending_geometry(&mut self, window_id: u64, geo: Rectangle<i32, Logical>) -> bool {
+        let Some(app) = self.windows.get_mut(&window_id) else {
+            return false;
+        };
+        if app.geometry == Some(geo) {
+            return false;
+        }
+        app.pending_geometry = Some(geo);
+        app.pending_since = Some(Instant::now());
+        true
+    }
+
     /// Collect embedded app windows whose pending geometry has timed out.
     /// Returns (window_id, window, geo) for each; caller must `map_element`.
     pub fn collect_timed_out(

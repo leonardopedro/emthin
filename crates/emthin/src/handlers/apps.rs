@@ -133,6 +133,10 @@ pub fn register_embedded_app(
         });
 
     configure_to_figure(&surface, spec.w, spec.h);
+    // The source box `figure_render` composites against. Only recorded once the
+    // client is bound, because that is when there is a figure rect to take a
+    // location from.
+    note_figure_geometry(state, window_id, &figure_key, spec.w, spec.h);
 
     state.ipc.send(OutgoingMessage::FigureBound {
         figure: figure_key.clone(),
@@ -222,6 +226,24 @@ pub fn configure_to_figure(surface: &ToplevelSurface, w: i32, h: i32) {
     surface.send_pending_configure();
 }
 
+/// Record `app_id`'s pending geometry from the figure it is bound to.
+///
+/// The location is the figure's placed rect, because that is where the element is
+/// mapped so the app keeps receiving frame callbacks; the size is the figure's
+/// *declared* size, because that is what the client is being configured into and
+/// therefore what `figure_render` must measure the client's buffer against.
+fn note_figure_geometry(state: &mut EmthinState, app_id: u64, figure_key: &str, w: i32, h: i32) {
+    let loc = state
+        .doc
+        .figures()
+        .get(figure_key)
+        .map(|f| f.rect.loc)
+        .unwrap_or_default();
+    state
+        .apps
+        .set_pending_geometry(app_id, Rectangle::new(loc, Size::from((w, h))));
+}
+
 /// Reconfigure the app bound to `figure_key` to the figure's current
 /// size, and report the new geometry to the control plane.
 ///
@@ -241,6 +263,7 @@ pub fn reconfigure_after_resize(state: &mut EmthinState, figure_key: &str) {
                 configure_to_figure(toplevel, w, h);
             }
         }
+        note_figure_geometry(state, app_id, figure_key, w, h);
     }
     // Keep the app mapped at the figure's rect so it keeps receiving
     // frame callbacks; `figure_render` does the actual compositing.
