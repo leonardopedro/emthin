@@ -229,8 +229,26 @@ impl DocUi {
     /// nothing. `PgUp` was permanently a no-op.
     ///
     /// One copy, set through the layout, which clamps.
+    /// Adopt `page` as the laid-out page.
+    ///
+    /// Forces a re-sync, because a figure's rect is only correct for the page it
+    /// was placed on: `page_rect_for` hands an off-page figure the origin and the
+    /// page size as a placeholder, and `place_figure` reads the letterbox factor
+    /// back out of whatever that returned. So after a switch every figure was
+    /// still carrying the rect computed for the *previous* page — the newly
+    /// visible one had the unscaled placeholder at the page origin, and the one
+    /// that went off-page still had its placed rect.
+    ///
+    /// Found by running the compositor: over IPC, `goto_page 1` reported the
+    /// second figure at exactly its declared 320x240 while the first had been
+    /// correctly scaled to 559x350 from a declared 640x400. The placeholder is
+    /// unscaled, so an unscaled rect on the now-visible page is the tell.
+    ///
+    /// The stale rect then drove compositing, hit-testing, the focus border, the
+    /// dormant labels and the IME origin.
     pub fn on_page_changed(&mut self, page: usize) {
         self.layout.set_current_page(page);
+        self.model.mark_dirty();
     }
 
     /// Record (or clear) an app's title.
@@ -1319,6 +1337,66 @@ mod page_tests {
         assert!(
             after.loc.x >= page.loc.x && after.loc.x + after.size.w <= page.loc.x + page.size.w,
             "the re-placed figure {after:?} must sit inside the new page {page:?}"
+        );
+    }
+
+    /// Switching pages must re-place the figure rects.
+    ///
+    /// A figure's rect is only correct for the page it was placed on: an off-page
+    /// figure gets the origin and the page size as a placeholder, and
+    /// `place_figure` derives the letterbox factor from whatever `page_rect_for`
+    /// returned — so the placeholder yields an *unscaled* rect. After a switch
+    /// every figure still carried the rect computed for the previous page.
+    ///
+    /// Found by running the compositor for the first time: over IPC, `goto_page 1`
+    /// reported the second figure at exactly its declared 320x240, while the first
+    /// had been correctly scaled from a declared 640x400 to 559x350. The stale
+    /// rect then drove compositing, hit-testing, the focus border, the dormant
+    /// labels and the IME origin.
+    #[test]
+    fn switching_pages_re_places_the_figure_rects() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1272, 736)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 notes #2 \\app(#1, #2, 640, 400, \"foot\")\n\
+             prose that pushes the next figure onto a second page\n\
+             #3 chat #4 \\app(#3, #4, 320, 240, \"foot\")\n",
+        );
+        ui.relayout();
+        assert!(ui.page_count() > 1, "the fixture must paginate");
+
+        // On page 0: the first figure is placed and scaled, the second is not.
+        let first = ui.figures().get("f0").expect("f0").rect;
+        assert!(
+            first.size.w < 640,
+            "the visible figure must be letterboxed, got {first:?}"
+        );
+        assert!(
+            ui.figures().get("f1").expect("f1").page != Some(0),
+            "the second figure must be off page 0"
+        );
+
+        ui.on_page_changed(1);
+        assert!(
+            ui.model().is_dirty(),
+            "a page change must force the figure re-sync"
+        );
+        ui.relayout();
+
+        // Now page 1 is visible: the second figure must be placed *and scaled*,
+        // and the first must no longer be the placed one.
+        let second = ui.figures().get("f1").expect("f1").rect;
+        assert_eq!(ui.figures().get("f1").expect("f1").page, Some(1));
+        assert!(
+            second.size.w < 320,
+            "the newly visible figure must be letterboxed too, got {second:?} \
+             (320x240 is the unscaled placeholder)"
+        );
+        let scale = second.size.w as f64 / 320.0;
+        assert!(
+            (scale - 0.87).abs() < 0.05,
+            "both figures must share the page's letterbox factor, got {scale}"
         );
     }
 }

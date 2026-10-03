@@ -603,6 +603,10 @@ impl EmthinState {
             pointer.frame(self);
         }
 
+        // `on_page_changed` marked the document dirty so the figure rects get
+        // re-placed against the new page; this is what does the work.
+        self.relayout_document();
+
         tracing::info!("switched to page {page}");
         self.needs_redraw = true;
         true

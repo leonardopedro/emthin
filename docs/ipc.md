@@ -158,13 +158,24 @@ zero-sized for a figure that isn't on the visible page.
 ## Figure keys
 
 A figure's `key` is `f<stmt-index>` — the `\app` statement's index in
-the document's statement list. It is **stable for the lifetime of the
-statement**: it does not change when the document is edited elsewhere,
-and it disappears only when the statement itself is deleted.
+the document's statement list.
 
-Keys are *not* revision-stamped. A client that caches a key across
-edits will keep pointing at the same figure; a client that wants to be
-sure should re-`list_state` after an edit it made itself.
+It is a **per-pass layout address, not an identity.** It changes
+whenever the document is edited *above* the statement, because that
+renumbers it. `mathed_core::figures::figure_key` mints it fresh on
+every render and `figures_in_frame` consumes it on the frame that same
+pass produced, which is the only thing it is for.
+
+So:
+
+- a client that caches a key across an edit it made itself may be
+  pointing at a different statement — re-`list_state`;
+- a client that wants to refer to a figure *across* edits has nothing
+  stable to hold. The compositor itself remembers app bindings against
+  the statement's marker pair (`Figure::stable_id`), which does survive
+  an insertion above, but that is not exposed on the wire. An
+  `insert_above_figure` request would be the honest fix; until it
+  exists, treat a key as valid only until the next edit.
 
 ## Ext-workspace-v1
 
