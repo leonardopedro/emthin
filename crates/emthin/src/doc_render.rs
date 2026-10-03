@@ -14,9 +14,11 @@ use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            element::{texture::TextureRenderElement, Id, Kind},
-            gles::{GlesRenderer, GlesTexture},
-            ContextId, ImportMem, Renderer,
+            element::{
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                Kind,
+            },
+            gles::GlesRenderer,
         },
     },
     utils::{Logical, Rectangle, Size, Transform},
@@ -31,7 +33,15 @@ use crate::element::CustomElement;
 /// document revision (so any edit re-imports).
 #[derive(Default)]
 pub struct DocPageTexture {
-    texture: Option<GlesTexture>,
+    /// The page's pixels, owned. `MemoryRenderBuffer` copies the slice into an
+    /// `Arc`, and `import_texture` caches the GL texture per context and uploads
+    /// only the damaged region, so keeping the buffer here costs one copy per
+    /// *document revision* and nothing per frame.
+    buffer: Option<MemoryRenderBuffer>,
+    /// The width the current buffer was built at, so a resize is visible without
+    /// reaching into the buffer type. Only the tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    width: usize,
     key: Option<(usize, u64)>,
 }
 
@@ -59,7 +69,7 @@ impl DocPageTexture {
     /// Drop the cached texture. Called when the GL context is lost or
     /// rebuilt (a resize that re-creates the winit surface).
     pub fn clear(&mut self) {
-        self.texture = None;
+        self.buffer = None;
         self.key = None;
     }
 
@@ -68,15 +78,59 @@ impl DocPageTexture {
         self.key != Some((page, revision))
     }
 
+    /// Copy `pixels` into an owned buffer, replacing any previous one.
+    ///
+    /// Split out of [`Self::element`] so the ownership claim is testable without
+    /// a GL context: the point is that the previous buffer is *dropped* here,
+    /// which is what a leaked `&'static [u8]` could never be checked for.
+    fn adopt(&mut self, pixels: &PagePixels<'_>) {
+        let size = Size::new(pixels.width as i32, pixels.height as i32);
+        // `from_slice` copies into an `Arc`, so the bytes are owned and are
+        // released when the previous buffer is dropped.
+        self.buffer = Some(MemoryRenderBuffer::from_slice(
+            pixels.rgba,
+            Fourcc::Rgba8888,
+            size,
+            // Buffer scale and transform describe the pixels themselves, not
+            // where they land on screen; the element's `size` places them.
+            256,
+            Transform::Normal,
+            None,
+        ));
+        self.width = pixels.width as usize;
+        self.key = Some((pixels.page, pixels.revision));
+    }
+
+    /// How many page buffers this cache is holding. Always 0 or 1; a method so a
+    /// test can say so rather than trusting the type.
+    #[cfg(test)]
+    fn buffer_count(&self) -> usize {
+        usize::from(self.buffer.is_some())
+    }
+
+    /// The width the current buffer was built at. Kept alongside it so the
+    /// ownership tests can check that a resize propagates without depending on
+    /// `MemoryRenderBuffer::size`, which is not reachable in this build.
+    #[cfg(test)]
+    fn buffer_width(&self) -> usize {
+        self.width
+    }
+
     /// Import the page's pixels if they differ from what's cached, and
     /// return the render element placing it at `rect`.
     ///
-    /// `import_memory` keeps a reference to the slice, so the buffer has
-    /// to outlive the texture. The bytes are therefore leaked per
-    /// re-import: pages re-import on *edit*, not on pointer motion, so
-    /// this is bounded by typing speed rather than frame rate, and the
-    /// alternative (a persistent staging buffer with explicit fences) is
-    /// a lot of machinery to avoid a few hundred MB over a long session.
+    /// The pixels go through `MemoryRenderBuffer`, which **owns** its copy of
+    /// the slice, so nothing is leaked.
+    ///
+    /// This used to be `Box::leak(pixels.rgba.to_vec())` per re-import, because
+    /// `import_memory` borrows the slice for the texture's lifetime and wants a
+    /// `&'static [u8]`. The re-import key is the document *revision*, which every
+    /// keystroke bumps, and an A4 page at 1px/pt is 595x842x4 B — about 2 MB —
+    /// so that leaked roughly 2 MB per character typed and the comment's estimate
+    /// of "a few hundred MB over a long session" was out by orders of magnitude.
+    ///
+    /// The copy is not extra work: the old code did `to_vec()` too. It is just
+    /// owned now instead of leaked.
     pub fn element(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -84,44 +138,21 @@ impl DocPageTexture {
     ) -> Option<CustomElement<GlesRenderer>> {
         let key = (pixels.page, pixels.revision);
         if self.key != Some(key) {
-            let owned: &'static [u8] = Box::leak(pixels.rgba.to_vec().into_boxed_slice());
-            let size = Size::new(pixels.width as i32, pixels.height as i32);
-            match renderer.import_memory(owned, Fourcc::Rgba8888, size, false) {
-                Ok(texture) => {
-                    self.texture = Some(texture);
-                    self.key = Some(key);
-                }
-                Err(e) => {
-                    tracing::warn!("doc page import failed: {e:?}");
-                    // Keep the old texture: a blank page is worse than a
-                    // stale one.
-                }
-            }
+            self.adopt(pixels);
         }
-        let texture = self.texture.as_ref()?;
-        let ctx: ContextId<GlesTexture> = renderer.context_id();
-        // Namespaced per page so the damage tracker doesn't collapse two
-        // pages' damage into one region.
-        let id = Id::new().namespaced(pixels.page.wrapping_add(1));
-        // `size` is in *logical* px (the texture is sampled 1:1 with the
-        // raster); only `location` is physical, because the element
-        // itself is placed in output coordinates.
-        Some(
-            TextureRenderElement::from_static_texture(
-                id,
-                ctx,
-                pixels.rect.loc.to_f64().to_physical(pixels.scale),
-                texture.clone(),
-                1,
-                Transform::Normal,
-                None,
-                None,
-                Some(pixels.rect.size),
-                None,
-                Kind::Unspecified,
-            )
-            .into(),
+
+        let buffer = self.buffer.as_ref()?;
+        MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            pixels.rect.loc.to_f64().to_physical(pixels.scale),
+            buffer,
+            Some(1.0),
+            None,
+            Some(pixels.rect.size),
+            Kind::Unspecified,
         )
+        .ok()
+        .map(Into::into)
     }
 }
 
@@ -133,7 +164,7 @@ mod tests {
     fn a_fresh_cache_is_stale_for_every_page() {
         let cache = DocPageTexture::new();
         assert!(cache.is_stale(0, 0));
-        assert!(cache.texture.is_none());
+        assert!(cache.buffer.is_none(), "nothing imported yet");
     }
 
     #[test]
@@ -154,5 +185,120 @@ mod tests {
         cache.key = Some((0, 1));
         cache.clear();
         assert!(cache.is_stale(0, 1), "a cleared cache must re-import");
+    }
+
+    /// The buffer is owned, so a re-import *replaces* it.
+    ///
+    /// This used to be `Box::leak(pixels.rgba.to_vec())` on every re-import,
+    /// keyed by the document *revision* — which every keystroke bumps. An A4 page
+    /// at 1px/pt is 595x842x4 B ≈ 2 MB, so that leaked about 2 MB per character
+    /// typed, and the old comment's "a few hundred MB over a long session" was out
+    /// by orders of magnitude.
+    ///
+    /// A leaked slice cannot be asserted on: nothing would ever report the old
+    /// ones. Holding the buffer makes "exactly one exists" a fact a test can check.
+    #[test]
+    fn twenty_revisions_still_hold_exactly_one_buffer() {
+        let mut cache = DocPageTexture::new();
+        assert_eq!(cache.buffer_count(), 0, "nothing imported yet");
+
+        let (w, h) = (8u32, 4u32);
+        let bytes = vec![0xAAu8; (w * h * 4) as usize];
+
+        for revision in 1..21u64 {
+            let pixels = PagePixels {
+                rgba: &bytes,
+                width: w,
+                height: h,
+                page: 0,
+                revision,
+                rect: Rectangle::new((0, 0).into(), Size::from((w as i32, h as i32))),
+                scale: 1.0,
+            };
+            cache.adopt(&pixels);
+            assert_eq!(
+                cache.buffer_count(),
+                1,
+                "revision {revision} must replace the buffer, not add one"
+            );
+        }
+        assert_eq!(
+            cache.key,
+            Some((0, 20)),
+            "the key tracks the newest revision"
+        );
+        assert_eq!(cache.buffer_width(), w as usize);
+    }
+
+    /// A resize changes the page dimensions, and the buffer must follow —
+    /// otherwise the stale one is uploaded at the new size.
+    #[test]
+    fn a_resize_replaces_the_buffer_at_the_new_dimensions() {
+        let mut cache = DocPageTexture::new();
+        let small = vec![1u8; 4 * 4 * 4];
+        let large = vec![1u8; 16 * 8 * 4];
+
+        cache.adopt(&PagePixels {
+            rgba: &small,
+            width: 4,
+            height: 4,
+            page: 0,
+            revision: 1,
+            rect: Rectangle::new((0, 0).into(), Size::from((4, 4))),
+            scale: 1.0,
+        });
+        assert_eq!(cache.buffer_width(), 4);
+
+        cache.adopt(&PagePixels {
+            rgba: &large,
+            width: 16,
+            height: 8,
+            page: 0,
+            revision: 2,
+            rect: Rectangle::new((0, 0).into(), Size::from((16, 8))),
+            scale: 1.0,
+        });
+        assert_eq!(cache.buffer_width(), 16, "width must follow the new page");
+        assert_eq!(cache.buffer_count(), 1);
+    }
+
+    /// A page switch re-imports even at an unchanged revision, because page and
+    /// revision are separate parts of the key.
+    #[test]
+    fn a_page_switch_is_a_distinct_key() {
+        let mut cache = DocPageTexture::new();
+        let bytes = vec![1u8; 4 * 4 * 4];
+        let p = |page: usize| PagePixels {
+            rgba: &bytes,
+            width: 4,
+            height: 4,
+            page,
+            revision: 7,
+            rect: Rectangle::new((0, 0).into(), Size::from((4, 4))),
+            scale: 1.0,
+        };
+        cache.adopt(&p(0));
+        assert!(!cache.is_stale(0, 7));
+        assert!(cache.is_stale(1, 7), "another page is another texture");
+    }
+
+    /// `clear` must drop the owned buffer, not just forget the key.
+    #[test]
+    fn clear_releases_the_buffer() {
+        let mut cache = DocPageTexture::new();
+        let bytes = vec![0u8; 4 * 4 * 4];
+        cache.adopt(&PagePixels {
+            rgba: &bytes,
+            width: 4,
+            height: 4,
+            page: 0,
+            revision: 1,
+            rect: Rectangle::new((0, 0).into(), Size::from((4, 4))),
+            scale: 1.0,
+        });
+        assert_eq!(cache.buffer_count(), 1);
+        cache.clear();
+        assert_eq!(cache.buffer_count(), 0, "the pixels must be released");
+        assert!(cache.is_stale(0, 1), "and the key forgotten");
     }
 }

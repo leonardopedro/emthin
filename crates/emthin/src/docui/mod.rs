@@ -606,12 +606,11 @@ mod session_tests {
         fn new(name: &str) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEQ: AtomicU32 = AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "emthin-session-{}-{}-{}",
-                std::process::id(),
-                format!("{:?}", std::thread::current().id()),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let thread = format!("{:?}", std::thread::current().id());
+            let path =
+                std::env::temp_dir().join(format!("emthin-session-{name}-{pid}-{thread}-{seq}"));
             std::fs::create_dir_all(&path).expect("create temp dir");
             TmpDir(path)
         }
@@ -914,11 +913,9 @@ mod page_tests {
     /// before, because it read the copy nobody updated.
     #[test]
     fn the_saved_page_is_the_visible_page() {
-        let dir = std::env::temp_dir().join(format!(
-            "emthin-pagesave-{}-{}",
-            std::process::id(),
-            format!("{:?}", std::thread::current().id())
-        ));
+        let pid = std::process::id();
+        let thread = format!("{:?}", std::thread::current().id());
+        let dir = std::env::temp_dir().join(format!("emthin-pagesave-{pid}-{thread}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let snapshot = dir.join("doc.loro");
 
