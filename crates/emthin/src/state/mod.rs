@@ -415,6 +415,48 @@ impl EmthinState {
     /// changes the non-exclusive zone: the page is centred in whatever
     /// space is usable, then every bound app is reconfigured to its (now
     /// moved and rescaled) figure rect.
+    /// Re-lay out the document and close any app whose `\app` statement is gone.
+    ///
+    /// Every production path that edits the document goes through here rather
+    /// than calling `DocUi::relayout` directly. `DocUi::relayout` returns the
+    /// window ids of apps whose figure disappeared — its doc comment has said "so
+    /// the caller can close them" from the start — and all seven call sites
+    /// discarded that value as a bare statement expression.
+    ///
+    /// The result was that deleting a figure statement left the client mapped in
+    /// the `Space` and registered in `AppManager`: it kept committing, kept
+    /// receiving frame callbacks, and was never drawn, because `figure_render`
+    /// only walks figures. An invisible client that never goes away, plus a
+    /// monotonically growing `state.apps`.
+    ///
+    /// Closing uses `xdg_toplevel::send_close`, the same mechanism `ipc_close`
+    /// uses, rather than killing anything — the client tears itself down and
+    /// `cleanup_dead_apps` then does the unmapping and figure release it always
+    /// did. A client that ignores `close` stays alive, which is the correct
+    /// outcome: emthin does not own the client's process.
+    pub fn relayout_document(&mut self) {
+        let released = self.doc.relayout();
+        self.close_apps_whose_figure_is_gone(&released);
+    }
+
+    fn close_apps_whose_figure_is_gone(&mut self, released: &[u64]) {
+        for window_id in released {
+            let Some(app) = self.apps.get(*window_id) else {
+                continue;
+            };
+            let Some(toplevel) = app.window.toplevel() else {
+                continue;
+            };
+            tracing::info!(
+                "closing app {window_id}: its \\app statement was deleted from the document"
+            );
+            toplevel.send_close();
+            // The binding is dropped now rather than waiting for the client to
+            // actually die, so nothing can draw or reconfigure it in between.
+            self.doc.figures_mut().release_app(*window_id);
+        }
+    }
+
     pub fn relayout_doc(&mut self) {
         let geo = self.usable_area();
         tracing::debug!(
@@ -437,7 +479,8 @@ impl EmthinState {
             .iter()
             .map(|f| (f.key.clone(), f.spec.w, f.spec.h))
             .collect();
-        self.doc.relayout();
+        let released = self.doc.relayout();
+        self.close_apps_whose_figure_is_gone(&released);
         for (key, w, h) in &before {
             let changed = self
                 .doc
@@ -534,7 +577,9 @@ impl EmthinState {
         self.focus.reset_on_page_switch();
         self.ime.reset_on_page_switch();
         self.cursor.reset_on_page_switch();
-        self.doc.on_page_changed();
+        // The document keeps its own copy of the page index (the layout owns
+        // everything visual reads), so it has to be told, not merely consulted.
+        self.doc.on_page_changed(page);
 
         self.ipc
             .send(crate::ipc::OutgoingMessage::PageChanged { page });

@@ -201,9 +201,23 @@ impl DocUi {
     }
 
     /// Called by `EmthinState::goto_page`.
-    pub fn on_page_changed(&mut self) {
-        // Nothing to do beyond what the state already did; kept as the
-        // single seam where page-dependent document state will live.
+    /// Adopt `page` as the visible page.
+    ///
+    /// This used to take no argument and do nothing, on the theory that
+    /// `PageState` had already moved. It had not, as far as the *document* was
+    /// concerned: there were two copies of the page index — `PageState`'s and
+    /// `DocLayoutCache`'s — and everything visual reads the layout one. The
+    /// page raster texture key, the figure filter, the caret and selection rects
+    /// and the dormant marks all read `self.layout.current_page`, which nothing
+    /// ever wrote outside session restore. So a page switch announced itself over
+    /// IPC, updated the ext-workspace bar, and rendered the same page — and since
+    /// `PgDn` computed its target from the layout copy too, the second press asked
+    /// for the same page, tripped `goto_page`'s already-there guard and did
+    /// nothing. `PgUp` was permanently a no-op.
+    ///
+    /// One copy, set through the layout, which clamps.
+    pub fn on_page_changed(&mut self, page: usize) {
+        self.layout.set_current_page(page);
     }
 
     /// Record (or clear) an app's title.
@@ -558,7 +572,7 @@ mod relaunch_tests {
     #[test]
     fn dormant_marks_follow_the_current_page() {
         let mut ui = doc_with_two_figures();
-        ui.on_page_changed();
+        ui.on_page_changed(0);
         // Page 0 is the only page in a short document, so this is the identity
         // case — recorded because it is the assumption the filter relies on.
         assert_eq!(ui.dormant_rects_on_current_page().len(), 2);
@@ -810,5 +824,115 @@ mod label_tests {
     #[test]
     fn an_unknown_key_has_no_label() {
         assert_eq!(ui().dormant_label("f9"), None);
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use smithay::utils::Size;
+
+    /// A document long enough to paginate in the fixture viewport.
+    fn paged() -> DocUi {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        let para = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+        ui.model_mut().replace(0..0, &para.repeat(300));
+        ui.relayout();
+        assert!(ui.page_count() > 1, "the fixture must paginate");
+        ui
+    }
+
+    /// Switching pages must change the page the layout reports, because
+    /// everything visual reads it: `doc_render`'s texture key, `figure_render`'s
+    /// figure filter, the caret and selection rects, and the dormant marks.
+    ///
+    /// There were **two** copies of the page index — `PageState::current_page`
+    /// and `DocLayoutCache::current_page` — and the page-switch path wrote only
+    /// the first, while all of those read the second. So `PgDn` announced
+    /// `page_changed{page:1}` over IPC, marked the ext-workspace bar, and
+    /// rendered the same page. Worse, `PgDn` computed its target from the layout
+    /// copy, so the second press asked for page 1 again, hit the "already there"
+    /// guard in `goto_page` and did nothing: the key was permanently stuck, and
+    /// `PgUp` was always a no-op.
+    #[test]
+    fn switching_pages_changes_the_page_the_layout_reports() {
+        let mut ui = paged();
+        assert_eq!(ui.current_page(), 0);
+        let first = ui
+            .layout()
+            .page()
+            .expect("page 0 is laid out")
+            .glyphs
+            .entries
+            .len();
+
+        ui.on_page_changed(1);
+
+        assert_eq!(ui.current_page(), 1, "the layout must follow");
+        let second = ui
+            .layout()
+            .page()
+            .expect("page 1 is laid out")
+            .glyphs
+            .entries
+            .len();
+        assert_ne!(
+            first, second,
+            "the two pages must differ, or the switch did nothing"
+        );
+
+        // And back again, since `PgUp` computed from the same copy.
+        ui.on_page_changed(0);
+        assert_eq!(ui.current_page(), 0);
+    }
+
+    /// Page navigation is relative, so the caller must be able to ask "what is
+    /// next?" and get an answer that is not permanently stuck on the first page.
+    #[test]
+    fn page_navigation_terms_move() {
+        let mut ui = paged();
+        let start = ui.current_page();
+        ui.on_page_changed(start + 1);
+        assert_eq!(ui.current_page(), start + 1);
+        ui.on_page_changed(ui.current_page().saturating_sub(1));
+        assert_eq!(ui.current_page(), start);
+    }
+
+    /// An out-of-range page clamps rather than pointing past the end, matching
+    /// `set_current_page`'s contract.
+    #[test]
+    fn an_out_of_range_page_clamps() {
+        let mut ui = paged();
+        let last = ui.page_count() - 1;
+        ui.on_page_changed(9999);
+        assert_eq!(ui.current_page(), last);
+    }
+
+    /// The page is persisted, so what `save` writes must be the page the layout
+    /// is actually showing — `session.json` recorded page 0 unconditionally
+    /// before, because it read the copy nobody updated.
+    #[test]
+    fn the_saved_page_is_the_visible_page() {
+        let dir = std::env::temp_dir().join(format!(
+            "emthin-pagesave-{}-{}",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let snapshot = dir.join("doc.loro");
+
+        let mut ui = paged();
+        ui.load(None, Some(&snapshot));
+        ui.on_page_changed(1);
+        ui.save();
+
+        let json = dir.join("session.json");
+        let text = std::fs::read_to_string(&json).expect("session.json written");
+        assert!(
+            text.contains(&format!("\"current_page\": {}", ui.current_page())),
+            "session.json must record the visible page, got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

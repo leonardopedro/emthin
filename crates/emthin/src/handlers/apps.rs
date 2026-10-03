@@ -193,7 +193,7 @@ fn claim_figure(
     let (w, h) = crate::docui::edit::default_figure_size();
     let id = (!app_id.is_empty()).then_some(app_id);
     crate::docui::edit::append_figure(state.doc.model_mut(), caption, w, h, id);
-    state.doc.relayout();
+    state.relayout_document();
     // The appended statement is last in document order, so its key is
     // the highest `f<stmt-index>`.
     let key = state
@@ -303,8 +303,28 @@ pub fn cleanup_dead_apps(state: &mut EmthinState) {
     }
     // Focus falls back to the document (no surface) when the focused app
     // died with nothing else to focus.
+    //
+    // The test is whether the *focused* window is the dead one. It used to be
+    // `current_focus().is_none()`, which is the negation of that: by the time this
+    // runs the dead window has already been unmapped and dropped from
+    // `state.apps`, so it could never be found again and focus was left pointing
+    // at it. Keystrokes then went to a dead surface — `input.rs` takes the
+    // "a client has focus" branch — so the document caret was dead until the user
+    // clicked, and the `focus.last_app_focus` wake toggle had nothing to restore.
+    //
+    // The equivalent check in `dialogs.rs` (`Some(Window(w)) => !w.alive()`) is
+    // unreachable for apps: `cleanup_dead_apps` runs first and unmaps the
+    // element, so `cleanup_dead_dialogs` never sees it.
     if let Some(keyboard) = state.seat.get_keyboard() {
-        if keyboard.current_focus().is_none() {
+        use smithay::wayland::seat::WaylandFocus;
+        let focus_dead = keyboard.current_focus().is_some_and(|w| {
+            let Some(xdg) = w.wl_surface().map(std::borrow::Cow::into_owned) else {
+                // A layer-shell or popup focus is not one of ours to reclaim.
+                return false;
+            };
+            state.apps.id_for_surface(&xdg).is_none()
+        });
+        if focus_dead {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             keyboard.set_focus(state, None, serial);
             tracing::debug!("focus returned to the document after window destroy");

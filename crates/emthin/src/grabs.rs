@@ -543,7 +543,7 @@ impl FigureResizeGrab {
                 "figure {} resized to {w}x{h} (\\app args rewritten)",
                 self.figure_key
             );
-            data.doc.relayout();
+            data.relayout_document();
         }
         // Reflow has settled: reconfigure the app and report the new
         // geometry to any control client.

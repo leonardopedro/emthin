@@ -101,7 +101,7 @@ fn ipc_set_figure_size(state: &mut EmthinState, figure: &str, w: i32, h: i32) {
     if crate::docui::edit::set_figure_size(state.doc.model_mut(), &fig, w, h) {
         // Reflow reconfigures the bound app through the normal
         // relayout path.
-        state.doc.relayout();
+        state.relayout_document();
         state.needs_redraw = true;
     }
 }
@@ -112,7 +112,7 @@ fn ipc_clone_figure(state: &mut EmthinState, figure: &str) {
     };
     tracing::debug!("IPC clone_figure figure={figure}");
     crate::docui::edit::clone_figure(state.doc.model_mut(), &fig);
-    state.doc.relayout();
+    state.relayout_document();
     state.needs_redraw = true;
 }
 
@@ -121,7 +121,7 @@ fn ipc_open_doc(state: &mut EmthinState, path: &str) {
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             *state.doc.model_mut() = crate::docui::DocModel::new(&text);
-            state.doc.relayout();
+            state.relayout_document();
             state.needs_redraw = true;
             tracing::info!("opened document {}", path.display());
         }

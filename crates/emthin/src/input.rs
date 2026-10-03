@@ -372,7 +372,7 @@ impl EmthinState {
             Action::OpenLauncher => self.open_launcher(),
             Action::CloneFigure => self.clone_focused_figure(),
         }
-        self.doc.relayout();
+        self.relayout_document();
         self.needs_redraw = true;
     }
 
