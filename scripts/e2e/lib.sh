@@ -231,11 +231,33 @@ start_emthin() {
   log "starting emthin ($E2E_EMTHIN)"
   ( setsid "$E2E_EMTHIN" --session-file "$E2E_DOC" --ipc-path "$E2E_IPC" "$@" \
       </dev/null >>"$E2E_ROOT/emthin.log" 2>&1 & )
+  local pid=""
   for _ in $(seq 1 60); do
-    [ -S "$E2E_IPC" ] && { sleep 1; return 0; }
+    pid="$(emthin_pid)"
+    if [ -n "$pid" ] && [ -S "$E2E_IPC" ]; then
+      # The socket appearing is not emthin being up. Ask it something: a run
+      # whose emthin died a moment after mapping went on to "verify" every
+      # check against a corpse, and reported `document: ` empty for each one,
+      # which reads like the feature failing rather than the harness.
+      if ipc_answers; then
+        return 0
+      fi
+    fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
     sleep 0.5
   done
-  die "emthin did not create $E2E_IPC; see $E2E_ROOT/emthin.log"
+  die "emthin did not come up${pid:+ (pid $pid exited)}; last log lines:
+$(tail -n 5 "$E2E_ROOT/emthin.log" 2>/dev/null | sed "s/^/    /")"
+}
+
+# Does the control socket actually answer? Used to tell "emthin is up" from
+# "a socket file exists".
+ipc_answers() {
+  [ -S "$E2E_IPC" ] || return 1
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state 2>/dev/null \
+    | grep -q '"state"'
 }
 
 emthin_pid() { pgrep -x emthin | head -1; }
@@ -270,6 +292,32 @@ stop_emthin() {
   warn "that is a real failure of the signal path, not a slow exit — look for"
   warn "\"shutdown signal received\" in $E2E_ROOT/emthin.log"
   kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Leftovers from a previous run are not a rare edge case, they are the default:
+# the compositor and emthin outlive a failed run, and the next one then starts on
+# top of them. Observed exactly: a run that worked against a freshly created
+# workspace failed against the one it inherited, because emthin bound its IPC path
+# and then exited, and every check reported against a dead process.
+#
+# So: before starting, deal with anything still alive from a previous run; and on
+# the way out, take down what this run started.
+reap_previous_run() {
+  local pid
+  for pid in $(emthin_pid); do
+    warn "a previous run's emthin is still alive (pid $pid); stopping it"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -x sway 2>/dev/null); do
+    warn "a previous run's sway is still alive (pid $pid); stopping it"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  for pid in $(emthin_pid); do kill -KILL "$pid" 2>/dev/null || true; done
+  for pid in $(pgrep -x sway 2>/dev/null); do kill -KILL "$pid" 2>/dev/null || true; done
+  # The compositor socket names vary by backend (Mutter takes what it is told,
+  # sway always picks wayland-N), so clear them all rather than one.
+  rm -f "$E2E_XDG"/wayland-* "$E2E_XDG"/"$E2E_DISPLAY"* 2>/dev/null || true
 }
 
 # ── IPC ─────────────────────────────────────────────────────────────────────

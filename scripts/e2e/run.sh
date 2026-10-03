@@ -112,6 +112,7 @@ echo >&2
 log "configuration: $CONFIG (compositor: $COMPOSITOR_MODE)"
 log "workspace: $E2E_ROOT"
 
+reap_previous_run
 start_compositor "$COMPOSITOR_MODE"
 if [ "$COMPOSITOR_MODE" = headless ]; then
   # Headless Mutter exits when its last client goes away, which happens between
@@ -123,6 +124,12 @@ start_emthin
 cleanup() {
   echo >&2
   stop_emthin
+  # The compositor is this run's, so take it down too: leaving sway holding
+  # :99 is what made the *next* run start against a workspace it did not create.
+  local pid
+  for pid in $(pgrep -x sway 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
 
