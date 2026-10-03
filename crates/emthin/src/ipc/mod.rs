@@ -15,8 +15,19 @@ pub struct IpcServer {
     listener: UnixListener,
     connection: Option<IpcConn>,
     /// Messages queued before a control client connects.
+    ///
+    /// Bounded: `send` is called for every `figure_bound` / `figure_changed` /
+    /// `app_title_changed` / `error`, and a compositor with apps but no control
+    /// client queued one message per event for the life of the session.
     pending: Vec<OutgoingMessage>,
 }
+
+/// How many messages to hold for a control client that has not connected yet.
+///
+/// These are the *state* notifications — a client that connects wants the current
+/// state, not a replay of every intermediate step — so the oldest are the ones
+/// worth dropping. Far more than a real burst.
+const MAX_PENDING_MESSAGES: usize = 256;
 
 impl IpcServer {
     /// Create a listening socket at `path` (non-blocking).
@@ -47,11 +58,11 @@ impl IpcServer {
                         if let Ok(json) = jsonrpc::serialize_outgoing(OutgoingMessage::Connected {
                             version: "0.1",
                         }) {
-                            conn.enqueue_raw(&json);
+                            let _ = conn.enqueue_raw(&json);
                         }
                         for msg in self.pending.drain(..) {
                             if let Ok(json) = jsonrpc::serialize_outgoing(msg) {
-                                conn.enqueue_raw(&json);
+                                let _ = conn.enqueue_raw(&json);
                             }
                         }
                         let _ = conn.try_flush();
@@ -80,6 +91,14 @@ impl IpcServer {
     /// READ interest only in calloop — WRITE readiness wouldn't fire.
     pub fn send(&mut self, msg: OutgoingMessage) {
         let Some(conn) = &mut self.connection else {
+            if self.pending.len() >= MAX_PENDING_MESSAGES {
+                // Drop the oldest: the newest is the state that matters.
+                let dropped = self.pending.remove(0);
+                tracing::debug!(
+                    "IPC pending queue full ({MAX_PENDING_MESSAGES}), dropped a stale message"
+                );
+                drop(dropped);
+            }
             self.pending.push(msg);
             return;
         };
@@ -90,7 +109,11 @@ impl IpcServer {
                 return;
             }
         };
-        conn.enqueue_raw(&json);
+        if let Err(e) = conn.enqueue_raw(&json) {
+            tracing::warn!("IPC write error: {e}");
+            self.connection = None;
+            return;
+        }
         if let Err(e) = conn.try_flush() {
             tracing::warn!("IPC write error: {e}");
             self.connection = None;

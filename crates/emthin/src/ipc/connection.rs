@@ -43,6 +43,25 @@ const _: () = assert!(
     "the ceiling must stay a ceiling"
 );
 
+/// Ceiling on queued outbound bytes.
+///
+/// `3ace423` bounded only the inbound side, but the outbound buffer had the same
+/// shape of problem: `enqueue_raw` appends without a limit, and `send` calls it
+/// for every `figure_bound` / `figure_changed` / `app_title_changed` / `error`
+/// — including on every `set_title`. A client that connects and then stops reading
+/// grows it for the life of the session.
+///
+/// Overflow disconnects rather than dropping the backlog silently: a control plane
+/// that has stopped reading is no longer receiving a coherent stream anyway, and
+/// every message in the buffer would be stale by the time it caught up. Generous
+/// enough that a slow reader riding out a burst is fine.
+const MAX_WRITE_BUF: usize = 4 * MAX_MSG_SIZE;
+
+const _: () = assert!(
+    MAX_WRITE_BUF < 64 * MAX_MSG_SIZE,
+    "the ceiling must stay a ceiling"
+);
+
 /// A single active IPC connection (one control client).
 pub struct IpcConn {
     pub(super) stream: UnixStream,
@@ -138,10 +157,31 @@ impl IpcConn {
     }
 
     /// Enqueue a raw byte payload with a `Content-Length` header.
-    pub fn enqueue_raw(&mut self, data: &[u8]) {
+    ///
+    /// Errors once the queue would exceed `MAX_WRITE_BUF`; the caller drops the
+    /// connection, which `IpcServer::send` already does for any write error.
+    pub fn enqueue_raw(&mut self, data: &[u8]) -> io::Result<()> {
         let header = format!("Content-Length: {}\r\n\r\n", data.len());
+        let added = header.len() + data.len();
+        if self.write_buf.len() + added > MAX_WRITE_BUF {
+            self.write_buf.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!(
+                    "outbound queue exceeded {MAX_WRITE_BUF} bytes: \
+                     the control client is not reading"
+                ),
+            ));
+        }
         self.write_buf.extend(header.as_bytes());
         self.write_buf.extend(data);
+        Ok(())
+    }
+
+    /// Bytes still queued for writing.
+    #[cfg(test)]
+    pub fn write_buf_len(&self) -> usize {
+        self.write_buf.len()
     }
 
     /// Flush as many bytes as possible from `write_buf` without blocking.
@@ -260,7 +300,7 @@ mod tests {
         peer.set_nonblocking(true).unwrap();
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"method\":\"test\"}";
-        conn.enqueue_raw(payload);
+        conn.enqueue_raw(payload).expect("enqueue");
         assert!(conn.has_pending_writes());
 
         conn.try_flush().unwrap();
@@ -393,7 +433,7 @@ mod tests {
     fn an_ordinary_message_still_round_trips() {
         let (a, _b) = UnixStream::pair().expect("pair");
         let mut conn = IpcConn::new(a).expect("conn");
-        conn.enqueue_raw(b"{\"jsonrpc\":\"2.0\"}");
+        conn.enqueue_raw(b"{\"jsonrpc\":\"2.0\"}").expect("enqueue");
         // Reuse the writer's framing to build a well-formed inbound message.
         let framed: Vec<u8> = conn.write_buf.iter().copied().collect();
         conn.write_buf.clear();
@@ -411,7 +451,7 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("pair");
         let mut conn = IpcConn::new(a).expect("conn");
         let body = vec![b'.'; MAX_MSG_SIZE];
-        conn.enqueue_raw(&body);
+        conn.enqueue_raw(&body).expect("enqueue");
         let framed: Vec<u8> = conn.write_buf.iter().copied().collect();
         conn.write_buf.clear();
         conn.read_buf.extend_from_slice(&framed);
@@ -419,5 +459,56 @@ mod tests {
             conn.try_recv().expect("parse").map(|v| v.len()),
             Some(MAX_MSG_SIZE)
         );
+    }
+
+    /// A client that stops reading must not grow the outbound queue for the life
+    /// of the session.
+    ///
+    /// `3ace423` bounded only the inbound buffer. This one had the same shape of
+    /// hole: `enqueue_raw` appended without a limit, and `send` calls it for every
+    /// `figure_bound` / `figure_changed` / `app_title_changed` / `error` —
+    /// including on every `set_title`.
+    #[test]
+    fn a_client_that_stops_reading_is_disconnected() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+
+        // The peer never reads, so nothing is ever flushed to it.
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut queued = 0usize;
+        let mut refused = None;
+        for _ in 0..1024 {
+            match conn.enqueue_raw(&chunk) {
+                Ok(()) => queued += chunk.len(),
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let err = refused.expect("a client that never reads must be cut off");
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero, "{err}");
+        assert!(
+            queued <= MAX_WRITE_BUF,
+            "the queue must never exceed its ceiling, queued {queued} of {MAX_WRITE_BUF}"
+        );
+        assert_eq!(
+            conn.write_buf_len(),
+            0,
+            "the backlog must be released, not left for a client that never reads"
+        );
+    }
+
+    /// An ordinary client is unaffected — the ceiling is far above any burst.
+    #[test]
+    fn an_ordinary_client_is_unaffected_by_the_write_ceiling() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+        for _ in 0..1024 {
+            conn.enqueue_raw(b"{\"jsonrpc\":\"2.0\",\"method\":\"state\"}")
+                .expect("a normal burst must be accepted");
+        }
+        assert!(conn.write_buf_len() < MAX_WRITE_BUF);
     }
 }
