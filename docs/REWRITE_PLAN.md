@@ -668,6 +668,46 @@ Manual E2E (nested under any host compositor):
 7. IME commit into an app figure and into the doc caret; clipboard
    host↔client and doc-copy all work.
 
+#### Result
+
+Run on 2026-10-03 under headless Mutter — `gnome-shell --headless --wayland
+--wayland-display=e2e --virtual-monitor=1280x800 --no-x11` on `Xvfb :99`,
+with `WAYLAND_DISPLAY=e2e`. GNOME 50's `gnome-shell` is nested by default
+(`--display-server` opts out) and `--headless` gives a compositor with a
+virtual output and no host window, which is what a harness wants.
+
+Driven over the IPC control socket (`docs/ipc.md`) rather than by synthetic
+pointer/keyboard input, because this machine has no `xdotool`, `wtype`,
+`ydotool` or `dotool`. `state` messages are the evidence.
+
+| Step | Verdict | Evidence |
+|---|---|---|
+| 1 spawn, figure, caption, app inside | **pass** | `figure_bound`; `f0 window=1 title='leo@nix2: ~/Projects/emthin'`; and `embedded app window_id=1 geometry committed: Rectangle { x: 437, y: 95, width: 800, height: 500 }` — the client's buffer promoted through the pending-geometry path, which is what makes `figure_render` composite it at all |
+| 2 edit around a figure → reflow | **pass** | `open_doc` with prose inserted above the second figure: page count 3 → 2 and the first figure's `y` 62 → 95 |
+| 3 resize → `\app` args rewritten | **pass** | `set_figure_size f0 800x500` → `\app(#1, #2, 800, 500, "foot")`, placed rect 559x350 → 699x437 (800 × the 0.874 letterbox factor) |
+| 4 clone → mirror | **pass** | `clone_figure f0` → `f2` with the same caption `notes` and the same id `foot`; document text `#i notes #o \app(#i, #o, 640, 400, "foot")` — byte-exact, 3 backslashes for 3 `\app`s |
+| 5 page switch | **pass, after a fix** | `goto_page 1` → the visible figure went from the unscaled placeholder 320x240 to a placed 280x210. The unscaled value *was* the bug; see below |
+| 6 quit → relaunch → restored | **pass, after a fix** | `goto_page 1` + `SIGTERM` → `shut down cleanly` and `session.json` `current_page: 1`; relaunch with **no `--doc`** → document restored, came up on page 1, figures dormant (`window=None`) |
+| 7 IME + clipboard | **not verified** | needs synthetic input and a real fcitx; no tooling on this machine |
+
+Two of the seven were failing before this run and are fixed in `a2b393c`:
+
+- **A page switch did not re-place the figure rects.** `on_page_changed` set the
+  layout's page and nothing else, so every figure kept the rect computed for the
+  previous page and the newly visible one kept the off-page placeholder — which is
+  *unscaled*, because `place_figure` reads the letterbox factor back out of
+  whatever `page_rect_for` returned. Step 5's `320x240` was the tell, next to step
+  3's correctly scaled `699x437`.
+- **Nothing stopped the event loop.** The graceful shutdown in `main` only runs
+  when `event_loop.run` returns, and no signal was wired to make that happen, so
+  SIGTERM and Ctrl+C both killed the process outright and the shutdown path was
+  unreachable. Step 6 lost the current page every time.
+
+The first of those also means this E2E was worth more than its coverage: the
+figure-rect staleness and the unreachable shutdown were both invisible to 234
+passing unit tests, because nothing in the suite ever changed the visible page or
+sent the process a signal.
+
 ## 7. Deletions checklist
 
 - `emthin/elisp/` (11 files) + `include_dir!` embed + standalone extraction
@@ -1110,7 +1150,7 @@ cargo test --workspace                                               ✓ 198 tes
 | W8 | done | `state/page.rs` replaces `state/workspace.rs`; ext-workspace-v1 re-pointed at pages (ids are page index + 1). |
 | W9 | done | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is framed, labelled with the app name and both relaunch gestures, and `Return` or a click over it runs its `\app`'s `launch:` command. That is §5.10's stand-in and this row's whole ask. The check (kill and relaunch → doc returns, figures dormant, `Return` launches into the same figure) runs headlessly except for the client appearing. The `spawn` **prompt** is *not* required here: §9 lists the spawn-launcher UX as a deliberate placeholder and nothing in §5.10 asks for one. |
 | W10 | done | `AGENTS.md` rewritten, `README.md` + `README_cn.md`, `docs/ipc.md`, `docs/build-notes.md`, CHANGELOG entry, stale migration-policy docs deleted. |
-| W11 | done | Gate above. Manual E2E under a host compositor is **not** run — no nested-compositor session was available in this environment. |
+| W11 | done | Gate above, plus the §6 manual E2E: run under headless Mutter on `Xvfb`, driven over the IPC control socket. Six of the seven steps verified; step 7's IME and clipboard paths need synthetic input, which this environment has no tooling for (no `xdotool`/`wtype`/`ydotool`). See §6. |
 
 ## Deviations from this plan, and why
 
@@ -1195,9 +1235,13 @@ literal*; `mathed_core`/`mathed_mini` green and Bevy `mathed` builds.
 
 ## Known gaps
 
-- **No manual E2E run.** §6/W11's seven-step manual test (spawn, edit,
-  resize, mirror, page switch, session restore, IME) needs a nested
-  compositor session; none was available. The automated gate covers
+- **§6 step 7 is unverified.** The manual E2E ran under headless Mutter
+  (`gnome-shell --headless --wayland` on `Xvfb :99`), driven over the IPC
+  control socket, and steps 1-6 are verified — see the table in §6. Step 7
+  (IME commit into an app figure and into the doc caret; clipboard
+  host<->client and doc-copy) needs synthetic key and pointer input, and this
+  machine has no `xdotool`, `wtype`, `ydotool` or `dotool`, nor a real fcitx.
+  The automated gate covers
   everything statically checkable, and the docui/figure/binding logic is
   unit-tested, but the render and input *wiring* has not been exercised
   against a real client.
