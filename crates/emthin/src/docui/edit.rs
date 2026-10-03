@@ -142,6 +142,33 @@ pub fn set_figure_id(model: &mut DocModel, figure: &Figure, id: Option<&str>) ->
 /// `lowest_free_marker_numbers`) so it can never collide with an
 /// existing marker, and the caption is the app's title (falling back to
 /// its app_id, then to the command name).
+/// Escape a client-supplied string for use as the body of a `\app` argument.
+///
+/// The caption and the binding id both come from `xdg_toplevel.set_title` and
+/// `set_app_id`, so they are attacker-controlled: *any* client can set either.
+/// Two things go wrong unescaped, and neither is visible at the point of
+/// insertion:
+///
+/// - a `"` closes the argument early, so `\app(#a, #b, 640, 400, "x", 1)`
+///   carries the wrong `w`/`h` and the figure silently changes size;
+/// - a `#` starts a marker, and marker ids are resolved **first-occurrence-wins**
+///   (`DocModel::scan`). A title of `#1 pwned` appended to a document that
+///   already has a `#1` re-points every segment after it.
+///
+/// The result is client-triggered corruption of the user's persisted document,
+/// which autosaves every five seconds.
+fn escape_arg(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Escape a client-supplied caption for the document body.
+///
+/// Backslash-escaping is the document's own convention, so a `\` the user meant
+/// literally round-trips rather than becoming a Typst escape.
+fn escape_caption(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('#', "\\#")
+}
+
 pub fn append_figure(
     model: &mut DocModel,
     caption: &str,
@@ -159,8 +186,11 @@ pub fn append_figure(
     // is that word behind a `#`.
     let start = format!("#{}", auto_marker_id(a));
     let end = format!("#{}", auto_marker_id(b));
-    let id_arg = id.map_or_else(String::new, |id| format!(", \"{id}\""));
-    let statement = format!("{start} {caption} {end} \\app({start}, {end}, {w}, {h}{id_arg})\n");
+    let id_arg = id.map_or_else(String::new, |id| format!(", \"{}\"", escape_arg(id)));
+    let statement = format!(
+        "{start} {} {end} \\app({start}, {end}, {w}, {h}{id_arg})\n",
+        escape_caption(caption)
+    );
     // A statement is a block: never glue it onto the tail of the last
     // line, or it lands inside the previous statement's argument list.
     let at = model.text().len();
@@ -383,5 +413,82 @@ mod tests {
         let figs = figures(&model);
         assert_eq!(figs.len(), 1);
         assert_eq!(&model.text()[figs[0].span.clone()], " a $x^2$ b ");
+    }
+    /// A hostile `title` must not be able to reshape the document.
+    ///
+    /// `title` and `app_id` come from `xdg_toplevel.set_title` / `set_app_id`, so
+    /// any client controls them. Appended verbatim they could close the `\app`
+    /// argument list with a `"` — silently changing the figure's `w`/`h` — or
+    /// introduce a `#N` marker. Marker ids resolve first-occurrence-wins, so a
+    /// second `#1` re-points every segment after it: client-triggered corruption
+    /// of the user's persisted document, which autosaves every five seconds.
+    #[test]
+    fn a_hostile_title_cannot_corrupt_the_document() {
+        let mut model = DocModel::new("#1 existing #2 \\app(#1, #2, 640, 400)\n");
+        append_figure(&mut model, "#1 pwned \" 1, 2, 3, \"y", 640, 400, None);
+        let text = model.text();
+        assert!(
+            text.contains("\\#1"),
+            "the caption hash must be escaped so it cannot become a marker: {text}"
+        );
+
+        let scan = model.scan();
+        let apps: Vec<_> = scan.stmts.iter().filter(|s| s.name == "app").collect();
+        assert_eq!(apps.len(), 2, "both figures must still parse: {text}");
+
+        // The pre-existing statement is untouched: its start marker is still #1
+        // and its width is still 640. A leaked marker would have re-pointed one.
+        let first = &apps[0];
+        let first_args: Vec<String> = first.args.iter().map(|a| format!("{a:?}")).collect();
+        assert!(
+            first_args[0].contains("\"1\""),
+            "the original start marker must still be #1: {text}"
+        );
+        assert!(
+            first_args[2].contains("640"),
+            "and the original width must be unchanged: {text}"
+        );
+    }
+
+    /// A hostile `app_id` must not be able to close the argument list either.
+    #[test]
+    fn a_hostile_app_id_cannot_close_the_argument_list() {
+        let mut model = DocModel::new("");
+        let hostile_id = "x\", 1, 1, \"y";
+        append_figure(&mut model, "Terminal", 640, 400, Some(hostile_id));
+        let text = model.text();
+        let scan = model.scan();
+        let app = scan
+            .stmts
+            .iter()
+            .find(|s| s.name == "app")
+            .expect("an app statement");
+        assert_eq!(
+            app.args.len(),
+            5,
+            "two marker refs, w, h and one quoted id, so the injected quote added nothing: {text}"
+        );
+        assert_eq!(
+            app.range.end,
+            text.trim_end().len(),
+            "nothing leaked past the statement: {text}"
+        );
+    }
+
+    /// Escaping is a round trip: the caption the user sees is the caption the
+    /// client set, not the escaped form.
+    #[test]
+    fn an_ordinary_title_is_written_verbatim() {
+        let mut model = DocModel::new("");
+        append_figure(&mut model, "Alacritty", 320, 240, Some("alacritty"));
+        let text = model.text();
+        assert!(
+            text.contains(" Alacritty ") && text.contains(r" \app("),
+            "an ordinary caption must not be mangled: {text}"
+        );
+        assert!(
+            text.contains(r#""alacritty""#),
+            "nor an ordinary id: {text}"
+        );
     }
 }
