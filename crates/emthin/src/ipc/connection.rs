@@ -5,6 +5,30 @@ use std::os::unix::net::UnixStream;
 /// Maximum allowed IPC message payload size (1 MiB).
 const MAX_MSG_SIZE: usize = 1024 * 1024;
 
+/// Maximum size of a message header (8 KiB).
+///
+/// A well-formed header is `Content-Length: <n>` — under 32 bytes. Nothing
+/// legitimate approaches 8 KiB, so anything larger is a peer that is not
+/// speaking this protocol.
+const MAX_HEADER_SIZE: usize = 8 * 1024;
+
+/// Ceiling on buffered incoming bytes.
+///
+/// `MAX_MSG_SIZE` bounds a *declared* length, which is why it looked like the
+/// buffer was bounded. It is not, in two ways:
+///
+/// - a peer that never sends `\r\n\r\n` never reaches the length check at
+///   all, and `fill_read_buf` appends until the socket drains — so a client
+///   writing plain bytes grows the buffer without limit;
+/// - a peer that pipelines several maximum-size messages faster than we drain
+///   them accumulates all of them first, because `fill_read_buf` reads to
+///   `WouldBlock` before any parsing happens.
+///
+/// Both are reachable from an unprivileged local client that connects to the
+/// control socket, so the buffer gets its own ceiling: one maximum message, its
+/// header, and room for the head of the next one.
+const MAX_READ_BUF: usize = MAX_MSG_SIZE + MAX_HEADER_SIZE + 64 * 1024;
+
 /// A single active IPC connection (one control client).
 pub struct IpcConn {
     pub(super) stream: UnixStream,
@@ -26,12 +50,29 @@ impl IpcConn {
 
     /// Drain available bytes from the stream into `read_buf`.
     /// Returns `true` if the peer closed the connection.
+    ///
+    /// Errors once `read_buf` would exceed `MAX_READ_BUF`; the caller drops the
+    /// connection on any error, so an abusive peer is disconnected rather than
+    /// allowed to keep allocating. The check is on the length *after* each read,
+    /// so the buffer overshoots by at most one 4 KiB chunk.
     pub fn fill_read_buf(&mut self) -> io::Result<bool> {
         let mut tmp = [0u8; 4096];
         loop {
             match self.stream.read(&mut tmp) {
                 Ok(0) => return Ok(true), // EOF — peer closed
-                Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    self.read_buf.extend_from_slice(&tmp[..n]);
+                    if self.read_buf.len() > MAX_READ_BUF {
+                        self.read_buf.clear();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "inbound buffer exceeded {MAX_READ_BUF} bytes \
+                                 without a complete message"
+                            ),
+                        ));
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) => return Err(e),
             }
@@ -41,8 +82,21 @@ impl IpcConn {
     /// Attempt to decode and return the next complete message, if available.
     /// Returns `Err` if the framed length exceeds `MAX_MSG_SIZE`.
     pub fn try_recv(&mut self) -> io::Result<Option<Vec<u8>>> {
-        let header_end = self.read_buf.windows(4).position(|w| w == b"\r\n\r\n");
+        // Bounding the header search is what makes the length check reachable:
+        // without it a peer that never terminates its header never gets parsed,
+        // so `len` is never consulted and `MAX_MSG_SIZE` never applies.
+        let searchable = self.read_buf.len().min(MAX_HEADER_SIZE);
+        let header_end = self.read_buf[..searchable]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n");
         let Some(header_end) = header_end else {
+            if self.read_buf.len() >= MAX_HEADER_SIZE {
+                self.read_buf.clear();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("header exceeded {MAX_HEADER_SIZE} bytes without a blank line"),
+                ));
+            }
             return Ok(None);
         };
         let header = &self.read_buf[..header_end];
@@ -227,5 +281,133 @@ mod tests {
         drop(peer); // Close the peer end.
         let eof = conn.fill_read_buf().unwrap();
         assert!(eof);
+    }
+
+    /// A peer that never terminates its header must not grow the buffer without
+    /// limit.
+    ///
+    /// `MAX_MSG_SIZE` bounds a *declared* length, so the buffer looked bounded.
+    /// It is not: a peer writing plain bytes never reaches the length check at
+    /// all, and `fill_read_buf` appends until the socket drains. Any process that
+    /// can connect to the control socket could do this.
+    #[test]
+    fn a_peer_that_never_finishes_its_header_is_cut_off() {
+        let (a, mut b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+
+        // A peer writing as fast as it can. The socket is non-blocking, so the
+        // writer has to retry on EAGAIN like any real client would; the first
+        // version of this test used `write_all` and silently wrote only as much
+        // as the socket buffer held, which fit under the ceiling and passed
+        // without testing anything.
+        let writer = std::thread::spawn(move || {
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut sent = 0usize;
+            while sent < 4 * 1024 * 1024 {
+                match b.write(&chunk) {
+                    Ok(0) => break,
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+            sent
+        });
+
+        let mut refused = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let before = conn.read_buf.len();
+            match conn.fill_read_buf() {
+                Ok(_) => assert!(
+                    conn.read_buf.len() <= MAX_READ_BUF,
+                    "the buffer grew to {} without being refused",
+                    conn.read_buf.len()
+                ),
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+            // Yield rather than spin: a tight loop burns its whole budget
+            // before the writer thread is scheduled, which made this test fail
+            // under load and pass alone.
+            if conn.read_buf.len() == before {
+                if writer.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        let err = refused.expect("an unbounded peer must be refused, not buffered");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            conn.read_buf.is_empty(),
+            "the buffer must be released on refusal, got {} bytes",
+            conn.read_buf.len()
+        );
+    }
+
+    /// The same peer, but this time a `Content-Length` header that is
+    /// syntactically fine and merely enormous — the check that already existed.
+    #[test]
+    fn an_oversized_declared_length_is_still_refused() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+        conn.read_buf
+            .extend_from_slice(b"Content-Length: 99999999\r\n\r\n");
+        let err = conn.try_recv().expect_err("must refuse");
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
+    }
+
+    /// A header padded out to something no real client would send.
+    #[test]
+    fn an_oversized_header_is_refused() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+        conn.read_buf
+            .extend_from_slice(&vec![b'C'; MAX_HEADER_SIZE + 16]);
+        let err = conn.try_recv().expect_err("must refuse");
+        assert!(err.to_string().contains("header exceeded"), "{err}");
+    }
+
+    /// A short header is still parsed — the bound must not reject real messages.
+    #[test]
+    fn an_ordinary_message_still_round_trips() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+        conn.enqueue_raw(b"{\"jsonrpc\":\"2.0\"}");
+        // Reuse the writer's framing to build a well-formed inbound message.
+        let framed: Vec<u8> = conn.write_buf.iter().copied().collect();
+        conn.write_buf.clear();
+        conn.read_buf.extend_from_slice(&framed);
+        assert_eq!(
+            conn.try_recv().expect("parse"),
+            Some(b"{\"jsonrpc\":\"2.0\"}".to_vec())
+        );
+    }
+
+    /// A maximum-size message is within the new ceiling — the bound must not
+    /// reject the largest message the protocol allows.
+    #[test]
+    fn a_maximum_size_message_is_within_the_buffer_ceiling() {
+        // A relationship between the constants, so it is checked when the
+        // crate is built rather than when the test runs: lowering MAX_READ_BUF
+        // below a maximum-size message would reject legal input.
+        const { assert!(MAX_MSG_SIZE + 64 < MAX_READ_BUF) };
+        let (a, _b) = UnixStream::pair().expect("pair");
+        let mut conn = IpcConn::new(a).expect("conn");
+        let body = vec![b'.'; MAX_MSG_SIZE];
+        conn.enqueue_raw(&body);
+        let framed: Vec<u8> = conn.write_buf.iter().copied().collect();
+        conn.write_buf.clear();
+        conn.read_buf.extend_from_slice(&framed);
+        assert_eq!(
+            conn.try_recv().expect("parse").map(|v| v.len()),
+            Some(MAX_MSG_SIZE)
+        );
     }
 }
