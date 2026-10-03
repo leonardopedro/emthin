@@ -3,6 +3,7 @@ pub mod cli;
 pub mod clipboard_bridge;
 pub mod doc_render;
 pub mod docui;
+pub mod dormant_label;
 pub mod element;
 pub mod figure_render;
 pub mod grabs;

@@ -244,7 +244,11 @@ fn namespace(key: &str) -> usize {
 /// figure is never hidden by the app painting over it — the point of the
 /// overlay is to be the top layer of the document, exactly like a
 /// comment highlight in a PDF viewer.
-pub fn build_overlay_elements(state: &EmthinState, scale: f64) -> Vec<CustomElement<GlesRenderer>> {
+pub fn build_overlay_elements(
+    state: &mut EmthinState,
+    renderer: &mut GlesRenderer,
+    scale: f64,
+) -> Vec<CustomElement<GlesRenderer>> {
     let mut out = Vec::new();
     let focused = focused_figure_key(state);
 
@@ -323,6 +327,23 @@ pub fn build_overlay_elements(state: &EmthinState, scale: f64) -> Vec<CustomElem
                 scale,
                 [0.45, 0.50, 0.58, 0.75],
             ));
+        }
+    }
+
+    // The label goes inside the frame, centred near the top so it reads as a
+    // caption for the slot rather than floating over the page.
+    for (key, rect) in state.doc.dormant_rects_on_current_page() {
+        let Some(text) = state.doc.dormant_label(&key) else {
+            continue;
+        };
+        let width_pt = (rect.size.w - 16).max(64) as f64;
+        let Some(image) = state.dormant_labels.get(&key, &text, width_pt) else {
+            continue;
+        };
+        let x = rect.loc.x + 8;
+        let y = rect.loc.y + 8;
+        if let Some(el) = crate::dormant_label::element(renderer, image, x, y, scale) {
+            out.push(el);
         }
     }
 

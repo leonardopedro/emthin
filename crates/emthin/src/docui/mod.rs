@@ -235,6 +235,35 @@ impl DocUi {
         self.figures.origin_on_page(app_id, self.current_page())
     }
 
+    /// The text to draw on a dormant figure, or `None` if it should carry none.
+    ///
+    /// §5.10's stand-in is "framed placeholder + app name + Enter to launch".
+    /// The name comes from the `launch:` command when there is one, because
+    /// that is the app that would actually start; otherwise the binding id is
+    /// the best name available, and failing that the figure key.
+    ///
+    /// The hint names **both** gestures because both work. A label that says
+    /// only "Enter" would under-report the click, and one that says only
+    /// "click" would under-report the key.
+    ///
+    /// This is text, so it cannot be a `SolidColor` bar: overlays here upload no
+    /// texture, and the compositor rasterizes it. Keeping the string here means
+    /// the decision of *what to say* is unit-tested while the drawing is not.
+    pub fn dormant_label(&self, key: &str) -> Option<String> {
+        let fig = self.figures.get(key)?;
+        if !fig.is_dormant() || fig.page != Some(self.current_page()) {
+            return None;
+        }
+        let name = fig
+            .spec
+            .launch
+            .as_deref()
+            .and_then(|cmd| crate::cli::split_command(cmd).first().cloned())
+            .or_else(|| fig.spec.id.clone())
+            .unwrap_or_else(|| key.to_owned());
+        Some(format!("{name} — click or Return to launch"))
+    }
+
     /// The dormant figures to mark on the current page, with their rects.
     ///
     /// A dormant figure is an empty slot. Without a mark it is
@@ -691,5 +720,95 @@ mod session_tests {
             tmp.0.join("session.json").exists(),
             "and the bookkeeping beside it, not somewhere else"
         );
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use smithay::utils::Size;
+
+    /// Three figures on page 0, one per naming case.
+    fn ui() -> DocUi {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 4000)));
+        ui.model_mut().replace(
+            0..0,
+            "#1 a #2 \\app(#1, #2, 600, 300, \"foot\", launch: \"foot -T\")\n\
+             #3 b #4 \\app(#3, #4, 600, 300, \"alacritty\")\n\
+             #5 c #6 \\app(#5, #6, 600, 300)\n",
+        );
+        ui.relayout();
+        ui
+    }
+
+    /// The label names the app that would actually start — the `launch:`
+    /// command's program — not the binding id, which is a glob and may not look
+    /// like anything the user can run.
+    #[test]
+    fn the_label_names_the_program_that_would_launch() {
+        let ui = ui();
+        let label = ui.dormant_label("f0").expect("a label");
+        assert!(label.starts_with("foot —"), "{label}");
+        // Only the program, not its arguments: "foot -T — click…" would read as
+        // one long program name.
+        assert!(!label.contains("-T"), "{label}");
+    }
+
+    /// With no `launch:` the binding id is the best name available.
+    #[test]
+    fn without_a_launch_command_the_binding_id_names_the_app() {
+        let ui = ui();
+        let label = ui.dormant_label("f1").expect("a label");
+        assert!(label.starts_with("alacritty —"), "{label}");
+    }
+
+    /// The hint names both gestures, because both work.
+    #[test]
+    fn the_label_names_both_gestures() {
+        let ui = ui();
+        let label = ui.dormant_label("f0").expect("a label");
+        assert!(label.contains("click"), "{label}");
+        assert!(label.contains("Return"), "{label}");
+    }
+
+    /// A figure with a client is not dormant and carries no label — a live app
+    /// does not need telling how to start.
+    #[test]
+    fn a_bound_figure_carries_no_label() {
+        let mut ui = ui();
+        assert!(ui.dormant_label("f0").is_some());
+        ui.figures_mut().bind("f0", 3);
+        assert_eq!(ui.dormant_label("f0"), None);
+    }
+
+    /// Only the visible page is labelled. A label on an off-page figure would
+    /// name a slot the user is not looking at.
+    #[test]
+    fn only_the_visible_page_is_labelled() {
+        let mut ui = ui();
+        assert!(ui.page_count() > 1, "the fixture must paginate");
+        let other = ui
+            .figures()
+            .figures()
+            .iter()
+            .find(|f| f.page != Some(0))
+            .expect("a figure off page 0")
+            .key
+            .clone();
+        assert_eq!(ui.dormant_label(&other), None, "off page 0");
+        ui.layout.set_current_page(1);
+        // f2 has neither a `launch:` command nor a binding id, so this is also
+        // the only coverage of the key fallback: the figure key names the slot
+        // rather than the label going blank.
+        assert_eq!(other, "f2", "the fixture's id-less figure");
+        let label = ui.dormant_label(&other).expect("labelled on its own page");
+        assert!(label.starts_with("f2 —"), "{label}");
+    }
+
+    /// A key naming no figure is not an error.
+    #[test]
+    fn an_unknown_key_has_no_label() {
+        assert_eq!(ui().dormant_label("f9"), None);
     }
 }

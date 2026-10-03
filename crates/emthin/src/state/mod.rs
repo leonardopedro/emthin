@@ -215,6 +215,11 @@ pub struct EmthinState {
     /// `GlesRenderer` to import into, and only the render pass has one.
     pub doc_page: crate::doc_render::DocPageTexture,
 
+    /// Rasterized dormant-figure labels. Same reasoning as `doc_page`: it needs
+    /// a renderer to upload into, and it is compositor state rather than
+    /// document state because only the compositor knows what is bound.
+    pub dormant_labels: crate::dormant_label::LabelCache,
+
     /// Clipboard/selection routing state.
     pub selection: SelectionState,
 
@@ -331,6 +336,7 @@ impl EmthinState {
             host: host::HostState::new(),
             doc: crate::docui::DocUi::new(),
             doc_page: crate::doc_render::DocPageTexture::new(),
+            dormant_labels: crate::dormant_label::LabelCache::default(),
             selection: SelectionState::default(),
             focus: FocusState::default(),
             ime,

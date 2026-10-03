@@ -132,7 +132,9 @@ fn render_frame(
         ));
 
         // --- 3. the document's own overlays ---
-        extras.extend(crate::figure_render::build_overlay_elements(state, scale));
+        extras.extend(crate::figure_render::build_overlay_elements(
+            state, renderer, scale,
+        ));
 
         // --- 4. software cursor (topmost) ---
         // Surface cursors (GTK3/Electron) can't be forwarded via
