@@ -41,13 +41,26 @@
 
 # ── the injection seam ──────────────────────────────────────────────────────
 
+# The socket is always in the *invoking user's* runtime directory, derived from
+# uid and never from $XDG_RUNTIME_DIR.
+#
+# This is not a detail: `run.sh` exports XDG_RUNTIME_DIR to point at the nested
+# compositor's runtime dir before any key is injected, so a lookup that trusted
+# $XDG_RUNTIME_DIR would look for the socket next to the compositor's socket and
+# conclude, correctly but uselessly, that no daemon was running. `ydotool(1)`
+# has the same default, so the calls below have to override it too.
+_socket_dir() { echo "${E2E_YDOTOOL_SOCKET_DIR:-/run/user/$(id -u)}"; }
+_socket() { echo "$(_socket_dir)/.ydotool_socket"; }
+
+# Run ydotool against the real user's socket, not the compositor's runtime dir.
+_yd() { XDG_RUNTIME_DIR="$(_socket_dir)" ydotool "$@"; }
+
 inject_available() {
   need ydotool
-  need ydotoold
-  # Either we can open the device ourselves, or a daemon already holds it.
-  if [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket" ]; then
+  if [ -S "$(_socket)" ]; then
     return 0
   fi
+  # Or we can open the device ourselves, with no daemon at all.
   [ -w /dev/uinput ] || return 1
   command -v ydotoold >/dev/null 2>&1 || return 1
 }
@@ -55,8 +68,8 @@ inject_available() {
 inject_note() {
   if [ -w /dev/uinput ]; then
     printf 'ydotool via /dev/uinput (writable by this user)'
-  elif [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket" ]; then
-    printf 'ydotool via a running ydotoold (device held elsewhere)'
+  elif [ -S "$(_socket)" ]; then
+    printf 'ydotool via ydotoold on %s' "$(_socket)"
   else
     printf 'ydotool UNAVAILABLE: /dev/uinput is %s\n' \
       "$(stat -c '%A %U:%G' /dev/uinput 2>/dev/null || echo 'absent')"
@@ -117,10 +130,10 @@ inject_key() {
   # stays held across the pair and is released after the second key goes up.
   if [ "${#codes[@]}" = 2 ]; then
     local mod="${codes[0]}" key="${codes[1]}"
-    ydotool key "${mod}:1" "${key}:1" "${key}:0" "${mod}:0" >/dev/null
+    _yd key "${mod}:1" "${key}:1" "${key}:0" "${mod}:0" >/dev/null
   else
     local c="${codes[0]}"
-    ydotool key "${c}:1" "${c}:0" >/dev/null
+    _yd key "${c}:1" "${c}:0" >/dev/null
   fi
   sleep "${INJECT_SETTLE:-0.12}"
 }
@@ -133,7 +146,7 @@ inject_type() {
       ' ') inject_key space ;;
       *)   ydotool_keycode "$ch" >/dev/null || {
               warn "no evdev code for '$ch'; skipping"; continue; }
-           ydotool key "$(ydotool_keycode "$ch"):1" "$(ydotool_keycode "$ch"):0" >/dev/null
+           _yd key "$(ydotool_keycode "$ch"):1" "$(ydotool_keycode "$ch"):0" >/dev/null
            sleep "${INJECT_TYPE_DELAY:-0.02}" ;;
     esac
   done

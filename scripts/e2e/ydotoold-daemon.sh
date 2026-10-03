@@ -43,11 +43,45 @@ if ! command -v ydotoold >/dev/null 2>&1; then
   fi
 fi
 
-XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-SOCKET="$XDG_RUNTIME_DIR/.ydotool_socket"
-PIDFILE="$XDG_RUNTIME_DIR/.ydotoold.pid"
+# Where the socket goes -- and this must be the *invoking user's* runtime
+# directory, not root's.
+#
+# `sudo` does not preserve XDG_RUNTIME_DIR, so the obvious default
+# `/run/user/$(id -u)` resolves to `/run/user/0` under sudo, which does not exist
+# on a normal desktop (only `/run/user/1000` does). Observed exactly: the daemon
+# started as `ydotoold -b -s /run/user/0/.ydotool_socket`, created no socket, and
+# the unprivileged test -- which looks in its own `/run/user/1000` -- correctly
+# reported /dev/uinput as unavailable and skipped every keyboard check. The two
+# halves could never meet.
+#
+# Deliberately not a world-writable location such as /tmp: this socket hands out
+# the ability to inject keystrokes system-wide, so it stays in a 0700 directory
+# only the invoking user can reach.
+_target_user="${SUDO_USER:-}"
+if [ -n "$_target_user" ] && id -u "$_target_user" >/dev/null 2>&1; then
+  _target_uid="$(id -u "$_target_user")"
+  RUNTIME_DIR="/run/user/$_target_uid"
+  if [ ! -d "$RUNTIME_DIR" ]; then
+    # No systemd user session for them (a container, a bare TTY). A private
+    # directory they own, still 0700.
+    RUNTIME_DIR="/tmp/e2e-ydotool-$_target_uid"
+    mkdir -p "$RUNTIME_DIR"
+    chown "$_target_uid" "$RUNTIME_DIR"
+    chmod 0700 "$RUNTIME_DIR"
+  fi
+elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR}" ]; then
+  RUNTIME_DIR="$XDG_RUNTIME_DIR"
+else
+  RUNTIME_DIR="/run/user/$(id -u)"
+fi
 
-usage() { echo "usage: $0 {start|stop|status}" >&2; exit 2; }
+SOCKET="$RUNTIME_DIR/.ydotool_socket"
+PIDFILE="$RUNTIME_DIR/.ydotoold.pid"
+
+usage() {
+  echo "usage: $0 {start|stop|status|socket|where|whereami}" >&2
+  exit 2
+}
 
 case "${1:-}" in
   start)
@@ -70,13 +104,23 @@ case "${1:-}" in
       exit 1
     fi
     echo "starting ydotoold (holding /dev/uinput)"
+    echo "  socket: $SOCKET"
     setsid ydotoold -b -s "$SOCKET" </dev/null >/dev/null 2>&1 &
-    echo $! > "$PIDFILE"
+    # The pidfile is only a convenience for `stop`. If it cannot be written the
+    # daemon is still fine, and under `set -e` an unguarded write aborted the
+    # script *after* the daemon had started -- leaving it running with nothing
+    # left to report it, which is how the original /run/user/0 run went quiet.
+    echo $! > "$PIDFILE" 2>/dev/null || true
     for _ in $(seq 1 20); do
-      [ -S "$SOCKET" ] && { echo "ydotoold up on $SOCKET"; exit 0; }
+      if [ -S "$SOCKET" ]; then
+        echo "ydotoold up on $SOCKET"
+        exit 0
+      fi
       sleep 0.25
     done
     echo "ydotoold did not create $SOCKET" >&2
+    echo "it may have exited; run it in the foreground to see why:" >&2
+    echo "  sudo ydotoold -s $SOCKET" >&2
     exit 1
     ;;
 
@@ -85,9 +129,50 @@ case "${1:-}" in
       kill "$(cat "$PIDFILE")" 2>/dev/null || true
       rm -f "$PIDFILE"
     fi
+    # Also match on the socket path, so a daemon started before the pidfile was
+    # fixed can still be stopped.
+    pkill -f "ydotoold .*-s $SOCKET" 2>/dev/null || true
     pkill -x ydotoold 2>/dev/null || true
     rm -f "$SOCKET"
     echo "ydotoold stopped"
+    ;;
+
+  socket)
+    # Which path the unprivileged side looks for. Printed so that a mismatch
+    # between the two halves is obvious instead of silent.
+    echo "$SOCKET"
+    ;;
+
+  where)
+    # Run as the invoking user to confirm both halves agree. This is the check
+    # that would have caught the /run/user/0 mismatch immediately.
+    echo "socket path:    $SOCKET"
+    echo "directory:      $RUNTIME_DIR ($(stat -c '%A %U:%G' "$RUNTIME_DIR" 2>/dev/null || echo missing))"
+    if [ -S "$SOCKET" ]; then
+      echo "socket:         present"
+    else
+      echo "socket:         ABSENT"
+      echo "check as the invoking user with: ls -l $SOCKET"
+    fi
+    ;;
+
+  whereami)
+    # Deliberately does not need root: this is the side the test runs on.
+    _me_uid="$(id -u)"
+    _dir="/run/user/$_me_uid"
+    echo "uid:            $_me_uid"
+    echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}"
+    echo "looking for:    $_dir/.ydotool_socket"
+    if [ -S "$_dir/.ydotool_socket" ]; then
+      echo "socket:         present"
+    else
+      echo "socket:         absent"
+    fi
+    if [ -w /dev/uinput ]; then
+      echo "/dev/uinput:    writable by this user"
+    else
+      echo "/dev/uinput:    NOT writable by this user (needs the daemon)"
+    fi
     ;;
 
   status)

@@ -53,6 +53,35 @@ clipboard_backend() {
   esac
 }
 
+# The current document text, straight out of `list_state`.
+#
+# Read over IPC rather than off the screen, which is the whole point: it does not
+# depend on rendering, so it still tells the truth about a regression that leaves
+# the page stale.
+current_document() {
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | doc_from_state
+}
+
+doc_from_state() {
+  python3 -c '
+import sys, json
+dec = json.JSONDecoder()
+text = sys.stdin.read()
+i = 0
+while i < len(text):
+    while i < len(text) and text[i] != "{":
+        i += 1
+    if i >= len(text):
+        break
+    try:
+        obj, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    if obj.get("method") == "state":
+        sys.stdout.write(obj["params"]["doc"])
+'
+}
+
 clipboard_checks() {
   echo >&2
   log "clipboard host<->client through emthin's proxy (no keys needed)"
@@ -99,7 +128,7 @@ clipboard_checks() {
     got="$(XDG_RUNTIME_DIR="$E2E_XDG" WAYLAND_DISPLAY="$E2E_DISPLAY" \
             timeout 4 wl-paste --no-newline 2>/dev/null || true)"
     if [ "${SKIP_CLIPBOARD:-0}" = 1 ]; then
-      warn "SKIP host->client: bridge backend cannot carry a Wayland selection"
+      skip "host->client clipboard" "the bridge backend cannot carry a Wayland selection"
     else
       check "host clipboard reaches a client inside the nested session" "$got" "$marker"
     fi
@@ -123,7 +152,7 @@ clipboard_checks() {
     back="$(XDG_RUNTIME_DIR="$host_runtime" WAYLAND_DISPLAY="$HOST_WAYLAND" \
             timeout 4 wl-paste --no-newline 2>/dev/null || true)"
     if [ "${SKIP_CLIPBOARD:-0}" = 1 ]; then
-      warn "SKIP client->host: bridge backend cannot carry a Wayland selection"
+      skip "client->host clipboard" "the bridge backend cannot carry a Wayland selection"
     else
       check "a client inside the nested session reaches the host clipboard" \
         "$back" "$marker"
@@ -163,40 +192,30 @@ keyboard_checks() {
   fi
 
   local marker="e2e$$"
-  inject_type "$marker"
-  sleep 0.5
+  if ! inject_type "$marker"; then
+    warn "the backend reported a failed delivery; the checks below will not mean much"
+  fi
+  # Give the compositor a moment to route the keys through the seat.
+  sleep "${E2E_SETTLE:-1.5}"
   local doc
-  doc="$(state | sed -n 's/^  //p' >/dev/null; python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state \
-          | python3 -c 'import sys,json; d=json.JSONDecoder(); t=sys.stdin.read(); i=0
-while i < len(t):
-    while i < len(t) and t[i] != "{": i += 1
-    if i >= len(t): break
-    try: o, i = d.raw_decode(t, i)
-    except ValueError: break
-    if o.get("method") == "state": print(o["params"]["doc"], end="")')"
+  doc="$(current_document)"
   check_contains "typed text reaches the document" "$doc" "$marker"
 
   # doc-copy: select the marker, Ctrl+C, move, Ctrl+V. Exercises the arboard
   # path that 1a79b38 fixed — before it, `host_clipboard` read a handle that
   # only copy created, so the first paste of a session did nothing.
-  inject_key ctrl+a
-  inject_key ctrl+c
-  inject_key End
-  inject_key Return
-  inject_type "$marker"
-  inject_key ctrl+v
+  inject_key ctrl+a || warn "ctrl+a was not delivered"
+  inject_key ctrl+c || warn "ctrl+c was not delivered"
+  inject_key End    || warn "End was not delivered"
+  inject_key Return || warn "Return was not delivered"
+  inject_type "$marker" || warn "the second burst was not delivered"
+  inject_key ctrl+v || warn "ctrl+v was not delivered"
   sleep 0.5
   local doc2
-  doc2="$(python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state \
-          | python3 -c 'import sys,json; d=json.JSONDecoder(); t=sys.stdin.read(); i=0
-while i < len(t):
-    while i < len(t) and t[i] != "{": i += 1
-    if i >= len(t): break
-    try: o, i = d.raw_decode(t, i)
-    except ValueError: break
-    if o.get("method") == "state": print(o["params"]["doc"], end="")')"
+  doc2="$(current_document)"
   local count
   count="$(printf '%s' "$doc2" | grep -o "$marker" | wc -l | tr -d ' ')"
+  CHECKS_RAN=$(( CHECKS_RAN + 1 ))
   if [ "${count:-0}" -ge 2 ]; then
     ok "doc-copy pastes (the marker appears $count times)"
   else

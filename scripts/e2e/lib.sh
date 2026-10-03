@@ -8,7 +8,13 @@
 #
 # shellcheck shell=bash
 
-set -euo pipefail
+# Deliberately NOT `set -e`. This file is sourced by run.sh, and errexit from a
+# sourced library applies to the caller: one `ydotool key` returning non-zero —
+# which it does whenever the daemon is not really there — killed the whole run
+# before any result was reported. A harness has to *report* a failed injection,
+# not abort on the first one, so failures are handled explicitly where they
+# happen. `step7.sh` is sourced too and relies on this.
+set -uo pipefail
 
 : "${E2E_ROOT:=$PWD/.e2e}"
 : "${E2E_DISPLAY:=e2e}"
@@ -210,8 +216,12 @@ state() { python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | python3 "$PW
 
 # ── assertions ──────────────────────────────────────────────────────────────
 FAILED=0
+CHECKS_RAN=0
+CHECKS_SKIPPED=0
+
 check() {
   local what="$1" got="$2" want="$3"
+  CHECKS_RAN=$(( CHECKS_RAN + 1 ))
   if [ "$got" = "$want" ]; then
     ok "$what"
   else
@@ -221,8 +231,19 @@ check() {
   fi
 }
 
+# A check that could not run, counted separately so that `finish` cannot claim
+# success on a run where everything was skipped — which is exactly what happened
+# when the sudo daemon put its socket in /run/user/0 and the keyboard checks all
+# declined: the run printed "all checks passed".
+skip() {
+  local what="$1" why="${2:-}"
+  CHECKS_SKIPPED=$(( CHECKS_SKIPPED + 1 ))
+  warn "SKIP $what${why:+: $why}"
+}
+
 check_contains() {
   local what="$1" hay="$2" needle="$3"
+  CHECKS_RAN=$(( CHECKS_RAN + 1 ))
   case "$hay" in
     *"$needle"*) ok "$what" ;;
     *) printf '\033[1;31mFAIL\033[0m %s\n      %s\n      does not contain: %s\n' \
@@ -233,6 +254,7 @@ check_contains() {
 
 check_not_contains() {
   local what="$1" hay="$2" needle="$3"
+  CHECKS_RAN=$(( CHECKS_RAN + 1 ))
   case "$hay" in
     *"$needle"*) printf '\033[1;31mFAIL\033[0m %s\n      %s\n      unexpectedly contains: %s\n' \
          "$what" "$hay" "$needle" >&2
@@ -243,8 +265,18 @@ check_not_contains() {
 
 finish() {
   echo >&2
+  printf '%s ran, %s skipped\n' "$CHECKS_RAN" "$CHECKS_SKIPPED" >&2
+  if [ "$CHECKS_RAN" -eq 0 ]; then
+    # Not a pass. A run in which every check declined has verified nothing, and
+    # saying "all checks passed" for it is the kind of thing that makes a gap
+    # look like a result.
+    printf '\033[1;31mNOTHING WAS VERIFIED\033[0m — %s check(s) skipped\n' \
+      "$CHECKS_SKIPPED" >&2
+    exit 2
+  fi
   if [ "$FAILED" = 0 ]; then
-    ok "all checks passed"
+    ok "all $CHECKS_RAN executed check(s) passed ($CHECKS_SKIPPED skipped)"
+    [ "$CHECKS_SKIPPED" -gt 0 ] && warn "some checks did not run; see above"
     exit 0
   fi
   printf '\033[1;31m%d check(s) failed\033[0m\n' "$FAILED" >&2
