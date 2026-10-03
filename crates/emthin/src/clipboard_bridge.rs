@@ -266,16 +266,7 @@ fn register_outgoing_pipe(state: &mut EmthinState, id: u64, read_fd: std::os::fd
 /// bridge's later `forward_client_selection` treats the data as
 /// already-at-the-host and doesn't try to bounce it back.
 pub fn set_host_clipboard(state: &mut EmthinState, text: &str) {
-    if state.selection.doc_clipboard.is_none() {
-        match arboard::Clipboard::new() {
-            Ok(c) => state.selection.doc_clipboard = Some(c),
-            Err(e) => {
-                tracing::warn!("document clipboard unavailable: {e}");
-                return;
-            }
-        }
-    }
-    let Some(clipboard) = state.selection.doc_clipboard.as_mut() else {
+    let Some(clipboard) = ensure_doc_clipboard(state) else {
         return;
     };
     match clipboard.set_text(text.to_owned()) {
@@ -287,9 +278,35 @@ pub fn set_host_clipboard(state: &mut EmthinState, text: &str) {
     }
 }
 
+/// The document's direct handle on the host clipboard, acquired on first use.
+///
+/// Constructing an `arboard::Clipboard` takes ownership of the X11 clipboard, so
+/// the handle is cached rather than rebuilt per keystroke — and released on host
+/// focus loss, because an X11 clipboard is owned by the focused window.
+///
+/// Both directions need this. It used to be created only by `set_host_clipboard`
+/// (i.e. only on *copy*), while `host_clipboard` read it with `as_mut()?` and
+/// returned `None` when it was absent. Since the handle starts out absent, the
+/// first paste of a session did nothing and reported nothing — and because
+/// copy-out-of-an-app is routed through the proxy backend rather than arboard,
+/// `doc_clipboard` stayed absent, so pasting *from any app into the document*
+/// never worked at all.
+fn ensure_doc_clipboard(state: &mut EmthinState) -> Option<&mut arboard::Clipboard> {
+    if state.selection.doc_clipboard.is_none() {
+        match arboard::Clipboard::new() {
+            Ok(c) => state.selection.doc_clipboard = Some(c),
+            Err(e) => {
+                tracing::warn!("document clipboard unavailable: {e}");
+                return None;
+            }
+        }
+    }
+    state.selection.doc_clipboard.as_mut()
+}
+
 /// Read the host clipboard for the document's paste.
 pub fn host_clipboard(state: &mut EmthinState) -> Option<String> {
-    let clipboard = state.selection.doc_clipboard.as_mut()?;
+    let clipboard = ensure_doc_clipboard(state)?;
     match clipboard.get_text() {
         Ok(text) => Some(text),
         Err(e) => {
