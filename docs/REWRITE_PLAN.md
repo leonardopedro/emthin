@@ -1108,7 +1108,7 @@ cargo test --workspace                                               ✓ 198 tes
 | W6 | done | Figure-first input routing, document text editing, `FigureResizeGrab`, `docui/keymap.rs`. |
 | W7 | done | New CLI and IPC set, auto-append figure binding with glob ids, `docs/ipc.md`. |
 | W8 | done | `state/page.rs` replaces `state/workspace.rs`; ext-workspace-v1 re-pointed at pages (ids are page index + 1). |
-| W9 | partial | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is marked, and `Return` or a click over it runs its `\app`'s `launch:` command. Still missing: the **dormant stand-in label** — §5.10 asks for "app name + Enter to launch" on the figure, and overlays are `SolidColor` only, so no text is drawn; and the `spawn` prompt for typing an arbitrary command. |
+| W9 | partial | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is framed, labelled with the app name and both relaunch gestures, and `Return` or a click over it runs its `\app`'s `launch:` command. That is §5.10's stand-in. Still missing: the `spawn` prompt for typing an *arbitrary* command into a slot — the last item, and it needs a text input surface of its own. |
 | W10 | done | `AGENTS.md` rewritten, `README.md` + `README_cn.md`, `docs/ipc.md`, `docs/build-notes.md`, CHANGELOG entry, stale migration-policy docs deleted. |
 | W11 | done | Gate above. Manual E2E under a host compositor is **not** run — no nested-compositor session was available in this environment. |
 
