@@ -280,11 +280,15 @@ pub fn reconfigure_after_resize(state: &mut EmthinState, figure_key: &str) {
     state.ipc.send(crate::ipc::OutgoingMessage::FigureChanged {
         figure: figure_key.to_string(),
         page,
+        // The *placed* rect, both origin and size. `rect.loc` is letterboxed but
+        // `w`/`h` were the declared size, so after `d8f889c` this reported a 640
+        // wide figure as `w=640` here and `w=608` from `list_state` — and
+        // `docs/ipc.md` says every rect is "what actually got placed".
         rect: crate::ipc::IpcRect {
             x: rect.loc.x,
             y: rect.loc.y,
-            w,
-            h,
+            w: rect.size.w,
+            h: rect.size.h,
         },
         bound: figure.app_id.is_some(),
     });

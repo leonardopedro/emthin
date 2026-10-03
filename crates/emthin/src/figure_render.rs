@@ -373,10 +373,17 @@ fn focused_figure_key(state: &EmthinState) -> Option<String> {
     };
     let wl = w.wl_surface()?;
     let app_id = state.apps.id_for_surface(&wl)?;
+    // Page-aware, like `DocUi::figure_at`. A page switch clears the *saved* and
+    // pointer focus but leaves the keyboard focus on the app that was on the old
+    // page, and an off-page figure's rect is the `(0, 0)` placeholder — so the
+    // border was drawn as a full-page-sized rectangle in the output's corner for
+    // as long as that app held focus.
+    let page = state.doc.current_page();
     state
         .doc
         .figures()
         .figure_of_app(app_id)
+        .filter(|f| f.page == Some(page))
         .map(|f| f.key.clone())
 }
 

@@ -155,11 +155,25 @@ fn ipc_list_state(state: &mut EmthinState) {
             key: f.key.clone(),
             id: f.spec.id.clone(),
             caption: state.doc.model().text()[f.span.clone()].trim().to_string(),
-            rect: IpcRect {
-                x: f.rect.loc.x,
-                y: f.rect.loc.y,
-                w: f.rect.size.w,
-                h: f.rect.size.h,
+            // `docs/ipc.md`: "rect is zero-sized for a figure that isn't on the
+            // visible page". It was not: an off-page figure keeps the `(0, 0)`
+            // placeholder `page_rect_for` hands it, so a frontend drawing
+            // `state.figures` stacked every off-page figure in the output's
+            // top-left corner.
+            rect: if f.page == Some(page) {
+                IpcRect {
+                    x: f.rect.loc.x,
+                    y: f.rect.loc.y,
+                    w: f.rect.size.w,
+                    h: f.rect.size.h,
+                }
+            } else {
+                IpcRect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                }
             },
             page: f.page.unwrap_or(0),
             window_id: f.app_id,
