@@ -188,10 +188,18 @@ impl DocLayoutCache {
     /// The caret rect for a doc byte, in output-local logical px.
     pub fn caret_rect(&self, doc_byte: usize) -> Option<Rectangle<i32, Logical>> {
         let geom = self.glyphs()?.caret_for_byte(doc_byte)?;
+        // `doc_to_screen` scales the origin; the size has to be scaled by the same
+        // factor or the caret keeps its page-local width and the glyphs it sits
+        // between are the scaled ones.
+        let page = self.page_rect();
+        let scale = page_scale(self.page_size, page.size) as f32;
         let origin = self.doc_to_screen(Point::new(f64::from(geom.x), f64::from(geom.top)));
         Some(Rectangle::new(
             origin,
-            Size::from((geom.width.ceil() as i32, geom.height.ceil() as i32)),
+            Size::from((
+                (geom.width * scale).ceil().max(1.0) as i32,
+                (geom.height * scale).ceil().max(1.0) as i32,
+            )),
         ))
     }
 
@@ -205,10 +213,18 @@ impl DocLayoutCache {
             .rects_for_range(range)
             .into_iter()
             .map(|r| {
+                // Same factor as the origin, for the same reason: an unscaled
+                // width made the highlight overrun the selection by 5% and run
+                // past the page edge on a full-width line.
+                let page = self.page_rect();
+                let scale = page_scale(self.page_size, page.size) as f32;
                 let origin = self.doc_to_screen(Point::new(f64::from(r.x0), f64::from(r.y0)));
                 Rectangle::new(
                     origin,
-                    Size::from(((r.x1 - r.x0).ceil() as i32, (r.y1 - r.y0).ceil() as i32)),
+                    Size::from((
+                        ((r.x1 - r.x0) * scale).ceil().max(1.0) as i32,
+                        ((r.y1 - r.y0) * scale).ceil().max(1.0) as i32,
+                    )),
                 )
             })
             .collect()
@@ -454,5 +470,86 @@ mod tests {
     fn a_degenerate_page_scales_by_one() {
         assert_eq!(page_scale(Size::from((0, 0)), Size::from((100, 100))), 1.0);
         assert_eq!(page_scale(Size::from((100, 100)), Size::from((0, 0))), 1.0);
+    }
+
+    /// The caret and selection boxes must be scaled by the same factor as the
+    /// page they sit on.
+    ///
+    /// `d8f889c` scaled the *origins* of every page→output mapping but left the
+    /// caret's and the selection's *sizes* in page-local pixels, which made the
+    /// caret wider than the glyph it sits in and made a highlight overrun the
+    /// selection — by 5% in the default 1280x800 window, and past the page edge
+    /// on a full-width line.
+    ///
+    /// Asserted against the factor itself rather than against "looks plausible",
+    /// because a loose bound passes with the bug in place.
+    #[test]
+    fn a_selection_box_is_the_doc_width_times_the_letterbox_scale() {
+        let mut cache = DocLayoutCache::new();
+        // Small viewport, so the page is genuinely downscaled.
+        cache.set_viewport(Size::from((400, 400)));
+        cache
+            .rebuild("hello world", &mathed_core::TransformOptions::default())
+            .expect("layout");
+        let scale = page_scale(cache.page_size, cache.page_rect().size);
+        assert!(scale < 0.9, "the fixture must downscale hard, got {scale}");
+
+        let doc_width: f32 = cache
+            .glyphs()
+            .expect("a glyph index")
+            .rects_for_range(0..5)
+            .iter()
+            .map(|r| r.x1 - r.x0)
+            .sum();
+        assert!(doc_width > 1.0, "the fixture must have a measurable width");
+
+        let placed = cache.selection_rects(0..5);
+        let width: i32 = placed.iter().map(|r| r.size.w).sum();
+        let expected = (f64::from(doc_width) * scale).round() as i32;
+        assert!(
+            (width - expected).abs() <= 1,
+            "selection width {width} should be the doc width {doc_width} at scale \
+             {scale}, i.e. about {expected}"
+        );
+    }
+
+    /// The caret must be as wide as the glyph it sits in — which it only is if
+    /// both go through the same scale.
+    #[test]
+    fn the_caret_is_as_wide_as_the_glyph_under_it() {
+        let mut cache = DocLayoutCache::new();
+        cache.set_viewport(Size::from((400, 400)));
+        cache
+            .rebuild("hello world", &mathed_core::TransformOptions::default())
+            .expect("layout");
+        let scale = page_scale(cache.page_size, cache.page_rect().size);
+        assert!(scale < 0.9, "the fixture must downscale, got {scale}");
+
+        // One glyph, placed.
+        let glyph = cache.selection_rects(0..1);
+        let glyph_w: i32 = glyph.iter().map(|r| r.size.w).sum();
+        // The caret straddling that same glyph.
+        let caret = cache.caret_rect(1).expect("a caret after the first glyph");
+        assert!(
+            (caret.size.w - glyph_w).abs() <= 1,
+            "caret width {} should match the placed glyph width {glyph_w} at scale {scale}",
+            caret.size.w
+        );
+    }
+
+    /// Scaling must not collapse the caret to nothing on a heavily downscaled
+    /// page — a `.max(1.0)` floor, not a bare multiply.
+    #[test]
+    fn a_caret_stays_visible_under_a_harsh_downscale() {
+        let mut cache = DocLayoutCache::new();
+        cache.set_viewport(Size::from((80, 80)));
+        cache
+            .rebuild("hi", &mathed_core::TransformOptions::default())
+            .expect("layout");
+        let caret = cache.caret_rect(1).expect("a caret");
+        assert!(
+            caret.size.w >= 1 && caret.size.h >= 1,
+            "the caret must not round away to nothing: {caret:?}"
+        );
     }
 }

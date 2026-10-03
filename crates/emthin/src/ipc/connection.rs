@@ -25,9 +25,23 @@ const MAX_HEADER_SIZE: usize = 8 * 1024;
 ///   `WouldBlock` before any parsing happens.
 ///
 /// Both are reachable from an unprivileged local client that connects to the
-/// control socket, so the buffer gets its own ceiling: one maximum message, its
-/// header, and room for the head of the next one.
-const MAX_READ_BUF: usize = MAX_MSG_SIZE + MAX_HEADER_SIZE + 64 * 1024;
+/// control socket, so the buffer gets its own ceiling.
+///
+/// Sized for *two* maximum-size messages plus a header, not one: `fill_read_buf`
+/// reads to `WouldBlock`, so one call can absorb whatever the socket holds — a
+/// client's default receive buffer is ~208 KiB. A reader part-way through a 1 MiB
+/// message that then receives the tail plus a second large message would cross a
+/// one-message ceiling and be disconnected for sending data the protocol allows.
+/// Two messages is far more than any real client pipelines and still bounded.
+const MAX_READ_BUF: usize = 2 * MAX_MSG_SIZE + MAX_HEADER_SIZE + 64 * 1024;
+
+// Checked when the crate is built, not when the test runs: lowering the ceiling
+// below what the protocol permits would silently reject legal input.
+const _: () = assert!(MAX_MSG_SIZE + 64 < MAX_READ_BUF);
+const _: () = assert!(
+    MAX_READ_BUF < 16 * MAX_MSG_SIZE,
+    "the ceiling must stay a ceiling"
+);
 
 /// A single active IPC connection (one control client).
 pub struct IpcConn {
@@ -394,10 +408,6 @@ mod tests {
     /// reject the largest message the protocol allows.
     #[test]
     fn a_maximum_size_message_is_within_the_buffer_ceiling() {
-        // A relationship between the constants, so it is checked when the
-        // crate is built rather than when the test runs: lowering MAX_READ_BUF
-        // below a maximum-size message would reject legal input.
-        const { assert!(MAX_MSG_SIZE + 64 < MAX_READ_BUF) };
         let (a, _b) = UnixStream::pair().expect("pair");
         let mut conn = IpcConn::new(a).expect("conn");
         let body = vec![b'.'; MAX_MSG_SIZE];
