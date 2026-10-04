@@ -72,24 +72,60 @@ fn atom_from_mime(mime: &str, conn: &RustConnection, atoms: &ClipboardAtoms) -> 
     }
 }
 
-fn selection_atom(kind: SelectionKind, atoms: &ClipboardAtoms) -> Atom {
-    match kind {
-        SelectionKind::Clipboard => atoms.CLIPBOARD,
-        SelectionKind::Primary => atoms.PRIMARY,
+/// The atom lookups the selection mapping needs.
+///
+/// Interning atoms needs a live X server, but the *mapping* between a
+/// [`SelectionKind`] and the X selections is pure logic — and it is the logic
+/// that decides whether a copy is mirrored at all. Naming the four atoms it
+/// needs lets the round-trip properties be tested without a display.
+trait SelectionAtoms {
+    fn clipboard(&self) -> Atom;
+    fn primary(&self) -> Atom;
+    fn clip_sel(&self) -> Atom;
+    fn prim_sel(&self) -> Atom;
+}
+
+impl SelectionAtoms for ClipboardAtoms {
+    fn clipboard(&self) -> Atom {
+        self.CLIPBOARD
+    }
+    fn primary(&self) -> Atom {
+        self.PRIMARY
+    }
+    fn clip_sel(&self) -> Atom {
+        self._EMTHIN_CLIP_SEL
+    }
+    fn prim_sel(&self) -> Atom {
+        self._EMTHIN_PRIM_SEL
     }
 }
 
-fn property_atom(kind: SelectionKind, atoms: &ClipboardAtoms) -> Atom {
+/// The one place a [`SelectionKind`] is associated with its two X atoms.
+///
+/// This started as two independent `match kind` arms — one picking the
+/// selection, one picking the property to transfer on — which had to be kept in
+/// agreement by hand. Nothing enforced that, and a disagreement is silent: the
+/// transfer would be written onto one selection and read from another. Pairing
+/// them in a single arm makes that unrepresentable.
+fn selection_and_property<A: SelectionAtoms>(kind: SelectionKind, atoms: &A) -> (Atom, Atom) {
     match kind {
-        SelectionKind::Clipboard => atoms._EMTHIN_CLIP_SEL,
-        SelectionKind::Primary => atoms._EMTHIN_PRIM_SEL,
+        SelectionKind::Clipboard => (atoms.clipboard(), atoms.clip_sel()),
+        SelectionKind::Primary => (atoms.primary(), atoms.prim_sel()),
     }
 }
 
-fn selection_kind_from_atom(atom: Atom, atoms: &ClipboardAtoms) -> Option<SelectionKind> {
-    if atom == atoms.CLIPBOARD {
+fn selection_atom<A: SelectionAtoms>(kind: SelectionKind, atoms: &A) -> Atom {
+    selection_and_property(kind, atoms).0
+}
+
+fn property_atom<A: SelectionAtoms>(kind: SelectionKind, atoms: &A) -> Atom {
+    selection_and_property(kind, atoms).1
+}
+
+fn selection_kind_from_atom<A: SelectionAtoms>(atom: Atom, atoms: &A) -> Option<SelectionKind> {
+    if atom == atoms.clipboard() {
         Some(SelectionKind::Clipboard)
-    } else if atom == atoms.PRIMARY {
+    } else if atom == atoms.primary() {
         Some(SelectionKind::Primary)
     } else {
         None
@@ -862,5 +898,131 @@ impl ClipboardBackend for X11ClipboardProxy {
         );
         Self::send_selection_notify(&self.conn, &req, true);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // Scope, stated plainly: these tests pin the *dispatch* — that the two kinds
+    // get different selections, different properties, and that a selection atom
+    // maps back to its own kind. They deliberately do NOT cover
+    // "SelectionAtoms for ClipboardAtoms", i.e. that the real impl returns
+    // atoms.CLIPBOARD rather than atoms.PRIMARY: interning those atoms needs
+    // a live X server, and a fake-atom test would happily pass with the real
+    // mapping swapped -- which is exactly what happened when this was written.
+    // That mapping is four one-line methods for a reviewer to read.
+    //
+    // What these *do* cover is the part that was genuinely duplicated: the two
+    // "match kind" arms that had to agree with each other.
+    //
+    // Distinct stand-ins for the interned atoms, so a mapping that conflates
+    /// two of them shows up as two equal values rather than passing by accident.
+    struct FakeAtoms;
+
+    impl SelectionAtoms for FakeAtoms {
+        fn clipboard(&self) -> Atom {
+            1
+        }
+        fn primary(&self) -> Atom {
+            2
+        }
+        fn clip_sel(&self) -> Atom {
+            3
+        }
+        fn prim_sel(&self) -> Atom {
+            4
+        }
+    }
+
+    #[test]
+    fn each_kind_maps_to_its_own_selection_atom() {
+        let a = FakeAtoms;
+        // Clipboard and Primary are separate X selections; sending a copy to the
+        // wrong one is silent -- no error, just a clipboard that never syncs.
+        assert_ne!(
+            selection_atom(SelectionKind::Clipboard, &a),
+            selection_atom(SelectionKind::Primary, &a)
+        );
+    }
+
+    #[test]
+    fn each_kind_maps_to_its_own_property_atom() {
+        let a = FakeAtoms;
+        assert_ne!(
+            property_atom(SelectionKind::Clipboard, &a),
+            property_atom(SelectionKind::Primary, &a)
+        );
+    }
+
+    #[test]
+    fn selection_atom_and_its_inverse_round_trip() {
+        // The property that actually matters: whatever we hand to
+        // `set_selection_owner` has to come back as the same kind when the
+        // owner-change notification arrives, or the origin bookkeeping in
+        // `emthin::clipboard_bridge` is reading the wrong selection.
+        let a = FakeAtoms;
+        for kind in [SelectionKind::Clipboard, SelectionKind::Primary] {
+            let atom = selection_atom(kind, &a);
+            assert_eq!(
+                Some(kind),
+                selection_kind_from_atom(atom, &a),
+                "{kind:?} did not survive the round trip through atom {atom}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_atom_is_not_mistaken_for_a_selection() {
+        let a = FakeAtoms;
+        for atom in [0, 5, 999] {
+            assert_eq!(
+                None,
+                selection_kind_from_atom(atom, &a),
+                "atom {atom} is not one of ours but was claimed as a selection"
+            );
+        }
+    }
+
+    #[test]
+    fn the_property_atoms_are_distinct_from_the_selection_atoms() {
+        // We hand data over on our own properties, which must not collide with
+        // the selections themselves: a transfer written onto CLIPBOARD would be
+        // read by every other client on the server as a selection change.
+        let a = FakeAtoms;
+        let selections = [
+            selection_atom(SelectionKind::Clipboard, &a),
+            selection_atom(SelectionKind::Primary, &a),
+        ];
+        let properties = [
+            property_atom(SelectionKind::Clipboard, &a),
+            property_atom(SelectionKind::Primary, &a),
+        ];
+        let sel: HashSet<Atom> = selections.into_iter().collect();
+        for p in properties {
+            assert!(
+                !sel.contains(&p),
+                "property atom {p} collides with a selection atom, so a transfer \
+                 would be delivered as a selection change"
+            );
+        }
+    }
+
+    #[test]
+    fn all_four_atoms_are_pairwise_distinct() {
+        // The precondition the three tests above lean on. If the real atom table
+        // ever interns two of these to the same value, every one of them would
+        // pass vacuously.
+        let a = FakeAtoms;
+        let all = [
+            selection_atom(SelectionKind::Clipboard, &a),
+            selection_atom(SelectionKind::Primary, &a),
+            property_atom(SelectionKind::Clipboard, &a),
+            property_atom(SelectionKind::Primary, &a),
+        ];
+        let unique: HashSet<Atom> = all.into_iter().collect();
+        assert_eq!(all.len(), unique.len(), "atom stand-ins must be distinct");
     }
 }
