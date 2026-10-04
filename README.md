@@ -61,6 +61,28 @@ search path (the `emthin-dbus` crate links `gio`). See
 
 ```sh
 # start with an empty document
+
+<!-- status: verified | tests: 310 cargo + 5 E2E checks | last_verified: 2026-10-04 -->
+
+## Verification
+
+```sh
+nix develop -c bash -c 'cargo fmt --all --check && \
+  cargo clippy --workspace --all-targets -- -D warnings && \
+  cargo test --workspace'          # 310 passed, 2 ignored
+
+./scripts/e2e/run.sh --config xdotool   # 5/5, exit 0
+```
+
+The E2E number is the load-bearing one: it drives a real nested session (sway on
+Xvfb, emthin inside it) and checks typed text, document copy/paste, both
+clipboard directions, and that emthin opens no X11 socket. `E2E_NO_X=1` reruns it
+with `DISPLAY` unset, so the clipboard is exercised with no X server reachable.
+
+What the count does not cover: `xwayland_satellite` supervisor tests are timing
+sensitive and occasionally flake; the doc/ model is shared with the sibling
+`velysterm` checkout, which must be verified separately when it changes.
+
 emthin
 
 # open a document and launch two apps into figures
