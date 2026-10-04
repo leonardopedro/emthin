@@ -75,6 +75,38 @@ def collect(s, seconds=1.5):
 
 def main():
     args = sys.argv[1:]
+    if "hold" in args[:2]:
+        # Stay connected until killed.
+        #
+        # Emthin gates pushing a client's selection to the host on
+        # `IpcServer::is_connected`, i.e. on a *live* connection, so every other
+        # ipc.py invocation is useless for that path: it connects, asks one
+        # question and exits, and the gate is closed again before anything looks
+        # at it. Without a connection held open, emthin reports `ipc=false` and a
+        # client copy never leaves the compositor -- which looks exactly like a
+        # broken clipboard proxy.
+        #
+        # `hold` is accepted in either argument position, because falling through
+        # to the request path is silent: it sends `hold` as a JSON-RPC method and
+        # the server just logs "unknown IPC method" while the caller waits for a
+        # connection that was never held.
+        rest = [a for a in args[:2] if a != "hold"]
+        s = connect(rest[0] if rest else SOCK)
+        sys.stderr.write("holding\n")
+        sys.stderr.flush()
+        try:
+            while True:
+                time.sleep(0.5)
+                # Drain anything the server sends, so its write side cannot fill.
+                s.settimeout(0.01)
+                try:
+                    if not s.recv(4096):
+                        break
+                except (socket.timeout, TimeoutError):
+                    pass
+        except KeyboardInterrupt:
+            pass
+        return
     if args and args[0] == "--script":
         path = args[1]
         s = connect()

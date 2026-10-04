@@ -105,43 +105,58 @@ earlier version of this harness reported the clipboard as "verified broken in
 both directions" — that was wrong twice over: it asserted across two compositor
 boundaries, and it shared one marker between the legs so a leak read as a pass.
 
-Current state of the two checks in `step7.sh`:
+### Both directions now pass — and there was never a proxy bug
 
-- **host → client passes**, and the log shows the whole path:
-  `Host Clipboard changed (5 types)` → `Wayland paste request` →
-  `selection Clipboard: … age=5.3s`.
-- **client → host fails.** This one took four attempts to pin down, and two
-  plausible explanations died on the way:
+```
+ ok  the host's clipboard reaches a client inside emthin
+ ok  a client inside emthin reaches the host's clipboard
+       emthin saw: selection Clipboard: ipc=true
+```
 
-  *~~"`wl-copy` maps no surface"~~ — **measured, true, and irrelevant.**
-  `WAYLAND_DEBUG=1` shows `wl-copy` and `wl-paste` both create zero surfaces and
-  issue no `wl_compositor.create_surface` at all. The hypothesis was that a
-  client's selection *offer* is per-surface while a paste *request* is not, which
-  would have explained the asymmetry exactly. So the check was rebuilt around
-  `gnome-text-editor`, a real GTK client with a real surface.
+**The cause was the harness, not the compositor.** `new_selection` only pushes a
+client's selection out to the host while an IPC client is connected:
 
-  That attempt first measured the wrong thing twice over: the editor maps inside
-  emthin's canvas (`embedded app window_id=1 geometry committed`) but the document
-  keeps keyboard focus, so `Ctrl+A`/`Ctrl+C` were landing on the document — which
-  owns its selection through `arboard`/X11, a different path that says nothing
-  about the data-control proxy. With the click that actually focuses it, the
-  document no longer receives the copy.
+```rust
+// Host push: keep the user's real desktop clipboard manager in sync.
+// Gated on IPC connectivity because GTK/Emacs announces clipboard
+// ownership on startup which would otherwise clobber host clipboard
+// before the user ever types anything.
+if ipc_connected {
+    clipboard.set_host_selection(ty.to_kind(), &mime_types);
+}
+```
 
-  *Result: with a focused, surface-owning client doing a genuine copy, the host
-  still does not receive it.* So "the test client has no surface" is refuted, and
-  this is a real one-boundary gap in emthin's clipboard proxy — not a harness
-  artefact.
+That gate is deliberate and correct. Every other `ipc.py` invocation connects,
+asks one question and exits — so the gate was shut again before anything observed
+it, emthin logged `ipc=false`, and the copy never left the compositor.
+`ipc.py hold` now keeps a connection open across the checks, and the check prints
+what emthin saw so the result can be read against the gate instead of guessed at.
 
-What is still unknown is *where* it breaks: emthin's log records **no event at
-all** for a client's selection change in any of these variants, which is
-consistent with either the proxy never observing the client-side selection or
-failing to publish the host-side one. Telling those apart means reading
-`emthin-clipboard`'s data-control selection handling directly, which is the next
-thing to do.
+Getting here took four wrong turns, all recorded because each one looked like
+the answer:
 
-The check stays **failing**, not skipped. It is now a precise, reproducible
-statement — "host → client works, client → host does not" — instead of the vague
-"clipboard is broken" it started as.
+1. **A shared marker between the two legs.** Either leg could read back the
+   other's selection and pass. A check that cannot fail is not a check.
+2. **Asserting across two compositor boundaries.** The bridge binds to
+   `$WAYLAND_DISPLAY` — the compositor emthin is nested inside — while the
+   assertion read the outer desktop, two boundaries and two unrelated X servers
+   away. `clip-bisect.sh` exists to keep that mistake from recurring.
+3. **"`wl-copy` maps no surface, so offers must be per-surface."** Measured under
+   `WAYLAND_DEBUG=1`: `wl-copy` and `wl-paste` both create zero surfaces and
+   never call `wl_compositor.create_surface`. True of the client, irrelevant to
+   the bug — `wl-paste` maps no surface either, and that path worked.
+4. **Rebuilding the check around `gnome-text-editor`**, a real GTK client with a
+   real surface. It measured the wrong thing twice before anything: the editor
+   maps inside the canvas but the document keeps keyboard focus, so `Ctrl+A`/
+   `Ctrl+C` went to the document (`arboard`/X11 — a different path entirely); and
+   the click meant to focus it failed silently because the log is ANSI-coloured
+   and `grep -oE` emits one match per line, so the geometry never reached the
+   arithmetic and the coordinates were never used.
+
+Every one of those reported "the proxy is broken". Reading the gate took one
+grep. The lesson is not "test more" — it is that a check whose failure mode is
+*silent by construction* should be read against the code path it exercises
+before its verdict is believed.
 
 ## Exit codes
 

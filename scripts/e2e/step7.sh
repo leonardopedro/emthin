@@ -110,6 +110,20 @@ clipboard_checks() {
   local backend; backend="$(clipboard_backend)"
   log "emthin's clipboard proxy settled on the '$backend' backend"
 
+  # Hold an IPC connection open for the duration of these checks.
+  #
+  # emthin only pushes a client's selection out to the host while an IPC client
+  # is connected (), which is deliberate: GTK and Emacs
+  # announce clipboard ownership at startup, and without that gate they would
+  # clobber the host clipboard before the user has typed anything. Every other
+  # ipc.py invocation connects, asks one question and exits -- so the gate is shut
+  # again before anything observes it, emthin logs , and a client copy
+  # never leaves the compositor. That is indistinguishable from a broken proxy,
+  # which is exactly what it looked like.
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" hold >/dev/null 2>&1 &
+  local holder=$!
+  sleep 1.5
+
   # ── host -> client ───────────────────────────────────────────────────────
   own_selection "$host" wl-copy --type text/plain -- "$h2c"
   local got
@@ -122,6 +136,13 @@ clipboard_checks() {
   got="$(paste_from "$host")"
   release_selection
   check "a client inside emthin reaches the host's clipboard" "$got" "$c2h"
+
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+
+  # What emthin itself thought it saw, so the result can be read against the
+  # gate rather than guessed at.
+  grep -ao 'selection Clipboard: ipc=[a-z]*' "$E2E_ROOT/emthin.log" 2>/dev/null | tail -2|sed 's/^/       emthin saw: /'
 
   # Beyond this point there is nothing more to check. Reaching the *desktop*
   # session from a nested compositor would mean crossing a second compositor
