@@ -208,6 +208,55 @@ mean reimplementing the host compositor's selection ownership — which would
 conflict with the host on any real desktop, where Mutter and KWin already mirror
 selections to Xwayland correctly. So this one is documented, not patched.
 
+### "The clipboard is Wayland" means two different things depending on the host
+
+The E2E proves emthin opens no X11 socket, and that result is real — but it is a
+property of the **test rig**, not of every desktop. There are two separate
+clipboard paths, they use different transports, and hosts differ in what they
+offer. Saying "Wayland" without saying which path and which host is how this gets
+misread.
+
+| path | transport | preferred | fallback |
+|---|---|---|---|
+| proxy — `emthin-clipboard`, client ↔ host | its own host connection | `ext_data_control_v1` / `zwlr_data_control_v1` (focus-free) | `wl_data_device` on winit's shared connection (**focus-gated**), then X11 |
+| document — `arboard`, keystroke path | — | Wayland data-control | X11 (arboard's own fallback, inside the crate) |
+
+What the two hosts in play actually advertise:
+
+```
+$ wayland-info                       # your GNOME session, mutter on wayland-0
+  wl_data_device_manager                    v3
+  zwp_primary_selection_device_manager_v1   v1
+  (neither zwlr_data_control_v1 nor ext_data_control_v1)
+```
+
+So on **mutter**, from an actual run:
+
+```
+WARN data_control: Host supports neither ext_data_control_v1 nor zwlr_data_control_v1
+WARN backend: Clipboard backend: data_control unavailable
+INFO wl_data_device: Clipboard sync initialized (wl_data_device_manager v3, primary_selection=true, shared connection)
+INFO backend: Clipboard backend: wl_data_device active
+```
+
+- the **proxy is Wayland to mutter**, via `wl_data_device` — and it did *not* fall
+  through to X11, because the second hint succeeded;
+- but that path is **focus-gated**: it shares winit's connection and only works
+  while emthin's window holds host keyboard focus. That is exactly why data-control
+  is the preferred hint;
+- the **document path is X11 to Xwayland**, because `arboard`'s Wayland backend is
+  built on `wl-clipboard-rs`, which requires data-control. With none available,
+  arboard takes its own X11 fallback.
+
+On **sway** (wlroots, the nested rig) `zwlr_data_control_v1` *is* present, so both
+paths are Wayland and focus-free — which is why the `E2E_NO_X=1` run passes all
+five checks with no X server reachable.
+
+The honest one-line version: **the proxy is Wayland on both hosts; the document's
+clipboard is Wayland only where data-control exists, and X11 to Xwayland on
+GNOME.** The residual X there is a mutter capability gap, not an emthin choice —
+`ext_data_control_v1` is the way out and mutter does not implement it.
+
 ## Exit codes
 
 | code | meaning |

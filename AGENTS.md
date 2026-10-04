@@ -617,6 +617,19 @@ are marked **rewritten**.
   **read-only**; `tick` pumps `flush`.
 - xclip: `-loops=0` means it **never exits** — spawn it and don't
   wait. Use `Stdio::null()` for stderr.
+- **The clipboard is two transports, and hosts differ in what they offer.**
+  `emthin-clipboard` (the proxy) tries `DataControl` → `WlDataDevice` → `X11`;
+  `arboard` (the document path) tries Wayland data-control → X11, with that
+  fallback living inside the crate and not being configurable. `arboard` is
+  declared with `features = ["wayland-data-control"]` so it is Wayland-first
+  wherever that is possible — without it arboard is *always* X11.
+  Measured on mutter (GNOME): neither `zwlr_data_control_v1` nor
+  `ext_data_control_v1` is advertised, so the proxy lands on `WlDataDevice`
+  (Wayland, but **focus-gated**) and `arboard` lands on X11/Xwayland. On wlroots
+  hosts both are Wayland and focus-free. So "the clipboard is Wayland" is only
+  true per host *and* per path — see `scripts/e2e/README.md` for the measured
+  logs. `scripts/e2e/step7.sh::wayland_only_check` guards the rig, where data
+  control does exist.
 - `BackendHint::WlDataDevice` is the only unsafe constructor (it takes
   a foreign `*mut wl_display`). Default field-drop order on
   `EmthinState` guarantees the backend drops before the display.
