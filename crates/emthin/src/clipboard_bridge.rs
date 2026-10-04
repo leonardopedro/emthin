@@ -280,9 +280,18 @@ pub fn set_host_clipboard(state: &mut EmthinState, text: &str) {
 
 /// The document's direct handle on the host clipboard, acquired on first use.
 ///
-/// Constructing an `arboard::Clipboard` takes ownership of the X11 clipboard, so
+/// Constructing an `arboard::Clipboard` takes ownership of the host selection, so
 /// the handle is cached rather than rebuilt per keystroke — and released on host
-/// focus loss, because an X11 clipboard is owned by the focused window.
+/// focus loss, because a clipboard is owned by the focused window.
+///
+/// With the `wayland-data-control` feature arboard prefers Wayland and falls back
+/// to X11, so on a Wayland host the document talks to the *same* compositor the
+/// `emthin-clipboard` proxy already does. That matters: the X11 backend speaks to
+/// `$DISPLAY`, which inside a nested session is the bare X server with no clipboard
+/// manager — it accepted writes and then logged
+/// `Could not hand the clipboard contents over to the clipboard manager`, so a copy
+/// out of the document silently went nowhere while looking successful. X11 is still
+/// reachable for the genuinely X11-only case (emthin under a plain X session).
 ///
 /// Both directions need this. It used to be created only by `set_host_clipboard`
 /// (i.e. only on *copy*), while `host_clipboard` read it with `as_mut()?` and

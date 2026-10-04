@@ -40,7 +40,7 @@ unicode-segmentation = "1"
 # Synchronous host clipboard for the document's copy/paste. The
 # emthin-clipboard proxy handles client<->host sync; this handles the
 # document's own keystroke path, which cannot afford a round trip.
-arboard = "3.6"
+arboard = { version = "3.6", features = ["wayland-data-control"] }
 
 
 [package.metadata.release]
