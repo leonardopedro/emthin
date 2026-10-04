@@ -20,6 +20,7 @@ set -uo pipefail
 : "${E2E_DISPLAY:=e2e}"          # the host compositor's socket (discovered)
 : "${E2E_CLIENT_DISPLAY:=e2e-c}"  # emthin's own socket, for its clients
 : "${E2E_XVFB_DISPLAY:=:99}"
+: "${E2E_NO_X:=0}"             # 1 = launch emthin with DISPLAY unset (Wayland-only)
 : "${E2E_VIEWPORT:=1280x800}"
 E2E_XDG="$E2E_ROOT/xdg"
 E2E_RUN="$E2E_ROOT/run"
@@ -234,7 +235,14 @@ start_emthin() {
   # compositor are two clearly different Wayland displays. emthin picks
   # wayland-N by default, which lands in the same directory as sway's and is
   # indistinguishable from it without reading the log.
-  ( setsid "$E2E_EMTHIN" --wayland-socket "$E2E_CLIENT_DISPLAY" \
+  # E2E_NO_X=1 unsets DISPLAY *for emthin only*, proving the clipboard needs no X
+  # at all. The harness keeps its own DISPLAY: sway still runs on the X11 backend
+  # and xdotool still drives it over XTEST, but the compositor under test never
+  # sees an X server, so an accidental X11 dependency cannot be satisfied by
+  # accident.
+  local -a prefix=()
+  [ "${E2E_NO_X:-0}" = "1" ] && prefix=(env -u DISPLAY)
+  ( setsid "${prefix[@]}" "$E2E_EMTHIN" --wayland-socket "$E2E_CLIENT_DISPLAY" \
       --session-file "$E2E_DOC" --ipc-path "$E2E_IPC" "$@" \
       </dev/null >>"$E2E_ROOT/emthin.log" 2>&1 & )
   local pid=""

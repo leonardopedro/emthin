@@ -81,6 +81,44 @@ while i < len(text):
 '
 }
 
+wayland_only_check() {
+  echo >&2
+  log "transport check: does emthin hold any X11 connection?"
+
+  local pid; pid="$(emthin_pid)"
+  if [ -z "$pid" ]; then
+    skip "wayland-only transport" "emthin is not running"
+    return 0
+  fi
+
+  # Check the process's own descriptors, not the log. A log line can announce
+  # one backend while the other sits quietly connected -- which is exactly how an
+  # X dependency hides: `Clipboard backend: data_control active` was true while
+  # arboard was still an X11 client.
+  local x11found="" ino name
+  for fd in /proc/"$pid"/fd/*; do
+    # `case`, not `[ ... = socket:* ]`: inside `[` the right-hand side is a
+    # literal, so that test never matches and the loop silently inspects
+    # nothing -- which is how this check would have passed forever.
+    case "$(readlink "$fd" 2>/dev/null)" in
+      socket:*) ;;
+      *) continue ;;
+    esac
+    ino="$(stat -L -c %i "$fd" 2>/dev/null)" || continue
+    name="$(awk -v i="$ino" '$7==i {print $8}' /proc/net/unix 2>/dev/null | head -1)"
+    case "$name" in
+      *X11-unix*|*"@/tmp/.X11"*) x11found="$name" ;;
+    esac
+  done
+
+  if [ -n "$x11found" ]; then
+    check "emthin opens no X11 connection" "$x11found" "(none)"
+  else
+    check "emthin opens no X11 connection" "(none)" "(none)"
+    log "  DISPLAY seen by emthin: $(tr '\0' '\n' < "/proc/$pid/environ" | grep '^DISPLAY=' || echo '(unset)')"
+  fi
+}
+
 clipboard_checks() {
   echo >&2
   log "clipboard: emthin's clients <-> the compositor emthin runs inside"
@@ -252,6 +290,7 @@ keyboard_checks() {
   fi
 }
 
+wayland_only_check
 clipboard_checks
 keyboard_checks
 finish
