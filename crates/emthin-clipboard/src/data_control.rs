@@ -218,6 +218,51 @@ impl Drop for ClipboardState {
 // ClipboardState — shared event handlers (protocol-agnostic logic)
 // ---------------------------------------------------------------------------
 
+/// Decide whether a host selection event is our own echo coming back.
+///
+/// A counter, not a bool: a client may set the selection more than once in quick
+/// succession (Firefox does, once without `SAVE_TARGETS` and again with it), and
+/// a bool would eat the *second* echo too and lose a real host change.
+///
+/// Returns true when the caller should emit the change, false when this event is
+/// the echo of something we just sent and must stay invisible. Decrements the
+/// counter either way it consumes one.
+fn claim_echo(suppress: &mut u32) -> bool {
+    match *suppress {
+        0 => true,
+        _ => {
+            *suppress -= 1;
+            false
+        }
+    }
+}
+
+/// Close out an offer sequence: return the MIME types belonging to the offer the
+/// selection event names, and drop every other entry as stale.
+///
+/// The clear is not tidiness. A `selection` event finalizes the sequence, and
+/// `pending_offers` is also fed by drag-and-drop, so anything left over belongs
+/// to an offer that will never be selected. Leaving it in the map would let a
+/// later selection pick up MIME types from an unrelated offer.
+///
+/// `ObjectId` trips clippy's `mutable_key_type` because it holds an
+/// `Arc<Atomic<bool>>` liveness flag. That flag is not part of the object's
+/// identity: wayland-backend documents that two ids compare equal only when they
+/// represent the same protocol object, and recycles ids on destruction, so its
+/// `Eq`/`Hash` are exactly what a map key needs. The lint only appeared once the
+/// type showed up in a signature -- as a struct field it never fired.
+#[allow(clippy::mutable_key_type)]
+fn finalize_offers(
+    pending: &mut HashMap<ObjectId, Vec<String>>,
+    selected: Option<ObjectId>,
+) -> Vec<String> {
+    let mime_types = selected
+        .and_then(|id| pending.remove(&id))
+        .unwrap_or_default();
+    pending.clear();
+    mime_types
+}
+
 impl ClipboardState {
     fn source_and_suppress(
         &mut self,
@@ -240,14 +285,10 @@ impl ClipboardState {
     }
 
     fn on_selection(&mut self, kind: SelectionKind, new_offer: Option<DataControlOffer>) {
-        let mime_types = new_offer
-            .as_ref()
-            .and_then(|o| self.pending_offers.remove(&o.id()))
-            .unwrap_or_default();
-
-        // Selection event finalizes the offer sequence — any remaining
-        // pending_offers entries are stale (e.g. orphaned DnD offers).
-        self.pending_offers.clear();
+        let mime_types = finalize_offers(
+            &mut self.pending_offers,
+            new_offer.as_ref().map(DataControlOffer::id),
+        );
 
         let (offer_slot, suppress) = match kind {
             SelectionKind::Clipboard => (&mut self.clipboard_offer, &mut self.suppress_clipboard),
@@ -259,8 +300,7 @@ impl ClipboardState {
         }
         *offer_slot = new_offer;
 
-        if *suppress > 0 {
-            *suppress -= 1;
+        if !claim_echo(suppress) {
             return;
         }
 
@@ -683,4 +723,124 @@ impl Dispatch<ZwlrDataControlSourceV1, SourceRole> for ClipboardState {
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::mutable_key_type)] // see finalize_offers
+mod tests {
+    use super::*;
+
+    fn state() -> ClipboardState {
+        ClipboardState {
+            manager: None,
+            device: None,
+            seat: None,
+            clipboard_offer: None,
+            primary_offer: None,
+            pending_offers: HashMap::new(),
+            clipboard_source: None,
+            primary_source: None,
+            events: Vec::new(),
+            suppress_clipboard: 0,
+            suppress_primary: 0,
+        }
+    }
+
+    // -- claim_echo ---------------------------------------------------------
+
+    #[test]
+    fn nothing_is_suppressed_when_no_echo_is_outstanding() {
+        let mut n = 0;
+        assert!(claim_echo(&mut n), "an unsuppressed change must be emitted");
+        assert_eq!(0, n, "emitting must not consume a slot that was not ours");
+    }
+
+    #[test]
+    fn one_echo_is_swallowed_and_the_next_change_gets_through() {
+        let mut n = 1;
+        assert!(!claim_echo(&mut n), "our own echo must not bounce back");
+        assert_eq!(0, n);
+        assert!(
+            claim_echo(&mut n),
+            "a real host change after one echo must not be eaten as well"
+        );
+    }
+
+    #[test]
+    fn consecutive_echoes_are_swallowed_one_for_one() {
+        // Firefox sets the selection twice: once without SAVE_TARGETS, again with
+        // it. Both echoes are ours; the third event is the host's.
+        let mut n = 2;
+        assert!(!claim_echo(&mut n));
+        assert_eq!(1, n);
+        assert!(!claim_echo(&mut n));
+        assert_eq!(0, n);
+        assert!(claim_echo(&mut n));
+    }
+
+    // -- finalize_offers ----------------------------------------------------
+
+    #[test]
+    fn the_selected_offers_types_are_returned() {
+        let mut pending = HashMap::new();
+        pending.insert(ObjectId::null(), vec!["text/plain".to_string()]);
+        assert_eq!(
+            vec!["text/plain".to_string()],
+            finalize_offers(&mut pending, Some(ObjectId::null()))
+        );
+    }
+
+    #[test]
+    fn a_selection_with_no_offer_yields_no_types() {
+        let mut pending = HashMap::new();
+        assert!(finalize_offers(&mut pending, None).is_empty());
+    }
+
+    #[test]
+    fn finalizing_drops_types_left_over_from_earlier_offers() {
+        let mut pending = HashMap::new();
+        pending.insert(ObjectId::null(), vec!["text/plain".to_string()]);
+        finalize_offers(&mut pending, None);
+        assert!(
+            pending.is_empty(),
+            "an unselected offer must not stay in the map for a later selection \
+             to pick up MIME types from"
+        );
+    }
+
+    #[test]
+    fn types_are_collected_in_the_order_they_were_offered() {
+        let mut pending = HashMap::new();
+        let types: Vec<String> = (0..3).map(|i| format!("type/{i}")).collect();
+        let expected = types.clone();
+        pending.insert(ObjectId::null(), types);
+        assert_eq!(
+            expected,
+            finalize_offers(&mut pending, Some(ObjectId::null()))
+        );
+    }
+
+    // -- routing ------------------------------------------------------------
+
+    #[test]
+    fn clipboard_and_primary_have_independent_suppress_counters() {
+        let mut st = state();
+        st.suppress_clipboard = 1;
+        st.suppress_primary = 0;
+
+        // Scoped separately: each call borrows the state mutably, so the two
+        // cannot be live at once.
+        {
+            let (_slot, suppress) = st.source_and_suppress(SelectionKind::Clipboard);
+            assert_eq!(1, *suppress, "only the clipboard echo is outstanding");
+        }
+        {
+            let (_slot, suppress) = st.source_and_suppress(SelectionKind::Primary);
+            assert_eq!(0, *suppress);
+        }
+    }
+
+    // ObjectId can only be null() from outside the wayland crate, so the
+    // multi-offer case (a DnD offer that never gets selected) cannot be built
+    // here. It is covered end to end by scripts/e2e/clip-bisect.sh instead.
 }
