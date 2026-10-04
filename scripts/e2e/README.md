@@ -158,6 +158,56 @@ grep. The lesson is not "test more" — it is that a check whose failure mode is
 *silent by construction* should be read against the code path it exercises
 before its verdict is believed.
 
+### The remaining hop: sway ↔ Xvfb, and why it is not ours
+
+`clip-bisect.sh` reports hop 1 failing in both directions. That hop belongs to
+the *host* compositor, not to emthin, and it is worth recording exactly what was
+measured rather than "wlroots doesn't do it":
+
+| | |
+|---|---|
+| sway | 1.12 (wlroots), `WLR_BACKENDS=x11` on Xvfb |
+| Xvfb | Xorg-server **21.1.24** |
+| `XFIXES` | **present, 138.87** — the extension wlroots' clipboard code requires |
+| `XINERAMA`, `SHAPE`, `BIG-REQUESTS` | **absent**, and *not* fixable: `Xvfb +extension XINERAMA …` is silently ignored, they are compiled out of this build |
+| `MIT-SHM` | present, 130.65 |
+
+So the extension wlroots needs is there, and the X server's own clipboard is
+healthy — `xclip -i` then `xclip -o` round-trips a marker on `:99` without
+involving Wayland at all. Yet:
+
+- **X → Wayland fails** for `xclip`, for `xsel`, and for `xclip -t text/plain`.
+  `wl-paste --list-types` on sway returns nothing at all, so the selection never
+  becomes a Wayland offer.
+- **Wayland → X fails** too, and this one is the convincing one: after
+  `wl-copy` on sway, reading the X clipboard returns the *previous* test's
+  marker. sway never took ownership, so nothing replaced what was there.
+- wlroots logs, three times at x11-backend init and before any client runs:
+
+  ```
+  [ERROR] [wlr] [backend/x11/backend.c:714] X11 error: op ChangeProperty
+           (no minor), code Atom (no extension), sequence 58, value 0
+  ```
+
+  `BadAtom` on `ChangeProperty` during backend init — consistent with a broken
+  selection-owner window in this environment rather than a policy decision.
+
+Two dead ends worth recording, because both produced confident wrong answers:
+
+- **"`xdpyinfo` says XFixes is absent."** `xdpyinfo` is not installed; the
+  command failed and `2>/dev/null` swallowed it, so the extension list came back
+  empty. Asking libX11 directly through `XQueryExtension` showed `XFIXES` present
+  all along.
+- **"`WLR_DEBUG=1` produced no output."** A `VAR=x func` prefix does nothing when
+  `func` is a shell function, so the variable never reached sway. `export` first.
+
+The consequence for the harness: emthin can only proxy to the compositor it is
+nested inside, so `step7.sh` asserts emthin ↔ sway, one boundary, and that is the
+boundary emthin is responsible for. Reaching the bare X server beyond sway would
+mean reimplementing the host compositor's selection ownership — which would
+conflict with the host on any real desktop, where Mutter and KWin already mirror
+selections to Xwayland correctly. So this one is documented, not patched.
+
 ## Exit codes
 
 | code | meaning |
