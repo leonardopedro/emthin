@@ -57,11 +57,6 @@ On NixOS the build needs `pkg-config`, `libxkbcommon` and `glib` on the
 search path (the `emthin-dbus` crate links `gio`). See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-## Usage
-
-```sh
-# start with an empty document
-
 <!-- status: verified | tests: 310 cargo + 5 E2E checks | last_verified: 2026-10-04 -->
 
 ## Verification
@@ -83,6 +78,10 @@ What the count does not cover: `xwayland_satellite` supervisor tests are timing
 sensitive and occasionally flake; the doc/ model is shared with the sibling
 `velysterm` checkout, which must be verified separately when it changes.
 
+## Usage
+
+```sh
+# start with an empty document
 emthin
 
 # open a document and launch two apps into figures
