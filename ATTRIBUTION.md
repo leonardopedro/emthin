@@ -9,6 +9,8 @@ cross-repo table — including what was deliberately **not** adopted — is
 | smithay (fork `ningxilai/smithay`, branch `emskin-patches`) | MIT | Wayland compositor substrate; the x11/text_input/seat_data patches are carried on the branch | the compositor itself — `AGENTS.md` "smithay is a fork" |
 | driftwm (sibling repo, same author) | GPL-3.0 | canvas mechanics for the document desktop | `handlers/apps.rs`, `docs/REWRITE_PLAN.md` |
 | velyst (git dep, tag `v0.0.1`) | see upstream | page rasterisation for the document layer | `doc_render.rs` |
+| **EWM** — the original emthin (`emskin/emskin`, fork parent of `leonardopedro/emthin`; identified by the owner) | GPL-3.0 (verified from the clone at `../emskin/`) | the pre-fork upstream this compositor derives from | `crates/emthin/src/protocols/workspace.rs` (diff-based workspace refresh) |
+| niri (github.com/YaLTeR/niri) | GPL-3.0-or-later | xwayland-satellite socket setup + spawn/watch helpers ported; per-function attribution in the submodules | `crates/emthin/src/xwayland_satellite/` |
 
 ## Notes
 

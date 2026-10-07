@@ -4,7 +4,8 @@
 //! ext-workspace-v1 protocol. Enables external bars and embedded apps to
 //! discover and switch workspaces.
 //!
-//! Design: diff-based refresh (inspired by EWM). `refresh()` runs every
+//! Design: diff-based refresh (inspired by EWM -- the original emthin this
+//! repo derives from; see `../ATTRIBUTION.md`). `refresh()` runs every
 //! event loop tick, diffs real state vs. last snapshot, sends only changes.
 
 use std::collections::{HashMap, HashSet};
