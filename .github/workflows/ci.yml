@@ -1,0 +1,80 @@
+# A14: emthin's own CI.
+#
+# Before this file existed, the only CI touch of this workspace was
+# `cargo check -p emthin` in unfer's cross-repo job — a check that (a) covered
+# one of three crates and (b) ran from *outside* this repo, so a red verdict
+# appeared under unfer's name. The tests AGENTS.md documents (`xwayland_*`,
+# `docui`, `figure_render`, `keymap`, `session`, figure binding) never ran in
+# CI at all. This workflow is the repo's own gate: fmt plus the full test
+# surface, including the two smithay-free sibling crates.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
+
+      # The path-dependency closure runs deeper than this repo alone, and
+      # every hop is a *path* dep that cargo resolves before it can build:
+      #   emthin → velysterm/mathed_core, mathed_mini   (../../../velysterm)
+      #   mathed_mini → unfer_protocol, unfer_ffi       (../../../unfer)
+      #   unfer_consensus → arctic                      (../../dynamic-arctic)
+      # (unfer's own CI clones this same set for its cross-repo job; the
+      # layout is load-bearing: siblings must land in $GITHUB_WORKSPACE/..
+      # so the relative paths resolve.)
+      - name: checkout sibling repos (path deps)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/velysterm.git ../velysterm
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/unfer.git ../unfer
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/dynamic-arctic.git ../dynamic-arctic
+
+      # System dependencies, as documented in `docs/build-notes.md` and the
+      # same set unfer's CI installs for this workspace:
+      #   * glib/udev/input/seat/gbm/drm/egl — pkg-config lookups at
+      #     build-script time (emthin-dbus -> gio, calloop -> udev,
+      #     smithay's renderer),
+      #   * xkbcommon/wayland/X11/xcb — link-time for smithay's wayland
+      #     frontend and winit.
+      - name: system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            pkg-config libglib2.0-dev libudev-dev libinput-dev libseat-dev \
+            libgbm-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
+            wayland-protocols libexpat1-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-render0-dev
+
+      # The toolchain comes from this repo's `rust-toolchain.toml` (channel +
+      # rustfmt/clippy components) — rustup activates it per-checkout, so the
+      # gate runs the version the repo pins rather than whatever is ambient.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # Swatinem/rust-cache@v2
+
+      # Deliberately NOT `--all`: this cargo-fmt walks the whole path-dep
+      # closure, so `--all` would format-check the sibling repos too (and a
+      # formatting drift in velysterm/unfer would turn *this* repo's gate red).
+      # Without `--all`, the virtual manifest covers exactly the three
+      # workspace members — verified locally with a probe diff in
+      # crates/emthin-dbus.
+      - name: rustfmt
+        run: cargo fmt --check
+
+      # All three workspace crates, not just the compositor: the plan A14
+      # acceptance is "`cargo test -p emthin` plus the clipboard/dbus crate
+      # tests". `--locked` keeps CI on the committed Cargo.lock.
+      - name: test
+        run: cargo test --locked --workspace
