@@ -4,7 +4,7 @@ For architecture and internals, read [`CLAUDE.md`](CLAUDE.md) and the per-crate 
 
 ## Setup
 
-Install the pinned Rust toolchain (currently 1.92.0 — `rustup show` inside
+Install the pinned Rust toolchain (currently 1.99.0 — `rustup show` inside
 `crates/emthin/` picks it up from `rust-toolchain.toml`) and the system libs.
 On Arch:
 

@@ -755,7 +755,7 @@ sent the process a signal.
   abstract socket, arm calloop `Generic` sources, spawn on first connect,
   `ToMain::Rearm` after crash; `Unlink` RAII in `xwayland_satellite::sockets`.
 - Toolchain: emthin pins `rust-toolchain.toml` (Rust ≥ 1.89, edition 2024
-  workspace); velysterm pins 1.97.1 — rustup honors each directory's pin;
+  workspace); velysterm pins 1.99.0 — rustup honors each directory's pin;
   run velysterm commands from `velysterm/`.
 - `crates/emthin/Cargo.toml` keeps literal `version`/`edition` values
   (cargo-aur limitation) — keep in sync with `[workspace.package]`.
