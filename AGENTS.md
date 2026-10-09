@@ -773,19 +773,30 @@ client disagreeing, and the next reflow will undo it silently.
 
 ## Local verification
 
-Before pushing, run:
+Run these **inside the flake devshell** — `nix develop` — not from a bare
+shell:
 
 ```
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-cargo test -p emthin
+nix develop -c cargo fmt --all --check
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+nix develop -c cargo build --workspace
+nix develop -c cargo test -p emthin
 ```
+
+The devshell is not a convenience. `emthin` -> `emthin-dbus` -> `gio`/`glib`,
+and every `-sys` crate in that chain locates the C library with `pkg-config`
+at build-script time; the devshell supplies `pkg-config`, `glib`/`glib.dev`
+and a `PKG_CONFIG_PATH` pointing at them (see `flake.nix`). Outside it the
+whole workspace stops at
+`error: failed to run custom build command for glib-sys` — a failure that
+names neither this repo nor the missing system package, and that reads like a
+broken build rather than an unset environment. Confusing that for a real
+regression is the reason this line is explicit; full detail, including the
+`libxkbcommon`/`LIBRARY_PATH` half, is in `docs/build-notes.md`.
 
 If the change touches the document model (anything under `docui/`, or
 `markers.rs`/`transform.rs` in velysterm), verify velysterm too — see
-"Document-model change" above and `docs/build-notes.md` for the NixOS
-`pkg-config` / `libxkbcommon` setup this build needs.
+"Document-model change" above.
 
 ## Code-style defaults
 
