@@ -1,6 +1,7 @@
 # Contributing to emthin
 
-For architecture and internals, read [`CLAUDE.md`](CLAUDE.md) and the per-crate `crates/*/CLAUDE.md` files.
+For architecture and internals, read [`AGENTS.md`](AGENTS.md) — its Module
+map covers every crate under `crates/*/`.
 
 ## Setup
 

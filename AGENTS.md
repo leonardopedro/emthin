@@ -740,9 +740,12 @@ lands in `../velysterm` (the sibling mathed checkout, path-depended).
 Verify it there and here:
 
 ```sh
-cd ../velysterm && cargo test -p mathed_core -p mathed_mini
-cd -          && cargo test -p emthin
+(cd ../velysterm && nix develop -c cargo test -p mathed_core -p mathed_mini)
+nix develop -c cargo test -p emthin
 ```
+
+(Both sides run through their own flake devshell — bare `cargo test` fails
+at `glib-sys`/`libudev-sys` outside one.)
 
 Adding a `PropKind` variant breaks every **exhaustive** `match` on it —
 `mathed_core::accessibility::describe_segment` is the one that matters;

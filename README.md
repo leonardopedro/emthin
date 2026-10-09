@@ -48,13 +48,14 @@ layer-shell, pointer constraints, ext-workspace-v1 — is unchanged.
 ## Build
 
 ```sh
-cargo build --release          # the emthin binary
-cargo clippy --workspace -- -D warnings
-cargo test -p emthin
+nix develop -c cargo build --release          # the emthin binary
+nix develop -c cargo clippy --workspace -- -D warnings
+nix develop -c cargo test -p emthin
 ```
 
-On NixOS the build needs `pkg-config`, `libxkbcommon` and `glib` on the
-search path (the `emthin-dbus` crate links `gio`). See
+The devshell supplies `pkg-config`, `libxkbcommon` and `glib` on the search
+path (the `emthin-dbus` crate links `gio`) — outside it every one of these
+dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
 <!-- status: verified | tests: 310 cargo + 5 E2E checks | last_verified: 2026-10-04 -->
@@ -67,6 +68,8 @@ nix develop -c bash -c 'cargo fmt --all --check && \
   cargo test --workspace'          # 310 passed, 2 ignored
 
 ./scripts/e2e/run.sh --config xdotool   # 5/5, exit 0
+
+nix-shell -p python3 --run "python3 scripts/check-links"   # relative markdown links (CI: linkcheck.yml)
 ```
 
 The E2E number is the load-bearing one: it drives a real nested session (sway on
