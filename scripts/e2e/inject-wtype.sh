@@ -14,7 +14,7 @@
 # notice rather than silently passing.
 
 # shellcheck source=lib.sh
-. "$(dirname "$(readlink -f "$0")")/lib.sh"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 inject_available() {
   need wtype

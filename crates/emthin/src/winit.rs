@@ -409,19 +409,36 @@ fn init_dmabuf(backend: &mut WinitGraphicsBackend<GlesRenderer>, state: &mut Emt
     use smithay::backend::{egl::EGLDevice, renderer::ImportDma};
     use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 
+    // No DRM render node means the EGL stack is a software fallback
+    // (llvmpipe under Xvfb, or any GPU-less host). It still *advertises*
+    // the dmabuf-import EGL extensions, but importing a client dmabuf
+    // fails inside Mesa ("dmabuf import failed to mmap: Operation not
+    // permitted" — EPERM on the sealed memfds GTK allocates with) and
+    // leaves a half-mapped texture that SEGVs the next frame in the
+    // rasterizer (`dri_sw_displaytarget_unmap` on a garbage pointer).
+    // The compositor must not advertise a capability it cannot honour:
+    // with no dmabuf global, clients fall back to wl_shm, whose buffers
+    // are copied on the CPU and always import. Verified with kgx — see
+    // docs/AGENT_LOOP.md.
+    let Some(render_node) =
+        EGLDevice::device_for_display(backend.renderer().egl_context().display())
+            .and_then(|device| device.try_get_render_node())
+            .ok()
+            .flatten()
+    else {
+        tracing::info!(
+            "DMA-BUF disabled: no DRM render node (software GL); clients will use wl_shm"
+        );
+        return;
+    };
+
     let dmabuf_formats = backend.renderer().dmabuf_formats();
 
-    let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
-        .and_then(|device| device.try_get_render_node())
+    let global = match DmabufFeedbackBuilder::new(render_node.dev_id(), dmabuf_formats.clone())
+        .build()
         .ok()
-        .flatten();
-
-    let global = match render_node.and_then(|node| {
-        DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone())
-            .build()
-            .ok()
-            .map(|fb| (node, fb))
-    }) {
+        .map(|fb| (render_node, fb))
+    {
         Some((node, feedback)) => {
             tracing::info!("DMA-BUF v4 initialized (render node: {node:?})");
             state
@@ -433,7 +450,7 @@ fn init_dmabuf(backend: &mut WinitGraphicsBackend<GlesRenderer>, state: &mut Emt
                 )
         }
         None => {
-            tracing::info!("DMA-BUF v3 initialized (no render node or feedback build failed)");
+            tracing::info!("DMA-BUF v3 initialized (feedback build failed)");
             state
                 .wl
                 .dmabuf_state

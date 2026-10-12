@@ -115,8 +115,11 @@ figure to the end of the document, captioned with the app's title.
 
 Editing is the ordinary set any editor has: printable keys insert,
 `Backspace`/`Delete` delete a grapheme, arrows move (with `Shift` to
-select, `Ctrl` by word), `Ctrl+A` selects all, `Ctrl+Z` / `Ctrl+Y` undo
-and redo, and `Ctrl+C` / `Ctrl+X` / `Ctrl+V` use the host clipboard.
+select, `Ctrl` by word), `Ctrl+A` selects all, `Ctrl+Z` undoes and
+`Ctrl+Shift+Z` (or `Ctrl+Y`) redoes, and `Ctrl+C` / `Ctrl+X` / `Ctrl+V`
+use the host clipboard. A shift chord arrives as the *uppercase*
+keysym, so the redo arm accepts both cases — matching only lowercase
+made `Ctrl+Shift+Z` unreachable from a real keyboard.
 
 ### Figures
 
@@ -137,6 +140,9 @@ future external frontend observe and drive the document. See
 ## Design
 
 - `docs/REWRITE_PLAN.md` — the rewrite design and work breakdown.
+- `docs/AGENT_LOOP.md` — the LLM debug loop: headless geometry JSON
+  (`scripts/agent/preview.sh`), live session driving and screenshots
+  (`scripts/agent/live.sh`). Semantic tier first, pixels second.
 - `AGENTS.md` — architecture, module map, and the compositor gotchas
   that survive the rewrite.
 

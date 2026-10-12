@@ -9,7 +9,9 @@
 use std::ops::Range;
 
 use mathed_core::figures::{resolve_figure, FigureSpec};
-use mathed_core::markers::{auto_marker_id, lowest_free_marker_numbers, Arg, Segment};
+use mathed_core::markers::{
+    auto_marker_id, auto_marker_token, lowest_free_marker_numbers, Arg, Segment,
+};
 
 use crate::docui::figures::Figure;
 use crate::docui::model::DocModel;
@@ -290,6 +292,20 @@ pub fn spec_of(w: i32, h: i32) -> FigureSpec {
     }
 }
 
+/// The token a typed `#` becomes: a fresh auto-named marker — the RFC
+/// 1751 word for the lowest free marker number (`#i`, `#o`, `#ad`, …)
+/// so figure ids are readable rather than `#12` — or, at an escaped
+/// position (`\#`), a literal `#`. This is the typing half of the
+/// marker vocabulary; `append_figure` mints the same words for
+/// compositor-generated statements.
+///
+/// Call *after* any selection has been deleted, so words freed by the
+/// deletion are reusable — the input path does exactly that. Paste and
+/// IME commit do not come through here, so pasted `#1` stays verbatim.
+pub fn typed_hash_token(model: &DocModel) -> String {
+    auto_marker_token(model.text(), model.caret()).unwrap_or_else(|| "#".to_owned())
+}
+
 #[cfg(test)]
 impl DocModel {
     /// Test shorthand for "append a figure to this document".
@@ -471,6 +487,37 @@ mod tests {
         let figs = figures(&model);
         assert_eq!(figs.len(), 1);
         assert_eq!(&model.text()[figs[0].span.clone()], " a $x^2$ b ");
+    }
+
+    // RFC 1751 words are the list sorted by length then alphabetically:
+    // index 1 = "i", 2 = "o", 3 = "ad", 4 = "am", 5 = "an", 6 = "as",
+    // 7 = "at". Marker numbers start at 1, so an empty document names
+    // its first marker `#i` and works up from there.
+
+    #[test]
+    fn typed_hash_names_from_the_rfc_list_in_free_order() {
+        let mut model = DocModel::new("");
+        assert_eq!(typed_hash_token(&model), "#i", "1 -> i");
+        model.insert_at_caret(&typed_hash_token(&model));
+        assert_eq!(typed_hash_token(&model), "#o", "2 -> o");
+        model.insert_at_caret(&typed_hash_token(&model));
+        assert_eq!(typed_hash_token(&model), "#ad", "3 -> ad");
+    }
+
+    #[test]
+    fn typed_hash_skips_words_the_document_already_uses() {
+        // "i" (1) and "ad" (3) are taken, so the lowest free number is
+        // 2 even though 3 appears later in the text.
+        let model = DocModel::new("#i cap #ad \\app(#i, #ad, 10, 20)");
+        assert_eq!(typed_hash_token(&model), "#o");
+    }
+
+    #[test]
+    fn an_escaped_hash_is_a_literal_hash() {
+        // `\#` is the Typst escape: the position is not a marker spot.
+        let mut model = DocModel::new("a\\");
+        model.set_caret(2);
+        assert_eq!(typed_hash_token(&model), "#");
     }
     /// A hostile `title` must not be able to reshape the document.
     ///

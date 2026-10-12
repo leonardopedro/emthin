@@ -15,8 +15,11 @@
 # anything. Mutter run non-headless wants to take the session and fails EBUSY
 # from inside a desktop session.
 
+# BASH_SOURCE, not $0: this file is *sourced*, and inside a sourced file $0 is
+# the caller — live.sh sources it from scripts/agent/, which would make this
+# line look for a lib.sh that is not there.
 # shellcheck source=lib.sh
-. "$(dirname "$(readlink -f "$0")")/lib.sh"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 inject_available() {
   need xdotool

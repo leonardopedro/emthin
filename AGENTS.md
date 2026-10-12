@@ -83,6 +83,19 @@ The `docui`, `figure_render`, `keymap`, `session` and figure-binding
 tests are plain unit tests: they are pure logic over the document and
 need no compositor.
 
+## Agent loop
+
+`docs/AGENT_LOOP.md` — the dual-modality debug loop for LLM-driven
+document editing: a semantic tier (`scripts/agent/preview.sh` →
+`mathed_mini --layout-json`, no display; live `state` over IPC) first,
+visual tier (headless `--doc-image` PNG, live `grim` screenshot)
+second. `scripts/agent/live.sh boot|state|shot|size|open|save|log|down`
+wraps the e2e's sway-on-Xvfb session for repeated edit→observe cycles.
+The loop paid for itself immediately: it found and root-caused the
+GUI-client dmabuf segfault (software GL advertised a dmabuf global it
+cannot import; now gated on a real DRM render node — see
+`docs/AGENT_LOOP.md` §Resolved).
+
 ---
 
 # Architecture

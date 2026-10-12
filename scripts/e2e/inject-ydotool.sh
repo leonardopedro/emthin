@@ -51,7 +51,7 @@
 # needs the device permission.
 
 # shellcheck source=lib.sh
-. "$(dirname "$(readlink -f "$0")")/lib.sh"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 # ── the injection seam ──────────────────────────────────────────────────────
 

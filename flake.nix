@@ -138,11 +138,24 @@
               # makes it map a real X window, which is what XTEST needs.
               sway
 
+              # ── agent loop: the visual tier ─────────────────────────
+              # grim captures sway's output over wlr-screencopy, which is
+              # how scripts/agent/live.sh takes the screenshot an LLM
+              # inspects when the semantic tier (IPC `state`) says the
+              # geometry is fine but "does it look right" still needs
+              # eyes. It runs as a client of the *host* compositor (sway),
+              # not of emthin, so emthin needs no screencopy protocol of
+              # its own.
+              grim
+
               # ── E2E: the harness itself is python + coreutils ────────
               # scripts/e2e/ipc.py speaks the control protocol and state.py
               # pretty-prints the reply. Found the hard way: the clipboard
               # checks passed without it because they do not use python, so the
               # gap only shows up on the keyboard path.
+              #
+              # Also the agent loop's control plane: scripts/agent/live.sh
+              # drives the same ipc.py over the same socket.
               python3
             ];
 

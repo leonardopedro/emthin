@@ -160,17 +160,27 @@ fn claim_figure(
     app_id: &str,
     title: &str,
 ) -> Option<String> {
-    // 1. an unbound figure whose binding id matches.
-    let by_id = state
+    // 1. every unbound figure whose binding id matches.
+    //
+    // *Every* match, not just the first: mirrors are several `\app`
+    // statements sharing one binding id (`FigureManager::figures_of_app`),
+    // and binding only the first left the rest dormant — `window: null`
+    // in `list_state` and no pixels composited, even though the mirror
+    // was on the visible page. The first in document order is the
+    // primary: it gets the configure and the geometry note.
+    let by_id: Vec<String> = state
         .doc
         .figures()
         .figures()
         .iter()
-        .find(|f| f.is_dormant() && matches_id(f.spec.id.as_deref(), app_id, title))
-        .map(|f| f.key.clone());
-    if let Some(key) = by_id {
-        state.doc.figures_mut().bind(&key, window_id);
-        return Some(key);
+        .filter(|f| f.is_dormant() && matches_id(f.spec.id.as_deref(), app_id, title))
+        .map(|f| f.key.clone())
+        .collect();
+    if let Some(primary) = by_id.first().cloned() {
+        for key in &by_id {
+            state.doc.figures_mut().bind(key, window_id);
+        }
+        return Some(primary);
     }
 
     // 2. the first unbound figure in document order.

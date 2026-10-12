@@ -7,7 +7,7 @@
 # the injection seam, so "no backend" is just a backend that declines.
 
 # shellcheck source=lib.sh
-. "$(dirname "$(readlink -f "$0")")/lib.sh"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 inject_available() { return 1; }
 inject_note() {

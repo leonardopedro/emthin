@@ -10,7 +10,7 @@
 # Run via ./run.sh --config <name>.
 
 # shellcheck source=lib.sh
-. "$(dirname "$(readlink -f "$0")")/lib.sh"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 HOST_WAYLAND="${E2E_HOST_WAYLAND:-wayland-0}"
 

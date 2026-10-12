@@ -173,19 +173,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("SIGTERM will kill the process without saving the session");
     }
 
-    // The loop already iterates at least once per frame, so checking the flag
-    // here is prompt while anything at all is happening.
+    // The loop checks the flag every iteration, but `run(None, …)` blocks
+    // indefinitely when nothing is happening — no frame, no input, no IPC — so
+    // an idle compositor never notices SIGTERM at all. The e2e caught this: the
+    // harness's teardown had to SIGKILL after 30s and reported "a real failure
+    // of the signal path". A bounded timeout wakes the loop even with no
+    // events, making the flag check prompt (≤100 ms) instead of eventual —
+    // which is exactly the cost `emthin::shutdown`'s doc comment says is worth
+    // avoiding a self-pipe for.
     // Cloned out of `state` so the closure does not re-borrow it: `LoopSignal`
     // stops through interior mutability, but reaching it through `state` while
     // `run` holds `&mut state` will not borrow-check however the method is
     // declared.
     let shutdown_signal = state.loop_signal.clone();
-    event_loop.run(None, &mut state, |st| {
-        if emthin::shutdown::requested() {
-            shutdown_signal.stop();
-        }
-        emthin::tick::event_loop_tick(st);
-    })?;
+    event_loop.run(
+        Some(std::time::Duration::from_millis(100)),
+        &mut state,
+        |st| {
+            if emthin::shutdown::requested() {
+                shutdown_signal.stop();
+            }
+            emthin::tick::event_loop_tick(st);
+        },
+    )?;
 
     // Graceful shutdown: snapshot the session, then reap children.
     state.doc.save();

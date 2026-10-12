@@ -169,6 +169,15 @@ impl FigureManager {
             .collect()
     }
 
+    /// Mutable form of [`FigureManager::figures_of_app`] — a title (or
+    /// any app-wide attribute) belongs to every mirror of the app.
+    pub fn figures_of_app_mut(&mut self, app_id: u64) -> Vec<&mut Figure> {
+        self.figures
+            .iter_mut()
+            .filter(|f| f.app_id == Some(app_id))
+            .collect()
+    }
+
     /// Rebuild the figure list from the document and the latest layout.
     ///
     /// Declarative state (spec, spans, arg ranges) comes from the doc;

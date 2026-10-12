@@ -253,14 +253,17 @@ impl DocUi {
 
     /// Record (or clear) an app's title.
     pub fn on_app_title_changed(&mut self, app_id: u64, title: &str) {
-        if let Some(figure) = self.figures.figure_of_app_mut(app_id) {
+        // Every mirror, not just the first: they are one app, and
+        // `list_state` reporting a title on one figure but `None` on
+        // its twins is a lie about what is on screen.
+        for figure in self.figures.figures_of_app_mut(app_id) {
             figure.title = Some(title.to_string());
         }
     }
 
     /// Record an app's app_id (used for wildcard figure binding).
     pub fn on_app_id_changed(&mut self, app_id: u64, app_id_str: &str) {
-        if let Some(figure) = self.figures.figure_of_app_mut(app_id) {
+        for figure in self.figures.figures_of_app_mut(app_id) {
             if figure.title.is_none() {
                 figure.title = Some(app_id_str.to_string());
             }

@@ -28,11 +28,13 @@
 //! times a second because winit delivers frame callbacks. No pipe, no fd, no
 //! epoll registration, nothing to go wrong at 3am.
 //!
-//! The cost is honest and worth stating: if the loop is completely idle, with no
-//! frame callback pending and no input, the request is noticed on the next event
-//! rather than immediately. A compositor that renders on demand can sit idle; the
-//! shutdown then waits for the next thing that happens. That is a delay, not a
-//! hang, and it is the right trade against a mechanism that does not work at all.
+//! The cost is honest and worth stating: the loop must wake up for the check to
+//! run. `main` therefore drives the loop with a bounded 100 ms timeout rather
+//! than `None`, so an idle compositor still polls the flag ten times a second.
+//! (Before that bound, the e2e's SIGTERM teardown timed out after 30 s and had
+//! to SIGKILL: no events meant no iterations meant no check — a delay that
+//! reads as a hang.) The flag check is the whole mechanism; nothing else has
+//! to go right at 3am.
 //!
 //! `request()` is called from a signal handler, so it must stay async-signal-safe:
 //! a relaxed atomic store and nothing else. No allocation, no locks, no logging.

@@ -461,9 +461,17 @@ impl EmthinState {
             .and_then(|focus| {
                 let wl = focus.wl_surface()?;
                 let app_id = self.apps.id_for_surface(&wl)?;
+                // Mirrors share one app, so `figure_of_app` would return
+                // the first in document order — a figure that may be on
+                // another page with its own `w × h`. Clone the one the
+                // user is actually looking at.
+                let page = self.doc.current_page();
                 self.doc
                     .figures()
-                    .figure_of_app(app_id)
+                    .figures_of_app(app_id)
+                    .into_iter()
+                    .find(|f| f.page == Some(page))
+                    .or_else(|| self.doc.figures().figure_of_app(app_id))
                     .map(|f| f.key.clone())
             })
             .or_else(|| {
@@ -518,26 +526,28 @@ impl EmthinState {
 
     /// Apply a key to the document when nothing else has keyboard focus.
     ///
-    /// Returns `true` if the key was consumed, re-laying out the document if the
-    /// keystroke changed it.
+    /// Returns `true` if the key was consumed. A keystroke that changed the
+    /// document leaves the model dirty, and the event loop tick performs the
+    /// re-layout.
     ///
-    /// The re-layout is not optional and does not belong inside the keystroke
-    /// handler: the page raster, the glyph index the caret is measured against,
-    /// and every figure rect are all products of the layout, and `DocUi::relayout`
-    /// is reached from nowhere else in the input path. Without it a keystroke
-    /// changed the model — and `DocUi::tick` autosaved the new text — while the
-    /// screen went on showing the previous page, so the characters appeared all
-    /// at once whenever something else happened to trigger a re-layout (a window
-    /// resize, `PgDn`, an IPC message).
+    /// The re-layout itself is not optional — the page raster, the glyph index
+    /// the caret is measured against, and every figure rect are products of the
+    /// layout, and without it a keystroke changed the model while the screen
+    /// went on showing the previous page. What changed is *when*: it used to run
+    /// here, once per keystroke, and `layout_doc_paged` is a whole-document
+    /// Typst compile. Measured on the e2e session document, that is 858 ms in a
+    /// debug build, so a ten-character burst queued eight and a half seconds of
+    /// serial typesetting — the loop could not service IPC or input while it
+    /// ran, and the e2e's keyboard check read an empty document back.
     ///
-    /// Gated on `is_dirty` because most keys here are caret motion, which leaves
-    /// the layout valid.
+    /// Deferring to `event_loop_tick` keeps the guarantee the old comment
+    /// demanded (the screen still catches up before anything observes it —
+    /// the tick runs at least every 100 ms and before IPC dispatch) while
+    /// coalescing a burst into **one** typeset instead of one per character.
+    /// A single keystroke is one loop iteration behind the model; a burst is
+    /// one typeset for the whole burst.
     fn edit_document_key(&mut self, keysym: u32) -> bool {
-        let consumed = self.edit_document_key_inner(keysym);
-        if consumed && self.doc.model().is_dirty() {
-            self.relayout_document();
-        }
-        consumed
+        self.edit_document_key_inner(keysym)
     }
 
     /// Returns `true` if the key was consumed. This is ordinary text
@@ -589,7 +599,23 @@ impl EmthinState {
                 let Some(text) = Self::char_for_keysym(keysym) else {
                     return false;
                 };
-                self.doc.model_mut().insert_at_caret(&text);
+                // Typing replaces an active selection, like any editor:
+                // `insert_at_caret` alone would leave the selected text in
+                // place and clear the anchor. Deleted first, so a `#` scan
+                // below also sees the words the deletion freed as reusable.
+                self.doc.model_mut().take_selection();
+                if text == "#" {
+                    // A typed `#` is a marker position, not a character: it
+                    // becomes the RFC 1751 word for the lowest free marker
+                    // number (`#i`, `#o`, `#ad`, …) unless the caret sits
+                    // after a backslash, where `\#` is the Typst escape and
+                    // a literal `#` is wanted. Same contract as mathed and
+                    // mathed_mini's `insert_hash`.
+                    let token = crate::docui::edit::typed_hash_token(self.doc.model());
+                    self.doc.model_mut().insert_at_caret(&token);
+                } else {
+                    self.doc.model_mut().insert_at_caret(&text);
+                }
             }
         }
         true
@@ -613,8 +639,15 @@ impl EmthinState {
                 let m = self.doc.model_mut();
                 match keysym {
                     // Ctrl+Z / Ctrl+Shift+Z (and Ctrl+Y) — undo/redo.
-                    k if k == keysyms::KEY_z || k == keysyms::KEY_y => {
-                        let redo = k == keysyms::KEY_y || shift;
+                    // Uppercase accepted: `sym` is the modified keysym, so
+                    // Ctrl+Shift+Z (the documented redo) arrives as `Z`,
+                    // not `z` — matching only lowercase made it unreachable.
+                    k if k == keysyms::KEY_z
+                        || k == keysyms::KEY_Z
+                        || k == keysyms::KEY_y
+                        || k == keysyms::KEY_Y =>
+                    {
+                        let redo = shift || k == keysyms::KEY_y || k == keysyms::KEY_Y;
                         if redo {
                             m.redo();
                         } else {
