@@ -23,6 +23,7 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
         IncomingMessage::OpenDoc { path } => ipc_open_doc(state, &path),
         IncomingMessage::SaveDoc { path } => ipc_save_doc(state, &path),
         IncomingMessage::ListState => ipc_list_state(state),
+        IncomingMessage::Voice { text, block } => ipc_voice(state, block, text.as_deref()),
         IncomingMessage::DbusRouterAddRule { rule } => {
             tracing::debug!("IPC dbus_router_add_rule id={}", rule.id);
             state
@@ -114,6 +115,22 @@ fn ipc_clone_figure(state: &mut EmthinState, figure: &str) {
     crate::docui::edit::clone_figure(state.doc.model_mut(), &fig);
     state.relayout_document();
     state.needs_redraw = true;
+}
+
+/// Queue a voice turn. The harness runs on a worker thread, so this
+/// returns immediately: the outcome arrives as a `voice_result`
+/// notification (or `error`) from the tick that polls the bridge.
+fn ipc_voice(state: &mut EmthinState, block: Option<usize>, text: Option<&str>) {
+    tracing::debug!("IPC voice block={block:?} text={text:?}");
+    match state.doc.voice_submit(block, text) {
+        Ok(submit) => tracing::info!(
+            "IPC voice: turn queued for block #{} (append_utterance={}, say={})",
+            submit.block_index,
+            submit.append_utterance,
+            submit.say
+        ),
+        Err(reason) => error(state, format!("voice: {reason}")),
+    }
 }
 
 fn ipc_open_doc(state: &mut EmthinState, path: &str) {

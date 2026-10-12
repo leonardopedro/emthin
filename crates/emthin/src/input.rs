@@ -372,6 +372,16 @@ impl EmthinState {
             Action::FocusDocument => self.focus_document(),
             Action::OpenLauncher => self.open_launcher(),
             Action::CloneFigure => self.clone_focused_figure(),
+            Action::VoiceTurn => {
+                // Queue one turn for the `\voice` block at the caret.
+                // A rejection (no harness installed, caret outside a
+                // block, nothing to ask) is a normal press, not an
+                // error: the document is untouched and the log line is
+                // the only trace.
+                if let Err(reason) = self.doc.voice_turn() {
+                    tracing::info!("voice: {reason}");
+                }
+            }
         }
         self.relayout_document();
         self.needs_redraw = true;

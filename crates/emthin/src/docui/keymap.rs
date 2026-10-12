@@ -13,6 +13,7 @@
 //! | `Home` / `End` | start / end of the document |
 //! | `Ctrl+Home` / `Ctrl+End` | start / end of the line |
 //! | `Ctrl+Shift+M` | clone the focused figure (add a mirror) |
+//! | `Ctrl+Shift+V` | run a voice turn for the `\voice` block at the caret |
 //! | `Escape` / `Ctrl+G` | return focus from a figure to the document |
 //!
 //! Figure-local bindings (resize with `Alt+arrows`) live in
@@ -46,6 +47,10 @@ pub enum Action {
     LineEnd,
     /// Clone the focused figure into a new `\app` statement (a mirror).
     CloneFigure,
+    /// Ask the voice harness about the `\voice` block at the caret —
+    /// the typed `you:` line if there is one, else the microphone in a
+    /// `listen`/`full` block. See `crate::docui::voice`.
+    VoiceTurn,
     /// Drop keyboard focus from the figure back to the document caret.
     FocusDocument,
 }
@@ -70,12 +75,17 @@ pub fn classify(sym: u32, pressed: KeyState, ctrl: bool, shift: bool, alt: bool)
         keysyms::KEY_Page_Down => Some(Action::NextPage),
         keysyms::KEY_Page_Up => Some(Action::PreviousPage),
         keysyms::KEY_Escape => Some(Action::FocusDocument),
-        keysyms::KEY_g if ctrl => Some(Action::FocusDocument),
+        // Letter arms accept both cases: `sym` is the *modified* keysym
+        // (shift applied), so a shift chord arrives uppercase — matching
+        // only the lowercase symbol made `Ctrl+Shift+M` unreachable in
+        // the real input path even though the unit test passed.
+        keysyms::KEY_g | keysyms::KEY_G if ctrl => Some(Action::FocusDocument),
         keysyms::KEY_Home if ctrl => Some(Action::LineStart),
         keysyms::KEY_End if ctrl => Some(Action::LineEnd),
         keysyms::KEY_Home if !ctrl && !alt => Some(Action::DocumentStart),
         keysyms::KEY_End if !ctrl && !alt => Some(Action::DocumentEnd),
-        keysyms::KEY_m if ctrl && shift => Some(Action::CloneFigure),
+        keysyms::KEY_m | keysyms::KEY_M if ctrl && shift => Some(Action::CloneFigure),
+        keysyms::KEY_v | keysyms::KEY_V if ctrl && shift => Some(Action::VoiceTurn),
         _ => None,
     }
 }
@@ -87,6 +97,10 @@ pub const DOCUMENTED_KEYMAP: &[(&str, &str)] = &[
     ("Home / End", "start / end of the document"),
     ("Ctrl+Home / Ctrl+End", "start / end of the line"),
     ("Ctrl+Shift+M", "clone the focused figure (add a mirror)"),
+    (
+        "Ctrl+Shift+V",
+        "run a voice turn for the \\voice block at the caret",
+    ),
     (
         "Escape / Ctrl+G",
         "return focus from a figure to the document",
@@ -189,9 +203,31 @@ mod tests {
         assert!(DOCUMENTED_KEYMAP
             .iter()
             .any(|(_, what)| what.contains("app launcher")));
+        // The real input path feeds the *modified* keysym (shift
+        // applied), so Ctrl+Shift+m arrives as uppercase `M` — pin that
+        // path, not the lowercase state no shift chord can produce.
         assert_eq!(
-            classify(keysyms::KEY_m, KeyState::Pressed, true, true, false),
+            classify(keysyms::KEY_M, KeyState::Pressed, true, true, false),
             Some(Action::CloneFigure)
+        );
+    }
+
+    #[test]
+    fn the_voice_turn_needs_ctrl_and_shift_and_steals_nothing_from_paste() {
+        assert_eq!(
+            classify(keysyms::KEY_V, KeyState::Pressed, true, true, false),
+            Some(Action::VoiceTurn),
+            "the real input path delivers the modified (uppercase) keysym"
+        );
+        assert_eq!(
+            classify(keysyms::KEY_v, KeyState::Pressed, true, false, false),
+            None,
+            "Ctrl+V is the document's paste — it must fall through"
+        );
+        assert_eq!(
+            classify(keysyms::KEY_v, KeyState::Pressed, false, true, false),
+            None,
+            "Shift+V alone is plain text"
         );
     }
 }

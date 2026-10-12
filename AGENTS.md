@@ -116,6 +116,7 @@ crates/emthin/src/
 │   ├── figures.rs       FigureManager: one Figure per \app, app↔figure binding
 │   ├── edit.rs          document edits the compositor makes (resize, append, clone)
 │   ├── formals.rs       \formal verification: ask `logos unf`, splice verdicts
+│   ├── voice.rs         \voice dialogue: drive voice.sh, splice the transcript
 │   └── keymap.rs        the global key bindings
 │
 ├── doc_render.rs        the page raster's trip to the GPU, cached by revision

@@ -8,6 +8,51 @@ use crate::state::EmthinState;
 /// lifecycle, IPC dispatch, clipboard events, and pending geometry
 /// timeouts.
 pub fn event_loop_tick(state: &mut EmthinState) {
+    // --- Voice: finish turns whose harness run has completed ---
+    //
+    // Before the relayout below so a reply spliced this tick is
+    // typeset this tick (`DocUi::poll_voice` marks the model dirty
+    // itself). The harness runs on a worker thread — a turn is
+    // seconds, a dictation is a recording — and this is the only point
+    // that collects its outcome. Events are forwarded to the control
+    // client: success as `voice_result`, failure as `error`, because
+    // the protocol has no responses, only notifications.
+    for event in state.doc.poll_voice() {
+        let msg = match event.outcome {
+            Ok(turn) => crate::ipc::OutgoingMessage::VoiceResult {
+                block: event.block_index,
+                utterance: turn.utterance,
+                reply: turn.reply,
+            },
+            Err(message) => crate::ipc::OutgoingMessage::Error {
+                message: format!("voice: {message}"),
+            },
+        };
+        state.ipc.send(msg);
+    }
+
+    // --- Re-layout a document an edit left dirty ---
+    //
+    // Keystrokes mark the model dirty and return; this is where the typeset
+    // actually happens (`input::edit_document_key` for why it is not done per
+    // keystroke). It runs first because everything below reads layout products:
+    // app binding takes figure rects for its geometry, IPC `list_state` reports
+    // them, and the autosave should snapshot a document whose on-screen layout
+    // matches its text. `relayout` is a no-op when the model is clean, which is
+    // every tick that had no edit.
+    //
+    // `needs_redraw` is re-armed when a relayout really ran: a `Redraw` can be
+    // delivered in the same winit dispatch batch as the keystroke that dirtied
+    // the model, so the frame may already have been drawn against the old
+    // layout — and winit's Input arm sets the flag *before* this runs, so
+    // nothing else would ask for another one. Without this the final raster of
+    // a burst can stay one typeset behind until the next unrelated input.
+    let dirty = state.doc.model().is_dirty();
+    state.relayout_document();
+    if dirty {
+        state.needs_redraw = true;
+    }
+
     // --- Reap exited apps ---
     // Unlike the old Emacs shell, an app exiting does **not** stop the
     // compositor: its figure stays in the document as a dormant

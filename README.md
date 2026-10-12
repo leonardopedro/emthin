@@ -110,6 +110,7 @@ figure to the end of the document, captioned with the app's title.
 | `Home` / `End` | start / end of the document |
 | `Ctrl+Home` / `Ctrl+End` | start / end of the line |
 | `Ctrl+Shift+M` | clone the focused figure (add a mirror) |
+| `Ctrl+Shift+V` | voice turn for the `\voice` block at the caret |
 | `Escape` / `Ctrl+G` | return focus from a figure to the document |
 | `XF86WakeUp` | toggle focus between the focused figure and the document |
 
@@ -130,6 +131,39 @@ made `Ctrl+Shift+Z` unreachable from a real keyboard.
   app renders in both. `Ctrl+Shift+M` clones a figure's statement.
 - Figures on other pages keep their apps running but idle — they stop
   receiving frame callbacks until you turn back to their page.
+
+## Voice
+
+A `\voice` block in the document is a **live dialogue session** with a
+local LLM — the same helper the `unfer` project's `voice/voice.sh`
+drives interactively, used here as a plugin (the shape `\slint` blocks
+have in `mathed`): the block marker names the helper process, the
+helper owns everything heavy (model round trip, microphone, TTS), and
+emthin degrades to a plain document when the helper is missing.
+
+```text
+\voice typeyou: what is a Krylov basis?
+```
+
+`Ctrl+Shift+V` (or the IPC `voice` method) asks about the block's
+unanswered `you:` line — or, in a `listen`/`full` block, opens the
+microphone and asks what it heard. The reply is spliced back into the
+transcript as a `gemma:` line on a later tick, because the helper runs
+on a worker thread: a turn is seconds, and the compositor must not
+stall.
+
+The transcript lives **in the document**, which is the point: it
+persists with the session, it is editable and undoable like any other
+text, and each turn feeds the helper its history read back out of the
+block — so editing a past turn edits the model's context too. Modes
+(`type`/`speak`/`listen`/`full`) select text vs. spoken replies and
+typed vs. spoken questions; only `listen`/`full` ever touch the
+microphone.
+
+The helper is resolved from `$EMTHIN_VOICE_BIN`, else `voice.sh` on
+`$PATH` (see `unfer/voice/` for the harness and its one-shot
+`turn`/`dictate` contract). Without it, `Ctrl+Shift+V` is a no-op and
+the document is unaffected — the `\formal`/`\slint` rule.
 
 ## Control protocol
 

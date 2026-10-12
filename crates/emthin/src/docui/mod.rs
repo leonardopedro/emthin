@@ -21,6 +21,7 @@ pub mod formals;
 pub mod keymap;
 pub mod layout;
 pub mod model;
+pub mod voice;
 
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,7 @@ pub use figures::{Figure, FigureManager};
 pub use formals::FormalVerifier;
 pub use layout::{DocLayoutCache, PlacedFigure};
 pub use model::DocModel;
+pub use voice::{VoiceBridge, VoiceEvent, VoiceSubmit, VoiceTurn};
 
 /// How often the session is autosaved. Loro snapshots are cheap
 /// (copy-on-write), so this can be aggressive — driftwm's as-you-work
@@ -46,6 +48,10 @@ pub struct DocUi {
     /// the document, so a relayout caused by an unrelated edit does not re-run
     /// the subprocess.
     formals: FormalVerifier,
+    /// The `\voice` dialogue seam: the `voice.sh` helper resolved from
+    /// `${EMTHIN_VOICE_BIN}` or `$PATH`, plus the one turn in flight.
+    /// Replies land in the transcript through [`DocUi::poll_voice`].
+    voice: VoiceBridge,
     /// Where the session is persisted (`None` = don't persist).
     session_file: Option<std::path::PathBuf>,
     last_autosave: Instant,
@@ -67,6 +73,7 @@ impl DocUi {
             layout: DocLayoutCache::new(),
             figures: FigureManager::new(),
             formals: FormalVerifier::new(),
+            voice: VoiceBridge::new(),
             session_file: None,
             last_autosave: Instant::now(),
             last_error: None,
@@ -89,6 +96,56 @@ impl DocUi {
     /// Pin a kernel, for a test or a deployment that wants a specific binary.
     pub fn formals_mut(&mut self) -> &mut FormalVerifier {
         &mut self.formals
+    }
+
+    /// The voice harness seam behind every `\voice` dialogue turn.
+    pub fn voice(&self) -> &VoiceBridge {
+        &self.voice
+    }
+
+    /// Pin a voice harness, for a test or a pinned deployment.
+    pub fn voice_mut(&mut self) -> &mut VoiceBridge {
+        &mut self.voice
+    }
+
+    /// Queue a voice turn for the `\voice` block at the caret
+    /// (`Ctrl+Shift+V`).
+    ///
+    /// The subprocess runs on a worker thread — a turn is seconds and a
+    /// dictation is a recording — so the outcome arrives through
+    /// [`DocUi::poll_voice`] on a later tick and never blocks the event
+    /// loop. An `Err` is a rejection the press can absorb (no harness
+    /// installed, caret outside every `\voice` block, nothing to ask):
+    /// the document is untouched.
+    pub fn voice_turn(&mut self) -> Result<VoiceSubmit, String> {
+        voice::submit(&self.model, &mut self.voice, voice::Target::Caret, None)
+    }
+
+    /// Queue a voice turn for the control protocol (`ipc::Voice`):
+    /// `text` is an explicit utterance (else the pending `you:` line, or
+    /// the microphone in a `listen`/`full` block), `block` a `\voice`
+    /// block index (else the caret's block, else the first — a script
+    /// driving the document has no caret of its own).
+    pub fn voice_submit(
+        &mut self,
+        block: Option<usize>,
+        text: Option<&str>,
+    ) -> Result<VoiceSubmit, String> {
+        let target = match block {
+            Some(i) => voice::Target::Block(i),
+            None => voice::Target::CaretOrFirst,
+        };
+        voice::submit(&self.model, &mut self.voice, target, text)
+    }
+
+    /// Drain finished voice turns into the document and return them.
+    ///
+    /// Called once per tick *before* the relayout, so a reply spliced
+    /// this tick is typeset this tick (`poll` marks the model dirty).
+    /// The events are for the caller to forward over IPC — the
+    /// protocol has no responses, only notifications.
+    pub fn poll_voice(&mut self) -> Vec<VoiceEvent> {
+        voice::poll(&mut self.model, &mut self.voice)
     }
 
     pub fn layout(&self) -> &DocLayoutCache {

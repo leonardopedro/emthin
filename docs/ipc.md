@@ -102,6 +102,40 @@ Dump the whole document and figure list. Answers with `state`.
 {"jsonrpc":"2.0","method":"list_state","params":{}}
 ```
 
+### `voice`
+
+Ask the voice harness about a `\voice` dialogue block — the same turn
+`Ctrl+Shift+V` queues from the keyboard. The harness (an external
+`voice.sh` process, resolved from `$EMTHIN_VOICE_BIN` or `$PATH`) runs
+on a worker thread, so the command returns immediately and the answer
+arrives later as a `voice_result` notification (or `error`). No
+`\voice` block, no harness installed, or a turn already in flight are
+rejections delivered as `error`.
+
+```json
+{"jsonrpc":"2.0","method":"voice","params":{"text":"hello there"}}
+{"jsonrpc":"2.0","method":"voice","params":{"block":0}}
+{"jsonrpc":"2.0","method":"voice","params":{}}
+```
+
+Both fields are optional, and present-but-wrong-typed fields are
+rejected rather than falling back — a client that asked for text and
+silently got a *recording* (or the wrong block) is the kind of
+surprise this protocol exists to avoid.
+
+- `text`: ask this utterance. Absent: the block's pending `you:` line
+  is asked if there is one; else, in a `listen`/`full` block, the
+  microphone is opened and the transcription becomes the question.
+- `block`: 0-based index among the document's `\voice` blocks
+  (`list_state`'s `doc` shows them). Absent: the caret's block, else
+  the first one — a driving script has no caret of its own.
+
+The reply is spliced into the block's transcript as a `gemma:` line
+(and the question as a `you:` line when it was not already typed
+there), so the document stays the dialogue's single source of truth:
+the next turn's model history is read back out of the transcript.
+A failed turn splices a `voice: <reason>` line instead of vanishing.
+
 ### `dbus_router_add_rule` / `dbus_router_remove_rule` / `dbus_router_list_rules`
 
 DBus routing rules for embedded clients (unchanged from the pre-rewrite
@@ -123,6 +157,7 @@ protocol).
 | `page_changed` | the visible page changed | `page` |
 | `state` | reply to `list_state` | `page`, `page_count`, `doc`, `figures` |
 | `doc_saved` | reply to `save_doc` | `path` |
+| `voice_result` | a `voice` turn finished and was spliced into its block | `block`, `utterance`, `reply` |
 | `x_wayland_ready` | the XWayland socket is bound | `display` |
 | `dbus_router_rule_added` | a DBus routing rule was added | `id`, `rule` |
 | `dbus_router_rule_removed` | a DBus routing rule was removed | `id` |

@@ -56,6 +56,17 @@ pub enum IncomingMessage {
     SaveDoc { path: String },
     /// Dump the full document + figure state.
     ListState,
+    /// Ask the voice harness about a `\voice` dialogue block
+    /// (`docui::voice`). `text` is an explicit utterance; without it
+    /// the block's pending `you:` line is asked, or — in a
+    /// `listen`/`full` block — the microphone is opened. `block` is
+    /// the 0-based index among the document's `\voice` blocks; when
+    /// absent the caret's block is used, else the first one. The
+    /// answer arrives as a `voice_result` notification (or `error`).
+    Voice {
+        text: Option<String>,
+        block: Option<usize>,
+    },
     /// Add a DBus routing rule.
     DbusRouterAddRule {
         rule: emthin_dbus::router::RouteRule,
@@ -111,6 +122,17 @@ pub enum OutgoingMessage {
     /// The document was written to disk.
     DocSaved {
         path: String,
+    },
+    /// A voice turn finished and was spliced into its `\voice` block
+    /// as a `gemma:` line. `block` is the block's 0-based index at
+    /// submit time; `utterance` is the question that was asked (typed,
+    /// dictated, or passed to the `voice` method). A failed turn
+    /// arrives as `Error` instead, and the failure is also spliced
+    /// into the transcript as a `voice:` line.
+    VoiceResult {
+        block: usize,
+        utterance: String,
+        reply: String,
     },
     /// XWayland is ready; children can be spawned with `DISPLAY=:<n>`.
     XWaylandReady {
@@ -199,6 +221,17 @@ impl IncomingMessage {
                 path: params_get_string(params, "path")?,
             },
             "list_state" => Self::ListState,
+            // Both fields optional: omitted `text` means "ask the
+            // pending you: line, or dictate", omitted `block` means
+            // "the caret's voice block, else the first". Present-but-
+            // wrong-typed fields are an error rather than a fallback:
+            // a script that asked for text and silently got a
+            // *recording* (or the wrong block) is exactly the kind of
+            // surprise this protocol exists to avoid.
+            "voice" => Self::Voice {
+                text: params_get_optional_string(params, "text")?,
+                block: params_get_optional_usize(params, "block")?,
+            },
             "dbus_router_add_rule" => {
                 let rule: emthin_dbus::router::RouteRule = serde_json::from_value(
                     params.get("rule").cloned().ok_or("missing field 'rule'")?,
@@ -236,6 +269,37 @@ fn params_get_usize(params: &serde_json::Value, key: &str) -> Result<usize, Stri
         .ok_or_else(|| format!("missing/invalid field '{key}'"))
 }
 
+/// An optional string param: absent or `null` is `None`, anything
+/// else must actually be a string.
+fn params_get_optional_string(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| format!("invalid field '{key}' (expected a string)")),
+    }
+}
+
+/// An optional non-negative integer param, same rules as
+/// [`params_get_optional_string`].
+fn params_get_optional_usize(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| format!("invalid field '{key}' (expected a non-negative integer)")),
+    }
+}
+
 impl IpcRect {
     fn to_json(self) -> serde_json::Value {
         serde_json::json!({"x": self.x, "y": self.y, "w": self.w, "h": self.h})
@@ -253,6 +317,7 @@ impl OutgoingMessage {
             Self::PageChanged { .. } => "page_changed",
             Self::State { .. } => "state",
             Self::DocSaved { .. } => "doc_saved",
+            Self::VoiceResult { .. } => "voice_result",
             Self::XWaylandReady { .. } => "x_wayland_ready",
             Self::DbusRouterRules { .. } => "dbus_router_rules",
             Self::DbusRouterRuleAdded { .. } => "dbus_router_rule_added",
@@ -303,6 +368,15 @@ impl OutgoingMessage {
                 "figures": figures,
             }),
             Self::DocSaved { path } => serde_json::json!({"path": path}),
+            Self::VoiceResult {
+                block,
+                utterance,
+                reply,
+            } => serde_json::json!({
+                "block": block,
+                "utterance": utterance,
+                "reply": reply,
+            }),
             Self::XWaylandReady { display } => serde_json::json!({"display": display}),
             Self::DbusRouterRules { rules } => {
                 serde_json::json!({"rules": serde_json::to_value(rules).unwrap_or_default()})
@@ -385,6 +459,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_voice_with_optional_text_and_block() {
+        let m = IncomingMessage::from_jsonrpc("voice", &serde_json::json!({}))
+            .expect("a bare voice turn");
+        assert!(matches!(
+            m,
+            IncomingMessage::Voice {
+                text: None,
+                block: None
+            }
+        ));
+        let m = IncomingMessage::from_jsonrpc(
+            "voice",
+            &serde_json::json!({"text": "hello", "block": 1}),
+        )
+        .expect("voice");
+        match m {
+            IncomingMessage::Voice { text, block } => {
+                assert_eq!(text.as_deref(), Some("hello"));
+                assert_eq!(block, Some(1));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A non-string `text` is not silently ignored — it is an error
+        // the caller can see, like every other malformed field.
+        assert!(IncomingMessage::from_jsonrpc("voice", &serde_json::json!({"text": 4})).is_err());
+    }
+
+    #[test]
     fn every_outgoing_method_name_is_snake_case() {
         // Guards the manual wire spelling: the one thing a derive
         // would silently break.
@@ -415,6 +517,11 @@ mod tests {
                 title: "t".into(),
             },
             OutgoingMessage::PageChanged { page: 0 },
+            OutgoingMessage::VoiceResult {
+                block: 0,
+                utterance: "u".into(),
+                reply: "r".into(),
+            },
             OutgoingMessage::XWaylandReady { display: 1 },
             OutgoingMessage::DbusRouterRuleRemoved { id: "i".into() },
             OutgoingMessage::Error {
