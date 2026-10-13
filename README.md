@@ -58,7 +58,7 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 310 cargo + 5 E2E checks | last_verified: 2026-10-04 -->
+<!-- status: verified | tests: 345 cargo (workspace, nix develop) + 5 E2E checks (run.sh) | last_verified: 2026-10-13 -->
 
 ## Verification
 

@@ -840,13 +840,19 @@ mod tests {
         /// `turn|dictate [--say] --history FILE [TEXT]` — the history
         /// path is found by scanning for `--history` because `--say`
         /// shifts every position behind it.
+        ///
+        /// The echo (`utterance`) repeats the same fixed text: a
+        /// dictation learns its `you:` line from the echo, so the fake
+        /// "hears" what it also answers. A placeholder echo would splice
+        /// a meaningless heard line into every dictate-mode assertion.
         fn answering(reply: &str) -> Self {
             let mut body = String::from("echo \"$@\" > \"$0.args\"\n");
             body.push_str("prev=''; for a in \"$@\"; do \n");
             body.push_str("  if [ \"$prev\" = --history ] && [ -f \"$a\" ]; then cp \"$a\" \"$0.history\"; fi\n");
             body.push_str("  prev=\"$a\"\ndone\n");
             body.push_str(&format!(
-                "printf '{{\"utterance\": \"u\", \"reply\": \"{}\"}}'\n",
+                "printf '{{\"utterance\": \"{}\", \"reply\": \"{}\"}}'\n",
+                reply.replace('"', "\\\""),
                 reply.replace('"', "\\\"")
             ));
             FakeHarness::new("ok", &body)

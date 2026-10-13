@@ -4,7 +4,7 @@
 //! The document owns all policy — there is no layout arithmetic in this
 //! file, which is exactly the inversion the rewrite was for.
 
-use crate::ipc::{IncomingMessage, IpcRect, OutgoingMessage, StateFigure};
+use crate::ipc::{IncomingMessage, IpcErrorCode, IpcRect, OutgoingMessage, StateFigure};
 use crate::EmthinState;
 
 pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
@@ -45,10 +45,13 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
     }
 }
 
-fn error(state: &mut EmthinState, message: impl Into<String>) {
+/// Emit an `error` notification: a closed-set `code` for clients to
+/// branch on, the human `message` for the transcript and logs. The code's
+/// category/retry/remediation semantics live in `docs/error-contract.md`.
+fn error(state: &mut EmthinState, code: IpcErrorCode, message: impl Into<String>) {
     let message = message.into();
-    tracing::warn!("IPC error: {message}");
-    state.ipc.send(OutgoingMessage::Error { message });
+    tracing::warn!("IPC error [{code:?}]: {message}");
+    state.ipc.send(OutgoingMessage::Error { code, message });
 }
 
 fn ipc_spawn(state: &mut EmthinState, cmd: &str, args: &[String]) {
@@ -59,7 +62,11 @@ fn ipc_spawn(state: &mut EmthinState, cmd: &str, args: &[String]) {
 
 fn ipc_close(state: &mut EmthinState, figure: &str) {
     let Some(app_id) = state.doc.figures().get(figure).and_then(|f| f.app_id) else {
-        return error(state, format!("no app bound to figure {figure}"));
+        return error(
+            state,
+            IpcErrorCode::NotBound,
+            format!("no app bound to figure {figure}"),
+        );
     };
     tracing::debug!("IPC close figure={figure} app={app_id}");
     if let Some(app) = state.apps.get(app_id) {
@@ -80,11 +87,21 @@ fn ipc_focus(state: &mut EmthinState, figure: Option<&str>) {
         None => None,
         Some(key) => {
             let Some(app_id) = state.doc.figures().get(key).and_then(|f| f.app_id) else {
-                return error(state, format!("no app bound to figure {key}"));
+                return error(
+                    state,
+                    IpcErrorCode::NotBound,
+                    format!("no app bound to figure {key}"),
+                );
             };
             match state.apps.get(app_id) {
                 Some(app) => Some(crate::KeyboardFocusTarget::from(app.window.clone())),
-                None => return error(state, format!("figure {key}'s app is gone")),
+                None => {
+                    return error(
+                        state,
+                        IpcErrorCode::AppGone,
+                        format!("figure {key}'s app is gone"),
+                    )
+                }
             }
         }
     };
@@ -96,7 +113,11 @@ fn ipc_focus(state: &mut EmthinState, figure: Option<&str>) {
 
 fn ipc_set_figure_size(state: &mut EmthinState, figure: &str, w: i32, h: i32) {
     let Some(fig) = state.doc.figures().get(figure).cloned() else {
-        return error(state, format!("unknown figure {figure}"));
+        return error(
+            state,
+            IpcErrorCode::UnknownFigure,
+            format!("unknown figure {figure}"),
+        );
     };
     tracing::debug!("IPC set_figure_size figure={figure} {w}x{h}");
     if crate::docui::edit::set_figure_size(state.doc.model_mut(), &fig, w, h) {
@@ -109,7 +130,11 @@ fn ipc_set_figure_size(state: &mut EmthinState, figure: &str, w: i32, h: i32) {
 
 fn ipc_clone_figure(state: &mut EmthinState, figure: &str) {
     let Some(fig) = state.doc.figures().get(figure).cloned() else {
-        return error(state, format!("unknown figure {figure}"));
+        return error(
+            state,
+            IpcErrorCode::UnknownFigure,
+            format!("unknown figure {figure}"),
+        );
     };
     tracing::debug!("IPC clone_figure figure={figure}");
     crate::docui::edit::clone_figure(state.doc.model_mut(), &fig);
@@ -129,7 +154,7 @@ fn ipc_voice(state: &mut EmthinState, block: Option<usize>, text: Option<&str>) 
             submit.append_utterance,
             submit.say
         ),
-        Err(reason) => error(state, format!("voice: {reason}")),
+        Err(reason) => error(state, IpcErrorCode::VoiceFailed, format!("voice: {reason}")),
     }
 }
 
@@ -142,7 +167,11 @@ fn ipc_open_doc(state: &mut EmthinState, path: &str) {
             state.needs_redraw = true;
             tracing::info!("opened document {}", path.display());
         }
-        Err(e) => error(state, format!("could not read {}: {e}", path.display())),
+        Err(e) => error(
+            state,
+            IpcErrorCode::IoFailed,
+            format!("could not read {}: {e}", path.display()),
+        ),
     }
 }
 
@@ -155,7 +184,11 @@ fn ipc_save_doc(state: &mut EmthinState, path: &str) {
                 path: path.display().to_string(),
             });
         }
-        Err(e) => error(state, format!("could not write {}: {e}", path.display())),
+        Err(e) => error(
+            state,
+            IpcErrorCode::IoFailed,
+            format!("could not write {}: {e}", path.display()),
+        ),
     }
 }
 

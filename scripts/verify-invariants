@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# emthin invariant gate.
+#
+# Machine-checks the invariants this repo actually states (AGENTS.md
+# "Invariants (every session)" + the smithay pin rule), in the same
+# check/gap style as australVM/scripts/verify-invariants: a missing tool
+# is a [gap], never a silent pass. Output lists every executed item;
+# exit 0 = green, 1 = at least one FAIL.
+#
+# Usage: bash scripts/verify-invariants   (from the repo root)
+
+set -u
+FAILED=0
+PASSED=0
+GAPS=0
+
+check() {
+    local name="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "[pass] $name"; PASSED=$((PASSED + 1))
+    else echo "[FAIL] $name"; FAILED=$((FAILED + 1)); fi
+}
+gap() { echo "[gap]  $1"; GAPS=$((GAPS + 1)); }
+check_py() {
+    local name="$1"; shift
+    if ! command -v python3 >/dev/null 2>&1; then
+        # uv-managed python3 lives outside the default non-login PATH.
+        for candidate in /usr/local/bin/python3 "$HOME/.local/bin/python3"; do
+            if [ -x "$candidate" ]; then
+                PATH="$(dirname "$candidate"):$PATH"; export PATH; break
+            fi
+        done
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        gap "$name (tooling absent: python3 not on PATH)"; return 0
+    fi
+    check "$name" "$@"
+}
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+# --- S1: crate version is literal and locked to the workspace --------------
+# cargo-aur 0.x cannot read `version.workspace = true`, so the crate keeps a
+# literal `version`/`edition`; AGENTS.md requires the literal to equal
+# [workspace.package].version so a release cannot drift by one version.
+check "S1: crates/emthin/Cargo.toml has a literal version (not workspace-inherited)" \
+    grep -q '^version = "[0-9]' crates/emthin/Cargo.toml
+crate_ver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/emthin/Cargo.toml | head -1)"
+ws_ver="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/version = "|"|/,""); print; exit}' Cargo.toml)"
+if [ -n "$crate_ver" ] && [ "$crate_ver" = "$ws_ver" ]; then
+    echo "[pass] S1: crate version ($crate_ver) == workspace.package.version"
+    PASSED=$((PASSED + 1))
+else
+    echo "[FAIL] S1: crate version ($crate_ver) != workspace.package.version ($ws_ver)"
+    FAILED=$((FAILED + 1))
+fi
+
+# --- S2: smithay is pinned by exact rev on the UPSTREAM repo ---------------
+# The dependency used to live on a personal fork (branch `emskin-patches`)
+# that was deleted outright, taking the build with it. The invariant is:
+# upstream URL + immutable 40-hex rev, and no trace of the dead fork.
+check "S2: smithay pinned by exact rev on github.com/Smithay/smithay" \
+    grep -q 'smithay = { git = "https://github.com/Smithay/smithay.git", rev = "[0-9a-f]\{40\}"' Cargo.toml
+# The historical note in Cargo.toml's comment names the dead fork on
+# purpose; the invariant is about dependency SOURCES, not prose.
+check "S2: no manifest sources a dependency from the deleted fork" \
+    bash -c '! grep -E "git.*ningxilai|ningxilai.*\\.git" Cargo.toml Cargo.lock'
+
+# --- S3: the protocol catalog gates exist ----------------------------------
+check "S3: scripts/check-ipc-docsync exists" test -f scripts/check-ipc-docsync
+check "S3: scripts/check-links exists" test -f scripts/check-links
+
+# --- S4: the catalog is in sync right now ----------------------------------
+check_py "S4: docs/ipc.md catalog matches ipc/messages.rs" \
+    python3 scripts/check-ipc-docsync
+
+echo ""
+echo "verify-invariants: $PASSED passed, $FAILED failed, $GAPS gap(s)"
+[ "$FAILED" -eq 0 ]

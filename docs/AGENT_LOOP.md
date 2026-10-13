@@ -17,9 +17,20 @@ rasteriser.
 ## Tier 1 — headless preview (no display, no compositor)
 
 ```sh
+./scripts/agent/preview.sh scripts/agent/demo.typ   # a sample doc with three figures
 ./scripts/agent/preview.sh notes.typ                # geometry + diagnostics JSON
 ./scripts/agent/preview.sh notes.typ --png out.png  # also render the page
 ```
+
+stdout is exactly **one compact JSON line** — devshell banners and
+errors go to stderr (velysterm's `flake.nix` shellHook writes there
+for this reason). `preview.sh` runs the prebuilt
+`velysterm/target/debug/mathed_mini` directly when it is up to date
+(measured: **0.14 s warm**), and only drops into velysterm's devshell
+(~6 s warm, minutes cold) to rebuild after Rust-source edits. It
+rejects binary loro session snapshots (emthin's `.doc` session file)
+with `exit 3` and an actionable message — the loop's documents are
+text; `live.sh save` (IPC `save_doc`) exports text.
 
 The JSON is one compact line from `mathed_mini --layout-json` (the
 sibling `velysterm` checkout, same path dependency the emthin build
@@ -123,11 +134,18 @@ enforced in code, not convention.
 
 ## What each tier costs
 
+Measured 2026-10-13 on the dev machine, warm caches:
+
 | | tier 1 | tier 1 `--png` | tier 2 `state` | tier 2 `shot` |
 |---|---|---|---|---|
 | compositor | no | no | sway + emthin | sway + emthin |
 | GPU / display | no | no (CPU raster) | yes (nested) | yes (nested) |
-| typical size | ~300 tokens JSON | ~10 KB PNG | ~200 tokens | ~5–50 KB PNG |
+| wall clock | **0.14 s** | ~0.3 s | ~1 s | ~1 s |
+| typical size | 562 B JSON (~150 tokens) | ~61 KB PNG | ~200 tokens | 5–50 KB PNG |
+| after a Rust edit | ~5.6 s (auto-rebuild) | +render | — | — |
+| first-ever run | ~6.8 min (cold build) | | | |
 
 The default is the left column. Eyes are the expensive part; spend
-them last.
+them last. The distilled editing playbook (geometry rules for "make
+it look nice", failure modes) lives in
+[`.agents/skills/emthin-document-editing/SKILL.md`](../.agents/skills/emthin-document-editing/SKILL.md).

@@ -149,10 +149,94 @@ pub enum OutgoingMessage {
     DbusRouterRuleRemoved {
         id: String,
     },
-    /// A command failed.
+    /// A command failed. `code` is the machine-readable reason from the
+    /// closed [`IpcErrorCode`] set; `message` is the human detail and is
+    /// free to change wording at any time — clients must branch on `code`.
     Error {
+        code: IpcErrorCode,
         message: String,
     },
+}
+
+/// The closed set of failure codes for the [`OutgoingMessage::Error`]
+/// notification.
+///
+/// The wire carries `{code, message}`: a tagged error (contract shape
+/// adapted from REA's error contract — code, category, retryability and
+/// remediation are decidable without parsing prose). Each code's category,
+/// retry semantics and remediation are documented in
+/// `docs/error-contract.md`, which `the_documented_error_codes_are_the_only_
+/// codes` pins to this enum in both directions — a code cannot ship without
+/// its doc row, and a doc row cannot promise a code that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcErrorCode {
+    /// The figure exists in the document but no app is mapped into it.
+    NotBound,
+    /// The figure was bound to an app that has since exited.
+    AppGone,
+    /// No figure with that key exists in the document.
+    UnknownFigure,
+    /// A voice turn could not be queued.
+    VoiceFailed,
+    /// A document file could not be read or written.
+    IoFailed,
+}
+
+impl IpcErrorCode {
+    /// The stable wire spelling; clients match on these strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBound => "not_bound",
+            Self::AppGone => "app_gone",
+            Self::UnknownFigure => "unknown_figure",
+            Self::VoiceFailed => "voice_failed",
+            Self::IoFailed => "io_failed",
+        }
+    }
+
+    /// The failure category (closed set: `not_found`, `unavailable`,
+    /// `execution_failure`, `io`, plus `malformed_input` for the inbound
+    /// case that has no code). Sent on the wire so a client groups
+    /// failures without maintaining its own code→category table.
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::NotBound | Self::UnknownFigure => "not_found",
+            Self::AppGone => "unavailable",
+            Self::VoiceFailed => "execution_failure",
+            Self::IoFailed => "io",
+        }
+    }
+
+    /// Whether repeating the *same* request may succeed. Only
+    /// `voice_failed` is retryable: the others are deterministic given
+    /// the document/app state, and a client that retries them loops on
+    /// the same refusal.
+    pub fn retryable(self) -> bool {
+        matches!(self, Self::VoiceFailed)
+    }
+
+    /// The documented recovery step, sent on the wire. Wording mirrors
+    /// `docs/error-contract.md`'s remediation column; the pin test below
+    /// keeps the two byte-equal per code, so a client can surface this
+    /// string verbatim without fetching the contract.
+    pub fn remediation(self) -> &'static str {
+        match self {
+            Self::NotBound => "The figure exists but no app is mapped into it. Spawn into it (or wait for `figure_bound`) before `close`/`focus`.",
+            Self::AppGone => "The figure's app exited after binding. Re-`spawn`; the next `figure_bound` re-establishes the mapping.",
+            Self::UnknownFigure => "No figure with that key exists — check `list_state`'s `figures` and the figure keys in the document.",
+            Self::VoiceFailed => "The turn could not be queued (no `\\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry.",
+            Self::IoFailed => "The document path could not be read/written — check the path exists and is writable by the compositor's user.",
+        }
+    }
+
+    /// Every code, for the doc-sync test.
+    pub const ALL: [IpcErrorCode; 5] = [
+        Self::NotBound,
+        Self::AppGone,
+        Self::UnknownFigure,
+        Self::VoiceFailed,
+        Self::IoFailed,
+    ];
 }
 
 /// One figure as reported by `list_state`.
@@ -386,7 +470,20 @@ impl OutgoingMessage {
                 "rule": serde_json::to_value(rule).unwrap_or_default(),
             }),
             Self::DbusRouterRuleRemoved { id } => serde_json::json!({"id": id}),
-            Self::Error { message } => serde_json::json!({"message": message}),
+            // N2 (2026-10-13, REAdapt R16): the error notification now
+            // carries `category`, `retryable` and `remediation` alongside
+            // `code`/`message`. Additive — a client that parses only
+            // code+message is unaffected; the fields let a client branch
+            // and surface recovery text without fetching the contract doc.
+            Self::Error { code, message } => {
+                serde_json::json!({
+                    "code": code.as_str(),
+                    "message": message,
+                    "category": code.category(),
+                    "retryable": code.retryable(),
+                    "remediation": code.remediation(),
+                })
+            }
         }
     }
 }
@@ -525,6 +622,7 @@ mod tests {
             OutgoingMessage::XWaylandReady { display: 1 },
             OutgoingMessage::DbusRouterRuleRemoved { id: "i".into() },
             OutgoingMessage::Error {
+                code: IpcErrorCode::VoiceFailed,
                 message: "m".into(),
             },
         ];
@@ -561,5 +659,161 @@ mod tests {
         assert_eq!(json["rect"]["h"], 400);
         assert_eq!(json["page"], 2);
         assert_eq!(json["bound"], false);
+    }
+
+    #[test]
+    fn the_documented_error_codes_are_the_only_codes() {
+        // docs/error-contract.md is the contract; IpcErrorCode is the
+        // implementation. Both directions are pinned: a code without a doc
+        // row is undiscoverable, a doc row without a code is a lie.
+        let doc =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/error-contract.md");
+        let text = std::fs::read_to_string(&doc).expect(
+            "docs/error-contract.md must exist — the error contract is part of the protocol",
+        );
+        let section = text
+            .split("\n## Closed code set")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("a '## Closed code set' section");
+        let mut documented: Vec<String> = Vec::new();
+        for line in section.lines() {
+            // Rows look like: | `not_bound` | not_found | … |. The header row
+            // (| `code` | …) is excluded by requiring the backtick.
+            let mut cells = line.split('|');
+            let (Some(_sep), Some(first), Some(_cat)) = (cells.next(), cells.next(), cells.next())
+            else {
+                continue;
+            };
+            let name = first.trim();
+            if name.starts_with('`')
+                && name.ends_with('`')
+                && name.len() > 2
+                && name[1..name.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_')
+            {
+                documented.push(name[1..name.len() - 1].to_string());
+            }
+        }
+        documented.sort();
+        let mut implemented: Vec<String> = IpcErrorCode::ALL
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        implemented.sort();
+        assert_eq!(
+            documented, implemented,
+            "docs/error-contract.md's closed code set and IpcErrorCode must list exactly the same codes"
+        );
+        assert!(
+            !documented.is_empty(),
+            "the doc table parsed no codes — did the section heading move?"
+        );
+    }
+
+    #[test]
+    fn the_documented_error_semantics_match_the_wire_fields() {
+        // N2 (2026-10-13): the error notification sends `category`,
+        // `retryable` and `remediation` on the wire. Each must agree with
+        // the doc table cell-for-cell — the doc is the contract (clients
+        // read it), the enum methods are what actually ships. Both
+        // directions: a doc edit without a code change fails, and a code
+        // change without a doc edit fails. Proven non-vacuous in both
+        // directions at authoring time (flip a cell → this fails; flip
+        // the method → this fails).
+        let doc =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/error-contract.md");
+        let text = std::fs::read_to_string(&doc).expect("docs/error-contract.md must exist");
+        let section = text
+            .split("\n## Closed code set")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("a '## Closed code set' section");
+        let mut rows: Vec<(String, String, bool, String)> = Vec::new();
+        for line in section.lines() {
+            // | `code` | category | yes/no | remediation | raised-by | — five
+            // cells after the leading separator; the header row's first cell
+            // is backticked too but its second cell is "category", not a
+            // category value, so the retry-cell check excludes it.
+            let cells: Vec<&str> = line.split('|').collect();
+            if cells.len() < 6 {
+                continue;
+            }
+            let name = cells[1].trim();
+            if !(name.starts_with('`') && name.ends_with('`') && name.len() > 2) {
+                continue;
+            }
+            let code = name[1..name.len() - 1].to_string();
+            let category = cells[2].trim().to_string();
+            let retry_cell = cells[3].trim();
+            let retryable = match retry_cell {
+                "yes" => true,
+                "no" => false,
+                _ => continue, // header row
+            };
+            let remediation = cells[4].trim().to_string();
+            assert!(
+                !remediation.is_empty(),
+                "{code}: empty remediation cell — every code ships recovery text"
+            );
+            rows.push((code, category, retryable, remediation));
+        }
+        assert_eq!(
+            rows.len(),
+            IpcErrorCode::ALL.len(),
+            "doc table has {} semantic rows, IpcErrorCode has {} codes",
+            rows.len(),
+            IpcErrorCode::ALL.len()
+        );
+        for code in IpcErrorCode::ALL {
+            let row = rows
+                .iter()
+                .find(|(c, ..)| c == code.as_str())
+                .unwrap_or_else(|| panic!("no doc row for {}", code.as_str()));
+            assert_eq!(
+                row.1,
+                code.category(),
+                "{}: doc category vs wire category",
+                code.as_str()
+            );
+            assert_eq!(
+                row.2,
+                code.retryable(),
+                "{}: doc retry vs wire retryable",
+                code.as_str()
+            );
+            assert_eq!(
+                row.3,
+                code.remediation(),
+                "{}: doc remediation vs wire remediation (byte-equal)",
+                code.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn error_notification_carries_the_semantic_fields() {
+        // The wire shape itself: a client parsing only code+message still
+        // works (additive change), and the new fields are present with the
+        // documented values.
+        let msg = OutgoingMessage::Error {
+            code: IpcErrorCode::VoiceFailed,
+            message: "turn not queued".into(),
+        };
+        let json = msg.into_params_value();
+        assert_eq!(json["code"], "voice_failed");
+        assert_eq!(json["message"], "turn not queued");
+        assert_eq!(json["category"], "execution_failure");
+        assert_eq!(json["retryable"], true);
+        assert!(json["remediation"].as_str().is_some_and(|s| !s.is_empty()));
+
+        let msg = OutgoingMessage::Error {
+            code: IpcErrorCode::UnknownFigure,
+            message: "unknown figure f9".into(),
+        };
+        let json = msg.into_params_value();
+        assert_eq!(json["retryable"], false);
+        assert_eq!(json["category"], "not_found");
     }
 }

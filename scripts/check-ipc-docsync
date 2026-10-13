@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""check-ipc-docsync — the IPC method catalog must match the code.
+
+`docs/ipc.md` is the protocol's catalog: every client→server method is a
+`###` heading, every server→client method is a row of the "Compositor →
+client" table. The catalog is hand-written, so it drifts — a method gets
+renamed in `ipc/messages.rs` and the doc keeps the old name until a client
+breaks in production. This gate makes the catalog a checked artifact
+(pattern adapted from REA's generated tool catalogs: the doc is generated-
+quality because it is verified, not because a generator writes it).
+
+Both directions are checked, because drift goes both ways:
+  * code → doc: a method added or renamed in the source must appear in the
+    catalog (otherwise no client author can discover it);
+  * doc → code: a heading or table row with no matching code is a lie
+    (otherwise a client author implements a method that never existed).
+
+Usage:
+    python3 scripts/check-ipc-docsync [REPO_ROOT]
+
+With no argument the repository root is derived from this script's location.
+Exit status: 0 in sync, 1 drift (each drifted name printed), 2 setup error.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+# Client → server: `"spawn" => Self::Spawn {` in the parse match. The
+# `dbus_router_add_rule` arm is a block (`=> {` … constructing the variant
+# inside), so the block form must count as a dispatch arm too.
+CLIENT_RE = re.compile(r'^\s*"([a-z][a-z0-9_]*)" => (Self::|\{)', re.M)
+# Server → client: `Self::Connected { .. } => "connected",` in
+# OutgoingMessage's `method_name()`. The `{ .. }` is required, not optional:
+# IpcErrorCode's `as_str()` in the same file uses fieldless `Self::X =>
+# "..."` arms, and those are error codes, not notifications. Every
+# OutgoingMessage variant carries fields today; a future fieldless variant
+# must still spell its arm `Self::X { .. }` to stay in the catalog.
+SERVER_RE = re.compile(r'Self::\w+ \{ \.\. \} => "([a-z][a-z0-9_]*)",')
+# A `###` heading's backticked names (headings may list several:
+# "### `open_doc` / `save_doc`").
+HEADING_RE = re.compile(r"^###\s+(.*)$", re.M)
+TICK_RE = re.compile(r"`([a-z][a-z0-9_]*)`")
+# First column of the Compositor → client table. The header row
+# (`| `method` | When | … `) is not a method and is filtered by is_row().
+ROW_RE = re.compile(r"^\|\s*`([a-z][a-z0-9_]*)`\s*\|")
+
+SERVER_SECTION = "## Compositor"
+
+
+def fail(msg: str) -> None:
+    print(f"check-ipc-docsync: {msg}", file=sys.stderr)
+
+
+def main() -> int:
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent
+    messages = root / "crates" / "emthin" / "src" / "ipc" / "messages.rs"
+    doc = root / "docs" / "ipc.md"
+    for p in (messages, doc):
+        if not p.is_file():
+            fail(f"missing {p}")
+            return 2
+
+    src = messages.read_text(encoding="utf-8")
+    client_code = {m.group(1) for m in CLIENT_RE.finditer(src)}
+    server_code = set(SERVER_RE.findall(src))
+
+    text = doc.read_text(encoding="utf-8")
+    head, _, tail = text.partition(SERVER_SECTION)
+    client_doc: set[str] = set()
+    for line in HEADING_RE.findall(head):
+        client_doc.update(TICK_RE.findall(line))
+    server_doc = {
+        m.group(1)
+        for line in tail.splitlines()
+        if (m := ROW_RE.match(line))
+        and [c.strip().strip("`").lower() for c in line.split("|")[2:4]] != ["when", "params"]
+    }
+
+    drift = False
+
+    def report(label: str, names: set[str]) -> None:
+        nonlocal drift
+        if names:
+            drift = True
+            print(f"check-ipc-docsync: {label}: {', '.join(sorted(names))}")
+
+    if not client_code or not server_code:
+        fail("no methods extracted from messages.rs — pattern moved?")
+        return 2
+    if not client_doc or not server_doc:
+        fail("no methods extracted from docs/ipc.md — sections moved?")
+        return 2
+
+    report("client→server methods in code but undocumented in ipc.md",
+           client_code - client_doc)
+    report("ipc.md headings with no matching client→server code",
+           client_doc - client_code)
+    report("server→client methods in code but missing from the doc table",
+           server_code - server_doc)
+    report("ipc.md table rows with no matching server→client code",
+           server_doc - server_code)
+
+    if drift:
+        return 1
+    print(
+        f"check-ipc-docsync: in sync "
+        f"({len(client_code)} client→server, {len(server_code)} server→client)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

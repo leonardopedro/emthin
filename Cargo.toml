@@ -13,7 +13,11 @@ license = "GPL-3.0"
 repository = "https://github.com/emthin/emthin"
 
 [workspace.dependencies]
-smithay = { git = "https://github.com/ningxilai/smithay.git", branch = "emskin-patches", default-features = false, features = [
+# Pinned by rev (not branch): the `emskin-patches` branch lived on a fork
+# (ningxilai/smithay) that has since been deleted; that commit was pushed
+# upstream to Smithay/smithay, so pin the exact same SHA there. Content is
+# byte-identical — same commit object, only the hosting URL changed.
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "2eb24b31785bb873a9f3808e0a57048d8adaef6a", default-features = false, features = [
     "backend_winit",
     "backend_drm",
     "wayland_frontend",

@@ -83,6 +83,26 @@ The `docui`, `figure_render`, `keymap`, `session` and figure-binding
 tests are plain unit tests: they are pure logic over the document and
 need no compositor.
 
+### Protocol gates
+
+- `python3 scripts/verify-invariants` — the repo's invariant gate
+  (workspace version lockstep between `[workspace.package]` and the
+  literal `version`/`edition` in `crates/emthin/Cargo.toml`, the smithay
+  rev-pin + dead-fork regression guard, catalog gates present and green).
+  A missing interpreter is an explained `[gap]`, never a false failure.
+  Run it before trusting any other verdict in this file; the workspace
+  runner (`../scripts/check-all-gates`) invokes it too.
+- `python3 scripts/check-links` — relative markdown links resolve
+  (CI: `linkcheck.yml`)
+- `python3 scripts/check-ipc-docsync` — `docs/ipc.md`'s method catalog
+  matches `ipc/messages.rs` in **both** directions (a client→server
+  method or a compositor→client notification added, renamed or removed
+  in code must land in the doc, and a doc heading/table row with no
+  matching code fails too). The catalog stays honest by being verified,
+  not by being generated — the pattern adapted from REA's generated
+  tool catalogs. Run it when touching `ipc/messages.rs`,
+  `ipc/jsonrpc.rs` or `docs/ipc.md`.
+
 ## Agent loop
 
 `docs/AGENT_LOOP.md` — the dual-modality debug loop for LLM-driven
@@ -91,9 +111,13 @@ document editing: a semantic tier (`scripts/agent/preview.sh` →
 visual tier (headless `--doc-image` PNG, live `grim` screenshot)
 second. `scripts/agent/live.sh boot|state|shot|size|open|save|log|down`
 wraps the e2e's sway-on-Xvfb session for repeated edit→observe cycles.
-The loop paid for itself immediately: it found and root-caused the
-GUI-client dmabuf segfault (software GL advertised a dmabuf global it
-cannot import; now gated on a real DRM render node — see
+The editing playbook (document cheat-sheet, geometry rules for
+"make it look nice", measured token/latency costs, failure modes) is
+`.agents/skills/emthin-document-editing/SKILL.md`; a runnable sample
+document is `scripts/agent/demo.typ`. The loop paid for itself
+immediately: it found and root-caused the GUI-client dmabuf segfault
+(software GL advertised a dmabuf global it
+ cannot import; now gated on a real DRM render node — see
 `docs/AGENT_LOOP.md` §Resolved).
 
 ---

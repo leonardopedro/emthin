@@ -25,6 +25,7 @@ pub fn event_loop_tick(state: &mut EmthinState) {
                 reply: turn.reply,
             },
             Err(message) => crate::ipc::OutgoingMessage::Error {
+                code: crate::ipc::IpcErrorCode::VoiceFailed,
                 message: format!("voice: {message}"),
             },
         };
