@@ -45,6 +45,36 @@ E3/E4 failing is a *true* result: the harness reports the broken state
 rather than skipping, and the README records why it is structural
 (nesting boundary sits below the input/clipboard stack, not above).
 
+## Obligation closure (REA reconstruction-ledger discipline)
+
+Closure discipline adapted from REA's reconstruction obligation ledgers
+(`rea/docs/reconstruction-obligation-ledgers.md`, MIT): a claim closes only
+when a verifier of **comparable authority** runs and its result is recorded.
+A lower-tier run never closes a higher-tier row — a `unit` pass cannot close a
+`harness` obligation any more than a green unit test closes REA's
+`packaged-process` one. Dispositions (`blocked`, `gated`, `open`) are never
+counted as verified.
+
+Authority tiers (closed vocabulary): `real-session` > `harness` > `headless` > `unit`.
+Closure values (closed vocabulary): `closed`, `open`, `blocked`, `gated`.
+
+| id | authority | verifier | required case kinds | closure |
+|---|---|---|---|---|
+| E1 | harness | `bash scripts/e2e/run.sh` | positive | closed |
+| E2 | harness | `bash scripts/e2e/run.sh` | positive | closed |
+| E3 | harness | `bash scripts/e2e/run.sh` | positive | blocked |
+| E4 | harness | `bash scripts/e2e/run.sh` | positive | blocked |
+| E5 | harness | `bash scripts/e2e/run.sh` | positive, teardown | closed |
+| E6 | real-session | `bash scripts/e2e/run.sh` | positive | gated |
+
+E2 additionally has live-session evidence (copy round-trip measured in a real
+session, `arboard` path `1a79b38`) — that is *stronger* than its closing
+verifier and is recorded in `README.md`, not claimed here. E3/E4 are
+`blocked` by the measured nested-clipboard hop (cause in `README.md`); a row
+that is blocked stays open forever unless the hop is fixed and the verifier
+then covers the positive case. E6 is `gated`: its verifier exists but the
+host's fcitx engagement is not arranged by the harness, so no run closes it.
+
 ## Change rule
 
 Adding a check to `step7.sh` means adding its row here in the same
