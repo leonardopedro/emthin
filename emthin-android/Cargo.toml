@@ -1,0 +1,28 @@
+[package]
+name = "emthin-pad"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "emthin pad — Android app embedding emthin's DocModel verbatim"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Standalone workspace: the crate lives inside the emthin checkout but
+# must not join the emthin workspace (it path-depends on velysterm and
+# builds its own release artifacts).
+[workspace]
+
+# `libemthin_pad.so` — loaded via System.loadLibrary("emthin_pad").
+
+[dependencies]
+jni = "0.22"
+serde_json = "1"
+mathed_core = { path = "../../velysterm/crates/mathed_core" }
+unicode-segmentation = "1"
+
+[profile.release]
+# Keep .dynsym (JNI resolves Java_* by dlsym), drop only debug info —
+# typst's debug info dwarfs the rest of the .so.
+strip = "debuginfo"
