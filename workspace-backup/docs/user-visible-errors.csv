@@ -1,0 +1,31 @@
+# User-visible error catalog — harm-ranked (PLAN_WORKSPACE_REVIEW_2026-10-14 P2).
+# Discipline adapted from REA docs/user-visible-errors.csv (MIT) — every
+# user-facing error surface is reviewed for copy risk and carries a
+# verification record. Columns: harm_rank,surface,code,trigger,current_copy_shape,
+# user_risk,retryable,remediation,verification.
+#
+# Cross-checked by scripts/check-error-catalog against the CODE SETS in source:
+#   emthin   IpcErrorCode::as_str arms   (crates/emthin/src/ipc/messages.rs)
+#   voice.sh `die <code>` call sites     (voice/voice.sh)
+#   modhost  error-event "kind" strings  (safestos/cranelift/src/bin/modhost.rs)
+# unfer_agent's UK-#### registry is owned by unfer_protocol (EXPECTED_SYMBOLS
+# discipline) and is deliberately OUT of this catalog's cross-check scope.
+# Fields contain no commas (semicolon separators inside fields) so the gate
+# parses without a CSV library.
+harm_rank,surface,code,trigger,current_copy_shape,user_risk,retryable,remediation,verification
+1,voice.sh,llm,LLM returns no reply,"FAIL llm no reply from <LLM_URL_DISP> (model up? ...): <first 300 bytes of response>",response prefix may echo upstream content; URL userinfo+query stripped since R12,maybe,start the model (/usr/local/bin/gemma4-toggle) and re-run,live-proven R1b + R12 redaction check (sekret/token= absent)
+2,voice.sh,env,tool or piper voice missing,"FAIL env missing tool: <tool> (run inside: nix develop .#voice)",none,no,nix develop .#voice,documented in unfer/voice/README.md (closed 5-code set)
+3,voice.sh,usage,bad arguments or unknown mode,"FAIL usage <argument error with the accepted mode list>",none,no,correct the invocation,proven live on 3 usage paths (R1b)
+4,voice.sh,history,history file missing or not a JSON array,"FAIL history <file path + reason>",path disclosure on a local CLI surface,no,fix or reset the history file,documented (R1b)
+5,voice.sh,mic,recorder heard nothing,"FAIL mic heard nothing (microphone up? VOICE_SECS=Ns)",none,maybe,check the microphone and VOICE_SECS,documented (R1b)
+6,emthin,voice_failed,voice turn could not be queued or the harness failed,"voice: <harness FAIL reason>",harness reasons can carry local paths; LLM_URL redaction lives upstream in voice.sh,maybe,run voice.sh directly to see the FAIL code,pinned by the_documented_error_codes_are_the_only_codes (E5)
+7,emthin,io_failed,document file read/write failed,"could not read|write <path>: <io error>",path + io error disclosed over the local IPC socket (companion-app surface),maybe,check the path and permissions,pinned by the_documented_error_codes_are_the_only_codes (E5)
+8,emthin,app_gone,figure op targets an app that exited,"figure <key>'s app is gone",none,no,relaunch the figure (Return on the dormant figure),pinned by the_documented_error_codes_are_the_only_codes (E5)
+9,emthin,not_bound,figure op with no app mapped,"no app bound to figure <key>",none,maybe,launch or bind an app to the figure,pinned by the_documented_error_codes_are_the_only_codes (E5)
+10,emthin,unknown_figure,figure key not in the document,"unknown figure <figure>",none,no,query the document state for valid figure keys,pinned by the_documented_error_codes_are_the_only_codes (E5)
+11,modhost,manifest_unreadable,manifest file cannot be read,"{event:error; kind:manifest_unreadable; detail:cannot read manifest <path>: <io error>} + eprintln mirror",detail carries the manifest path and io error on an operator CLI surface,no,fix the manifest path or permissions,modhost --json NDJSON contract (celld CLI discipline; enumerated 2026-10-14)
+12,modhost,manifest_invalid,manifest fails to parse,"{event:error; kind:manifest_invalid; detail:invalid manifest: <parse error>} + eprintln mirror",parse error text on an operator CLI surface,no,fix the manifest syntax,enumerated 2026-10-14
+13,modhost,load_failed,module load failed,"{event:error; kind:load_failed; detail:load failed: <error>} + eprintln mirror",detail carries loader internals on an operator CLI surface,no,inspect the module and its dependencies,enumerated 2026-10-14
+14,modhost,call_failed,gated kernel call failed at runtime,"{event:error; kind:call_failed; detail:<error>}",detail carries call internals on an operator CLI surface,maybe,check the module's manifest grants,enumerated 2026-10-14
+15,modhost,swap_failed,module swap failed,"{event:error; kind:swap_failed; detail:<error>}",detail carries swap internals on an operator CLI surface,maybe,check the running module state,enumerated 2026-10-14
+16,modhost,attestation_refused,authorization engine refused a call,"{event:error; kind:attestation_refused; detail:<refusal>}",detail carries the refusal reason on an operator CLI surface,no,fix the manifest grants or use a granted module,enumerated 2026-10-14

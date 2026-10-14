@@ -1,0 +1,114 @@
+#!/bin/bash
+# check-scenario-ledgers — P1c of PLAN_WORKSPACE_REVIEW_2026-10-14.md.
+#
+# Machine-checks the "Obligation closure" tables added to the federation's
+# scenario contracts (REA reconstruction-obligation discipline, MIT):
+#
+#   1. authority ∈ {real-session, harness, headless, unit}   (closed vocab)
+#   2. closure   ∈ {closed, open, blocked, gated}            (closed vocab)
+#   3. every row's verifier names a script that EXISTS in that repo
+#   4. every scenario ID in the scenario table has exactly one closure row
+#      (and vice versa)
+#
+# Scenario IDs match `[A-Z][0-9]+` (A-/E-/D- rows today): any new
+# contract section's rows are held to the same vocab + parity checks
+# without a gate edit.
+#
+# Closure semantics are documented in each SCENARIOS.md: a lower authority
+# tier never closes a higher-tier row, and blocked/gated/open are dispositions,
+# never verified. This gate checks the ledger is well-formed and honest about
+# where its verifiers live; it does not run the verifiers.
+#
+# Pure bash+awk: no python3, so this gate can never gap on tooling.
+set -u
+root="$(cd "$(dirname "$0")/.." && pwd)"
+fail=0
+
+check_file() {
+    local file="$1" reporoot="$2"
+    if [ ! -f "$file" ]; then
+        echo "FAIL $file missing"
+        fail=1
+        return
+    fi
+
+    local rec
+    rec=$(awk '
+        /^## Obligation closure/ { sect="closure"; next }
+        /^## Scenarios/          { sect="scen"; next }
+        /^## /                   { sect="" }
+        sect == "scen" && /^\| *[A-Z][0-9]+ / {
+            split($0, c, "|")
+            gsub(/^ +| +$/, "", c[2])
+            print "scen " c[2]
+        }
+        sect == "closure" && /^\| *[A-Z][0-9]+ / {
+            split($0, c, "|")
+            for (i = 2; i <= 6; i++) { gsub(/^ +| +$/, "", c[i]) }
+            print "row " c[2] " " c[3] " " c[6] " " c[4]
+        }
+    ' "$file")
+
+    local scen_ids="" closure_ids="" id auth clos verifier
+    while read -r kind a b c d; do
+        case "$kind" in
+            scen)
+                scen_ids="$scen_ids $a"
+                ;;
+            row)
+                id="$a"; auth="$b"; clos="$c"; verifier="$d"
+                closure_ids="$closure_ids $id"
+                case "$auth" in
+                    real-session|harness|headless|unit) ;;
+                    *) echo "FAIL $file $id: authority '$auth' not in {real-session,harness,headless,unit}"; fail=1 ;;
+                esac
+                case "$clos" in
+                    closed|open|blocked|gated) ;;
+                    *) echo "FAIL $file $id: closure '$clos' not in {closed,open,blocked,gated}"; fail=1 ;;
+                esac
+                # verifier cell: `cmd [args] path/to/script.sh` -> find the
+                # first path-like token and require it to exist in the repo.
+                local vpath
+                vpath=$(printf '%s' "$verifier" | tr -d '`' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+\.sh$' | head -1)
+                if [ -z "$vpath" ]; then
+                    echo "FAIL $file $id: verifier '$verifier' names no script"
+                    fail=1
+                elif [ ! -f "$reporoot/$vpath" ]; then
+                    echo "FAIL $file $id: verifier script '$vpath' does not exist in $reporoot"
+                    fail=1
+                fi
+                ;;
+        esac
+    done <<< "$rec"
+
+    if [ -z "$rec" ]; then
+        echo "FAIL $file: no scenarios/obligation rows parsed"
+        fail=1
+        return
+    fi
+
+    # ID parity both directions
+    for id in $scen_ids; do
+        case " $closure_ids " in
+            *" $id "*) ;;
+            *) echo "FAIL $file: scenario $id has no obligation-closure row"; fail=1 ;;
+        esac
+    done
+    for id in $closure_ids; do
+        case " $scen_ids " in
+            *" $id "*) ;;
+            *) echo "FAIL $file: closure row $id has no scenario"; fail=1 ;;
+        esac
+    done
+    echo "check-scenario-ledgers: $(basename $(dirname $file)) $(basename $file): $(echo $scen_ids | wc -w) scenario(s), vocab + verifiers + parity ok"
+}
+
+check_file "$root/emthin/scripts/e2e/SCENARIOS.md"    "$root/emthin"
+check_file "$root/velysterm/scripts/SCENARIOS.md"     "$root/velysterm"
+
+if [ "$fail" -ne 0 ]; then
+    echo "check-scenario-ledgers: FAILED"
+    exit 1
+fi
+echo "check-scenario-ledgers: OK"
+exit 0

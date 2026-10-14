@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# X5 — build-artifact gate.
+#
+# Fails when a build directory, bytecode cache, or compiler-emitted report is
+# tracked in git. Written because .gitignore alone is not enough: a file
+# committed *before* the ignore rule was added stays tracked forever, which is
+# how a 1.2 MB generated `calltree.html` and a CPython `.pyc` came to sit in
+# two repos' histories.
+#
+# Usage:  scripts/tree-size [repo ...]      (defaults to every sibling checkout)
+# Exit:   0 clean, 1 if anything is tracked that should not be.
+
+set -uo pipefail
+
+# shellcheck source=workspace-root.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
+
+# Directories and files that are outputs, never sources. Matched against
+# repo-relative paths from `git ls-files`.
+PATTERNS='(^|/)(_build|target|node_modules|__pycache__|\.venv|venv)/|(^|/)(calltree|error)\.html$|\.py[co]$|(^|/)logs?/[^/]*\.log$|\.orig$|\.rej$|\.swp$|~$|(^|/)\.DS_Store$'
+
+# `qfm_text_runs/` is deliberately absent: its metrics.ndjson and train.log are
+# pinned experimental evidence cited by the test suites, not build detritus.
+
+if [ "$#" -gt 0 ]; then
+  roots=("$@")
+else
+  mapfile -t roots < <(ws_all_checkouts)
+fi
+
+# Zero repos means the gate inspected nothing. Exiting 0 here is how this gate
+# spent its first CI run reporting "clean" over zero checkouts: the old root
+# search needed three siblings, CI had two, and a gate that finds no repos must
+# not read as a repo that has no artifacts.
+if [ "${#roots[@]}" -eq 0 ]; then
+  echo "tree-size: no git checkouts found (looked under $(ws_root))" >&2
+  echo "tree-size: refusing to report 'clean' over zero repos." >&2
+  exit 1
+fi
+
+total=0
+for repo in "${roots[@]}"; do
+  [ -d "$repo/.git" ] || {
+    echo "tree-size: skipping $repo (not a git checkout)" >&2
+    continue
+  }
+  hits="$(git -C "$repo" ls-files | grep -E "$PATTERNS" || true)"
+  if [ -z "$hits" ]; then
+    echo "ok   $repo: no tracked build artifacts"
+    continue
+  fi
+
+  # A repo may deliberately keep one of these. unfer's .gitignore whitelists
+  # `logs/heavy_tests_*.log` as "the cited ALL-GREEN evidence log", so a blanket
+  # pattern would flag an intentional retention and train people to delete it.
+  # The repo's own ignore rules are the authority.
+  #
+  # `--no-index` is essential. Without it `git check-ignore` consults the index
+  # and therefore reports *nothing* as ignored for a tracked file -- which made
+  # this loop classify every tracked path as "deliberately kept" and the gate
+  # unable to fail at all. It passed with a tracked .pyc still staged. Probe the
+  # rules, not the index.
+  real_hits=""
+  kept=""
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    if git -C "$repo" check-ignore --no-index -q "$h" 2>/dev/null; then
+      real_hits="$real_hits$h"$'\n'
+    else
+      kept="$kept$h"$'\n'
+    fi
+  done <<< "$hits"
+
+  n_real="$(printf '%s' "$real_hits" | grep -c . || true)"
+  n_kept="$(printf '%s' "$kept" | grep -c . || true)"
+
+  if [ "$n_real" -gt 0 ]; then
+    total=$((total + n_real))
+    echo "FAIL $repo: $n_real tracked build artifact(s)" >&2
+    printf '%s' "$real_hits" | sed 's/^/       /' >&2
+    echo "       Untrack with: git -C $repo rm --cached <path>" >&2
+  fi
+  if [ "$n_kept" -gt 0 ]; then
+    echo "ok   $repo: $n_kept deliberately kept (whitelisted in .gitignore)" >&2
+    printf '%s' "$kept" | sed 's/^/       kept: /' >&2
+  fi
+  if [ "$n_real" -eq 0 ] && [ "$n_kept" -eq 0 ]; then
+    echo "ok   $repo: no tracked build artifacts"
+  fi
+done
+
+if [ "$total" -gt 0 ]; then
+  echo >&2
+  echo "tree-size: $total tracked build artifact(s). These are generated; commit" >&2
+  echo "the .gitignore rule AND git rm --cached the file -- an ignore added later" >&2
+  echo "does not apply retroactively." >&2
+  exit 1
+fi
+
+echo "tree-size: clean"

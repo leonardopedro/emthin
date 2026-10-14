@@ -1,0 +1,35 @@
+# workspace-backup-files — the mirror set, one list for both halves.
+# Consumed by scripts/sync-workspace-backup (copy) and
+# scripts/check-backup-sync (drift gate). Paths relative to the workspace
+# root; `docs/...` and `scripts/...` keep their prefix in the mirror.
+#
+# Why this list exists (decision: PLAN_S4_BACKLOG_2026-10-14.md execution
+# log, "copy as backup"): the workspace root is not a git repo, so these
+# files have no version control at the root. They are mirrored into
+# emthin/workspace-backup/ (a git checkout) — copy, never move: every
+# link, gate and invocation assumes they live at the root.
+
+ATTRIBUTION.md
+ERROR_COPY_AUDIT.md
+PROJECT_REVIEW_AND_IMPROVEMENT_PLAN.md
+PLAN_ANALYTIC_DECISION_ENGINE.md
+PLAN_CROSS_PROJECT_REVIEW_2026-10-12.md
+PLAN_CROSS_PROJECT_REVIEW_2026-10-13.md
+PLAN_FEDERATION_IMPROVEMENT_2026-10-09.md
+PLAN_MATHED_NATIVE_AND_IMPROVEMENT.md
+PLAN_S4_BACKLOG_2026-10-14.md
+PLAN_WORKSPACE_REVIEW_2026-10-14.md
+docs/user-visible-errors.csv
+scripts/README.md
+scripts/check-all-gates
+scripts/check-attribution
+scripts/check-book-sync
+scripts/check-error-catalog
+scripts/check-scenario-ledgers
+scripts/check-status
+scripts/sync-book
+scripts/tree-size
+scripts/workspace-root.sh
+scripts/workspace-backup-files
+scripts/sync-workspace-backup
+scripts/check-backup-sync

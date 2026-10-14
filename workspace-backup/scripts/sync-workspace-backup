@@ -1,0 +1,46 @@
+#!/bin/bash
+# sync-workspace-backup — refresh emthin/workspace-backup/ from the
+# workspace-root sources (copy, never move: see workspace-backup-files).
+#
+# The workspace root is not a git repo, so the coordination files have no
+# version control at the root; emthin/ is a git checkout, so the mirror
+# gives them one. Sources stay authoritative at the root — every link,
+# gate and documented invocation assumes they live there.
+#
+# Usage: bash scripts/sync-workspace-backup        (copy + verify)
+#        bash scripts/sync-workspace-backup --check  (verify only)
+set -eu
+root="$(cd "$(dirname "$0")/.." && pwd)"
+mirror="$root/emthin/workspace-backup"
+list="$root/scripts/workspace-backup-files"
+
+[ -f "$list" ] || { echo "sync-workspace-backup: $list missing" >&2; exit 1; }
+
+check_only=0
+[ "${1:-}" = "--check" ] && check_only=1
+
+fail=0
+while IFS= read -r rel; do
+    case "$rel" in ''|'#'*) continue ;; esac
+    src="$root/$rel"
+    dst="$mirror/$rel"
+    if [ "$check_only" -eq 0 ]; then
+        [ -f "$src" ] || { echo "FAIL source missing: $rel" >&2; fail=1; continue; }
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst"
+    fi
+    if [ ! -f "$dst" ]; then
+        echo "FAIL mirror missing: $rel (run scripts/sync-workspace-backup)" >&2
+        fail=1
+    elif [ -f "$src" ] && ! cmp -s "$src" "$dst"; then
+        echo "FAIL mirror drifted: $rel (sources changed; re-run scripts/sync-workspace-backup and commit)" >&2
+        fail=1
+    fi
+done < "$list"
+
+[ "$fail" -eq 0 ] || { echo "sync-workspace-backup: FAILED" >&2; exit 1; }
+if [ "$check_only" -eq 1 ]; then
+    echo "sync-workspace-backup: mirror in sync"
+else
+    echo "sync-workspace-backup: mirror refreshed and in sync"
+fi

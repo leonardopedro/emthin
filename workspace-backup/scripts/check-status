@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# F3 (2026-10-13) — this used to be a stale *fork* of `unfer/scripts/check-status`
+# (presence + date only, no `--recount`/`--run`), which meant the workspace had
+# two copies of the same gate and the weaker one was the documented entry point
+# — the exact duplicate-gate class S2 already deleted once
+# (`timepiece/scripts/check-mass-gap-spec-parity`). One gate, one owner: this
+# wrapper delegates to the canonical, CI-wired copy so the recount/run halves
+# are reachable from the workspace root too. Doc references to
+# `scripts/check-status` stay valid.
+#
+# Usage:  scripts/check-status [--recount REPO=LOG ...] [--run [REPO ...]]
+# Exit:   0 clean, 1 on a missing/invalid status block or recounted mismatch.
+
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+canonical="$here/../unfer/scripts/check-status"
+
+if [ ! -x "$canonical" ] && [ ! -f "$canonical" ]; then
+    printf 'check-status: canonical gate missing: %s\n' "$canonical" >&2
+    printf 'check-status: (unfer checkout absent from this workspace?)\n' >&2
+    exit 2
+fi
+
+exec bash "$canonical" "$@"

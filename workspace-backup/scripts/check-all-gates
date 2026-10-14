@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Workspace gate runner — every repo's gates, one invocation.
+#
+# For each of the seven licensed checkouts it runs, when present:
+#   * scripts/verify-invariants   (or scripts/check_site.py for the prose
+#     site, which has no verify-invariants), and
+#   * scripts/check-links,
+# then the workspace-level scripts/check-attribution.
+#
+# Conventions follow the per-repo gates (see australVM/scripts/verify-invariants):
+#   * a missing gate is a [gap], never a silent pass and never a failure —
+#     the summary makes the gaps visible so they can be closed (see
+#     PLAN_CROSS_PROJECT_REVIEW_2026-10-12.md B4/B6);
+#   * missing tooling (python3) downgrades the affected gate to a [gap] too:
+#     "no interpreter here" must stay distinguishable from "invariant broken";
+#   * gates are dispatched by their shebang: verify-invariants is bash in most
+#     repos, check-links is python3 everywhere;
+#   * exit code is non-zero if and only if at least one gate FAILED.
+#
+# Usage:  bash scripts/check-all-gates [repo ...]
+# With no arguments all seven repos are checked.
+
+set -u
+
+workspace_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# python3 is uv-managed on this machine and lives outside the default
+# non-login PATH; without the fallback every python gate would [gap] on a
+# machine that actually has an interpreter. Only the search for python3 is
+# special-cased — a gate that still finds nothing reports the gap honestly.
+if ! command -v python3 >/dev/null 2>&1; then
+    for candidate in /usr/local/bin/python3 "$HOME/.local/bin/python3"; do
+        if [ -x "$candidate" ]; then
+            PATH="$(dirname "$candidate"):$PATH"
+            export PATH
+            break
+        fi
+    done
+fi
+
+repos=(unfer australVM velysterm timepiece dynamic-arctic test emthin)
+if [ "$#" -gt 0 ]; then
+    repos=("$@")
+fi
+
+PASSED=0
+FAILED=0
+GAPS=0
+
+pass() { echo "[pass] $1"; PASSED=$((PASSED + 1)); }
+fail() { echo "[FAIL] $1"; FAILED=$((FAILED + 1)); }
+gap()  { echo "[gap]  $1"; GAPS=$((GAPS + 1)); }
+
+run_gate() { # name command...
+    local name="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        pass "$name"
+    else
+        fail "$name"
+    fi
+}
+
+run_script_gate() { # name path [cwd] — dispatch by shebang; run in the gate's own repo
+    local name="$1" s="$2" cwd="${3:-$PWD}"
+    local -a interp
+    case "$(head -n 1 "$s")" in
+        *python*) interp=(python3) ;;
+        *)        interp=(bash) ;;
+    esac
+    if [ "${interp[0]}" = "python3" ] && ! command -v python3 >/dev/null 2>&1; then
+        gap "$name (tooling absent: python3 not on PATH)"
+        return 0
+    fi
+    # Gates resolve their inputs repo-relative (SRC="docs/…"), so they must
+    # run with the repo root as cwd — invoking them from the workspace root
+    # made the mass-gap parity gate exit 2 on a missing path.
+    if (cd "$cwd" && "${interp[@]}" "$s") >/dev/null 2>&1; then
+        pass "$name"
+    else
+        fail "$name"
+    fi
+}
+
+for repo in "${repos[@]}"; do
+    dir="$workspace_root/$repo"
+    if [ ! -d "$dir" ]; then
+        gap "$repo: checkout missing"
+        continue
+    fi
+    echo "== $repo"
+
+    if [ -f "$dir/scripts/verify-invariants" ]; then
+        run_script_gate "$repo/verify-invariants" "$dir/scripts/verify-invariants" "$dir"
+    elif [ -f "$dir/scripts/check_site.py" ]; then
+        # The prose site's gate is its checker; there is no verify-invariants.
+        run_script_gate "$repo/check_site.py" "$dir/scripts/check_site.py" "$dir"
+    else
+        gap "$repo/verify-invariants (no gate script in this repo)"
+    fi
+
+    if [ -f "$dir/scripts/check-links" ]; then
+        run_script_gate "$repo/check-links" "$dir/scripts/check-links" "$dir"
+    else
+        gap "$repo/check-links (no gate script in this repo)"
+    fi
+
+    # Every other check-* gate the repo carries (IPC/op catalog sync,
+    # TODO ledger, …) runs here too, so `check-*` is the extension point:
+    # drop a new gate in a repo's scripts/ and the workspace pass picks it
+    # up. check-links is skipped — already run above.
+    for extra in "$dir"/scripts/check-*; do
+        [ -f "$extra" ] || continue
+        base="$(basename "$extra")"
+        [ "$base" = "check-links" ] && continue
+        run_script_gate "$repo/$base" "$extra" "$dir"
+    done
+done
+
+echo "== workspace"
+run_gate "check-attribution" bash "$workspace_root/scripts/check-attribution"
+
+# Workspace-level check-* gates auto-discover the same way the per-repo
+# extras do — a new gate needs no runner edit. The skip list is explicit:
+# the runner itself and check-status (a maintenance utility, not a gate)
+# must never be swept in just because they match the name pattern.
+for extra in "$workspace_root"/scripts/check-*; do
+    [ -f "$extra" ] || continue
+    base="$(basename "$extra")"
+    case "$base" in
+        check-all-gates | check-attribution | check-status) continue ;;
+    esac
+    run_script_gate "workspace/$base" "$extra" "$workspace_root"
+done
+
+echo ""
+echo "check-all-gates: $PASSED passed, $FAILED failed, $GAPS gap(s)"
+if [ "$FAILED" -ne 0 ]; then
+    exit 1
+fi

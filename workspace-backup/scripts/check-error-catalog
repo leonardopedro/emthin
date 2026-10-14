@@ -1,0 +1,104 @@
+#!/bin/bash
+# check-error-catalog — P2 of PLAN_WORKSPACE_REVIEW_2026-10-14.md.
+#
+# Machine-checks docs/user-visible-errors.csv (REA user-visible-errors.csv
+# discipline, MIT) against the code sets the source actually emits:
+#
+#   1. header + shape: exact columns; harm_rank unique and contiguous 1..N;
+#      retryable ∈ {yes,no,maybe}; verification non-empty
+#   2. code-set parity per surface (bidirectional — a source code missing
+#      from the catalog fails, and a catalog code the source cannot emit
+#      fails):
+#        emthin   IpcErrorCode::as_str arms
+#        voice.sh `die <code>` call sites
+#        modhost  error-event "kind" strings
+#
+# Pure bash+awk+grep: no python3, so this gate can never gap on tooling.
+set -u
+root="$(cd "$(dirname "$0")/.." && pwd)"
+csv="$root/docs/user-visible-errors.csv"
+fail=0
+
+if [ ! -f "$csv" ]; then
+    echo "FAIL $csv missing"
+    exit 1
+fi
+
+want_header="harm_rank,surface,code,trigger,current_copy_shape,user_risk,retryable,remediation,verification"
+header=$(grep -m1 '^harm_rank,' "$csv")
+if [ "$header" != "$want_header" ]; then
+    echo "FAIL catalog header drifted"
+    echo "  want: $want_header"
+    echo "  got:  $header"
+    fail=1
+fi
+
+# ── shape checks ───────────────────────────────────────────────────────────
+rows=$(grep -v '^#' "$csv" | grep -v '^harm_rank,' | grep -v '^$')
+n=$(printf '%s\n' "$rows" | wc -l)
+ranks=$(printf '%s\n' "$rows" | cut -d, -f1 | sort -n | tr '\n' ' ')
+want_ranks=$(seq -s ' ' 1 "$n")
+if [ "$ranks" != "$want_ranks " ] && [ "$ranks" != "$want_ranks" ]; then
+    echo "FAIL harm_rank not contiguous 1..$n: $ranks"
+    fail=1
+fi
+
+while IFS= read -r row; do
+    rank=$(printf '%s' "$row" | cut -d, -f1)
+    retryable=$(printf '%s' "$row" | awk -F, '{print $7}')
+    verification=$(printf '%s' "$row" | awk -F, '{print $9}')
+    case "$retryable" in
+        yes|no|maybe) ;;
+        *) echo "FAIL row $rank: retryable '$retryable' not in {yes,no,maybe}"; fail=1 ;;
+    esac
+    if [ -z "$verification" ]; then
+        echo "FAIL row $rank: empty verification"
+        fail=1
+    fi
+done <<< "$rows"
+
+# ── code-set parity per surface ────────────────────────────────────────────
+surface_codes() { # $1=surface -> sorted catalog codes
+    printf '%s\n' "$rows" | awk -F, -v s="$1" '$2 == s {print $3}' | sort -u
+}
+
+# emthin: IpcErrorCode::as_str arms -> => "wire_spelling"
+emthin_src=$(sed -n '/fn as_str/,/^    }/p' "$root/emthin/crates/emthin/src/ipc/messages.rs" \
+    | grep -oE 'Self::[A-Za-z]+ => "[a-z_]+"' \
+    | sed -E 's/.* => "([a-z_]+)"/\1/' | sort -u)
+
+# voice.sh: `die <code>` call sites (comments say `die <code>` which cannot match)
+voice_src=$(grep -vE '^\s*#' "$root/unfer/voice/voice.sh" \
+    | grep -oE '\bdie [a-z]+' | awk '{print $2}' | sort -u)
+
+# modhost: error-event kind strings
+modhost_src=$(grep -oE '"kind": "[a-z_]+"' \
+    "$root/australVM/safestos/cranelift/src/bin/modhost.rs" \
+    | sed -E 's/.*"kind": "([a-z_]+)"/\1/' | sort -u)
+
+check_parity() { # $1=surface $2=source-codes
+    local surf="$1" src="$2" cat
+    cat=$(surface_codes "$surf" | sort -u)
+    if [ -z "$src" ]; then
+        echo "FAIL $surf: no codes extracted from source (parser broken?)"
+        fail=1
+        return
+    fi
+    local missing extra
+    missing=$(comm -23 <(printf '%s\n' "$src") <(printf '%s\n' "$cat") | tr '\n' ' ')
+    extra=$(comm -13 <(printf '%s\n' "$src") <(printf '%s\n' "$cat") | tr '\n' ' ')
+    [ -n "$(printf '%s' "$missing" | tr -d ' ')" ] && { echo "FAIL $surf: source codes missing from catalog: $missing"; fail=1; }
+    [ -n "$(printf '%s' "$extra" | tr -d ' ')" ] && { echo "FAIL $surf: catalog codes not emitted by source: $extra"; fail=1; }
+    echo "check-error-catalog: $surf $(printf '%s\n' "$src" | wc -l) code(s) in parity"
+}
+
+check_parity emthin   "$emthin_src"
+check_parity voice.sh "$voice_src"
+check_parity modhost  "$modhost_src"
+
+if [ "$fail" -ne 0 ]; then
+    echo "check-error-catalog: FAILED"
+    exit 1
+fi
+echo "check-error-catalog: OK — $n row(s), shape + parity green"
+exit 0

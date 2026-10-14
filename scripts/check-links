@@ -32,6 +32,13 @@ from urllib.parse import unquote
 SKIP_DIRS = {
     ".git", "target", "node_modules", ".lake", "_build", "__pycache__",
     "dist", "result", ".direnv", "ol10", "vendor",
+    # workspace-backup/ is a mirror of the workspace-root coordination docs
+    # (ATTRIBUTION.md, PLAN_*.md, scripts/), not this repo's content. Its
+    # links are root-relative by design (../celld, ../driftwm, ...) and
+    # cannot resolve from inside emthin/ — nor should they: mirror
+    # integrity is `scripts/sync-workspace-backup`'s job (byte-identical
+    # to the source, whose own gates run at the workspace root).
+    "workspace-backup",
 }
 SCHEMES = ("http://", "https://", "mailto:", "ftp://", "//", "data:", "tel:", "file:")
 

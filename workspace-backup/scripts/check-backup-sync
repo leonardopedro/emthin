@@ -1,0 +1,12 @@
+#!/bin/bash
+# check-backup-sync — emthin/workspace-backup/ must be byte-identical to
+# its workspace-root sources (drift gate for the copy-as-backup decision;
+# the same check `sync-workspace-backup --check` performs, exposed as a
+# gate so check-all-gates' workspace auto-discovery picks it up).
+#
+# This is what makes the check-links/check-attribution exclusions of
+# workspace-backup/ safe: the mirror adds no coverage, but drift between
+# a committed mirror and its source fails here loudly.
+set -eu
+root="$(cd "$(dirname "$0")/.." && pwd)"
+exec bash "$root/scripts/sync-workspace-backup" --check
