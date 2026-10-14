@@ -32,7 +32,7 @@ gates in this directory are cheap (grep/python) and safe to parallelise;
 | `check-attribution` | policy #4 of `../ATTRIBUTION.md`: every adaptation claim (`adapted/inspired/ported/borrowed from`, `based on/derived from`) in the seven checkouts + root plan docs resolves to a ledger row, an internal path, or a reviewed allowlist entry |
 | `check-scenario-ledgers` | the obligation-closure tables in `emthin`/`velysterm` SCENARIOS.md (REA discipline): closed vocab for authority/closure, every row's verifier names a script that exists, scenario IDs ↔ closure rows bijective |
 | `check-error-catalog` | `docs/user-visible-errors.csv` shape (harm ranks 1..N, retryable vocab, verification non-empty) + bidirectional code-set parity vs the source enums (`emthin` `IpcErrorCode`, `voice.sh` FAIL codes, `modhost` error kinds) |
-| `check-backup-sync` / `sync-workspace-backup` | byte-identity of both mirrors: `emthin/workspace-backup/` ↔ its root sources (refresh with `sync-workspace-backup`, then commit), and `unfer/scripts/{check-attribution,workspace-root.sh}` ↔ the root copies (unfer's CI runs its own copy directly) |
+| `check-backup-sync` / `sync-workspace-backup` | byte-identity of both mirrors: `emthin/workspace-backup/` ↔ its root sources (refresh with `sync-workspace-backup`, then commit), and `unfer/scripts/{check-attribution,workspace-root.sh,tree-size}` ↔ the root copies (unfer's CI runs its own copy directly) |
 
 Workspace `check-*` gates are auto-discovered by `check-all-gates` (the
 runner skips itself and `check-status`, a maintenance utility) — drop a

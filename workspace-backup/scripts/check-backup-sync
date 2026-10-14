@@ -15,9 +15,11 @@
 #
 # Only pairs with a documented identity contract are asserted here:
 # workspace-root.sh's header names unfer/scripts as "per-repo mirrors",
-# check-attribution is "unfer's copy". check-status is deliberately NOT
-# asserted — the root copy is a delegating wrapper (F3), not a mirror —
-# and tree-size has no identity contract on record.
+# check-attribution is "unfer's copy", and tree-size's contract (recorded
+# in its own header, 2026-10-14) names the root copy canonical with unfer
+# holding a byte-identical mirror that unfer's CI runs directly (ci.yml:
+# `bash scripts/tree-size`). check-status is deliberately NOT asserted —
+# the root copy is a delegating wrapper (F3), not a mirror.
 #
 # This is what makes the check-links/check-attribution exclusions of
 # workspace-backup/ safe: the mirror adds no coverage, but drift between
@@ -28,7 +30,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 bash "$root/scripts/sync-workspace-backup" --check || fail=1
 
-for f in check-attribution workspace-root.sh; do
+for f in check-attribution workspace-root.sh tree-size; do
     src="$root/scripts/$f"
     dst="$root/unfer/scripts/$f"
     if [ ! -f "$dst" ]; then
