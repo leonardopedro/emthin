@@ -102,6 +102,14 @@ need no compositor.
   not by being generated — the pattern adapted from REA's generated
   tool catalogs. Run it when touching `ipc/messages.rs`,
   `ipc/jsonrpc.rs` or `docs/ipc.md`.
+- `bash ../scripts/check-backup-sync` — `workspace-backup/` in this
+  repo is a byte-identical copy of the workspace-root coordination
+  files (the root is not a git repo; this repo is their git home).
+  **Never edit files inside it**: edit the root sources, then run
+  `bash scripts/sync-workspace-backup` from the workspace root and
+  commit the refresh. Drift fails the workspace sweep loudly. The
+  directory also sits out `check-links` on purpose — its links are
+  root-relative (rationale: `workspace-backup/README.md`).
 
 ## Agent loop
 
