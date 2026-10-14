@@ -1,12 +1,44 @@
 #!/bin/bash
-# check-backup-sync — emthin/workspace-backup/ must be byte-identical to
-# its workspace-root sources (drift gate for the copy-as-backup decision;
-# the same check `sync-workspace-backup --check` performs, exposed as a
-# gate so check-all-gates' workspace auto-discovery picks it up).
+# check-backup-sync — byte-identity gate for BOTH mirror mechanisms:
+#
+#   1. emthin/workspace-backup/ vs its workspace-root sources (the
+#      copy-as-backup decision) — the same check `sync-workspace-backup
+#      --check` performs, exposed as a gate so check-all-gates' workspace
+#      auto-discovery picks it up.
+#   2. unfer/scripts/{check-attribution,workspace-root.sh} vs the root
+#      copies (the pair PLAN_WORKSPACE_REVIEW F1 calls "both attribution
+#      gates"). unfer's CI runs its copy directly, so drift there stays
+#      green at the root and goes red only in the repo's own pipeline —
+#      found 2026-10-14 when the root copy gained the workspace-backup
+#      exclusion and the PLAN_* glob that the unfer copy lacked (3
+#      unresolved FAILs in unfer, 0 at the root).
+#
+# Only pairs with a documented identity contract are asserted here:
+# workspace-root.sh's header names unfer/scripts as "per-repo mirrors",
+# check-attribution is "unfer's copy". check-status is deliberately NOT
+# asserted — the root copy is a delegating wrapper (F3), not a mirror —
+# and tree-size has no identity contract on record.
 #
 # This is what makes the check-links/check-attribution exclusions of
 # workspace-backup/ safe: the mirror adds no coverage, but drift between
 # a committed mirror and its source fails here loudly.
 set -eu
 root="$(cd "$(dirname "$0")/.." && pwd)"
-exec bash "$root/scripts/sync-workspace-backup" --check
+
+fail=0
+bash "$root/scripts/sync-workspace-backup" --check || fail=1
+
+for f in check-attribution workspace-root.sh; do
+    src="$root/scripts/$f"
+    dst="$root/unfer/scripts/$f"
+    if [ ! -f "$dst" ]; then
+        echo "FAIL mirror missing: unfer/scripts/$f (copy scripts/$f there and commit)"
+        fail=1
+    elif ! cmp -s "$src" "$dst"; then
+        echo "FAIL mirror drifted: unfer/scripts/$f (re-copy the root scripts/$f into unfer/scripts/ and commit both)"
+        fail=1
+    fi
+done
+
+[ "$fail" -eq 0 ] || { echo "check-backup-sync: FAILED" >&2; exit 1; }
+echo "check-backup-sync: mirrors in sync (workspace-backup + unfer/scripts gate copies)"

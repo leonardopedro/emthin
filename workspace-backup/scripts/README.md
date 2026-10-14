@@ -32,6 +32,7 @@ gates in this directory are cheap (grep/python) and safe to parallelise;
 | `check-attribution` | policy #4 of `../ATTRIBUTION.md`: every adaptation claim (`adapted/inspired/ported/borrowed from`, `based on/derived from`) in the seven checkouts + root plan docs resolves to a ledger row, an internal path, or a reviewed allowlist entry |
 | `check-scenario-ledgers` | the obligation-closure tables in `emthin`/`velysterm` SCENARIOS.md (REA discipline): closed vocab for authority/closure, every row's verifier names a script that exists, scenario IDs ↔ closure rows bijective |
 | `check-error-catalog` | `docs/user-visible-errors.csv` shape (harm ranks 1..N, retryable vocab, verification non-empty) + bidirectional code-set parity vs the source enums (`emthin` `IpcErrorCode`, `voice.sh` FAIL codes, `modhost` error kinds) |
+| `check-backup-sync` / `sync-workspace-backup` | byte-identity of both mirrors: `emthin/workspace-backup/` ↔ its root sources (refresh with `sync-workspace-backup`, then commit), and `unfer/scripts/{check-attribution,workspace-root.sh}` ↔ the root copies (unfer's CI runs its own copy directly) |
 
 Workspace `check-*` gates are auto-discovered by `check-all-gates` (the
 runner skips itself and `check-status`, a maintenance utility) — drop a
@@ -48,11 +49,16 @@ The workspace root is not a git repository and hosts no CI, so
 # federation gates: weekly, Monday 06:00 local. Output to a dated log;
 # grep for FAIL/gap after the run.
 0 6 * * 1 /bin/bash -c 'cd /home/leo/Projects && bash scripts/check-all-gates > /tmp/check-all-gates-$(date +\%F).log 2>&1'
-```
-
-The schedule exists to catch drift like F1 (a gate convention broken by
-a well-intentioned edit) between sessions; the stage-boundary invariant
+```The schedule exists to catch drift like F1 (a gate convention broken by a
+well-intentioned edit) between sessions; the stage-boundary invariant
 remains "run `check-all-gates` before claiming done", schedule or not.
+
+**Host note (2026-10-14):** this machine has no `crontab`/`cron` binary
+(NixOS, verified) — the line above cannot be installed here as written.
+Owner decision on S4-5: **documented-only**, no scheduler installed; the
+stage-boundary run is the safety net until a CI target or an explicit
+scheduler (e.g. a systemd user timer) is chosen. Re-open S4-5 if and
+when a mechanism actually runs.
 
 ## Per-repo gates (what `check-all-gates` invokes)
 

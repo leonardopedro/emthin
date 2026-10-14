@@ -1,0 +1,247 @@
+This project includes the folders unfer/ , australVM/ , velysterm/ , timepiece , dynamic-arctic , test/ , emthin/. Please create a new much more detailed plan resulting from a review (including of the literature mentioned ./AnaCPtex/ ,  ./AnaCP/  and ./AnaNC.md , ./AnaNC/ ) and adaptation to this project of the following: 
+**No, there is no single pre-packaged, unified library that integrates all of these pieces out of the box.**
+
+The pieces currently exist in three separate research and engineering silos:
+
+1. **The Academic Continual Learning Repositories:**  
+   Saleh Momeni, Changnan Xiao, and Bing Liu released **AnaCP** (NeurIPS 2025 see folders ./AnaCPtex/ and ./AnaCP/ ) and **AnaNC** (AAAI 2026 see files ./AnaNC.md and ./AnaNC/ ), but their codebases are benchmark evaluation suites designed for Computer Vision benchmarks (e.g., CIFAR-100, ImageNet-R). They are not packaged as reusable inference libraries.
+2. **The Decision Model Repositories:**  
+   Frameworks like **`open-jev`** and **`laya`** provide typed System 1 interfaces (`Choice`, `probabilities`, `confidence`), but they use standard fine-tuned classification heads that suffer from catastrophic forgetting and lack closed-form analytic learning.
+3. **The Calibration Bridge:**  
+   Converting AnaNC’s raw physical energy and geometric distance scores into normalized Bayesian probabilities ($P(Y \mid X)$ summing to 1.0 alongside an open-world $(K+1)$ rejection state) is the theoretical formulation we synthesized above.
+
+---
+
+### The Unified Implementation
+
+Here is a complete, self-contained Python implementation combining:
+* **AnaCP:** Closed-form Analytic Contrastive Projection (adapts features without backpropagation).
+* **AnaNC:** Analytic Neural Collapse onto an Equiangular Tight Frame (ETF) hypersphere.
+* **Calibrated Probability Engine:** Maps spherical distance to $P(Y \mid X)$ (sums to 1.0) and Free Energy to epistemic confidence $P(\text{ID} \mid X) \in [0, 1]$.
+* **`open-jev` Interface:** Outputs standard `ChoiceAnswer`-compatible dictionaries.
+
+```python
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+@dataclass
+class ChoiceAnswer:
+    choice: str
+    probabilities: Dict[str, float]  # Strictly sums to 1.0
+    confidence: float                # Epistemic certainty P(ID | X) in [0, 1]
+    p_ood: float                     # Probability of out-of-distribution / reject
+
+
+class UnifiedAnalyticDecisionEngine(nn.Module):
+    """
+    Unified System 1 Continual Decision Model.
+    Combines:
+      - AnaCP (Analytic Contrastive Projection)
+      - AnaNC (Analytic Neural Collapse on ETF Hypersphere)
+      - Calibrated Energy-to-Probability Inference
+    """
+    def __init__(self, feature_dim: int, proj_dim: int = 256, temperature: float = 0.1, reg_lambda: float = 1e-3):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.proj_dim = proj_dim
+        self.temperature = temperature
+        self.reg_lambda = reg_lambda
+        
+        # 1. AnaCP Buffers (Feature Autocorrelation & Scatter Tracking)
+        self.register_buffer("R_xx", reg_lambda * torch.eye(feature_dim)) # (D, D) Autocorrelation
+        self.register_buffer("W_proj", torch.eye(feature_dim, proj_dim))  # (D, d) Contrastive Projection
+        
+        # 2. AnaNC Buffers (ETF Prototypes & Energy Calibration)
+        self.register_buffer("class_counts", torch.zeros(0, dtype=torch.float32))
+        self.register_buffer("class_sums", torch.zeros(0, proj_dim, dtype=torch.float32))
+        self.register_buffer("prototypes", torch.zeros(0, proj_dim, dtype=torch.float32))
+        
+        # 3. Energy Calibration Parameters
+        self.register_buffer("energy_threshold", torch.tensor(0.0))
+        self.register_buffer("energy_scale", torch.tensor(1.0))
+        
+        self.class_names: List[str] = []
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
+
+    def _expand_classes(self, new_names: List[str]):
+        """Expands buffers dynamically when novel classes arrive."""
+        diff = len(new_names) - self.prototypes.shape[0]
+        if diff <= 0:
+            return
+        device = self.prototypes.device
+        self.class_counts = torch.cat([self.class_counts, torch.zeros(diff, device=device)])
+        self.class_sums = torch.cat([self.class_sums, torch.zeros(diff, self.proj_dim, device=device)])
+        self.prototypes = torch.cat([self.prototypes, torch.zeros(diff, self.proj_dim, device=device)])
+        self.class_names = new_names
+
+    @torch.no_grad()
+    def update(self, raw_features: torch.Tensor, labels: torch.Tensor, class_names: Optional[List[str]] = None):
+        """
+        Closed-form, zero-backprop update across both AnaCP and AnaNC.
+        - raw_features: (N, feature_dim) embeddings from frozen backbone
+        - labels: (N,) integer class indices
+        """
+        N, D = raw_features.shape
+        device = raw_features.device
+        
+        # Step A: Update class vocabulary
+        max_label = int(labels.max().item()) + 1
+        if class_names is None:
+            class_names = [f"class_{i}" for i in range(max(max_label, self.num_classes))]
+        self._expand_classes(class_names)
+
+        # Step B [AnaCP]: Update recursive autocorrelation matrix (R_xx += X^T X)
+        self.R_xx += torch.matmul(raw_features.T, raw_features)
+        
+        # Closed-form Contrastive Matrix: S_B (Between-class scatter)
+        one_hot = torch.zeros(N, self.num_classes, device=device).scatter_(1, labels.unsqueeze(1), 1.0)
+        class_means_raw = torch.matmul(one_hot.T, raw_features) / (one_hot.sum(dim=0, keepdim=True).T + 1e-5)
+        S_b = torch.matmul(class_means_raw.T, class_means_raw)
+        
+        # Solve for AnaCP Projection W_proj = R_xx^{-1} S_B (using fast Cholesky / pseudo-inverse)
+        inv_R = torch.linalg.pinv(self.R_xx)
+        W_full = torch.matmul(inv_R, S_b)
+        # Low-rank SVD truncation to proj_dim
+        U, S, Vh = torch.linalg.svd(W_full, full_matrices=False)
+        self.W_proj = U[:, :self.proj_dim] # (D, proj_dim)
+
+        # Step C: Project raw features through AnaCP
+        projected_z = torch.matmul(raw_features, self.W_proj) # (N, proj_dim)
+        projected_z = nn.functional.normalize(projected_z, p=2, dim=-1) # Unit sphere
+
+        # Step D [AnaNC]: Accumulate ETF class prototypes
+        for k in range(max_label):
+            mask = (labels == k)
+            if mask.sum() > 0:
+                k_samples = projected_z[mask]
+                self.class_sums[k] += k_samples.sum(dim=0)
+                self.class_counts[k] += mask.sum()
+                # Normalize onto the Neural Collapse ETF manifold
+                self.prototypes[k] = nn.functional.normalize(self.class_sums[k], p=2, dim=0)
+
+        # Step E: Auto-Calibrate Energy on observed features
+        similarities = torch.matmul(projected_z, self.prototypes.T)
+        energies = -self.temperature * torch.logsumexp(similarities / self.temperature, dim=-1)
+        self.energy_threshold = torch.quantile(energies, 0.95)
+        self.energy_scale = torch.std(energies) + 1e-5
+
+    @torch.no_grad()
+    def predict(self, raw_features: torch.Tensor) -> List[ChoiceAnswer]:
+        """
+        Executes calibrated inference:
+        - AnaCP Feature Projection
+        - AnaNC Distance to ETF Prototypes
+        - Free Energy Epistemic Calibration
+        """
+        # 1. AnaCP Projection onto hypersphere
+        z = torch.matmul(raw_features, self.W_proj)
+        z = nn.functional.normalize(z, p=2, dim=-1) # (N, proj_dim)
+
+        # 2. Geometric Cosine Distance & Logits
+        cosine_sim = torch.matmul(z, self.prototypes.T) # (N, K)
+        logits = cosine_sim / self.temperature
+        
+        # 3. Class-conditional probabilities P(Y=k | X, ID) (Sums strictly to 1.0)
+        id_probabilities = torch.softmax(logits, dim=-1)
+
+        # 4. Physical Free Energy
+        energy_scores = -self.temperature * torch.logsumexp(logits, dim=-1)
+
+        # 5. Epistemic Confidence P(ID | X) via Logistic Energy Gap
+        energy_gap = (energy_scores - self.energy_threshold) / self.energy_scale
+        p_in_distribution = torch.sigmoid(-energy_gap)
+
+        # 6. Augmented Open-Set Distribution (K+1 classes)
+        ood_logit = (-self.energy_threshold / self.temperature).expand(z.shape[0], 1)
+        augmented_logits = torch.cat([logits, ood_logit], dim=-1)
+        k_plus_1_probs = torch.softmax(augmented_logits, dim=-1)
+
+        # Format answers into open-jev / laya typed structures
+        results = []
+        for i in range(raw_features.shape[0]):
+            prob_dict = {
+                self.class_names[k]: float(id_probabilities[i, k].item()) 
+                for k in range(self.num_classes)
+            }
+            best_choice = max(prob_dict, key=prob_dict.get)
+            
+            results.append(ChoiceAnswer(
+                choice=best_choice,
+                probabilities=prob_dict,
+                confidence=float(p_in_distribution[i].item()),
+                p_ood=float(k_plus_1_probs[i, -1].item())
+            ))
+            
+        return results
+```
+
+---
+
+### How to Hook It Up to a Real Model (e.g. ModernBERT)
+
+```python
+from transformers import AutoModel, AutoTokenizer
+
+# 1. Load your frozen System 1 backbone
+device = "cuda" if torch.cuda.is_available() else "cpu"
+tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
+backbone = AutoModel.from_pretrained("answerdotai/ModernBERT-base").to(device).eval()
+
+def embed(texts: List[str]) -> torch.Tensor:
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = backbone(**inputs)
+        # Mean pooling over token embeddings
+        return outputs.last_hidden_state.mean(dim=1)
+
+# 2. Instantiate the Unified Analytic Decision Engine
+engine = UnifiedAnalyticDecisionEngine(feature_dim=768, proj_dim=128).to(device)
+
+# 3. Stream in Task 1: (Instant, closed-form, no backprop!)
+task1_texts = [
+    "I need an invoice copy for last month",
+    "Where is my receipt?",
+    "My database connection timed out with code 500",
+    "The server API is returning 502 Bad Gateway"
+]
+task1_labels = torch.tensor([0, 0, 1, 1], device=device) # 0: Billing, 1: Technical
+task1_features = embed(task1_texts)
+
+engine.update(task1_features, task1_labels, class_names=["Billing", "Technical"])
+
+# 4. Stream in Task 2 later: New class arrives (Zero Forgetting!)
+task2_texts = [
+    "I want to cancel my account immediately",
+    "Please close my subscription"
+]
+task2_labels = torch.tensor([2, 2], device=device) # 2: Churn
+task2_features = embed(task2_texts)
+
+engine.update(task2_features, task2_labels, class_names=["Billing", "Technical", "Churn"])
+
+# 5. Make Decisions on Test Queries
+queries = [
+    "Can you resend my payment receipt?",         # Clear In-Distribution (Billing)
+    "What is the average orbital radius of Mars?" # Completely OOD
+]
+query_features = embed(queries)
+answers = engine.predict(query_features)
+
+for q, ans in zip(queries, answers):
+    print(f"\nQuery: '{q}'")
+    print(f"Decision: {ans.choice}")
+    print(f"Probabilities: {ans.probabilities}")
+    print(f"Epistemic Confidence P(ID): {ans.confidence:.4f}")
+    print(f"OOD Rejection Probability: {ans.p_ood:.4f}")
+```
+
+### Why This Fulfills Your Original Goal
+* **Contrastive Feature Separation (AnaCP):** Features are projected through a closed-form between-class scatter matrix $S_B$, preventing feature stagnation.
+* **ETF Hypersphere & Exact Collapse (AnaNC):** Prototypes live on an Equiangular Tight Frame, eliminating vanishing gradients and the convex hull limit.
+* **Probabilities Sum to 1.0:** `ans.probabilities` provides a strictly normalized conditional probability distribution via GDA on the sphere.
+* **Physically Grounded Confidence:** `ans.confidence` is computed from the free energy on the sphere, dropping close to $0.0$ for out-of-distribution queries while driving `p_ood` to $1.0$.

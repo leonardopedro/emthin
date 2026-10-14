@@ -8,13 +8,13 @@ Scope discipline unchanged from S3 §5: no Lean4 code here (owner's boundary —
 
 ## 1. Backlog rows
 
-| # | item | kind | repo | owner | acceptance |
-|---|---|---|---|---|---|
-| **S4-1** | **ProofFlow → logos study note.** Evaluate `../ProofFlow/` (dependency-graph proof autoformalization, arXiv 2510.15981) as a discipline for `logos`' formalize pipeline: does a dependency-graph-driven scheduling of which obligations to formalize next improve the LLM formalize→Lean4 loop's acceptance rate? Output is a *study note* (fit, gaps, verdict), not code. | study (§6 of S3) | unfer/logos | LLM-Lean4-specialist, then owner | note lands in `unfer/docs/`; states (a) which ProofFlow mechanisms map onto logos' pipeline, (b) which do not and why, (c) a go/no-go for the Rust-side orchestration the specialist's contract would gate; no Lean4 code until the specialist signs the output contract |
-| **S4-2** | **Engram agent-memory revisit.** The deferred new-feature candidate (S3 §3.3): decide whether `kernel_client`'s in-memory `HashMap<u64, Session>` still suffices, or an observed requirement justifies a bounded persistent memory with retrieval. **Resolved 2026-10-14 — still not observed; evidence in the execution log below.** | new feature (deferred, justification on record) | velysterm/kernel_client | owner | either a written "still not observed" row updating S3 §3.3, or an observed workflow that the tool-design doctrine's bar (`"an observed requirement those primitives cannot satisfy"`) admits — only then design, with Engram (`engram-reference/`) as reference-only (paper reproduction row already in the ledger) |
-| **S4-3** | **Harness-contract docs for voice/logos.** S3 §3.4 adopted deepseek-harness's BENCHMARK.md-paired-with-harness practice "only where cheap (deferred, backlog)": write the harness contract for `unfer/voice/` and `logos`' LLM loop where it is still missing. | improve (dsh) | unfer | owner/agent | each harness's doc states entry command, environment preconditions, honest skip semantics, redaction rules (workspace `scripts/README.md` redaction policy); `check-links` + attribution green |
-| **S4-4** | **D1/D2 scenario rows → real-session upgrade.** The desktop save-conflict rows close at `unit` authority (binary's own `save()`, in-process). The upgrade path: run the conflict live with a display and an external editor (open doc in `mathed`, rewrite the file from a shell, Ctrl+S twice, observe refusal + notified overwrite). | improve (S3 P1b follow-through) | velysterm | owner (needs a display) | `scripts/SCENARIOS.md` D1/D2 authority raised to `real-session` (or `harness` with a scripted driver) **only after** a recorded run; verifier row updated in the same change; `check-scenario-ledgers` green |
-| **S4-5** | **Scheduled gate run wired for real.** S3 P4 documented the cron line (workspace root has no CI). If an owner-chosen CI target ever exists for the workspace root, the cron note becomes a `workflow_dispatch`+cron workflow. | improve (F6 completion) | workspace root | owner | either the workflow file running `check-all-gates` weekly, or the cron line confirmed installed and its log rotated; `check-all-gates` unchanged |
+| # | item | kind | repo | owner | acceptance | status |
+|---|---|---|---|---|---|---|
+| **S4-1** | **ProofFlow → logos study note.** Evaluate `../ProofFlow/` (dependency-graph proof autoformalization, arXiv 2510.15981) as a discipline for `logos`' formalize pipeline: does a dependency-graph-driven scheduling of which obligations to formalize next improve the LLM formalize→Lean4 loop's acceptance rate? Output is a *study note* (fit, gaps, verdict), not code. | study (§6 of S3) | unfer/logos | LLM-Lean4-specialist, then owner | note lands in `unfer/docs/`; states (a) which ProofFlow mechanisms map onto logos' pipeline, (b) which do not and why, (c) a go/no-go for the Rust-side orchestration the specialist's contract would gate; no Lean4 code until the specialist signs the output contract | **done** 2026-10-14 → `unfer/docs/PROOFFLOW_STUDY.md` (§3) |
+| **S4-2** | **Engram agent-memory revisit.** The deferred new-feature candidate (S3 §3.3): decide whether `kernel_client`'s in-memory `HashMap<u64, Session>` still suffices, or an observed requirement justifies a bounded persistent memory with retrieval. **Resolved 2026-10-14 — still not observed; evidence in the execution log below.** | new feature (deferred, justification on record) | velysterm/kernel_client | owner | either a written "still not observed" row updating S3 §3.3, or an observed workflow that the tool-design doctrine's bar (`"an observed requirement those primitives cannot satisfy"`) admits — only then design, with Engram (`engram-reference/`) as reference-only (paper reproduction row already in the ledger) | **done** 2026-10-14 — "still not observed", evidence in §3 |
+| **S4-3** | **Harness-contract docs for voice/logos.** S3 §3.4 adopted deepseek-harness's BENCHMARK.md-paired-with-harness practice "only where cheap (deferred, backlog)": write the harness contract for `unfer/voice/` and `logos`' LLM loop where it is still missing. | improve (dsh) | unfer | owner/agent | each harness's doc states entry command, environment preconditions, honest skip semantics, redaction rules (workspace `scripts/README.md` redaction policy); `check-links` + attribution green | **done** 2026-10-14 — `voice/README.md` + `docs/FORMALIZE.md` §7 (§3) |
+| **S4-4** | **D1/D2 scenario rows → real-session upgrade.** The desktop save-conflict rows close at `unit` authority (binary's own `save()`, in-process). The upgrade path: run the conflict live with a display and an external editor (open doc in `mathed`, rewrite the file from a shell, Ctrl+S twice, observe refusal + notified overwrite). | improve (S3 P1b follow-through) | velysterm | owner (needs a display) | `scripts/SCENARIOS.md` D1/D2 authority raised to `real-session` (or `harness` with a scripted driver) **only after** a recorded run; verifier row updated in the same change; `check-scenario-ledgers` green | **partial** — unit-tier E2E recorded (§3, follow-up session); real-session half open |
+| **S4-5** | **Scheduled gate run wired for real.** S3 P4 documented the cron line (workspace root has no CI). If an owner-chosen CI target ever exists for the workspace root, the cron note becomes a `workflow_dispatch`+cron workflow. | improve (F6 completion) | workspace root | owner | either the workflow file running `check-all-gates` weekly, or the cron line confirmed installed and its log rotated; `check-all-gates` unchanged | **declined by owner** 2026-10-14 — documented-only: this host has no `crontab` and no timer was installed; the README cron note is the record. Acceptance ("confirmed installed") intentionally not met — re-open if a scheduler or CI target appears |
 
 ## 2. Decision log
 
@@ -50,6 +50,8 @@ Convention per `PLAN_WORKSPACE_REVIEW_2026-10-14.md` §9 (`DN (date):` rows).
      sweep after all changes: **31/0/0**.
 - 2026-10-14: S4-1, S4-2, S4-3, S4-5 not started — each row's acceptance
   stands as written; S4-4's real-session half remains open by design.
+  **Superseded the same day** by the entries below: S4-1/2/3 executed,
+  S4-5 still open (status column in §1 is now the source of truth).
 - 2026-10-14 (second session — owner asked "why not runned"; three items
   executed, S4-5 declined by owner selection):
   1. **S4-1 done** → `unfer/docs/PROOFFLOW_STUDY.md`. Headline: the
@@ -85,10 +87,30 @@ Convention per `PLAN_WORKSPACE_REVIEW_2026-10-14.md` §9 (`DN (date):` rows).
   4. **Root files now have git** (owner decision: *copy, not move*):
      `emthin/workspace-backup/` mirrors the coordination files; refreshed by
      `scripts/sync-workspace-backup`, gated by `scripts/check-backup-sync`
-     (byte-identity; negative-proven: drift → exit 1, resync → 0).
-     `check-links` (emthin) and `check-attribution` exclude the mirror with
-     the reasoning in-script: identical text must not be resolved against a
-     different window than its gated source.
+     (byte-identity; negative-proven: drift → exit 1, resync → 0).   `check-links` (emthin) and `check-attribution` exclude the mirror with
+   the reasoning in-script: identical text must not be resolved against
+   a different window than its gated source.
+- 2026-10-14 (third session — owner: "fix the limitations … why S4 not
+  runned"; fixes + two owner decisions):
+  1. **Red gate fixed at cause:** `unfer/scripts/check-attribution` had
+     drifted from the root copy (the workspace-backup exclusion and the
+     `PLAN_*` glob landed only at the root) — unfer's own run failed
+     with 3 unresolved `emthin/workspace-backup` claims while the root
+     sweep stayed green. Re-synced: both copies 264 hits / 0 unresolved /
+     exit 0. Drift now fails loudly: `check-backup-sync` also asserts
+     byte-identity of the documented mirror pair (`check-attribution`,
+     `workspace-root.sh`; `check-status` is a delegating wrapper by
+     design, F3) — negative-proven (drift → exit 1, restore → 0) and
+     documented in `scripts/README.md`.
+  2. **Status surface fixed:** §1 gained a status column — the
+     "not started" line above is superseded by it (S4-1/2/3 done,
+     S4-4 partial, S4-5 declined).
+  3. **Owner decisions:** (a) copy-not-move **reaffirmed** ("leave it
+     as it is; as long as there is a backup") — the mirror stays the
+     git home of the root files, and `PromptANaCP` (12 KB root prompt,
+     previously uncovered) joined `workspace-backup-files`;
+     (b) S4-5 stays **documented-only** — no scheduler installed (this
+     host has no `crontab`); README annotated, row marked declined.
 
 ## 4. Copyright & compliance
 

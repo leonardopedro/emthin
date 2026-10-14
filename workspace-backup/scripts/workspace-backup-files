@@ -33,3 +33,9 @@ scripts/workspace-root.sh
 scripts/workspace-backup-files
 scripts/sync-workspace-backup
 scripts/check-backup-sync
+
+# Root prompt artifact (the review-plan prompt that spawned the AnaCP
+# cycle) — added 2026-10-14 when the owner's condition was "as long as
+# there is a backup": it had no git home anywhere. LeanCache.lean stays
+# uncovered deliberately (0-byte generated cache; generated = untracked).
+PromptANaCP
