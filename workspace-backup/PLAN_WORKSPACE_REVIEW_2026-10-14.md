@@ -75,6 +75,7 @@ mathed_core's save path writes the Loro-backed document without checking whether
 
 ### 3.3 Engram / engram-reference (DeepSeek memory paper)
 Memory architecture for persistent agents. This is the *reference implementation* class the old plan's C2 ("persistent agent memory with bounded context + retrieval") wanted. **Deferred with justification:** kernel_client's `HashMap<u64, Session>` is deliberately in-memory per document; a memory subsystem is a new feature whose requirement has not been observed in the current workflows (tool-design doctrine: "Custom orchestration languages… need an observed requirement those primitives cannot satisfy"). Carried as a backlog row.
+**Resolved 2026-10-14 (S4-2): still not observed** — assessment with evidence (C2 memory exists in-loop; sessions persist loop state by design and exclude C2 memory with rationale; the one observed retrieval need, lemma reuse, already has engram-backed storage) in `PLAN_S4_BACKLOG_2026-10-14.md`'s execution log.
 
 ### 3.4 deepseek-harness (dsh) — agent harness
 Open-source agent harness with a BENCHMARK.md discipline. Relevant to `unfer_agent`'s NDJSON loop and emthin's `scripts/agent/` loop. **Adopted:** the practice of a benchmark/discipline doc *paired with* the harness — emthin's `docs/AGENT_LOOP.md` is that already; unfer's `voice/` and `logos` harnesses gain a "harness contract" section only where cheap (deferred, backlog).
