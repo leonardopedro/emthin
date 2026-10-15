@@ -33,6 +33,7 @@ gates in this directory are cheap (grep/python) and safe to parallelise;
 | `check-scenario-ledgers` | the obligation-closure tables in `emthin`/`velysterm` SCENARIOS.md (REA discipline): closed vocab for authority/closure, every row's verifier names a script that exists, scenario IDs ↔ closure rows bijective |
 | `check-error-catalog` | `docs/user-visible-errors.csv` shape (harm ranks 1..N, retryable vocab, verification non-empty) + bidirectional code-set parity vs the source enums (`emthin` `IpcErrorCode`, `voice.sh` FAIL codes, `modhost` error kinds) |
 | `check-backup-sync` / `sync-workspace-backup` | byte-identity of both mirrors: `emthin/workspace-backup/` ↔ its root sources (refresh with `sync-workspace-backup`, then commit), and `unfer/scripts/{check-attribution,workspace-root.sh,tree-size}` ↔ the root copies (unfer's CI runs its own copy directly) |
+| `testing-depths.md` | the R15 depth labels: each repo's named verification surfaces mapped onto rea's five lanes (module / composition / boundary / acceptance / conformance) with named skips — descriptive; the gates above enforce the *claims* around suites, this catalog says which lane a green run licenses |
 
 Workspace `check-*` gates are auto-discovered by `check-all-gates` (the
 runner skips itself and `check-status`, a maintenance utility) — drop a

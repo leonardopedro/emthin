@@ -29,6 +29,7 @@ scripts/check-scenario-ledgers
 scripts/check-status
 scripts/sync-book
 scripts/tree-size
+scripts/testing-depths.md
 scripts/workspace-root.sh
 scripts/workspace-backup-files
 scripts/sync-workspace-backup
