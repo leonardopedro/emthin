@@ -46,6 +46,7 @@ the gap culture and is inherited here, not re-litigated.
 |---|---|---|
 | module | the workspace suite (347): docui, keymap, session serde, figure binding, IPC protocol units | `nix develop -c cargo test --workspace` |
 | boundary | clipboard/dbus crate against a real session bus; xwayland supervisor timing | the `emthin-dbus` suites inside the same run |
+| boundary | the tier-1 replay scenario: sandboxed `doc` → `apply` edit script → closed-vocab `expect` (13 asserts, ~0.8 s; the scenario cannot skip a check it was written to make) | `./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt` (CI `e2e` job, first step) |
 | acceptance | the §6 step-7 E2E: XTEST keystrokes → document, clipboard both ways, `list_state`, SIGTERM | `./scripts/e2e/run.sh --config xdotool` (5 checks; CI `e2e` job) |
 | named skip | IME commit (needs the host's fcitx *engaged*, not merely installed) | `scripts/e2e/README.md`; clipboard-free rerun is `E2E_NO_X=1` |
 
@@ -53,7 +54,7 @@ the gap culture and is inherited here, not re-litigated.
 
 | lane | surface | evidence |
 |---|---|---|
-| module + composition | mathed_core / mathed_mini / mathed / mathed_biblio CPU suites (986 incl. doc-tests) | `nix develop -c cargo test --workspace` |
+| module + composition | mathed_core / mathed_mini / mathed / mathed_biblio CPU suites (995 incl. doc-tests; round 3 added tier-1b `semantic_facts` + `docs_diff` inspect tests) | `nix develop -c cargo test --workspace` |
 | boundary | `mathed`'s `kernel_smoke` and `mathed_mini`'s `overlay_renders_green` — document → KernelBridge → prob_kernel → annotation/pixels | CI `smoke` job (headless) |
 | boundary | slint_blocks driving the real helper process (process boundary) | `cargo test -p mathed` with the helper built; self-skip when absent |
 | conformance | `AGENT_OPS` registry ↔ dispatch ↔ `docs/AGENT_OP_CATALOG.md` | `python3 scripts/check-op-catalog` (+ the F4 prose guard) |
