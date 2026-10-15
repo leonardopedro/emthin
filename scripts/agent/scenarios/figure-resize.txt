@@ -1,0 +1,29 @@
+# §9 demo scenario — resize the terminal figure and prove the delta,
+# headless: observe → apply an edit script → assert. No compositor.
+#
+#   ./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt
+#
+# Paths resolve relative to this file. The acceptance lane for the
+# same edit class is scripts/e2e/run.sh against a real nested session.
+
+doc ../demo.typ
+
+# baseline: the demo document as it stands
+expect pages == 3
+expect figures == 3
+expect diag == 0
+expect figure f0 w == 400
+expect figure f0 caption == Terminal
+expect unresolved == 0
+
+# the edit script: widen the terminal figure to the text column
+apply figure-resize.patch
+
+# post-conditions: only the edited figure moved
+expect figure f0 w == 440
+expect figure f0 caption == Terminal
+expect figure f1 w == 410
+expect figure f2 w == 350
+expect pages == 3
+expect diag == 0
+expect figures == 3

@@ -62,6 +62,50 @@ diagnostics or adjust sizes → repeat. Reach for `--png` (or tier 2)
 only when the diagnostics are clean and the question is aesthetic —
 spacing taste, colour, whether a caption crowds its figure.
 
+### Tier 1b — the document's meaning, no compile
+
+```sh
+./scripts/agent/preview.sh notes.typ --semantic   # defs, uses, dangling ids — one line
+```
+
+Same contract (one compact JSON line), one layer deeper:
+`defs` (name, 1-based line, `uses` = the occurrences
+`SemanticIndex::plan_rename` would edit), `unresolved` (free
+identifiers that resolve to no definition — one row per name, and
+application-argument identifiers are excluded, so `$norm(x)$`
+reports `norm`'s referents, not its dummy `x`), `models` (the bare
+name when the statement carries one, else the body's leading
+identifier), `statements` (counts by kind), `translators`,
+`templates`. Every key is present even when empty — absence must be
+readable as a claim.
+
+The difference that matters: **no Typst compile.** Typst eval
+rejects unknown multi-letter math variables, so a document
+containing `$foo$` fails tier 1 with `layout failed: Eval` —
+honestly, because a user cannot render it either — but `--semantic`
+still reports `unresolved: [{"name": "foo", "line": …}]`, which is
+exactly the fact needed to fix it. (Measured: the same document's
+tier-1 call exits 1; tier 1b exits 0.)
+
+### What changed — the snapshot delta
+
+```sh
+./scripts/agent/preview.sh --diff notes.before.typ notes.typ
+```
+
+One line describing what one edit changed: figures added / removed /
+changed (caption, size, id, launch, page, rect — only the fields
+that actually moved), page-count and diagnostic deltas, and the
+semantic delta (defs added/removed, uses moved, unresolved added/
+removed, models, statement counts, translators, templates).
+Figures are matched by caption first — the identity an editor
+keeps when an insertion renumbers every later `figure_key` (the
+caveat REWRITE_PLAN records) — then by key, which catches a caption
+edit as one change instead of a removal plus an addition. Neither
+document compiling is an **error naming the side**, never a silent
+removal: a broken edit reads as "broke the compile", not "the
+figure disappeared".
+
 ## Tier 2 — live session (real compositor, real apps)
 
 ```sh
@@ -132,6 +176,38 @@ client, and `down` still shuts down gracefully. A compositor must
 not advertise a capability it cannot honour — that invariant is now
 enforced in code, not convention.
 
+## Replay — scripted observe → apply → assert
+
+```sh
+./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt
+```
+
+A scenario file drives the whole loop headlessly: `doc` loads the
+document, `apply` applies an edit script (a `.patch`/`.diff applied
+with patch(1), or a full replacement document — an LLM's returned
+edit script can be either), `expect` asserts on the current state.
+The runner executes it in a throwaway sandbox and prints a
+transcript: a label line per step, one JSON observation per state
+change (filter `^{` for just the data), and the `--diff` delta after
+every `apply`.
+
+The assertion vocabulary is **closed** — pages/figures/diagnostics
+counts, per-figure fields (`figure f0 w == 440`, captions with
+spaces), defs and their use counts, unresolved/models/statement
+counts — and an unknown verb fails the run rather than being
+ignored, so a scenario cannot quietly skip what it was written to
+check. Failures keep the sandbox (`REPLAY_KEEP=1` keeps a passing
+one) and exit 1; a compile-breaking edit is reported as exactly
+that. Paths resolve relative to the scenario file, so a run is
+reproducible from any cwd.
+
+Lanes (`scripts/testing-depths.md`): replay is the **boundary** lane
+— filesystem plus a real compile, no compositor, no display. The
+**acceptance** lane stays `scripts/e2e/run.sh` against a real nested
+session, and CI runs the replay step *first* (the e2e job in
+`.github/workflows/ci.yml`) so a document-engine regression fails
+before the session lane starts.
+
 ## What each tier costs
 
 Measured 2026-10-13 on the dev machine, warm caches:
@@ -149,3 +225,13 @@ The default is the left column. Eyes are the expensive part; spend
 them last. The distilled editing playbook (geometry rules for "make
 it look nice", failure modes) lives in
 [`.agents/skills/emthin-document-editing/SKILL.md`](../.agents/skills/emthin-document-editing/SKILL.md).
+
+The three headless additions re-measured 2026-10-15 (warm, fast
+path — the same machine, the prebuilt binary, no devshell entered):
+
+| | `--semantic` | `--diff` | replay scenario |
+|---|---|---|---|
+| compositor / GPU | no | no | no |
+| wall clock | **0.02 s** | **0.03 s** | **0.8 s** (13 asserts) |
+| typical output | 88–142 B JSON | ~526 B JSON | 2.4 KB transcript, 10 JSON lines |
+| Typst compile | none | both docs | per state change |

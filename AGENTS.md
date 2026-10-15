@@ -117,7 +117,15 @@ need no compositor.
 document editing: a semantic tier (`scripts/agent/preview.sh` →
 `mathed_mini --layout-json`, no display; live `state` over IPC) first,
 visual tier (headless `--doc-image` PNG, live `grim` screenshot)
-second. `scripts/agent/live.sh boot|state|shot|size|open|save|log|down`
+second. Tier 1b adds the meaning dump (`preview.sh <doc> --semantic`:
+defs with use counts, dangling identifiers, models, statement counts —
+no Typst compile, so it reports the `$foo$` that broke the render) and
+the snapshot delta (`preview.sh --diff before after`: figures
+added/removed/rekeyed/changed + semantic deltas, one line). The
+headless acceptance script is `scripts/agent/replay.sh <scenario>` —
+`doc`/`apply`/`expect` with a closed assertion vocabulary, sandboxed;
+CI runs it before the E2E in the e2e job.
+`scripts/agent/live.sh boot|state|shot|size|open|save|log|down`
 wraps the e2e's sway-on-Xvfb session for repeated edit→observe cycles.
 The editing playbook (document cheat-sheet, geometry rules for
 "make it look nice", measured token/latency costs, failure modes) is

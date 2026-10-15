@@ -1,0 +1,8 @@
+--- demo.typ
++++ demo.typ
+@@ -1,4 +1,4 @@
+-#1 Terminal #2 \app(#1, #2, 400, 300, "foot", launch: "foot")
++#1 Terminal #2 \app(#1, #2, 440, 300, "foot", launch: "foot")
+ A terminal figure: the caption between #1 and #2 is ordinary prose, and
+ the statement reserves a 400x300 slot in the page flow.
+ 

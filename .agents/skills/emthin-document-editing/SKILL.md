@@ -33,7 +33,7 @@ Prose flows between figures...
 ## The loop — cheapest observation first
 
 1. **Edit** the `.typ` text.
-2. **Preview** (semantic tier, ~0.1 s, one JSON line on stdout):
+2. **Preview** (geometry tier, one JSON line on stdout):
 
    ```sh
    ./scripts/agent/preview.sh scripts/agent/demo.typ
@@ -43,12 +43,33 @@ Prose flows between figures...
    plus `page`, `rect{x,y,w,h}` where it landed, `page_count`, and
    `diagnostics[]` (dangling markers, unparseable sizes, page
    overflow). Empty diagnostics = structurally sound.
-3. **Fix** any diagnostics; re-preview. A compile failure exits
+3. **Ask what it means** with `--semantic` when the question is
+   definitions, uses or dangling identifiers — or when the document
+   does not compile at all (tier 1b runs no Typst eval, so it still
+   reports the `$foo$` that broke the render):
+
+   ```sh
+   ./scripts/agent/preview.sh scripts/agent/demo.typ --semantic
+   ```
+
+   `defs{name,line,uses}`, `unresolved`, `models`, `statements`,
+   `translators`, `templates` — all keys present even when empty.
+4. **Fix** any diagnostics; re-preview. A compile failure exits
    non-zero with the Typst error on stderr — never an empty report.
-4. **Judge geometry** against the aesthetics rules below. If the
+5. **Read the delta, not two dumps**: after an edit,
+   `./scripts/agent/preview.sh --diff before.typ after.typ` reports
+   exactly what moved (figures added/removed/rekeyed/changed,
+   pages, diagnostics, semantics) in one ~500 B line. A broken
+   edit is an error naming the side — never a silent removal.
+6. **Judge geometry** against the aesthetics rules below. If the
    numbers are right and the question is *taste*, render once:
    `--png /tmp/out.png` (~60 KB — spend eyes last).
-5. **Live session** (`./scripts/agent/live.sh`) only when real apps
+7. **Regression-proof it**: encode the expectations as a scenario
+   (`doc` / `apply` / `expect`, closed vocabulary) and run
+   `./scripts/agent/replay.sh <scenario>` — 13 asserts in ~0.8 s,
+   sandboxed, exit 1 on any miss. Scenario example:
+   `scripts/agent/scenarios/figure-resize.txt`.
+8. **Live session** (`./scripts/agent/live.sh`) only when real apps
    matter: binding, focus, live pixels. `state` ≈ 200 tokens;
    `shot` is a screenshot — last resort.
 
@@ -93,6 +114,9 @@ alignment, and spillover are all visible in geometry without pixels.
 | `preview.sh --png` | ~0.3 s | ~61 KB PNG |
 | `live.sh state` | ~1 s | ~200 tokens |
 | `live.sh shot` | ~1 s | 5–50 KB PNG |
+| `preview.sh --semantic` (2026-10-15) | **0.02 s** | 88–142 B JSON |
+| `preview.sh --diff` (2026-10-15) | **0.03 s** | ~526 B JSON |
+| `replay.sh` 13-assert scenario (2026-10-15) | **0.8 s** | 2.4 KB transcript |
 
 Eyes and compositor are the expensive parts; geometry answers most
 questions for pennies.
