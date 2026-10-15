@@ -58,14 +58,14 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 345 cargo (workspace, nix develop) + 5 E2E checks (run.sh) | last_verified: 2026-10-13 -->
+<!-- status: verified | tests: 347 cargo (workspace, nix develop) + 5/5 run.sh E2E green 2026-10-15 (three consecutive runs; harness hardened against stale state — see scripts/e2e/README "Stale state" post-mortem; the E2E now runs in CI) | last_verified: 2026-10-15 -->
 
 ## Verification
 
 ```sh
 nix develop -c bash -c 'cargo fmt --all --check && \
   cargo clippy --workspace --all-targets -- -D warnings && \
-  cargo test --workspace'          # 310 passed, 2 ignored
+  cargo test --workspace'          # 347 passed, 2 ignored
 
 ./scripts/e2e/run.sh --config xdotool   # 5/5, exit 0
 
@@ -76,6 +76,10 @@ The E2E number is the load-bearing one: it drives a real nested session (sway on
 Xvfb, emthin inside it) and checks typed text, document copy/paste, both
 clipboard directions, and that emthin opens no X11 socket. `E2E_NO_X=1` reruns it
 with `DISPLAY` unset, so the clipboard is exercised with no X server reachable.
+Since 2026-10-15 it also runs in CI (`.github/workflows/ci.yml`, the `e2e` job:
+nix devshell, `--config xdotool`, harness logs uploaded on failure) — for two
+days it ran only by hand and a stale-state regression went unnoticed; the
+harness reaps carried state now, see `scripts/e2e/README.md`.
 
 What the count does not cover: `xwayland_satellite` supervisor tests are timing
 sensitive and occasionally flake; the doc/ model is shared with the sibling

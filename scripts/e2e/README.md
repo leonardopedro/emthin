@@ -281,28 +281,60 @@ harness.
 | `step7-ydotool.sh` | the whole uinput route as one command |
 | `ipc.py`, `state.py` | the control protocol, and a readable dump of `state` |
 
+## Stale state — the 2026-10-15 regression
+
+Two runs at identical code, two days apart, disagreed: 10-13 green, 10-15 red
+four times in a row. The difference was not code — it was state the harness
+carried across runs:
+
+- **`.e2e/run/emthin.ipc`.** A SIGKILLed emthin leaves its control socket
+  behind as a dead file. The `[ -S ]` readiness gate cannot tell it from a
+  live one, and emthin itself refuses to bind over it (`AlreadyInUse`).
+- **A leaked Xvfb on the private display `:99`.** Cleanup took sway down but
+  not Xvfb, so the server outlived its run and the next run *adopted* whatever
+  answered there — including servers it never started.
+- **Carried workspace state in general.** The failures began the moment the
+  run stopped being the run that created the workspace — the exact hazard the
+  shutdown comment already named for sway, one compositor at a time.
+
+The symptom pointed somewhere other than the cause: an empty `list_state`,
+keystrokes not landing (a document bug), and SIGTERM not honored (a shutdown
+bug) — while the clipboard and transport checks kept passing, because those
+never touch the carried state. One `rm -rf .e2e` turned all five checks green;
+two more runs stayed green.
+
+The fixes live in `lib.sh` and `run.sh`: `reap_previous_run` now stops Xvfb
+alongside sway and emthin and removes the stale IPC socket before starting;
+`cleanup` takes Xvfb down on the way out. A run now starts from state it
+created, or from nothing. Since 2026-10-15 the harness also runs in CI (the
+`e2e` job in `.github/workflows/ci.yml`), so a regression of this class cannot
+go unnoticed for two days again.
+
 ## What passes today
 
-Run on this machine, `--config xdotool`, sway on Xvfb, emthin inside it:
+Run on this machine, `--config xdotool`, sway on Xvfb, emthin inside it —
+three consecutive runs, 2026-10-15:
 
 ```
+ ok  emthin opens no X11 connection
+ ok  the host's clipboard reaches a client inside emthin
+ ok  a client inside emthin reaches the host's clipboard
  ok  typed text reaches the document
  ok  doc-copy pastes (the marker appears 3 times)
-FAIL host clipboard reaches a client inside the nested session
-FAIL a client inside the nested session reaches the host clipboard
 
-4 ran, 0 skipped
-2 check(s) failed
+5 ran, 0 skipped
+ ok  all 5 executed check(s) passed (0 skipped)
 ```
 
 So §6 step 7's keyboard half is **verified**: keys reach the document, and
 Ctrl+A / Ctrl+C / Ctrl+V round-trips through `arboard` — which is the
 `1a79b38` path, live.
 
-The clipboard half is **verified as broken**, in both directions, and the cause
-is structural rather than a flake (see above). The IME commit is still not
-exercised: it needs the host's fcitx engaged, which `fcitx5` being installed does
-not arrange.
+The clipboard half is **verified in both directions** — the earlier "verified
+as broken" verdict was retracted in [The clipboard checks](#the-clipboard-checks):
+there was never a proxy bug, only the IPC-connectivity gate the harness now
+holds open. The IME commit is still not exercised: it needs the host's fcitx
+engaged, which `fcitx5` being installed does not arrange.
 
 ## Known unresolved
 

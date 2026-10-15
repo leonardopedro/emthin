@@ -326,12 +326,25 @@ reap_previous_run() {
     warn "a previous run's sway is still alive (pid $pid); stopping it"
     kill -TERM "$pid" 2>/dev/null || true
   done
+  # A live Xvfb on the harness's private display is never ours to reuse: a
+  # foreign or leaked server there was observed to break the keyboard path
+  # while every other check kept passing (10-15 post-mortem). Take it down
+  # and let start_xvfb own a fresh one.
+  for pid in $(pgrep -x Xvfb 2>/dev/null); do
+    warn "a previous run's Xvfb is still alive (pid $pid); stopping it"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
   sleep 1
   for pid in $(emthin_pid); do kill -KILL "$pid" 2>/dev/null || true; done
   for pid in $(pgrep -x sway 2>/dev/null); do kill -KILL "$pid" 2>/dev/null || true; done
+  for pid in $(pgrep -x Xvfb 2>/dev/null); do kill -KILL "$pid" 2>/dev/null || true; done
   # The compositor socket names vary by backend (Mutter takes what it is told,
   # sway always picks wayland-N), so clear them all rather than one.
   rm -f "$E2E_XDG"/wayland-* "$E2E_XDG"/"$E2E_DISPLAY"* 2>/dev/null || true
+  # A SIGKILLed emthin leaves its control socket behind as a dead file; the
+  # [ -S ] readiness gate cannot tell it from a live one, and emthin itself
+  # refuses to bind over it (AlreadyInUse). Remove it before starting.
+  rm -f "$E2E_IPC" 2>/dev/null || true
 }
 
 # ── IPC ─────────────────────────────────────────────────────────────────────

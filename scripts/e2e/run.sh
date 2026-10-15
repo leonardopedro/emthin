@@ -126,8 +126,13 @@ cleanup() {
   stop_emthin
   # The compositor is this run's, so take it down too: leaving sway holding
   # :99 is what made the *next* run start against a workspace it did not create.
+  # Xvfb counts for the same reason — a leaked server on the private display
+  # outlives the run and corrupts the next one (10-15 post-mortem).
   local pid
   for pid in $(pgrep -x sway 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -x Xvfb 2>/dev/null); do
     kill -TERM "$pid" 2>/dev/null || true
   done
 }

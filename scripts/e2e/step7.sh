@@ -58,7 +58,16 @@ clipboard_backend() {
 # depend on rendering, so it still tells the truth about a regression that leaves
 # the page stale.
 current_document() {
-  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | doc_from_state
+  if [ -n "${E2E_DUMP_STATE:-}" ]; then
+    # Debug affordance: dump the raw list_state frames next to the run so an
+    # empty document can be told apart from a parser that found no `state`
+    # notification (the two look identical through `doc_from_state`).
+    python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state \
+      >"$E2E_RUN/last_list_state.json" 2>"$E2E_RUN/last_list_state.err"
+    doc_from_state <"$E2E_RUN/last_list_state.json"
+  else
+    python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | doc_from_state
+  fi
 }
 
 doc_from_state() {

@@ -78,3 +78,61 @@ jobs:
       # tests". `--locked` keeps CI on the committed Cargo.lock.
       - name: test
         run: cargo test --locked --workspace
+
+  # The §6 step-7 E2E — the only gate that exercises the real session:
+  # keystrokes through XTEST, the clipboard proxy both ways, list_state on
+  # the control socket, and graceful SIGTERM shutdown. Until 2026-10-15 this
+  # ran only by hand, and a stale-state regression (10-13 green → 10-15
+  # red across identical code) went unnoticed for two days; the harness was
+  # hardened against carried state and now runs on every push.
+  #
+  # Everything graphical comes from the flake's devshell (Xvfb, sway,
+  # xdotool, wl-clipboard), so the job installs nix and builds inside
+  # `nix develop` — the repo's documented build environment — rather than
+  # duplicating the apt system-deps step above. The xdotool config is forced
+  # because it is the configuration the harness is verified against: ydotool
+  # needs /dev/uinput privileges runners do not grant, and the headless
+  # Mutter config is for machines with a free logind session.
+  e2e:
+    name: step-7 E2E (xdotool · sway · Xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
+
+      # Same layout as the test job — the path-dep closure is load-bearing
+      # and shared between the two jobs.
+      - name: checkout sibling repos (path deps)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/velysterm.git ../velysterm
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/unfer.git ../unfer
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/dynamic-arctic.git ../dynamic-arctic
+
+      # Flakes on a stock runner: enable the experimental features and put
+      # nix on PATH. cache.nixos.org is public, so the devshell's binary
+      # cache hits without credentials.
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa  # DeterminateSystems/nix-installer-action@v23
+
+      # Build inside the devshell so the E2E runs against the flake's own
+      # toolchain and library paths (the same environment scripts/e2e/README
+      # documents for a hand run). run.sh would build on demand, but doing it
+      # here keeps the build's exit status attributable to this step.
+      - name: build emthin (nix devshell, locked)
+        run: nix develop -c cargo build --locked -p emthin
+
+      - name: run the step-7 E2E
+        run: nix develop -c ./scripts/e2e/run.sh --config xdotool
+
+      # On failure the harness logs (xvfb/sway/gnome-shell/session) are the
+      # diagnosis — same files scripts/e2e/README tells a human to send.
+      - name: upload E2E logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # actions/upload-artifact@v7.0.1
+        with:
+          name: e2e-logs
+          path: .e2e/
+          if-no-files-found: ignore
+          retention-days: 14
