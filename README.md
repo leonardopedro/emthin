@@ -79,7 +79,9 @@ with `DISPLAY` unset, so the clipboard is exercised with no X server reachable.
 Since 2026-10-15 it also runs in CI (`.github/workflows/ci.yml`, the `e2e` job:
 nix devshell, `--config xdotool`, harness logs uploaded on failure) — for two
 days it ran only by hand and a stale-state regression went unnoticed; the
-harness reaps carried state now, see `scripts/e2e/README.md`.
+harness reaps carried state now, see `scripts/e2e/README.md`. What each gate
+can and cannot see — and how to classify the next seam regression — is
+[`docs/measurement-surfaces.md`](docs/measurement-surfaces.md).
 
 What the count does not cover: `xwayland_satellite` supervisor tests are timing
 sensitive and occasionally flake; the doc/ model is shared with the sibling
