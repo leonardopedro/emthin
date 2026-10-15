@@ -76,8 +76,21 @@ jobs:
       # All three workspace crates, not just the compositor: the plan A14
       # acceptance is "`cargo test -p emthin` plus the clipboard/dbus crate
       # tests". `--locked` keeps CI on the committed Cargo.lock.
+      #
+      # F2 (round 3): tee the run and hand the log to the canonical status
+      # gate in the unfer sibling (already cloned above as a path dep), so
+      # the block's 347 is recounted from the run CI performs — a stale
+      # count here becomes a red build instead of a silent claim. pipefail
+      # matters: without it a failing suite would exit 0 through tee, and a
+      # failed suite stops before the recount — a broken run cannot evidence
+      # a count. If this goes green-but-wrong the other way (environment
+      # scoping the count differently than nix develop), scope the block —
+      # do not delete the gate.
       - name: test
-        run: cargo test --locked --workspace
+        run: |
+          set -o pipefail
+          cargo test --locked --workspace 2>&1 | tee /tmp/emthin_tests.log
+          bash ../unfer/scripts/check-status --recount emthin=/tmp/emthin_tests.log
 
   # The §6 step-7 E2E — the only gate that exercises the real session:
   # keystrokes through XTEST, the clipboard proxy both ways, list_state on
