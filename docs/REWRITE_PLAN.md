@@ -1150,7 +1150,7 @@ cargo test --workspace                                               ✓ 198 tes
 | W8 | done | `state/page.rs` replaces `state/workspace.rs`; ext-workspace-v1 re-pointed at pages (ids are page index + 1). |
 | W9 | done | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is framed, labelled with the app name and both relaunch gestures, and `Return` or a click over it runs its `\app`'s `launch:` command. That is §5.10's stand-in and this row's whole ask. The check (kill and relaunch → doc returns, figures dormant, `Return` launches into the same figure) runs headlessly except for the client appearing. The `spawn` **prompt** is *not* required here: §9 lists the spawn-launcher UX as a deliberate placeholder and nothing in §5.10 asks for one. |
 | W10 | done | `AGENTS.md` rewritten, `README.md` + `README_cn.md`, `docs/ipc.md`, `docs/build-notes.md`, CHANGELOG entry, stale migration-policy docs deleted. |
-| W11 | done | Gate above, plus the §6 manual E2E: run under headless Mutter on `Xvfb`, driven over the IPC control socket. Six of the seven steps verified; step 7's IME and clipboard paths need synthetic input, which this environment has no tooling for (no `xdotool`/`wtype`/`ydotool`). See §6. |
+| W11 | done | Gate above, plus the §6 manual E2E: run under headless Mutter on `Xvfb`, driven over the IPC control socket. All seven steps verified (steps 1-6 under Mutter; step 7 closed 2026-10-15 by the `run.sh` nested-sway harness — 5/5 ×5, CI-wired; IME-commit leg a named skip for host fcitx). See §6. |
 
 ## Deviations from this plan, and why
 
@@ -1235,16 +1235,23 @@ literal*; `mathed_core`/`mathed_mini` green and Bevy `mathed` builds.
 
 ## Known gaps
 
-- **§6 step 7 is unverified.** The manual E2E ran under headless Mutter
-  (`gnome-shell --headless --wayland` on `Xvfb :99`), driven over the IPC
-  control socket, and steps 1-6 are verified — see the table in §6. Step 7
-  (IME commit into an app figure and into the doc caret; clipboard
-  host<->client and doc-copy) needs synthetic key and pointer input, and this
-  machine has no `xdotool`, `wtype`, `ydotool` or `dotool`, nor a real fcitx.
-  The automated gate covers
-  everything statically checkable, and the docui/figure/binding logic is
-  unit-tested, but the render and input *wiring* has not been exercised
-  against a real client.
+- **§6 step 7 — RESOLVED 2026-10-15** (deviation recorded: the claim
+  below was true when written and is now false). The harness ships its own
+  input path: `scripts/e2e/run.sh --config xdotool` runs a nested sway
+  (wlroots x11 backend) on `Xvfb :99`, XTESTs keystrokes into the nested
+  seat, and verifies doc-read, typed text reaching the document, doc-copy,
+  both clipboard directions, and graceful SIGTERM shutdown — **5/5, five
+  consecutive runs, on every push** (`.github/workflows/ci.yml` e2e job).
+  Post-mortem for the stale-state regression that made this fail:
+  `scripts/e2e/README.md` "Stale state"; surface taxonomy:
+  `docs/measurement-surfaces.md`. Historical text, kept for the record:
+  *the manual E2E ran under headless Mutter (`gnome-shell --headless
+  --wayland` on `Xvfb :99`), driven over the IPC control socket; step 7
+  (IME commit, clipboard host<->client, doc-copy) needed synthetic input
+  and the machine had no `xdotool`/`wtype`/`ydotool`/`dotool`, nor a real
+  fcitx.* **Remaining named skip:** the IME-commit leg still needs the
+  host's fcitx engaged — the run says so plainly instead of passing
+  silently (unavailable authority, named per the rea discipline).
 - **Dormant-figure affordance** is complete: `Return` over the figure
   relaunches it, a left click on it relaunches it, the launcher prefers the
   pointed-at figure, and a dormant figure is framed and labelled with the app
@@ -1332,8 +1339,14 @@ the document instead of degrading to a generic failure.
 
 ### Still open
 
-- **No manual E2E run** — same limitation as Part 1 (no nested session), and it
-  now also covers the `\formal` badge's rendered appearance in a real page.
+- **The `\formal` badge's rendered appearance in a real page** — the only
+  residual of Part 1's "no manual E2E" gap. The nested session itself now
+  exists (`run.sh` boots sway on Xvfb and runs on every push; steps 1-7 are
+  exercised), so this is no longer "no environment": what is missing is a
+  check that renders a `\formal` statement in that session and asserts the
+  badge. Closing it needs the logos roundtrip (`formals.rs` asks `logos
+  unf`) inside the harness — a task, not a limitation. The IME-commit leg
+  (host fcitx engaged) is the other named skip, recorded under Known gaps.
 - **Dormant-figure affordance** (W9 partial, above) also bounds P7d: the DAG
   figure reserves its slot, and both `Return` and a click over it relaunch the
   viewer.
