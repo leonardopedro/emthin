@@ -136,6 +136,16 @@ jobs:
       - name: build emthin (nix devshell, locked)
         run: nix develop -c cargo build --locked -p emthin
 
+      # The tier-1 replay lane (§9): headless observe → apply → assert
+      # against the document engine — a different lane from the E2E
+      # below (filesystem boundary, no compositor; see
+      # scripts/testing-depths.md), cheap enough to run first so a
+      # document-engine regression fails before the session lane.
+      # replay.sh re-enters velysterm's devshell itself (preview.sh
+      # owns the mathed_mini build), so this step needs no wrapper.
+      - name: run the tier-1 replay scenario
+        run: ./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt
+
       - name: run the step-7 E2E
         run: nix develop -c ./scripts/e2e/run.sh --config xdotool
 
