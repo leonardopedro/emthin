@@ -1,0 +1,108 @@
+# Seven-Repo Cross-Project Review & Improvement Plan — 2026-10-15 (round 3)
+
+**Date:** 2026-10-15 · **Scope:** `unfer/`, `australVM/`, `velysterm/`, `timepiece/`, `dynamic-arctic/`, `test/`, `emthin/`
+**Reference study (this cycle):** the AnaCP / AnaNC reference repositories (`AnaCP/`, `AnaNC/`, papers *AnaCP: Toward Upper-Bound Continual Learning via Analytic Contrastive Projection* (NeurIPS 2025) and *Continual Out-of-Distribution Detection with Analytic Neural Collapse* (AAAI 2026)) — studied as **reference-implementation discipline**: standalone modules with a two-method API (`update(X, Y)` / `predict(X)`), one closed-form solve per update (`torch.linalg.solve(A + reg·I, B)`), and reference-vs-reimplementation deviation tables. The federation already consumes both repos through `unfer/decide_core` (rows R1–R3 in `test/unfer/sequential-anacp-annc.md`); this round takes the *pattern* — a deviation table per reimplementation — and applies it to the review itself: every place today's measured state disagrees with a written claim is listed below with cause and fix, not silently corrected.
+**Predecessor:** `PLAN_CROSS_PROJECT_REVIEW_2026-10-13.md` (round 2, executed: 28 gates green at its boundary). This document re-reviews the *measured* state two days later and executes the deferrals round 2 recorded.
+**Owner scope cuts (2026-10-15):** (1) **the mass gap is out of scope** — no mass-gap item is executed, verified, or recounted this round; `unfer/fock_sirk/tests/mass_gap_campaign.rs`'s uncommitted control-bound fix (1e-6 → 1e-5) stays unverified by owner instruction and is excluded from commits. (2) After this plan's execution, the next workstream is the **emthin+mathed LLM-debuggability** task (see §9): make the app cheaply debuggable by an LLM, then use that surface to drive the app's documented goals to completion. Lean 4 code remains delegated; this plan writes none.
+
+---
+
+## 0. Executive summary
+
+Round 2 built the claim→verifier culture; this round **ran every verifier again** and found the culture now catches drift quickly: the three stale counts (unfer, emthin, velysterm) were found by `check-status --recount` against fresh logs and are fixed here; `dynamic-arctic`'s status marker was honest while its README *prose* still said 66 (23 lib + 51 bin = 74 measured, three places). The real find is a **new functional regression**: emthin's E2E `run.sh` fails today (doc-copy, keyboard path, graceful shutdown all broken on a nested sway session) while its cargo suite is green at **347** — a doc/model seam failure invisible to cargo, now the top P-item. Two `timepiece` gates failed under `check-all-gates` (they `[gap]`ped in a bare shell): `check-gitbook-drift` had **9 unreviewed citation misses** from pages written 2026-10-14/15 — fixed by extending the gate with a sibling-source surface (unfer Rust/Cadabra/docs + reference-repo Python), scoped so Lean forward references cannot be masked. All 32 workspace gates pass at the end of this round's execution, 0 gaps.
+
+| repo | claim this morning | measured today | verdict → action |
+|---|---|---|---|
+| `unfer` | 1792 cargo (10-13) | **1797 / 0 failed** | stale (+5: sequential + ESA-validation suites) → recounted, rev 28 |
+| `emthin` | 345 cargo + 5/5 E2E (10-13) | **347 / 0 failed**; **E2E 3/5 FAIL** | count stale (+2) → recounted; **E2E regression → P1** |
+| `velysterm` | 976 cargo (10-13) | **986 / 0 failed** | stale (+10: D1/D2 save-stamp work) → recounted |
+| `dynamic-arctic` | 74 cargo (10-13) | **74 / 0 failed** | marker honest; prose "66" stale in 3 files → fixed |
+| `australVM` | 110 dune / 14 suites | **110 / 14 / 0 failures** | honest (date bump) |
+| `test` | 71 pages / 382 links | **71 / 382, pass** | honest |
+| `timepiece` | unverified, not run | not run (Lean lane); **2 gates failed → 0** | drift gate fixed (P2 executed) |
+
+`check-all-gates`: **32 passed / 0 failed / 0 gaps** (was 30/2 at 14:05).
+
+---
+
+## 1. Deep review — per folder (measured 2026-10-15)
+
+### 1.1 `unfer` — 1797/0 (rev 28)
+The +5 since 10-13 is `decide_core/tests/sequential.rs` (4) plus the new ESA/validation suites. Per-crate from one log (target-name attribution): `unfer_protocol` 402, logos 352, `unfer_ffi` 229, `prob_kernel` 143, `decide_core` 116, `unfer_consensus` 111, `nested_fock_algebra` 98, `qfm` 91, `unfer_edge` 63, `qfm_text` 62, `unfer_data` 52, `ode_sirk` 36, `unfer_taler` 30, `unfer_identity` 7, `sirk_core_model` 5. Only dirty file: `fock_sirk/tests/mass_gap_campaign.rs` (owner-excluded, §0). Commit subjects have regressed to `mm`/`a` one-letter messages (53d90ae, 02e9f87, 5786461, …) — noted in P6, not fixed here (owner habit, not a gate).
+
+### 1.2 `emthin` — 347/0 cargo; **E2E failing**
+Cargo green (emthin 293 + dbus 40 + clipboard 14). E2E `./scripts/e2e/run.sh --config xdotool` measured **4 failures across 4 runs**: `doc-copy` (marker absent, document reads empty), `typed text reaches the document` (empty doc), and `emthin did not exit within 30s of SIGTERM → SIGKILL` (the script itself says "that is a real failure of the signal path"). The app's own log shows saves and clipboard working — the document the *control client* reads back is empty, i.e. the doc-model/save seam, not the compositor. Root-cause is P1 and is deliberately **not guessed at** in this plan. Also found: `run.sh`'s `cleanup()` kills sway but leaks `Xvfb :99` — the stale server made the next run "start against a workspace it did not create" (the script's own comment names this hazard); fixed in P1 as the cheap half.
+
+### 1.3 `velysterm` — 986/0
++51 over the 935 of 10-08: kernel_client +18, mathed_core +15, mathed +11, mathed_mini +7 — the D1/D2 save-stamp (`ac43b70`) and scenario-verifier work. `mathed_snapshot_scratch` still untracked-and-undocumented (round-2 deferral) → P5. Owner-decision files (`mathed-screenshot.png`) untouched.
+
+### 1.4 `timepiece` — gate failure, fixed
+`verify-invariants` and `check-gitbook-drift` pass in a bare shell but **fail when python3 is present** — i.e. on every dev box and in CI. 9 unreviewed `[MISS lean]` citations, all from pages written 10-14/15 (`unfer/sequential-anacp-annc.md`: `DECIDE_SPEC`, `_generate_replay_data`, `ananc.py`, `answer_choice`, `answer_score`, `id_score`, `projected_dim`; `mathematical-foundations/ode-singularity.md`: `qg_unitarity_check`, `transformed_esa_charts`). Every token has a real home — they cite the Rust engine, the reference repos, and Cadabra modules, none of which the gate could see. Fixed by extending the resolver (P2, executed): foreign extensions `.py`/`.cdb`; a **sibling-source token surface** (unfer `*.rs`/`docs/*.cdb`/`docs/*.md`, AnaCP/AnaNC `*.py`/`*.md`) *scoped by citing page* — `test/unfer/**` pages may resolve against unfer+reference tokens; math/the-program pages may resolve only `unfer/docs` artifacts, so a planned Lean lemma can never be masked by a `.rs` comment mention. Proven non-vacuous by three mutations (bogus token → FAIL; Rust token from math page → FAIL; same token from unfer page → PASS). 0 unreviewed misses, 86 pending entries unchanged, 0.5 s.
+
+### 1.5 `dynamic-arctic` — 74/0; prose drift fixed
+Status marker honest (74). README body claimed "66 (19 lib + 47 bin)" in three files (`README.md` ×2, `README_UPSTREAM.md`, `docs/RUNBOOK.md`); measured plain `cargo test` = `--all-features` = 74 = 23 lib + 51 bin. All four spots recounted with the cause recorded (the bench-validation commit recounted the block but not the prose).
+
+### 1.6 `australVM` — 110/14/0
+Re-run properly this time (`nix develop -c` + `LD_LIBRARY_PATH` for the bridge `.so`, the README's documented invocation — round 2's bare `dune runtest` rc=127 was my invocation error, not a repo defect). Honest; date bumped.
+
+### 1.7 `test` — 71 pages / 382 links, pass
+Site checker green; the two pages that caused the timepiece drift are now citation-clean. `the-program/statistical-model-theory.md` remains untracked (written earlier this session) → committed in P3.
+
+## 2. Cross-cutting findings (round 3)
+
+1. **Bare-shell gates lie by `[gap]`.** timepiece's two python gates reported "skip, no interpreter" on this host while python3 sat in `/usr/local/bin` outside the default non-login PATH; `check-all-gates` has the fallback, direct invocations don't. Any human running a gate directly saw green-by-skip. The gates themselves are fine; the *invocation* needs the same fallback (P7).
+2. **E2E is the only thing standing between "cargo green" and "app works".** emthin proved the exact failure mode the status-block culture cannot see: suites green, product broken. The E2E run is not wired into any CI job (emthin CI runs cargo + linkcheck only) → P1 wires it after the fix.
+3. **Count prose is still unguarded** beyond the velysterm op-count guard (round 2 F4): four files across two repos shipped stale test-count prose the same day their blocks were recounted → P4 generalizes the prose guard to test counts in Verification sections.
+4. **`git log` subjects have degraded** to `mm`/`a` in unfer/timepiece/test since round 2's conventional commits. Not gated; noted (P6) as a hygiene observation for the owner.
+
+## 3. P-items (this round's execution)
+
+- **P1 — emthin E2E regression: root-cause and fix, then wire E2E into CI.** Reproduce under `run.sh`; instrument the control-client document read; the failure is in the doc-model/save seam (app log saves fine, reader sees empty). Fix at the producing boundary; make `cleanup()` also kill Xvfb; then add an E2E job (or step) to emthin CI with `E2E_NO_X=1` for the headless lane. Acceptance: 5/5 twice in a row from a clean shell, CI job green.
+- **P2 — timepiece drift gate sibling surface** (executed in this document's preparation): resolver + scoping + three mutation proofs; verify-invariants 6/0/1gap(lake).
+- **P3 — recount + commit hygiene (this round's measured fixes).** All README recounts, the dynamic-arctic prose fixes, the timepiece gate change, and `test/` untracked pages committed per repo in conventional style, **no push**; owner-excluded files (§0 mass-gap diff, velysterm scratch/png, timepiece/prompts) stay out.
+- **P4 — test-count prose guard.** Extend the round-2 prose guard: `check-status` (or the per-repo catalogs) flags any `N tests pass`/`# N passed` claim in README/AGENTS Verification prose that disagrees with the repo's own `--list`/recount number; proven non-vacuous by mutation.
+- **P5 — `mathed_snapshot_scratch` disposition** (round-2 deferral, now decided): document it — a `crates/` member with 5 passing tests reachable from no doc is exactly finding class 5 of the 10-09 plan; AGENTS/README gain a one-paragraph owner note, or the crate is removed by owner decision. Default: document.
+- **P6 — repro_fig7a heavy-lane scheduling** (round-2 deferral): dynamic-arctic's heavy bench gets a recorded scheduling note (heavy-tests.yml class, `#[ignore]`d like unfer's) or an explicit "owner runs manually" row; no gate change.
+- **P7 — direct-invocation parity for python gates.** timepiece's `verify-invariants`/`check-gitbook-drift` gain the same python3 fallback `check-all-gates` has (or document the wrapper as the only supported entry), so a human's direct run cannot `[gap]` past a real miss on a box that has the interpreter.
+
+## 4. Reference-study application (AnaCP/AnaNC discipline)
+
+The reference repos ship one module, two methods, and deviations from the papers *written down next to the code*. The federation's analogous habit — the deviation table — is applied in two places this round: (a) §1's per-repo claim-vs-measurement tables (the review *is* the deviation table); (b) emthin's P1 post-mortem must land as a deviation-style note in `emthin/docs/` (what the cargo suite measures vs what the E2E measures vs what a user sees), so the next seam regression is classifiable without re-deriving it. Nothing is vendored from either repo (no LICENSE; reimplemented-from-equations only — the `ATTRIBUTION.md` rows 65–66 already govern).
+
+## 5. Lean4 delegation boundary (unchanged)
+
+No Lean 4 code is written this round. `timepiece`'s Lean lane stays "unverified | not run" honestly; the 86 pending forward references in `pending-lemmas.txt` remain the specialist's obligation ledger; `lake` stays a recorded `[gap]` (toolchain absent).
+
+## 6. Copyright & compliance
+
+AnaCP/AnaNC: ideas only, no code/text (rows 65–66 in workspace `ATTRIBUTION.md`; `check-attribution` green). No other ledger rows change.
+
+## 7. Sequencing & acceptance
+
+| stage | items | acceptance |
+|---|---|---|
+| S1 (preparation, done) | P2, all recounts (§0 table), dynamic-arctic prose | `check-all-gates` **32/0/0**; `check-status` rc=0 with 4 recount lines |
+| S2 (this plan's execution) | P1, P3–P7 | P1: E2E 5/5 ×2 + CI job; P4/P7: mutation-proven; P3: commits land, gates stay green |
+| S3 (next workstream) | emthin+mathed LLM-debuggability (§9) | see §9 |
+
+## 8. Execution log
+
+S2 executed 2026-10-15; stage boundary green — `check-all-gates` **32/0/0**,
+`check-status` rc=0 (7 blocks, P4 prose guard active).
+
+| item | landed | evidence |
+|---|---|---|
+| **P1** emthin E2E | Root cause is **not** the doc-model/save seam this plan hypothesized: state carried across runs. A SIGKILLed emthin leaves a dead `emthin.ipc` that the `[ -S ]` readiness gate cannot tell from a live one (new emthin: `AlreadyInUse`); cleanup leaked `Xvfb :99` and the next run *adopted* whatever answered there. Symptom (empty `list_state`, keystrokes not landing, SIGTERM hang) vs cause fingerprint: clipboard/transport kept passing because they never touch carried state. Fixes: reap Xvfb + stale IPC (`lib.sh`), cleanup kills Xvfb (`run.sh`), `E2E_DUMP_STATE` raw-frame dump (`step7.sh`). **5/5 ×3 consecutive runs**; CI `e2e` job added; deviation note `emthin/docs/measurement-surfaces.md`; post-mortem in `scripts/e2e/README.md`. | emthin `9a85802`, `db1ad23`. *Acceptance half-deferred:* "CI job green" needs a push/dispatch — no push authorized; job is YAML-validated and runs the exact locally-verified command |
+| **P2** | (preparation; resolver + scoping + 3 mutation proofs) | timepiece verify-invariants 6/0/1gap(lake) |
+| **P3** commits | Per-repo conventional commits, no push. One near-miss caught and corrected: `git add -A` swept owner-excluded `mathed-screenshot.png` (velysterm) and the timepiece CONSOLIDATED_PLAN entry into two commits — both reset and recommitted cleanly; the plan entry got its own honest `docs(plan)` commit. | see each repo's log |
+| **P4** prose guard | `check-status` P4 half: headline shapes `# N passed` / `N tests pass` held to the block, every repo. Mutation-proven both shapes (348/75 → FAIL with file:line; reverted; rc=0). The fock_sirk annotation gained the scope label the rule implies ("# fock_sirk: 401 passed …"); sub-scope prose stays out of scope by construction. | unfer `5b4fa1f`; also fixed dynamic-arctic's 66→74 prose (`95dd60b`) |
+| **P5** scratch crate | Measured: 0 tests of its own — the round-2 "5 passing tests" was a mis-scoped count. Documented-not-deleted in velysterm AGENTS (delete the day it stops building); crate source committed because `members = crates/*` would break fresh clones without it. | velysterm `29f5a3c` |
+| **P6** repro_fig7a | Weekly `heavy-repro.yml` (unfer heavy-tests.yml discipline): release build, datapoints uploaded, record-not-gate; AGENTS pointer. | dynamic-arctic `81daee2` |
+| **P7** python fallback | Both timepiece gates search the uv locations like `check-all-gates`; A/B proven under a stripped PATH: original `[gap] python3 not on PATH`, patched runs all 88 citation lines. | timepiece `b827ead` |
+| **F2** CI recount | emthin + velysterm test jobs tee their run into `check-status --recount` (canonical gate, unfer sibling already cloned); scope = the block's plain workspace run. Environment-count-delta remedy recorded in the workflow: scope the block, do not delete the gate. | emthin `0d2dcf7`, velysterm `c1e5150` |
+| **R15** depth labels | `scripts/testing-depths.md`: per-repo lanes over rea's five depths + named-skip rows; descriptive (the gates enforce claims; the catalog says which lane a green licenses). Mirrored. | emthin `681f74d` |
+| **federation P5** | Mechanical sweep of australVM + timepiece scripts against AGENTS/README: exactly two undocumented surfaces (`check-todo-ledger`, `pending-lemmas.txt`), both now documented; re-sweep clean. | australVM `f829dea1`, timepiece `4168c9f` |
+
+## 9. Next workstream (owner-assigned, 2026-10-15)
+
+**emthin + mathed must become cheaply and reliably debuggable by an LLM** — low RAM, low token cost — so an LLM can edit a document (including app windows through Wayland) and make it look nice graphically and functionally. Reference discipline: `rea/`. Then use that debuggability to drive the app's documented goals (emthin `docs/AGENT_LOOP.md`, velysterm `PLAN_parallel_velysterm.md` goal statement, mathed crate docs) to completion. Planned shape (refined after the rea/ study): a headless deterministic document-replay harness (feed an LLM a compact doc-model dump + scenario script, get back an edit script), a snapshot/diff surface that renders "what changed" in a few hundred tokens, and reuse of the existing E2E nested-session machinery as the acceptance lane. Executed after S2.
