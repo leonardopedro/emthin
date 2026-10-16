@@ -145,7 +145,7 @@ jobs:
           # Same annotation mirror as the test job: the failure's tail is
           # readable through the public annotations API without log access.
           nix develop -c cargo build --locked -p emthin 2>&1 | tee /tmp/e2e_build.log || {
-            tail -25 /tmp/e2e_build.log | sed 's/^/::error::build: /'
+            tail -8 /tmp/e2e_build.log | sed 's/^/::error::build: /'
             exit 1
           }
 
