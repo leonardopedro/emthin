@@ -1,6 +1,5 @@
 .claude/*
 !.claude/skills/
 target
-Cargo.lock
 *.elc
 .e2e/
