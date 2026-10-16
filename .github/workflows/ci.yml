@@ -159,6 +159,33 @@ jobs:
       - name: run the tier-1 replay scenario
         run: ./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt
 
+      # The nixpkgs sway wrapper falls back to `dbus-run-session` when the
+      # job has no session bus (no DBUS_SESSION_BUS_ADDRESS, and no
+      # $XDG_RUNTIME_DIR/bus on this image), and its dbus-daemon opens
+      # /etc/dbus-1/session.conf — present on NixOS, where the harness was
+      # written, absent here: the daemon dies with "EOF reading address from
+      # bus daemon", the wrapper never execs sway, and the harness reports
+      # "sway created no wayland socket" with a two-line sway.log (bbb2097).
+      # Give the image the file the wrapper expects, taken from the flake's
+      # own dbus so config and daemon cannot drift apart — minus its
+      # <include> of that very path, which reads fine from share/ but is a
+      # self-inclusion once the file *is* /etc/dbus-1/session.conf
+      # ("Circular inclusion of file", reproduced in a mount namespace with
+      # an empty /etc/dbus-1; the stripped copy then answers ListNames).
+      - name: provide the session-bus config sway's wrapper reads
+        run: |
+          # shellcheck disable=SC2016
+          # The $(...) below must expand inside the devshell, where
+          # dbus-daemon is on PATH — not in the outer shell.
+          if [ ! -e /etc/dbus-1/session.conf ]; then
+            nix develop -c bash -c 'conf="$(dirname "$(readlink -f "$(command -v dbus-daemon)")")/../share/dbus-1/session.conf"; test -f "$conf" && cp "$conf" /tmp/e2e-session.conf'
+            sed -i '/<include ignore_missing="yes">\/etc\/dbus-1\/session.conf<\/include>/d' /tmp/e2e-session.conf
+            sudo mkdir -p /etc/dbus-1
+            sudo install -m 644 /tmp/e2e-session.conf /etc/dbus-1/session.conf
+          fi
+          grep -c "<listen" /etc/dbus-1/session.conf
+          ls -la /etc/dbus-1/session.conf
+
       - name: run the step-7 E2E
         run: |
           # File redirection, NOT a pipe: run.sh leaves the session's
