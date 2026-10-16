@@ -160,7 +160,15 @@ jobs:
         run: ./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt
 
       - name: run the step-7 E2E
-        run: nix develop -c ./scripts/e2e/run.sh --config xdotool
+        run: |
+          set -o pipefail
+          # Same annotation mirror as the build step: the harness's failing
+          # summary is the diagnosis, and the annotations API returns it
+          # without log access.
+          nix develop -c ./scripts/e2e/run.sh --config xdotool 2>&1 | tee /tmp/e2e_run.log || {
+            tail -12 /tmp/e2e_run.log | sed 's/^/::error::e2e: /'
+            exit 1
+          }
 
       # On failure the harness logs (xvfb/sway/gnome-shell/session) are the
       # diagnosis — same files scripts/e2e/README tells a human to send.
