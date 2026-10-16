@@ -52,6 +52,13 @@
               glib.dev
               libxkbcommon
               libglvnd
+              # The EGL *vendor* behind libglvnd's dispatch. libglvnd alone
+              # only forwards: a host with no mesa has no EGL platform at all,
+              # and emthin dies in smithay's ffi with "Unable to find suitable
+              # EGL platform / Egl(DisplayNotSupported)" the moment its window
+              # is a Wayland one. NixOS supplies mesa system-wide, which is
+              # why dev boxes never saw the gap — the CI runner did (b1a5347).
+              mesa
               wayland
               libdrm
               libinput
@@ -170,7 +177,14 @@
             # winit opens libwayland, and smithay's EGL backend opens libEGL.
             # Found the hard way — without libEGL emthin gets as far as creating
             # the window and then panics in smithay's ffi.
-            export LD_LIBRARY_PATH="${pkgs.wayland}/lib:${pkgs.libglvnd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            #
+            # libEGL resolves to libglvnd (the dispatch), so the vendor it
+            # forwards to must be told about explicitly: mesa's egl_vendor.d
+            # is what actually implements the wayland platform. Without it the
+            # dispatch finds no vendor that supports Wayland and emthin exits
+            # with Egl(DisplayNotSupported) on a GPU-less runner.
+            export LD_LIBRARY_PATH="${pkgs.wayland}/lib:${pkgs.libglvnd}/lib:${pkgs.mesa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
 
             # So scripts/e2e/* can tell whether they are already inside the
             # flake and re-enter it if not, rather than the caller having to
