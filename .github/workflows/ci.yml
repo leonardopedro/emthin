@@ -89,7 +89,13 @@ jobs:
       - name: test
         run: |
           set -o pipefail
-          cargo test --locked --workspace 2>&1 | tee /tmp/emthin_tests.log
+          # On failure the log's tail is mirrored into ::error annotations —
+          # the REST API returns those without log access, which is how the
+          # 10-16 CI-only failures were diagnosed.
+          cargo test --locked --workspace 2>&1 | tee /tmp/emthin_tests.log || {
+            tail -25 /tmp/emthin_tests.log | sed 's/^/::error::test: /'
+            exit 1
+          }
           bash ../unfer/scripts/check-status --recount emthin=/tmp/emthin_tests.log
 
   # The §6 step-7 E2E — the only gate that exercises the real session:
@@ -134,7 +140,14 @@ jobs:
       # documents for a hand run). run.sh would build on demand, but doing it
       # here keeps the build's exit status attributable to this step.
       - name: build emthin (nix devshell, locked)
-        run: nix develop -c cargo build --locked -p emthin
+        run: |
+          set -o pipefail
+          # Same annotation mirror as the test job: the failure's tail is
+          # readable through the public annotations API without log access.
+          nix develop -c cargo build --locked -p emthin 2>&1 | tee /tmp/e2e_build.log || {
+            tail -25 /tmp/e2e_build.log | sed 's/^/::error::build: /'
+            exit 1
+          }
 
       # The tier-1 replay lane (§9): headless observe → apply → assert
       # against the document engine — a different lane from the E2E

@@ -11,4 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
       - name: check-links
-        run: python3 scripts/check-links
+        run: |
+          set -o pipefail
+          # On failure the report is mirrored into ::error annotations, the
+          # one channel the REST API returns without log access.
+          python3 scripts/check-links 2>&1 | tee /tmp/check-links.log || {
+            tail -10 /tmp/check-links.log | sed 's/^/::error::check-links: /'
+            exit 1
+          }
