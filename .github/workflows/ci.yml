@@ -174,7 +174,9 @@ jobs:
           timeout --kill-after=30 600 nix develop -c ./scripts/e2e/run.sh --config xdotool > /tmp/e2e_run.log 2>&1 || rc=$?
           tail -60 /tmp/e2e_run.log
           if [ $rc -ne 0 ]; then
-            tail -12 /tmp/e2e_run.log | sed 's/^/::error::e2e: /'
+            # Numbered: annotations arrive unordered through the API, and
+            # line numbers reconstruct the sequence (and locate the crash).
+            nl -ba /tmp/e2e_run.log | tail -40 | sed 's/^/::error::e2e /'
             exit $rc
           fi
 
