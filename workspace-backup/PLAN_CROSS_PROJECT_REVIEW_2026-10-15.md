@@ -128,3 +128,33 @@ Study first, then built. `rea/` contributed two disciplines carried into the sur
 3. The tree carried **uncommitted WIP tests that did not compile** (`semantic_facts` asserted but absent) — the workspace count could not have been produced from that state; resolved by implementing the function (row 1 above).
 4. R15's catalog said velysterm 986 — stale after this work; updated to 995 with a lane note.
 5. **Suite observation (counted, not hidden):** `mathed_mini::kernel_bridge::tests::rich_media_annotations_are_inline_thumbnails` (stub-kernel subprocess, 15 s settle) failed in one full-workspace `-j 2` run of the final battery and passed on immediate rerun, in isolation, and in the earlier full run — a load-sensitive intermittent of the unfer_ffi class, recorded here rather than papered over. The verified 995 comes from the passing run the recount gate accepted; the failing run was refused by that same gate ("a broken run cannot evidence a count").
+
+   **Root-caused and fixed 2026-10-16 (continuation).** Not load
+   sensitivity but two probe-proven races on the stub seam:
+   (1) **name collision + truncate-on-open** — the stub name is pid +
+   content-hash + nanosecond nonce; measured on this host the clock's
+   minimum gap is 30 ns and 1M concurrent builds yield **3,752 identical
+   paths**, so a sibling test's non-exclusive `File::create` could rewrite
+   the stub mid-`exec`;
+   (2) **inherited write-fd at exec** — a `fork()` inside the µs write
+   window inherits the write-fd, so `execve` fails with ETXTBSY although
+   the creator already closed and *no second opener exists* (the holder
+   inherits, never opens — which is exactly why D.8's strace and `/proc`
+   scans found nothing, and why the holder exits inside every observation
+   window): A/B probe **0/8000 failures without forking neighbors,
+   110–132/8000 with**.
+   Fixed at the producing boundaries with repo precedents only: exclusive
+   stub creation (`create_new(true)` + suffix advance, the
+   `export::stub_rules_bin` pattern) and a bounded ETXTBSY spawn retry
+   with backoff on the worker's kernel launch (the D.8 retry on the other
+   seam; non-ETXTBSY errors never retried) — velysterm `a0b1776`.
+   The regression test forces the collision (nine callers, one base name)
+   and is mutation-proven: restoring truncate-on-open fails it
+   deterministically (all nine paths identical), the current code passes.
+   **Verified**: retry probe 0/8000 with forkers; **1,160/1,160** test
+   executions across repeated full-suite runs at the parameters that
+   failed 3× in ~1,280 before; workspace **996 / 0 failed**, `--recount`
+   gate green (**995 → 996**, +1 = the regression test); fmt / clippy
+   `-D warnings` / `doc -D warnings` / `--no-default-features` all green
+   at the final tree. The D.8 residue in
+   `PROJECT_REVIEW_AND_IMPROVEMENT_PLAN.md` is updated to match.

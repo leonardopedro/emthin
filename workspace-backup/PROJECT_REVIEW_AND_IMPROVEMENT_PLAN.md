@@ -1503,3 +1503,38 @@ retrying until green would be the dishonest option and is not what happens.
 - **(c) The qualifier can go**: no status line needs the "except a known flaky
   pair" escape any more — the pair is fixed and the count in the status block
   is recounted separately anyway.
+
+#### Root cause established 2026-10-16 (round-3 continuation) — the residue above is closed
+
+The cause was not unobservable; it was looked for in the wrong place: every
+observation pass searched for a *second opener*, and the holder at the
+kernel-bridge instance of this class never opens anything. Two mechanisms,
+each proven by probe rather than inference:
+
+1. **Name collision + truncate-on-open.** The stub name's nanosecond nonce
+   cannot carry uniqueness at this clock's measured 30 ns granularity: 1M
+   concurrent builds produced **3,752 identical paths**, and a non-exclusive
+   `File::create` let the loser truncate the winner's stub mid-`exec`.
+   `export::stub_rules_bin`'s own comment already records this class as "the
+   historical flake" (its `create_new` guard is the precedent);
+   `kernel_bridge::stub_kernel_module` still used truncate-on-open and was
+   moved onto the same pattern 2026-10-16 (`velysterm a0b1776`), with a
+   collision-forcing regression test (nine callers, one base name) that fails
+   deterministically when truncate-on-open is restored.
+2. **Inherited write-fd at exec — the residual this section could not see.**
+   A `fork()` inside the µs write window inherits the write-fd, so `execve`
+   fails while the creator's close has already completed and **no second
+   opener exists anywhere**: the holder *inherits* the descriptor instead of
+   opening one (strace has no opener to show), and it exits inside every
+   observation window (`/proc` scans at failure time find nothing;
+   cross-process scans see no other reference to the path) — every
+   observation this section made, reproduced as the mechanism. A/B probe:
+   **0/8000** execs fail without forking neighbors, **110–132/8000** with.
+   The bounded 5× backoff retry already added above rides it out: **0/8000**
+   with forkers present, and **1,160/1,160** test executions across repeated
+   full-suite runs of the final battery.
+
+Recorded under this section's own rule — the fix and its evidence land at
+the moment the cause does. The round-3 plan's §9 deviation 5 carries the
+same write-up for the kernel-bridge instance, with the recount it moved
+(995 → 996).
