@@ -172,11 +172,19 @@ jobs:
           # mirror (observed 2026-10-16 on 887f5cc).
           rc=0
           timeout --kill-after=30 600 nix develop -c ./scripts/e2e/run.sh --config xdotool > /tmp/e2e_run.log 2>&1 || rc=$?
+          cp .e2e/xvfb.log /tmp/e2e_xvfb.log 2>/dev/null || true
           tail -60 /tmp/e2e_run.log
           if [ $rc -ne 0 ]; then
-            # Numbered: annotations arrive unordered through the API, and
-            # line numbers reconstruct the sequence (and locate the crash).
-            nl -ba /tmp/e2e_run.log | tail -40 | sed 's/^/::error::e2e /'
+            # ONE annotation per file: the API keeps only the first ~10
+            # annotations, so per-line emission silently drops the tail —
+            # where the actual failure lives (observed on 7603d3e). %0A
+            # makes a multi-line payload out of a single workflow command.
+            body=$(tail -30 /tmp/e2e_run.log | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/$/%0A/' | tr -d '\n')
+            echo "::error::e2e rc=$rc | $body"
+            if [ -f /tmp/e2e_xvfb.log ]; then
+              xv=$(tail -8 /tmp/e2e_xvfb.log | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/$/%0A/' | tr -d '\n')
+              echo "::error::xvfb.log | $xv"
+            fi
             exit $rc
           fi
 
