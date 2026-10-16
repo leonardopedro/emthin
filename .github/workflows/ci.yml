@@ -185,6 +185,13 @@ jobs:
               xv=$(tail -8 /tmp/e2e_xvfb.log | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/$/%0A/' | tr -d '\n')
               echo "::error::xvfb.log | $xv"
             fi
+            # The compositor's own log: the harness names it on failure
+            # ("see sway.log") and it holds the actual reason.
+            cp .e2e/sway.log /tmp/e2e_sway.log 2>/dev/null || true
+            if [ -f /tmp/e2e_sway.log ]; then
+              sw=$(tail -14 /tmp/e2e_sway.log | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/$/%0A/' | tr -d '\n')
+              echo "::error::sway.log | $sw"
+            fi
             exit $rc
           fi
 
