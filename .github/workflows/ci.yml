@@ -167,9 +167,12 @@ jobs:
           # output — observed 2026-10-16 on 637257e). `timeout` bounds the
           # step itself, and the failing tail is re-emitted as ::error
           # annotations, the one channel the API returns without log access.
-          timeout --kill-after=30 600 nix develop -c ./scripts/e2e/run.sh --config xdotool > /tmp/e2e_run.log 2>&1
-          rc=$?
-          cat /tmp/e2e_run.log
+          # `|| rc=$?`, not `rc=$?` after: the runner's shell is `bash -e`,
+          # which aborts at the failing command itself and would skip the
+          # mirror (observed 2026-10-16 on 887f5cc).
+          rc=0
+          timeout --kill-after=30 600 nix develop -c ./scripts/e2e/run.sh --config xdotool > /tmp/e2e_run.log 2>&1 || rc=$?
+          tail -60 /tmp/e2e_run.log
           if [ $rc -ne 0 ]; then
             tail -12 /tmp/e2e_run.log | sed 's/^/::error::e2e: /'
             exit $rc
