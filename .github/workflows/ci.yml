@@ -161,14 +161,19 @@ jobs:
 
       - name: run the step-7 E2E
         run: |
-          set -o pipefail
-          # Same annotation mirror as the build step: the harness's failing
-          # summary is the diagnosis, and the annotations API returns it
-          # without log access.
-          nix develop -c ./scripts/e2e/run.sh --config xdotool 2>&1 | tee /tmp/e2e_run.log || {
+          # File redirection, NOT a pipe: run.sh leaves the session's
+          # daemons holding its stdout, and piping to tee made the step wait
+          # on those inherited write-ends forever (the 45-min timeout, no
+          # output — observed 2026-10-16 on 637257e). `timeout` bounds the
+          # step itself, and the failing tail is re-emitted as ::error
+          # annotations, the one channel the API returns without log access.
+          timeout --kill-after=30 600 nix develop -c ./scripts/e2e/run.sh --config xdotool > /tmp/e2e_run.log 2>&1
+          rc=$?
+          cat /tmp/e2e_run.log
+          if [ $rc -ne 0 ]; then
             tail -12 /tmp/e2e_run.log | sed 's/^/::error::e2e: /'
-            exit 1
-          }
+            exit $rc
+          fi
 
       # On failure the harness logs (xvfb/sway/gnome-shell/session) are the
       # diagnosis — same files scripts/e2e/README tells a human to send.
