@@ -38,6 +38,23 @@ while IFS= read -r rel; do
     fi
 done < "$list"
 
+# Coverage half (round 4). The list is this non-repo directory's version
+# control manifest: the workspace root has no .git, so a root script that is
+# absent from the list has no committed copy anywhere. Both this script and
+# the drift gate only ever *iterate* the list, so an unlisted file was
+# invisible to both and reported green. This is not a theoretical hole —
+# `check-shebangs` was added on 2026-10-18, passed `check-backup-sync`, and
+# had no version control at all until this half existed. Every file directly
+# under scripts/ must therefore be listed.
+for path in "$root"/scripts/*; do
+    [ -f "$path" ] || continue
+    base="$(basename "$path")"
+    if ! grep -qxF "scripts/$base" "$list"; then
+        echo "FAIL unlisted: scripts/$base (add it to scripts/workspace-backup-files, then re-run)"
+        fail=1
+    fi
+done
+
 [ "$fail" -eq 0 ] || { echo "sync-workspace-backup: FAILED" >&2; exit 1; }
 if [ "$check_only" -eq 1 ]; then
     echo "sync-workspace-backup: mirror in sync"

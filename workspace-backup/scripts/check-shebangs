@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# X10 — shebang-portability gate.
+#
+# Why this gate exists (round 4, P2 found / P6 keeps):
+#
+#   Four workspace gates and three velysterm scripts shipped
+#   `#!/bin/bash`. This host is NixOS, where `/bin/bash` does not exist, so a
+#   human's `./scripts/check-error-catalog` returned rc=126 (bad interpreter)
+#   while `check-all-gates` reported [pass]. The aggregate runner dispatches
+#   every gate through `bash` and never consults the shebang -- so the wrapper
+#   is structurally blind to this, and the only thing that notices is a person
+#   running the script directly.
+#
+#   A gate that is green through the wrapper and dead on direct invocation is
+#   green by accident. This gate closes that hole durably.
+#
+# What it checks:
+#
+#   Every executable file with a `#!` line under `scripts/` (workspace root and
+#   each checkout) is classified:
+#
+#     portable     `#!/usr/bin/env <prog> [...]`  -> always accepted. The env
+#                  indirection is what makes a shebang survive a host whose
+#                  interpreters live in /nix/store, so this is the form every
+#                  script here is being moved to.
+#     absolute-ok  `#!/bin/bash` etc. where that path EXISTS on this host.
+#                  Accepted, but reported: it is one host move from being the
+#                  exact bug this gate exists for (and it already is one on any
+#                  NixOS box). Accepted rather than failed on purpose -- CI
+#                  runners legitimately have /bin/bash, and failing those would
+#                  break every workflow for a portability nit.
+#     FAIL         `#!/bin/bash` etc. where that path DOES NOT EXIST on this
+#                  host. The script cannot be executed directly here; rc=126 is
+#                  guaranteed. Fix by switching to the env form.
+#
+# What it deliberately does NOT claim:
+#
+#   - It does not read the script body, so it cannot tell whether the named
+#     interpreter is the one the *contents* need (`#!/usr/bin/env bash` on a
+#     POSIX-sh script passes). Shebang/portability only.
+#   - It does not resolve interpreter *presence* for the portable form: if
+#     `python3` is absent from PATH that is a `[gap]` at run time, not a bad
+#     shebang, and this gate stays quiet about it.
+#   - It scans only files a human would invoke directly (mode +x). A
+#     non-executable `.sh` is data, and is checked by nothing here.
+#
+# Usage:  scripts/check-shebangs [-v]
+# Exit:   0 clean (portable + absolute-ok only), 1 on any FAIL, 2 when there
+#         is nothing to scan (an empty scan is never a pass).
+
+set -uo pipefail
+
+# shellcheck source=workspace-root.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
+
+# Build/vcs/mirror dirs: not our trees, and the workspace-backup mirror is
+# byte-identical to sources already scanned at the root (mirror integrity is
+# check-backup-sync's job, not this gate's). Pruned with -path/-prune rather
+# than GNU find's --exclude-dir: this host's bare-shell find is not GNU
+# findutils and rejects the long option outright (measured: "unknown predicate").
+
+verbose=0
+for arg in "$@"; do
+  case "$arg" in
+    -v) verbose=1 ;;
+    -h | --help) sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "check-shebangs: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+root="$(ws_root)"
+[ -n "$root" ] || { echo "check-shebangs: cannot locate the workspace root." >&2; exit 1; }
+
+# The workspace scripts dir plus every checked-out repo's scripts dir (the same
+# target set the other hygiene gates use, via ws_checkout).
+targets=("$root/scripts")
+for r in australVM dynamic-arctic emthin unfer velysterm timepiece test; do
+  if dir="$(ws_checkout "$r")"; then targets+=("$dir/scripts"); fi
+done
+
+scanned=0
+portable=0
+abs_ok=0
+fail=0
+skipped=0
+
+# Only files a human would invoke directly: executable, and carrying a shebang.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  # -perm -u+x: what makes a script directly invocable. -size +0: an empty file
+  # has no shebang line to judge.
+  [ -f "$f" ] && [ -x "$f" ] && [ -s "$f" ] || continue
+  shebang="$(head -n1 "$f")"
+  case "$shebang" in
+    '#!'*) ;;
+    *) continue ;;
+  esac
+  scanned=$((scanned + 1))
+
+  rel="${f#"$root"/}"
+
+  # Strip "#!" and split. `env`-mediated forms are portable by construction,
+  # including `env -S ...`.
+  rest="${shebang#\#!}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"   # ltrim
+  # First word is the interpreter path (absolute or a bare name).
+  interp="${rest%%[[:space:]]*}"
+
+  case "$interp" in
+    */env | env)
+      portable=$((portable + 1))
+      [ "$verbose" -eq 1 ] && printf 'portable %s\n' "$rel"
+      continue
+      ;;
+  esac
+
+  # A bare interpreter name (no slash) is resolved by the kernel via PATH-less
+  # exec semantics that only `env` mediates portably. Treat as FAIL-shaped but
+  # only if the path does not exist; a bare name with no slash is not a valid
+  # absolute shebang in practice, so report it as FAIL with a clear remedy.
+  case "$interp" in
+    /*)
+      if [ -x "$interp" ]; then
+        abs_ok=$((abs_ok + 1))
+        printf 'portable? %s  shebang is absolute (%s) -- accepted here, but it\n' "$rel" "$interp"
+        printf '          breaks on any host where that path is absent (NixOS). Prefer `#! /usr/bin/env %s`.\n' "$(basename "$interp")"
+      else
+        fail=$((fail + 1))
+        printf 'FAIL %s\n' "$rel"
+        printf '     shebang %s does not exist on this host (%s) -- direct invocation returns rc=126.\n' "$interp" "$rel"
+        printf '     fix: use `#!/usr/bin/env %s`.\n' "$(basename "$interp")"
+      fi
+      ;;
+    *)
+      skipped=$((skipped + 1))
+      [ "$verbose" -eq 1 ] && printf 'skip   %s  (bare interpreter name: %s)\n' "$rel" "$interp"
+      ;;
+  esac
+done < <(find "${targets[@]}" \
+  \( -name .git -o -name target -o -name _build -o -name .lake \
+     -o -name node_modules -o -name .venv -o -name __pycache__ \
+     -o -name dist -o -name result -o -name .direnv \
+     -o -name workspace-backup -o -name .github_bk \
+     -o -name vendor -o -name ol10 \) -prune -o -type f -print 2>/dev/null)
+
+printf 'check-shebangs: %d executable script(s) scanned: %d portable, %d absolute-but-present, %d skipped, %d broken\n' \
+  "$scanned" "$portable" "$abs_ok" "$skipped" "$fail"
+
+[ "$scanned" -gt 0 ] || {
+  echo "check-shebangs: nothing scanned. A silent grep is a broken gate, not a clean one." >&2
+  exit 2
+}
+
+if [ "$fail" -ne 0 ]; then
+  echo "check-shebangs: an executable script names an interpreter this host does not have." >&2
+  exit 1
+fi
+echo "check-shebangs: every executable script carries a runnable shebang here."
