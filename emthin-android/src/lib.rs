@@ -277,6 +277,70 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_redo<'local>(
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
+// ----- rendering ------------------------------------------------------
+//
+// Deliberately *stateless*: it takes the document text, never the
+// `DocModel` handle. Two reasons, both load-bearing:
+//
+//   1. The handle is documented as UI-thread-only (no synchronisation),
+//      and Typst layout costs ~400 ms for a few pages — far too long to
+//      hold the UI thread without an ANR. Taking text lets the caller
+//      copy the string on the UI thread and rasterise on a worker.
+//   2. The renderer is mathed's own (`mathed_mini::render_doc`), which
+//      is the same engine `velysterm/crates/mathed_android` blits. The
+//      pad's document syntax *is* mathed's marker syntax, so no
+//      conversion is needed.
+
+/// Renders `doc_text` at `width_pt` points wide.
+///
+/// Returns `{ "width", "height", "rgba" }` with `rgba` base64-encoded
+/// RGBA8 — the same one-value transport mathed_android uses for its
+/// screenshots.
+fn render_text(doc_text: &str, width_pt: f64) -> Result<String, String> {
+    use base64::Engine as _;
+
+    let width_pt = if width_pt.is_finite() && width_pt > 0.0 {
+        width_pt
+    } else {
+        600.0
+    };
+
+    // `imaging::RgbaImage` carries its dimensions as fields and its
+    // pixels in `data` (RGBA8), the same shape engine.rs samples from.
+    // `RenderError` is `Debug`-only (a sibling crate's type; not widened
+    // here), so the diagnostic uses `{:?}`.
+    let img = mathed_mini::render_doc(doc_text, width_pt).map_err(|e| format!("render: {e:?}"))?;
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 {
+        return Err("render: empty raster".to_string());
+    }
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&img.data);
+    Ok(json!({ "width": w, "height": h, "rgba": b64 }).to_string())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_renderText<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    doc_text: JString<'local>,
+    width_pt: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = doc_text.to_string();
+            // A failed render is data, not a crash: the pad keeps
+            // editing and shows the diagnostic instead of dying on a
+            // half-typed expression.
+            let json = match render_text(&text, width_pt.max(1) as f64) {
+                Ok(ok) => ok,
+                Err(e) => json!({ "error": e }).to_string(),
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 // ----- tests ----------------------------------------------------------
 //
 // These run the *emthin* `DocModel` tests too (they live inside the
@@ -366,5 +430,48 @@ mod tests {
         assert_eq!(v["segments"].as_array().unwrap().len(), 1);
         assert_eq!(v["segments"][0]["prop"], json!("app"));
         assert_eq!(v["segments"][0]["span"], json!([2, 7]));
+    }
+
+    /// The render seam actually produces pixels, and the base64 half of
+    /// the contract decodes back to exactly `width * height * 4` RGBA
+    /// bytes — the invariant the Java side relies on before handing the
+    /// buffer to a `Bitmap`.
+    #[test]
+    fn render_text_returns_a_decodable_rgba_raster() {
+        use base64::Engine as _;
+
+        // The app's real starter document (MainActivity.STARTER),
+        // string argument and all — not a simplified stand-in, so this
+        // pins what the pad actually opens with.
+        let starter = String::from("#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n")
+            + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
+        let v: Value = serde_json::from_str(&render_text(&starter, 200.0)
+            .expect("the starter document must render"))
+            .unwrap();
+
+        assert!(v.get("error").is_none(), "unexpected render error: {v}");
+        let (w, h) = (v["width"].as_u64().unwrap(), v["height"].as_u64().unwrap());
+        assert!(w > 0 && h > 0, "empty raster {w}x{h}");
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(v["rgba"].as_str().unwrap())
+            .expect("rgba must be base64");
+        assert_eq!(bytes.len() as u64, w * h * 4, "RGBA8 is 4 bytes/px");
+    }
+
+    /// A non-positive width falls back to the default instead of
+    /// erroring, so a caller passing a not-yet-measured view width
+    /// (0 before first layout) still gets a raster.
+    ///
+    /// Asserted by *equivalence with an explicit 600pt* rather than by
+    /// pixel width: `render_doc` trims the raster to ink, so the width
+    /// follows the content, not the request (measured: "hello mathed"
+    /// comes back 59x8 at the default width).
+    #[test]
+    fn render_text_falls_back_on_a_non_positive_width() {
+        let fallback = render_text("hello mathed", 0.0).expect("width 0 must fall back, not fail");
+        let explicit = render_text("hello mathed", 600.0).expect("600pt must render");
+        assert_eq!(fallback, explicit, "0pt must be treated as the 600pt default");
+        assert!(!fallback.contains("\"error\""), "unexpected: {fallback}");
     }
 }

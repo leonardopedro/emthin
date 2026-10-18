@@ -98,6 +98,46 @@ jobs:
           }
           bash ../unfer/scripts/check-status --recount emthin=/tmp/emthin_tests.log
 
+  # emthin-pad: the Android frontend. It is its own workspace (empty
+  # `[workspace]` table), so the workspace `cargo test` above never touches
+  # it — without this job its tests ran nowhere at all, which round 4 found
+  # and round 5 closed. Host-only by design: the engine half is
+  # target-independent, so these run with no NDK, no emulator and no
+  # waydroid (AGENTS.md "#emthin-android"). Building the *APK* stays an
+  # owner-run lane: `build-apk.sh` hard-pins four Nix store paths that a
+  # flake update moves.
+  android:
+    name: emthin-pad host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
+
+      # Same path-dep closure as `test`: emthin-pad → velysterm
+      # (mathed_core, mathed_mini) → unfer (decide_core, pulled in by
+      # mathed_core). dynamic-arctic is not needed: mathed_mini's `kernel`
+      # feature is off here, which drops unfer_consensus.
+      - name: checkout sibling repos (path deps)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/velysterm.git ../velysterm
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/unfer.git ../unfer
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # Swatinem/rust-cache@v2
+        with:
+          workspaces: emthin-android
+
+      # `cd` rather than `--manifest-path`, so rustup picks up
+      # emthin-android's own rust-toolchain.toml instead of the root one.
+      - name: test
+        run: |
+          set -o pipefail
+          cd emthin-android
+          cargo test --locked 2>&1 | tee /tmp/emthin_pad_tests.log || {
+            tail -25 /tmp/emthin_pad_tests.log | sed 's/^/::error::android: /'
+            exit 1
+          }
+
   # The §6 step-7 E2E — the only gate that exercises the real session:
   # keystrokes through XTEST, the clipboard proxy both ways, list_state on
   # the control socket, and graceful SIGTERM shutdown. Until 2026-10-15 this

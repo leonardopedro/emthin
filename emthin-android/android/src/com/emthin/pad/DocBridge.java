@@ -27,4 +27,16 @@ public final class DocBridge {
     public static native String undo(long handle);
 
     public static native String redo(long handle);
+
+    /**
+     * Renders a mathed document to pixels, returning
+     * {@code {width, height, rgba}} with {@code rgba} base64-encoded
+     * RGBA8 — or {@code {error}} on a typesetting failure.
+     *
+     * <p><b>Stateless and safe to call off the UI thread.</b> It takes the
+     * document <em>text</em>, never the handle, because Typst layout costs
+     * hundreds of milliseconds and the handle is UI-thread-only. Copy the
+     * text on the UI thread, rasterise on a worker, post the result back.
+     */
+    public static native String renderText(String docText, int widthPt);
 }

@@ -58,7 +58,7 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 347 cargo (workspace, nix develop) + 5/5 run.sh E2E green (2026-10-18 re-verified once; the five-consecutive-run campaign was 2026-10-15 — harness hardened against stale state, see scripts/e2e/README "Stale state" post-mortem; the tier-1 replay scenario and the E2E both run in CI) + 20 emthin-pad host tests (undocumented lane, see AGENTS.md) | last_verified: 2026-10-18 -->
+<!-- status: verified | tests: 347 cargo (workspace, nix develop) + 5/5 run.sh E2E green (2026-10-18 re-verified once; the five-consecutive-run campaign was 2026-10-15 — harness hardened against stale state, see scripts/e2e/README "Stale state" post-mortem; the tier-1 replay scenario and the E2E both run in CI) + 22 emthin-pad host tests (see AGENTS.md #emthin-android) | last_verified: 2026-10-18 -->
 
 ## Verification
 

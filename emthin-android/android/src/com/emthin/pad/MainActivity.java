@@ -1,20 +1,30 @@
 package com.emthin.pad;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.Editable;
 import android.text.Spannable;
 import android.text.TextWatcher;
 import android.text.style.BackgroundColorSpan;
+import android.util.Base64;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+
+import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * emthin pad — a plain {@link EditText} driven by the Rust-side emthin
@@ -42,8 +52,23 @@ public class MainActivity extends Activity {
     private Button undoButton;
     private Button redoButton;
     private TextView status;
+    private ImageView preview;
+    private TextView previewError;
     /** True while we mutate the EditText ourselves (suppresses sync). */
     private boolean applying;
+
+    /** Renders mathed off the UI thread (Typst layout is hundreds of ms). */
+    private final ExecutorService renderer = Executors.newSingleThreadExecutor();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    /** Bumped per edit; a worker result is dropped if a newer edit won. */
+    private int renderGeneration;
+    /** Debounce handle, so a burst of keystrokes rasterises once. */
+    private final Runnable renderNow = new Runnable() {
+        @Override
+        public void run() {
+            startRender(editor.getText().toString());
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -90,6 +115,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        main.removeCallbacks(renderNow);
+        renderer.shutdown();
         if (handle != 0) {
             DocBridge.free(handle);
             handle = 0;
@@ -152,11 +179,111 @@ public class MainActivity extends Activity {
         root.addView(editor, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
+        // mathed preview: the document typeset by the same engine
+        // velysterm's mathed_android blits (mathed_mini::render_doc), so
+        // what the pad shows agrees with what a real mathed frontend
+        // would produce. The editor keeps 1f of the height and the
+        // preview takes what is left, so typing never hides it.
+        TextView previewLabel = new TextView(this);
+        previewLabel.setText("mathed render");
+        previewLabel.setTextColor(Color.parseColor("#6E7A87"));
+        previewLabel.setTextSize(11f);
+        previewLabel.setPadding(0, dp(8), 0, dp(4));
+        root.addView(previewLabel, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        preview = new ImageView(this);
+        preview.setAdjustViewBounds(true);
+        preview.setBackgroundColor(Color.parseColor("#FAFBFC")); // mathed's paper white
+
+        previewError = new TextView(this);
+        previewError.setTextColor(Color.parseColor("#E06C75"));
+        previewError.setTextSize(11f);
+        previewError.setVisibility(View.GONE);
+
+        LinearLayout previewBox = new LinearLayout(this);
+        previewBox.setOrientation(LinearLayout.VERTICAL);
+        previewBox.addView(preview, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        previewBox.addView(previewError, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        ScrollView previewScroll = new ScrollView(this);
+        previewScroll.setFillViewport(true);
+        previewScroll.addView(previewBox);
+        root.addView(previewScroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
         setContentView(root);
     }
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    // ----- mathed rendering --------------------------------------------
+
+    /** Debounces: a burst of keystrokes rasterises once, ~300 ms after the last. */
+    private void scheduleRender() {
+        main.removeCallbacks(renderNow);
+        main.postDelayed(renderNow, 300);
+    }
+
+    /**
+     * Rasterises {@code text} on the worker thread and applies it only if
+     * no newer edit superseded it while Typst was laying out.
+     */
+    private void startRender(final String text) {
+        final int generation = ++renderGeneration;
+        // ~2 view-widths at the engine's ~1.2 px/pt keeps text legible
+        // without rasterising a page wider than the screen.
+        final int widthPt = Math.max(240, editor.getWidth() / 2);
+
+        renderer.execute(new Runnable() {
+            @Override
+            public void run() {
+                final String json = DocBridge.renderText(text, widthPt);
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (generation == renderGeneration) {
+                            applyPreview(json);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /** Decodes the bridge's {width,height,rgba} into the preview ImageView. */
+    private void applyPreview(String json) {
+        try {
+            JSONObject o = new JSONObject(json);
+            String error = o.optString("error", "");
+            if (!error.isEmpty()) {
+                previewError.setText("render: " + error);
+                previewError.setVisibility(View.VISIBLE);
+                return;
+            }
+
+            int w = o.getInt("width");
+            int h = o.getInt("height");
+            byte[] rgba = Base64.decode(o.getString("rgba"), Base64.DEFAULT);
+            if (rgba.length != w * h * 4 || w <= 0 || h <= 0) {
+                throw new IllegalStateException("bad raster " + w + "x" + h
+                        + " (" + rgba.length + " bytes)");
+            }
+
+            Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            // ARGB_8888's native buffer is RGBA byte order, which is what
+            // the bridge encodes — a straight copy, no swizzle.
+            bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba));
+            preview.setImageBitmap(bmp);
+            previewError.setVisibility(View.GONE);
+        } catch (Exception e) {
+            previewError.setText("render: " + e.getMessage());
+            previewError.setVisibility(View.VISIBLE);
+        }
     }
 
     // ----- state -------------------------------------------------------
@@ -187,6 +314,7 @@ public class MainActivity extends Activity {
             undoButton.setEnabled(o.getBoolean("canUndo"));
             redoButton.setEnabled(o.getBoolean("canRedo"));
             refreshSegments(o);
+            scheduleRender();
         } catch (Exception e) {
             status.setText("state error: " + e.getMessage());
         }

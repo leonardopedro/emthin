@@ -530,6 +530,36 @@ model the desktop compositor drives, behind a JNI bridge instead of IPC.
 - `debug.keystore` is tracked on purpose — it is a **debug** signing key
   for a debug APK, not a release credential.
 
+## Rendering — mathed inside the pad
+
+The pad typesets its own document with **mathed**, not with a Java
+renderer. `render_text()` in `src/lib.rs` calls `mathed_mini::render_doc`
+(`default-features = false`, dropping `gui` + `kernel` — the unfer
+kernel's dependency tree does not build for Android; `mathed_mini`'s
+`render` module is *not* feature-gated, which is what makes this work).
+No conversion layer exists because **the pad's document syntax *is*
+mathed's marker syntax**: the same `#1 cap #2 \\app(...)` text both
+`DocModel` parses and mathed typesets, so the preview agrees with what
+`velysterm/crates/mathed_android` would blit.
+
+Two decisions worth knowing before changing it:
+
+- **`renderText` is stateless on purpose** — it takes the document
+  *text*, never the `DocModel` handle. The handle is UI-thread-only (the
+  JNI contract says so explicitly), and Typst layout costs hundreds of
+  milliseconds, so taking text lets `MainActivity` copy a `String` on the
+  UI thread and rasterise on a worker. Do not "simplify" this into a
+  handle-taking call.
+- **A failed render is data, not a crash**: it comes back as
+  `{"error": ...}` so a half-typed expression cannot kill the app.
+
+`render_doc` trims its raster to ink, so the preview's pixel width
+follows the content, not the requested width (measured: the starter
+document renders, and `"hello mathed"` at the 600pt default comes back
+59x8). The Java side debounces ~300 ms and drops any worker result a
+newer edit superseded, so typing never blocks and a slow render never
+overwrites a newer frame.
+
 ## Build (gradle-free)
 
 `build-apk.sh` does the whole chain: cargo cross-compiles the `.so` for
@@ -543,9 +573,12 @@ owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **20 host tests
-  against the real `DocModel`** (sync + undo/redo round-trips, ~0.5 s),
-  with no NDK and no emulator. This is the cheap lane an LLM can drive.
+- **module** — `cargo test` inside `emthin-android/` runs **22 host tests
+  against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
+  conversion, and the mathed render seam — including a render of the
+  app's actual starter document and the RGBA base64 contract the Java
+  side decodes), ~0.5 s, with no NDK and no emulator. This is the cheap
+  lane an LLM can drive.
 - **boundary** — the APK build + `../scripts/waydroid-sudo-fixes.sh`
   (root-side waydroid checks). Neither is wired into CI: the NDK pin and
   the root requirement both make it an owner-run surface.

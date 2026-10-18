@@ -31,6 +31,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
+]
+
+[[package]]
 name = "append-only-bytes"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,6 +192,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "brotli"
+version = "8.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -591,8 +627,10 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 name = "emthin-pad"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "jni",
  "mathed_core",
+ "mathed_mini",
  "serde_json",
  "unicode-segmentation",
 ]
@@ -1093,7 +1131,7 @@ dependencies = [
  "image",
  "kurbo",
  "pic-scale",
- "vello_cpu",
+ "vello_cpu 0.0.8",
 ]
 
 [[package]]
@@ -1114,6 +1152,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d285dc30731c8485de5fa732fbdf2b3affdf01e4da7c2135022ca6fa664bf6"
 dependencies = [
+ "brotli",
  "hayro-postscript",
 ]
 
@@ -1522,6 +1561,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
 
 [[package]]
+name = "imaging"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39a5e8c7c22da30056963bac3deab021ce768df9e73a252d3c07f854f2664b4d"
+dependencies = [
+ "kurbo",
+ "peniko",
+]
+
+[[package]]
+name = "imaging_vello_cpu"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d978b62a30f095ccdcd54546f3f1a972e3f4a14f9bafd3cccfb0f3e573202724"
+dependencies = [
+ "imaging",
+ "kurbo",
+ "peniko",
+ "vello_common 0.0.9",
+ "vello_cpu 0.0.9",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1881,6 +1943,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mathed_biblio"
+version = "0.1.0"
+dependencies = [
+ "hayagriva",
+ "mathed_core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mathed_core"
 version = "0.1.0"
 dependencies = [
@@ -1893,6 +1964,26 @@ dependencies = [
  "typst",
  "unicode-math-class",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "mathed_mini"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "flate2",
+ "imaging",
+ "imaging_vello_cpu",
+ "mathed_biblio",
+ "mathed_core",
+ "png",
+ "serde_json",
+ "typst",
+ "typst-assets",
+ "typst-eval",
+ "typst-layout",
+ "typst-library",
+ "typst_imaging",
 ]
 
 [[package]]
@@ -2972,6 +3063,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "svg_imaging"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e44a74005d79358c9b53269a18d60010331fd313fe8d5f308a1b5e51df097c59"
+dependencies = [
+ "hashbrown 0.17.1",
+ "image",
+ "imaging",
+ "kurbo",
+ "peniko",
+ "usvg",
+]
+
+[[package]]
 name = "svgtypes"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3582,6 +3687,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "typst_imaging"
+version = "0.0.1"
+source = "git+https://github.com/voxell-tech/velyst?tag=v0.0.1#a1b51e6bb33558dcff0dc57fff37c9f9db804e99"
+dependencies = [
+ "hayro-svg",
+ "imaging",
+ "svg_imaging",
+ "typst-library",
+]
+
+[[package]]
 name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3822,6 +3938,19 @@ dependencies = [
  "hashbrown 0.17.1",
  "png",
  "vello_common 0.0.8",
+]
+
+[[package]]
+name = "vello_cpu"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "588691169aed86b5c8fb487266afee01323234e6fd0a3f2aaec0eaa8e4007f23"
+dependencies = [
+ "bytemuck",
+ "glifo",
+ "hashbrown 0.17.1",
+ "png",
+ "vello_common 0.0.9",
 ]
 
 [[package]]

@@ -20,6 +20,15 @@ crate-type = ["cdylib"]
 jni = "0.22"
 serde_json = "1"
 mathed_core = { path = "../../velysterm/crates/mathed_core" }
+# The document renderer (Typst paged layout -> CPU raster). `default-features
+# = false` drops `gui` (winit/softbuffer) and `kernel` (the unfer kernel's
+# dependency tree does not build for Android) — the same choice
+# `velysterm/crates/mathed_android` makes. `render` itself is NOT feature
+# gated, so `render_doc` is available here.
+mathed_mini = { path = "../../velysterm/crates/mathed_mini", default-features = false }
+# base64 carries a raster across the JNI string boundary in one value,
+# matching mathed_android's screenshot transport.
+base64 = "0.22"
 unicode-segmentation = "1"
 
 [profile.release]
