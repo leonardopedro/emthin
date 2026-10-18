@@ -511,6 +511,47 @@ calloop / mio / tokio all work the same. Tests use plain
 
 ---
 
+# emthin-android (`emthin-pad`)
+
+An Android app that embeds emthin's `DocModel` verbatim — the same Rust
+model the desktop compositor drives, behind a JNI bridge instead of IPC.
+
+## Layout and the seam
+
+- `emthin-pad` is a **standalone workspace**: its `Cargo.toml` carries an
+  empty `[workspace]` table on purpose, so it does not join the emthin
+  workspace even though it lives inside this checkout (it path-depends on
+  `velysterm` and produces its own release artifacts). **Its tests are not
+  in the workspace's 347** — see the verification lane below.
+- `src/lib.rs` is a `cdylib` (`libemthin_pad.so`, loaded via
+  `System.loadLibrary("emthin_pad")`); `android/src/com/emthin/pad/`
+  holds `MainActivity.java` + `DocBridge.java` (the JNI surface).
+- Own `rust-toolchain.toml` (1.99.0), independent of the desktop lanes.
+- `debug.keystore` is tracked on purpose — it is a **debug** signing key
+  for a debug APK, not a release credential.
+
+## Build (gradle-free)
+
+`build-apk.sh` does the whole chain: cargo cross-compiles the `.so` for
+`x86_64-linux-android` (the waydroid ABI), `javac` + `d8` produce
+`classes.dex`, `aapt2` links the manifest, then `zipalign` + `apksigner`
+debug-sign. **It hard-pins Nix store paths** for the SDK, build-tools
+(37.0.0), NDK (30.0.14904198-rc1) and JDK (21.0.12.1+1): a `nix flake
+update` that moves any of those four store paths breaks the script until
+the hashes are refreshed. That fragility is why the APK build is an
+owner-run lane, not a gate.
+
+## Verification lane
+
+- **module** — `cargo test` inside `emthin-android/` runs **20 host tests
+  against the real `DocModel`** (sync + undo/redo round-trips, ~0.5 s),
+  with no NDK and no emulator. This is the cheap lane an LLM can drive.
+- **boundary** — the APK build + `../scripts/waydroid-sudo-fixes.sh`
+  (root-side waydroid checks). Neither is wired into CI: the NDK pin and
+  the root requirement both make it an owner-run surface.
+
+---
+
 
 ---
 
