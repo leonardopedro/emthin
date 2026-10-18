@@ -36,7 +36,7 @@ the gap culture and is inherited here, not re-litigated.
 |---|---|---|
 | module + composition | the workspace suite (1797) | `cargo test --workspace --exclude fock_sirk` (README Verification) |
 | boundary | `ops_e2e` (real socket), the fuzz lane | `cargo test -p unfer_ffi --test ops_e2e`; `.github/workflows/fuzz.yml` |
-| conformance | physics/SIRK goldens against Cadabra2 CHECKs (401 across 56 binaries) | `cargo test -p fock_sirk --release`; heavy lane `scripts/run_heavy_tests.sh` + `.github/workflows/heavy-tests.yml` (weekly) |
+| conformance | physics/SIRK goldens against Cadabra2 CHECKs (462 across 64 binaries, 2026-10-18; the README's per-suite prose keeps its own dated history) | `cargo test -p fock_sirk --release`; heavy lane `scripts/run_heavy_tests.sh` + `.github/workflows/heavy-tests.yml` (weekly) |
 | conformance | decide calibration report pinned to its run | `decide_report` golden gate (D6 in ci.yml) |
 | named skip | three intermittents in `unfer_ffi`'s action/owner-log group | documented in README; counted, not hidden |
 
@@ -49,6 +49,8 @@ the gap culture and is inherited here, not re-litigated.
 | boundary | the tier-1 replay scenario: sandboxed `doc` → `apply` edit script → closed-vocab `expect` (13 asserts, ~0.8 s; the scenario cannot skip a check it was written to make) | `./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt` (CI `e2e` job, first step) |
 | acceptance | the §6 step-7 E2E: XTEST keystrokes → document, clipboard both ways, `list_state`, SIGTERM | `./scripts/e2e/run.sh --config xdotool` (5 checks; CI `e2e` job) |
 | named skip | IME commit (needs the host's fcitx *engaged*, not merely installed) | `scripts/e2e/README.md`; clipboard-free rerun is `E2E_NO_X=1` |
+| module | `emthin-pad`'s 20 host tests against the real `DocModel` (standalone workspace — **not** in the 347 above) | `cargo test` inside `emthin-android/` |
+| named skip | the APK build + waydroid run | `emthin-android/build-apk.sh` hard-pins four Nix store paths (SDK/build-tools/NDK/JDK); root-side checks in `scripts/waydroid-sudo-fixes.sh` — owner-run, no CI |
 
 ## velysterm
 

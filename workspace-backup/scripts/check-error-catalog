@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check-error-catalog — P2 of PLAN_WORKSPACE_REVIEW_2026-10-14.md.
 #
 # Machine-checks docs/user-visible-errors.csv (REA user-visible-errors.csv

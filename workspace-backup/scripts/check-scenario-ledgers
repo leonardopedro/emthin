@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check-scenario-ledgers — P1c of PLAN_WORKSPACE_REVIEW_2026-10-14.md.
 #
 # Machine-checks the "Obligation closure" tables added to the federation's

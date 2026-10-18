@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check-backup-sync — byte-identity gate for BOTH mirror mechanisms:
 #
 #   1. emthin/workspace-backup/ vs its workspace-root sources (the

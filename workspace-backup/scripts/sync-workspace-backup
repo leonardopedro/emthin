@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # sync-workspace-backup — refresh emthin/workspace-backup/ from the
 # workspace-root sources (copy, never move: see workspace-backup-files).
 #

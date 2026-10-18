@@ -34,12 +34,15 @@ gates in this directory are cheap (grep/python) and safe to parallelise;
 | `check-error-catalog` | `docs/user-visible-errors.csv` shape (harm ranks 1..N, retryable vocab, verification non-empty) + bidirectional code-set parity vs the source enums (`emthin` `IpcErrorCode`, `voice.sh` FAIL codes, `modhost` error kinds) |
 | `check-backup-sync` / `sync-workspace-backup` | byte-identity of both mirrors: `emthin/workspace-backup/` ↔ its root sources (refresh with `sync-workspace-backup`, then commit), and `unfer/scripts/{check-attribution,workspace-root.sh,tree-size}` ↔ the root copies (unfer's CI runs its own copy directly) |
 | `testing-depths.md` | the R15 depth labels: each repo's named verification surfaces mapped onto rea's five lanes (module / composition / boundary / acceptance / conformance) with named skips — descriptive; the gates above enforce the *claims* around suites, this catalog says which lane a green run licenses |
+| `check-book-sync` / `sync-book` | book ↔ site parity for the math corpus |
+| `check-status` / `tree-size` | maintenance utilities |
+| `check-shebangs` | every executable script under `scripts/` (root + checkouts) carries a shebang that can actually run on the host: `env`-mediated forms pass, an absolute interpreter that is **absent** fails (rc=126 on direct invocation), an absolute one that is present is reported but accepted — CI runners legitimately have `/bin/bash`. Proves the P2 fix (round 4) cannot regress; `check-all-gates` is blind to this because it dispatches through `bash` |
+| `workspace-backup-files` | the mirror list both backup scripts consume (root docs/scripts ↔ `emthin/workspace-backup/`); a new root plan doc is added here in the same change |
+| `waydroid-sudo-fixes.sh` | host utility, not a gate: the root-side waydroid checks for the Android (emthin-pad) lane |
 
 Workspace `check-*` gates are auto-discovered by `check-all-gates` (the
 runner skips itself and `check-status`, a maintenance utility) — drop a
 new `check-*` here and the workspace pass picks it up.
-| `check-book-sync` / `sync-book` | book ↔ site parity for the math corpus |
-| `check-status` / `tree-size` | maintenance utilities |
 
 ### Scheduled runs (P4 — no CI target exists for the workspace root)
 
@@ -129,3 +132,15 @@ land **in the same change** — an item that skips one is not done:
 - **Scenario row.** New E2E assertions get their row in the owning
   `SCENARIOS.md` with an honest status (verified / degraded /
   environment-gated).
+
+## Commit subjects (P7, round 4 — observation, not a gate)
+
+`australVM`, `timepiece` and `emthin` have drifted back to one-letter
+commit subjects (`mm`, `a`). This is not enforced anywhere, but it is not
+free either: **`australVM/AGENTS.md` documents that its `CHANGELOG.md` is
+*generated* from conventional commits by git-cliff**, so every `mm` is a
+change that ships with no changelog entry. Conventional subjects
+(`fix(scope): …`, `docs(scope): …`) keep both the log readable and the
+generated changelog honest. The workspace gates deliberately stay out of
+commit-message territory — this is a note for whoever commits, not a rule
+a machine should police.
