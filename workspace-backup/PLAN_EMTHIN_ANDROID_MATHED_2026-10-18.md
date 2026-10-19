@@ -171,3 +171,45 @@ lane — the built artifact's dex is measured and this session's install
 ran from that build. With this, the device tier is closed end to end:
 built → installed → launched → drawn → typeset text legible on the
 canvas.
+
+## 9. Execution note (2026-10-19, close) — the visual loop's last two pins, and the adb wall measured twice
+
+Two host-tier repairs landed after §8's capture, both pinned by tests
+that sample what the user sees rather than the inputs:
+
+- **The unbound `\app` placeholder was opaque red** while its own doc
+  comment promised "transparent" — every figure slot not yet covered
+  by a compositor surface painted debug-red on every consumer's
+  canvas (found by the visual loop of §8). It now fills with
+  `mathed_android`'s `FIGURE_TINT` (#1E2A38) verbatim, so raster and
+  frontend overlay agree pixel-for-pixel, and
+  `mathed_mini::render::tests::figure_placeholder_fill_is_the_documented_tint`
+  samples the *rendered raster* (not the placeholder bytes), so the
+  comment and the pixel cannot drift apart again.
+- **The pad's preview canvas is pinned in code**: the 24th emthin-pad
+  host test (`page_view_canvas_matches_mathed_engine_bg`) reads the
+  shipped `MainActivity.java`, anchors on the `pageView` background
+  call, and asserts the hex equals `mathed_android::engine::BG`
+  (against the real constant, via a test-only path dependency) — the
+  `#14181D`-class bug now fails `cargo test` instead of blanking the
+  preview. `emthin-android` re-measured **24 / 0**; claim sites
+  (emthin README status line, `scripts/testing-depths.md`, AGENTS)
+  updated in the same pass. velysterm's touched crates re-measured
+  green (`mathed_core` **293**, `mathed_mini` **256 + 1 ignored**).
+
+**The adb wall was measured twice and is unchanged:** a fresh
+connect/disconnect cycle this session again stopped at `unauthorized`,
+and the owner looked at the running Android display and found no RSA
+dialog to tap — consistent with §8, which measured that this build
+never surfaces it. The no-root avenues are exhausted on record:
+`waydroid shell` needs euid 0; `waydroid prop set` round-trips for
+ordinary props (`debug.*` verified) but cannot move `ro.adb.secure`
+(stays 1, so adbd keeps demanding the dialog); and the waydroid
+window is a Wayland surface that XTEST/xdotool cannot reach. The two
+remaining device items therefore stay owner-run `[gap]`s: the
+installed-vs-built APK byte comparison (`pm path` + `pull` + md5)
+and the below-fold glyph capture (needs adb `input`/`screencap` —
+§8 measured that the window's wheel/drag translation does not scroll
+the pad's `ScrollView`). `scripts/waydroid-sudo-fixes.sh` section D
+is the lane for both, alongside the reboot-when-convenient
+kernel-drift note.
