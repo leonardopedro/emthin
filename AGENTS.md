@@ -581,16 +581,18 @@ owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **24 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **25 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, and the mathed page seam — the app's actual starter
   document rendered page-by-page with the RGBA base64 contract the Java
   side decodes, chunk continuity across a genuinely paginated document,
-  the scale/chunk fallbacks, and a canvas pin: the Java `pageView`
+  the scale/chunk fallbacks, a canvas pin: the Java `pageView`
   background must equal `mathed_android::engine::BG`, asserted against
   the real constant so a colour change on either side fails here instead
-  of making the preview blank), a few seconds, with no NDK and no
-  emulator. This is the cheap lane an LLM can drive.
+  of making the preview blank, and a cite-label raster pin — a `\cite`
+  must rasterise byte-identical to its literal `[1]` label, the wiring
+  the 2026-10-19 visual loop found missing), a few seconds, with no NDK
+  and no emulator. This is the cheap lane an LLM can drive.
 - **boundary** — the APK build + `../scripts/waydroid-sudo-fixes.sh`
   (root-side waydroid checks). Neither is wired into CI: the NDK pin and
   the root requirement both make it an owner-run surface.

@@ -322,12 +322,24 @@ fn render_pages(
     use base64::Engine as _;
     use mathed_core::transform::TransformOptions;
 
+    // Citations render as their visible `[N]` label only when the
+    // transform is handed the document's reference entries: the
+    // `\cite(...)` token itself is hidden, so the default (empty)
+    // options list made every citation disappear from the preview
+    // (found by the 2026-10-19 visual loop). The preview has no caret,
+    // so it renders the collapsed view — labels shown, tokens hidden.
+    let scan = mathed_core::markers::scan(doc_text);
+    let opts = TransformOptions {
+        references: mathed_core::markers::scan_references(&scan),
+        ..TransformOptions::default()
+    };
+
     // `PageLayout::image` is an `imaging::RgbaImage` carrying its
     // dimensions as fields and its pixels in `data` (RGBA8), the same
     // shape engine.rs samples from. `RenderError` is `Debug`-only (a
     // sibling crate's type; not widened here), so the diagnostic uses
     // `{:?}`.
-    let pages = mathed_mini::layout_doc_paged_scaled(doc_text, &TransformOptions::default(), scale)
+    let pages = mathed_mini::layout_doc_paged_scaled(doc_text, &opts, scale)
         .map_err(|e| format!("render: {e:?}"))?;
     let total = pages.len();
     if total == 0 {
@@ -605,6 +617,25 @@ mod tests {
             mathed_android::engine::BG[0],
             mathed_android::engine::BG[1],
             mathed_android::engine::BG[2],
+        );
+    }
+
+    /// Wiring pin (2026-10-19 visual loop): `renderPages` must splice
+    /// cite labels. With the default options the `\cite(...)` token is
+    /// hidden with *no* label — the citation disappeared from the
+    /// preview entirely. Pinned by byte-equivalence (the codebase's
+    /// established style): a `\cite` must rasterise exactly like its
+    /// visible `[1]` label written literally, so a missing label
+    /// changes the raster and fails here.
+    #[test]
+    fn render_pages_splices_cite_labels_into_the_raster() {
+        let cited = "#1 alpha claim #2 \\cite(#1,#2)";
+        let literal = "#1 alpha claim #2 [1]";
+        let a = render_pages(cited, 0, 8, 1.0).expect("cited renders");
+        let b = render_pages(literal, 0, 8, 1.0).expect("literal renders");
+        assert_eq!(
+            a, b,
+            "a \\cite must rasterise exactly like its visible [1] label"
         );
     }
 }
