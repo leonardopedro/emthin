@@ -102,3 +102,39 @@ round 5 wired the two Android lanes into CI but this one stayed open.
 The job is standalone (the avm-pkg workspace has no cross-repo path
 deps by design), runs the exact `cargo test --workspace` command the
 README's Verification snippet names, and is YAML-validated.
+
+## 8. Execution note (2026-10-19, later) — the device tier ran; the preview verified visually
+
+The §7/§P5 "device tier stays a `[gap]`" is closed. The APK lane never
+needed a downloaded Android SDK: `build-apk.sh` builds against the
+already-pinned Nix toolchain, and the 24.4 MB APK (11:42) carries the
+W4 canvas fix — measured, not assumed: `classes.dex` contains the
+`#14181D` literal and no `#FAFBFC`.
+
+**What the device tier showed (Waydroid, 2026-10-19):** the pad
+installs (`waydroid app install`), launches, and its preview draws.
+A compositor-side capture (Mutter.ScreenCast → PipeWire → GStreamer,
+built because a stuck modal grab had killed keyboard injection and the
+Print/portal screenshot routes all session) shows the running app:
+the `Undo`/`Redo`/`rev 1-2 segs: app, app` bar, the editor holding the
+starter document, the `mathed render` label, the streamed
+`page 1 / 2` caption, the **`#14181D` pageView canvas band**, and
+THEME_PRELUDE's tinted figure slot (`#1E2A38`) as raster content —
+pixel-for-pixel the host raster of the same document at the device's
+capped 2.5 px/pt (2 pages, 1489×2105). Glyph rows sit below that
+fold (page 1 = margin + figure first), so legibility was proven on the
+identical engine output instead of the screen crop: composited over
+`#14181D`, the white-on-transparent text OCRs clean (`terminal`,
+`editor`) — exactly the content the old `#FAFBFC` paper background
+made invisible.
+
+**Waydroid notes for whoever runs this next:** app windows map only
+while `waydroid show-full-ui` runs on GNOME (its window is the Android
+screen); the graphics composer HAL (`hwcomposer.waydroid.so` +
+mesa-GBM) had crash-looped at session start after the freeze/thaw
+cycles, and one clean `systemctl --user restart waydroid-session`
+(recycling the LXC container) plus `show-full-ui` brought it back.
+`waydroid logcat`/`shell` stay root-gated — `scripts/waydroid-sudo-fixes.sh`
+section D remains the owner-run lane for logcat-level launch proof, and
+`adb` still needs on-device key approval. Host tiers re-measured after
+the change: `emthin-android` **23 / 0**.
