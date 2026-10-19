@@ -138,3 +138,21 @@ cycles, and one clean `systemctl --user restart waydroid-session`
 section D remains the owner-run lane for logcat-level launch proof, and
 `adb` still needs on-device key approval. Host tiers re-measured after
 the change: `emthin-android` **23 / 0**.
+
+**adb lane (platform-tools from `~/Downloads`, 2026-10-19) — measured,
+not assumed:** the container's network loses its address when a DHCP
+renewal falls in an idle freeze (ARP `FAILED`; one clean session
+restart restores it), after which `adb connect 192.168.240.112:5555`
+connects and stops at **unauthorized**. This build never surfaces the
+RSA confirmation dialog — not over TCP connects, not as a notification
+(shade pulled and captured), and `waydroid app launch` cannot target
+the dialog activity (package only). `waydroid adb connect` reports
+"Established ADB connection" and leaves the same unauthorized state.
+Key provisioning (`adb_keys`, `ro.adb.secure`, `logcat`) all exec into
+the container and need euid 0, so the logcat-level `Displayed
+com.emthin.pad/…` proof and an installed-vs-built APK byte comparison
+remain the owner-run lane (`scripts/waydroid-sudo-fixes.sh` section D
+does the first). Also measured: the waydroid window translates wheel
+and drag gestures but neither scrolls the pad's `ScrollView`, so the
+glyph rows below the fold could not be scrolled into a screen capture;
+the same-engine composite OCR above remains the legibility evidence.
