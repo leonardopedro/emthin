@@ -86,23 +86,41 @@ start_compositor() {
   rm -f "$E2E_XDG/$E2E_DISPLAY" "$E2E_XDG/$E2E_DISPLAY.lock" 2>/dev/null || true
 
   case "$mode" in
-  sway)
-    # The one that makes `xdotool` reachable, and the reason it is here rather
-    # than Mutter: a wlroots compositor with WLR_BACKENDS=x11 maps a real X
-    # window on Xvfb, and it never asks logind for anything. Mutter run
-    # non-headless wants to take the session and fails EBUSY from inside a
-    # desktop, which would mean logging out of GNOME to run a test.
-    start_xvfb
-    export DISPLAY="$E2E_XVFB_DISPLAY"
+  sway|sway-headless)
+    # Two backends for one compositor, chosen by what the injection config
+    # needs:
+    #
+    #   sway          WLR_BACKENDS=x11 on Xvfb — the one that makes `xdotool`
+    #                 reachable, and the reason it is here rather than Mutter:
+    #                 a wlroots compositor with the x11 backend maps a real X
+    #                 window on Xvfb, and it never asks logind for anything.
+    #                 Mutter run non-headless wants to take the session and
+    #                 fails EBUSY from inside a desktop, which would mean
+    #                 logging out of GNOME to run a test.
+    #
+    #   sway-headless WLR_BACKENDS=headless — the pure-Wayland pairing for
+    #                 `wtype`: zwp_virtual_keyboard_v1 is a wlroots core
+    #                 protocol (Mutter does not implement it, so wtype can
+    #                 never work against gnome-shell), and a headless sway
+    #                 needs no X server, no logind and no host compositor at
+    #                 all. This is the lane that runs on a Wayland machine
+    #                 with nothing but the devshell.
+    local backend=x11
+    if [ "$mode" = sway-headless ]; then
+      backend=headless
+    else
+      start_xvfb
+      export DISPLAY="$E2E_XVFB_DISPLAY"
+    fi
     export XDG_RUNTIME_DIR="$E2E_XDG"
     need sway
     cat > "$E2E_ROOT/sway.conf" <<-EOF
 		output * mode $E2E_VIEWPORT
 		exec_always true
 	EOF
-    log "starting sway (wlroots, x11 backend) on $DISPLAY"
-    ( setsid env DISPLAY="$DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-        WLR_BACKENDS=x11 WLR_LIBINPUT_NO_DEVICES=1 \
+    log "starting sway (wlroots, $backend backend)${DISPLAY:+ on $DISPLAY}"
+    ( setsid env DISPLAY="${DISPLAY:-}" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        WLR_BACKENDS=$backend WLR_LIBINPUT_NO_DEVICES=1 \
         sway -c "$E2E_ROOT/sway.conf" \
         </dev/null >>"$E2E_ROOT/sway.log" 2>&1 & )
     # `WAYLAND_DISPLAY` names a socket for *clients*; sway picks its own name and

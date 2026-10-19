@@ -15,8 +15,9 @@
 #   xdotool   XTEST. No privileges, but needs a nested compositor with an X
 #             window, which Mutter will only do when the logind session is
 #             free — not from inside another desktop.
-#   wtype     zwp_virtual_keyboard_v1. No privileges, works headless, but Mutter
-#             does not implement the protocol. Use under sway/weston/wayfire.
+#   wtype     zwp_virtual_keyboard_v1. No privileges and no X server. Mutter
+#             does not implement the protocol, so this config boots its own
+#             headless sway (wlroots implements it) — the pure-Wayland lane.
 #   none      No injection. The clipboard half of step 7 still runs; the
 #             keyboard half is reported as unverified.
 #
@@ -51,6 +52,11 @@ done
 # everything else is happy with headless Mutter.
 COMPOSITOR_MODE=headless
 [ "$CONFIG" = xdotool ] && COMPOSITOR_MODE=sway
+# wtype speaks zwp_virtual_keyboard_v1, which Mutter does not implement — the
+# headless Mutter pairing could never work. Pair it with headless sway (a
+# wlroots core protocol there) so the config is pure Wayland: no X server, no
+# root, no host compositor.
+[ "$CONFIG" = wtype ] && COMPOSITOR_MODE=sway-headless
 
 export E2E_ROOT="${E2E_ROOT:-$REPO/.e2e}"
 mkdir -p "$E2E_ROOT"
@@ -82,6 +88,8 @@ if [ "$LIST" = 1 ]; then
   log "compositor: gnome-shell --headless --wayland --no-x11"
   printf '  --config xdotool uses sway with WLR_BACKENDS=x11 on Xvfb instead,\n'
   printf '  which maps a real X window and needs no logind session.\n'
+  printf '  --config wtype uses headless sway (WLR_BACKENDS=headless): the\n'
+  printf '  pure-Wayland lane — zwp_virtual_keyboard_v1, no X, no root.\n'
   exit 0
 fi
 
