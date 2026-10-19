@@ -101,9 +101,21 @@ guard_doc() {
 
 MINI="$VELYSTERM/target/debug/mathed_mini"
 
-# Stale when the binary is missing or any source it depends on is newer.
+# Stale when the binary is missing, unrunnable, or any source it depends
+# on is newer.
 mini_stale() {
   [ -x "$MINI" ] || return 0
+  # Executable ≠ runnable: a nix-store GC sweep can delete the dynamic
+  # linker this binary was built against. Its mtime is then newer than
+  # every source, so the mtime check alone says "fresh" and the fast path
+  # dies with "cannot execute: required file not found" (measured
+  # 2026-10-19). Probe by exec: `--help` is an unknown option, so a
+  # runnable binary answers with usage and exit 0, while the shell
+  # reports 126/127 only when exec itself failed. Capture rc explicitly —
+  # this script runs `set -e`.
+  local rc=0
+  "$MINI" --help >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ge 126 ] && return 0
   local probe
   probe=$(find "$VELYSTERM/crates/mathed_core/src" "$VELYSTERM/crates/mathed_mini/src" \
               -name '*.rs' -newer "$MINI" -print -quit 2>/dev/null || true)

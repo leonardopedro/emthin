@@ -355,7 +355,12 @@ public class MainActivity extends Activity {
 
                 ImageView pageView = new ImageView(this);
                 pageView.setAdjustViewBounds(true);
-                pageView.setBackgroundColor(Color.parseColor("#FAFBFC")); // mathed's paper white
+                // mathed's canvas, not "paper white": the page raster is
+                // white text on transparent (THEME_PRELUDE sets fill:
+                // white) with tinted figure slots, so it must sit on the
+                // same dark canvas mathed_android's engine paints
+                // (BG #14181D) or the text is invisible.
+                pageView.setBackgroundColor(Color.parseColor("#14181D"));
                 pageView.setImageBitmap(bmp);
                 previewPages.addView(pageView);
 
