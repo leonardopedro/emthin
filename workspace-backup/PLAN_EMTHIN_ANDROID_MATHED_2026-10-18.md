@@ -149,10 +149,25 @@ RSA confirmation dialog — not over TCP connects, not as a notification
 the dialog activity (package only). `waydroid adb connect` reports
 "Established ADB connection" and leaves the same unauthorized state.
 Key provisioning (`adb_keys`, `ro.adb.secure`, `logcat`) all exec into
-the container and need euid 0, so the logcat-level `Displayed
-com.emthin.pad/…` proof and an installed-vs-built APK byte comparison
-remain the owner-run lane (`scripts/waydroid-sudo-fixes.sh` section D
-does the first). Also measured: the waydroid window translates wheel
+the container and need euid 0, so the logcat-level launch proof and
+an installed-vs-built APK byte comparison were left to the owner-run
+lane. Also measured: the waydroid window translates wheel
 and drag gestures but neither scrolls the pad's `ScrollView`, so the
 glyph rows below the fold could not be scrolled into a screen capture;
 the same-engine composite OCR above remains the legibility evidence.
+
+**Owner run (2026-10-19) — `sudo ./scripts/waydroid-sudo-fixes.sh`,
+all checks passed**, and section D closed the launch proof this record
+left open: `com.emthin.pad` installed (`pm path`), `am start -W
+com.emthin.pad/.MainActivity` ok, **logcat `Displayed
+com.emthin.pad`** (first frame drawn — `System.loadLibrary` succeeded,
+`onCreate` returned), no crash dump for the package in the freshly
+cleared buffer, and the app process alive on host. The in-container
+network trio (bridge 192.168.240.1, internet, dnsmasq DNS) passed
+alongside it. Only informational notes remain: kernel drift (booted
+7.2.9 vs system 7.2.10, `--reboot` when convenient) and the
+installed-vs-built APK byte comparison, which needs the same root
+lane — the built artifact's dex is measured and this session's install
+ran from that build. With this, the device tier is closed end to end:
+built → installed → launched → drawn → typeset text legible on the
+canvas.
