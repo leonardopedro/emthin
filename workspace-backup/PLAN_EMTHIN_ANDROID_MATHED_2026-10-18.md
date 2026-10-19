@@ -264,3 +264,34 @@ references panel (Ctrl+0), the kernel menu's Space fold — live in
 `mathed_mini`/`mathed`, not the pad's render path, and are covered by
 their own suites (`cite_popup`, `references_panel`,
 `app.rs::down_arrow_enters_traverses_and_exits_a_collapsed_translator`).
+
+## 11. Execution note (2026-10-19, close) — §9's gap closed rootlessly
+
+§9's "no-root avenues are exhausted" was wrong, and both `[gap]` items
+it left are now closed.
+
+**Rootless adb authorization (the missing avenue):** the container's
+`/data` is not an image — `waydroid.host_data_path` points at a plain
+user-owned host directory (`~/.local/share/waydroid/data`). Appending
+the host's `~/.android/adbkey.pub` to `data/misc/adb/adb_keys` (mode
+640) and reconnecting flipped `unauthorized` → **`device`** with no
+euid 0 and no dialog — which also explains the owner seeing no RSA
+dialog to tap: the key-file route needs no dialog. `waydroid shell`,
+`logcat` and `bugreport` stay root-gated; the AGENTS device-tier
+notes now record both this and the input correction below.
+
+**Installed-vs-built APK byte comparison — closed:** `pm path` →
+`base.apk` pulled → md5 `2cc0a307fee7101520739ed65df7402a` is
+byte-identical to `emthin-android/build/emthin-pad.apk` (24,437,216
+bytes, the 11:42 build) — the device runs exactly that artifact.
+
+**Below-fold glyph capture — closed:** §8's "wheel/drag does not
+scroll the ScrollView" held only for host XTEST (mouse-as-selection);
+`adb shell input swipe` injects real touch events and scrolls the
+preview normally. Captured and OCR-read below the original fold:
+typeset **`terminal`** (page 1's figure caption), the streamed
+**`page 2 / 2`** caption (the scroll-driven chunk streaming working
+on device), and typeset **`editor`** (page 2's figure caption) —
+white-on-`#14181D` glyph rows, legible, at the device's capped
+2.5 px/pt. The device tier is now closed end to end *including* the
+byte comparison and the below-fold legibility proof.
