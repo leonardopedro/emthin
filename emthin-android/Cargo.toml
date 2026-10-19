@@ -31,6 +31,12 @@ mathed_mini = { path = "../../velysterm/crates/mathed_mini", default-features = 
 base64 = "0.22"
 unicode-segmentation = "1"
 
+# Tests only: the preview's pageView canvas must equal mathed_android's
+# engine `BG` (the paint its frames sit on), so the pin test compares
+# the Java colour literal against the real constant rather than a copy.
+[dev-dependencies]
+mathed_android = { path = "../../velysterm/crates/mathed_android" }
+
 [profile.release]
 # Keep .dynsym (JNI resolves Java_* by dlsym), drop only debug info —
 # typst's debug info dwarfs the rest of the .so.

@@ -564,4 +564,47 @@ mod tests {
             "max_pages 0 must clamp to 1, not return an empty chunk"
         );
     }
+
+    /// The preview's `pageView` canvas must stay mathed's engine
+    /// background (`mathed_android::engine::BG`). The page raster is
+    /// white text on transparent, so a light canvas silently hides the
+    /// typeset document — the exact bug the `#14181D` fix closed.
+    /// Pinned against the real constant, not a copy: change either side
+    /// and this fails instead of the preview going blank. Reads the
+    /// shipped Java source, so it guards what `build-apk.sh` compiles.
+    #[test]
+    fn page_view_canvas_matches_mathed_engine_bg() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+
+        // The pageView background call — anchored on the view name so
+        // the root's #101418 (a deliberate, different colour) cannot
+        // match. Exactly one occurrence: a renamed call must fail here
+        // rather than leave the canvas unpinned.
+        let marker = "pageView.setBackgroundColor(Color.parseColor(\"#";
+        let occurrences = java.matches(marker).count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one pageView.setBackgroundColor(\"#…\") call"
+        );
+        let hex_at = java.find(marker).unwrap() + marker.len();
+        let hex = java
+            .get(hex_at..hex_at + 6)
+            .expect("6 hex digits after the marker");
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digits");
+        let java_rgb = [channel(0), channel(2), channel(4)];
+
+        assert_eq!(
+            java_rgb,
+            mathed_android::engine::BG,
+            "MainActivity's pageView canvas {hex} must equal mathed's engine BG \
+             (#{:02x}{:02x}{:02x}) or white-on-transparent page text is invisible",
+            mathed_android::engine::BG[0],
+            mathed_android::engine::BG[1],
+            mathed_android::engine::BG[2],
+        );
+    }
 }

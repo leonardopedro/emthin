@@ -581,16 +581,57 @@ owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **23 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **24 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, and the mathed page seam — the app's actual starter
   document rendered page-by-page with the RGBA base64 contract the Java
   side decodes, chunk continuity across a genuinely paginated document,
-  and the scale/chunk fallbacks), a few seconds, with no NDK and no
+  the scale/chunk fallbacks, and a canvas pin: the Java `pageView`
+  background must equal `mathed_android::engine::BG`, asserted against
+  the real constant so a colour change on either side fails here instead
+  of making the preview blank), a few seconds, with no NDK and no
   emulator. This is the cheap lane an LLM can drive.
 - **boundary** — the APK build + `../scripts/waydroid-sudo-fixes.sh`
   (root-side waydroid checks). Neither is wired into CI: the NDK pin and
   the root requirement both make it an owner-run surface.
+
+## Device tier — waydroid (measured 2026-10-19)
+
+Operating notes from the first full device verification (built →
+installed → launched → drawn → typeset text legible), so the next run
+does not rediscover them:
+
+- **On GNOME the app's window *is* `waydroid show-full-ui`'s window.**
+  Waydroid maps no per-app windows on mutter (no layer-shell), so the
+  full-UI window is the whole Android screen. The CLI hands off and
+  exits on its own — a dead `pgrep show-full-ui` does **not** mean the
+  window died; the window lives with the container's composer/task
+  services.
+- **Composer HAL crash-loop after freeze/thaw cycles**:
+  `hwcomposer.waydroid.so` (with mesa-GBM) can SIGSEGV/SIGABRT on
+  session start — visible as `android.hardware.graphics.composer@
+  2.1-service` and `surfaceflinger` coredumps in `coredumpctl`.
+  Symptom: `waydroid app launch` looks like a no-op and no window ever
+  maps while the app process is alive in the container. Recovery: one
+  clean `systemctl --user restart waydroid-session` (this recycles the
+  LXC container and its graphics stack), then `waydroid show-full-ui`.
+- **Network dies with freeze-adjacent DHCP renewals**: when a T1
+  renewal lands inside an idle freeze, netd drops the address on thaw
+  and never re-DISCOVERs — host→container ARP shows `FAILED` and
+  `adb connect` reports "No route to host" while `waydroid status`
+  still quotes the old IP. The same session restart repairs it;
+  `../scripts/waydroid-sudo-fixes.sh --repair-net` automates it.
+- **Input arrives as a mouse, not a touch**: taps work, but wheel
+  events are dropped and a drag is a *selection* gesture, so
+  `xdotool` cannot scroll a `ScrollView` — preview checks that need
+  scrolling are not automatable over XTEST alone.
+- **`adb` over TCP stops at `unauthorized`** and this build never
+  surfaces the RSA dialog (reconnects, notification shade,
+  package-only activity launch all measured). Key provisioning
+  (`adb_keys`, `ro.adb.secure`, `logcat`, `bugreport`) all exec into
+  the container and need euid 0; the owner-run launch proof is
+  `../scripts/waydroid-sudo-fixes.sh` section D (installed, launched,
+  `Displayed`, crash-free, process alive).
 
 ---
 
