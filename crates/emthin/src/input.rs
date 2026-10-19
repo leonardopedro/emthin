@@ -22,6 +22,10 @@ impl EmthinState {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
+                // Apply a host keymap that arrived since the last key
+                // *before* this one is translated — the intercept below
+                // reads the seat's keymap. See `crate::host_keymap`.
+                self.sync_host_keymap();
                 let Some(keyboard) = self.seat.get_keyboard() else {
                     return;
                 };
@@ -56,6 +60,19 @@ impl EmthinState {
                         );
                         false
                     },
+                );
+
+                // One line per key event at DEBUG: the raw code, the
+                // keysym the seat's keymap produced, and where the key
+                // landed. This is the trace that localizes keymap
+                // translation bugs (see `crate::host_keymap`).
+                tracing::debug!(
+                    "key: code={:?} state={:?} sym={:#x} action={} client_focus={}",
+                    event.key_code(),
+                    event.state(),
+                    sym,
+                    pending.is_some(),
+                    keyboard.current_focus().is_some(),
                 );
 
                 if is_wakeup && event.state() == KeyState::Pressed {

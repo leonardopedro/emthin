@@ -1,7 +1,7 @@
 use clap::Parser;
 use smithay::reexports::wayland_server::Display;
 
-use emthin::{activation, cli::Cli, ipc, state, util, EmthinState};
+use emthin::{activation, cli::Cli, host_keymap, ipc, state, util, EmthinState};
 use emthin_clipboard::{BackendHint, ClipboardBackend};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,6 +88,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         tracing::info!("EMTHIN_DISABLE_HOST_CLIPBOARD set; host clipboard sync disabled");
+    }
+
+    // Host keyboard layout: smithay's winit backend does not expose the
+    // host keymap (its `WinitKeyboardInputEvent` carries only the raw
+    // scancode), so the seat keymap compiled above re-translates every
+    // key — wrong characters whenever the two keymaps disagree (a German
+    // layout host, a synthetic `wtype` keymap). Connect a separate
+    // wayland-client on winit's host connection, snoop
+    // `wl_keyboard.keymap`, and feed it to the seat with
+    // `KeyboardHandle::set_keymap_from_string` (see `host_keymap.rs`).
+    //
+    // Skipped when the user pinned a keymap explicitly (non-empty
+    // `xkb_layout` above: `--xkb-layout`, or `--xkb-variant`'s implicit
+    // "us" base) or set `EMTHIN_DISABLE_HOST_KEYMAP=1`. No-op on X11.
+    if xkb_layout.is_empty() && std::env::var_os("EMTHIN_DISABLE_HOST_KEYMAP").is_none() {
+        if let Some(ptr) = util::host_wl_display_ptr(&state) {
+            // SAFETY: the wl_display is owned by winit's backend, which
+            // lives in `state.backend` for the entire compositor run.
+            // The listener sits in `state.host_keymap`, declared after
+            // `backend`, so default field-drop order guarantees the
+            // listener drops before the wl_display.
+            if let Some(listener) = unsafe { host_keymap::HostKeymapListener::connect(ptr) } {
+                state.host_keymap = Some(listener);
+                state.sync_host_keymap();
+            }
+        }
+    } else {
+        tracing::info!("host keymap adoption disabled; keeping the configured keymap");
     }
 
     // Bind the in-process DBus broker before any child processes; its

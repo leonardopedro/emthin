@@ -85,7 +85,7 @@ need no compositor.
 
 ### Protocol gates
 
-- `python3 scripts/verify-invariants` — the repo's invariant gate
+- `bash scripts/verify-invariants` — the repo's invariant gate
   (workspace version lockstep between `[workspace.package]` and the
   literal `version`/`edition` in `crates/emthin/Cargo.toml`, the smithay
   rev-pin + dead-fork regression guard, catalog gates present and green).
@@ -640,10 +640,19 @@ are marked **rewritten**.
   immediately on connect if those states were in the initial configure —
   don't set them for a figure (which is sized by the document).
 - Host keyboard layout: smithay's winit backend does **not** expose the
-  host keymap. `main.rs` connects a separate `wayland-client`, receives
-  `wl_keyboard.keymap`, and calls
-  `KeyboardHandle::set_keymap_from_string()`. Env vars
-  (`XKB_DEFAULT_*`) are unreliable on KDE Wayland.
+  host keymap. `main.rs` connects a separate `wayland-client`
+  (`host_keymap.rs`), snoops `wl_keyboard.keymap`, and calls
+  `KeyboardHandle::set_keymap_from_string()` — also on later layout
+  switches. `--xkb-layout`/`--xkb-variant` and
+  `EMTHIN_DISABLE_HOST_KEYMAP=1` pin the compiled keymap instead. Env
+  vars (`XKB_DEFAULT_*`) are unreliable on KDE Wayland.
+- winit drops keys that arrive during a host keymap swap: it clears the
+  focused window between the seat's `Leave` and `Enter` around the swap,
+  and `key_input` silently discards keys in that gap. A physical
+  keyboard never swaps the host keymap mid-keystroke, but virtual
+  keyboards (`wtype`, on-screen keyboards) do — their first press is
+  lost. The e2e `wtype` lane leads every injection with `wtype -s` to
+  outwait the swap; a real fix belongs in winit.
 
 ## Custom elements and textures
 

@@ -220,6 +220,16 @@ pub struct EmthinState {
     /// document state because only the compositor knows what is bound.
     pub dormant_labels: crate::dormant_label::LabelCache,
 
+    /// Host-keymap snoop (separate wayland-client piggybacking on
+    /// winit's host connection) + the last keymap applied to the seat.
+    /// Declared after `backend` so default field-drop order releases the
+    /// listener before winit's `wl_display` — same contract as
+    /// `selection`. See `crate::host_keymap`.
+    pub host_keymap: Option<crate::host_keymap::HostKeymapListener>,
+    /// Last keymap string applied to the seat (dedupe bookkeeping for
+    /// [`crate::host_keymap::HostKeymapListener`]).
+    pub applied_host_keymap: Option<String>,
+
     /// Clipboard/selection routing state.
     pub selection: SelectionState,
 
@@ -337,6 +347,8 @@ impl EmthinState {
             doc: crate::docui::DocUi::new(),
             doc_page: crate::doc_render::DocPageTexture::new(),
             dormant_labels: crate::dormant_label::LabelCache::default(),
+            host_keymap: None,
+            applied_host_keymap: None,
             selection: SelectionState::default(),
             focus: FocusState::default(),
             ime,

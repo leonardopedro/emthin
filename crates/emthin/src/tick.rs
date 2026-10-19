@@ -8,6 +8,14 @@ use crate::state::EmthinState;
 /// lifecycle, IPC dispatch, clipboard events, and pending geometry
 /// timeouts.
 pub fn event_loop_tick(state: &mut EmthinState) {
+    // --- Host keymap: apply a layout switch the listener snooped ---
+    //
+    // One try-recv when nothing arrived. The input path calls this too
+    // (before a key is translated); the tick call keeps the seat current
+    // even when the switch lands while the user is not typing, because
+    // embedded clients share the seat's keymap.
+    state.sync_host_keymap();
+
     // --- Voice: finish turns whose harness run has completed ---
     //
     // Before the relayout below so a reply spliced this tick is

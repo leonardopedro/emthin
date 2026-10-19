@@ -8,6 +8,7 @@ pub mod element;
 pub mod figure_render;
 pub mod grabs;
 pub mod handlers;
+pub mod host_keymap;
 pub mod input;
 pub mod ipc;
 pub mod mirror_render;
