@@ -29,14 +29,23 @@ public final class DocBridge {
     public static native String redo(long handle);
 
     /**
-     * Renders a mathed document to pixels, returning
-     * {@code {width, height, rgba}} with {@code rgba} base64-encoded
-     * RGBA8 — or {@code {error}} on a typesetting failure.
+     * Renders a chunk of a mathed document's pages to pixels, returning
+     * {@code {total, start, pages:[{width, height, rgba}, …]}} with each
+     * {@code rgba} base64-encoded RGBA8 — or {@code {error}} on a
+     * typesetting failure. {@code total} is the document's full page
+     * count; a {@code start} past it yields an empty {@code pages}
+     * ("nothing more to load"), not an error.
      *
      * <p><b>Stateless and safe to call off the UI thread.</b> It takes the
      * document <em>text</em>, never the handle, because Typst layout costs
      * hundreds of milliseconds and the handle is UI-thread-only. Copy the
      * text on the UI thread, rasterise on a worker, post the result back.
+     *
+     * <p><b>Paged on purpose:</b> the layout is Typst's own page model (the
+     * PDF-viewer unit), so a long document streams in chunks and scrolling
+     * a preview never re-rasterises. {@code scale} is pixels per point
+     * (non-positive falls back to 1.0); {@code maxPages} is clamped to
+     * 1..8 per call.
      */
-    public static native String renderText(String docText, int widthPt);
+    public static native String renderPages(String docText, int start, int maxPages, float scale);
 }

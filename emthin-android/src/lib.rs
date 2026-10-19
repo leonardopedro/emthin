@@ -24,7 +24,7 @@
 pub mod model;
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jint, jlong};
+use jni::sys::{jfloat, jint, jlong};
 use jni::{EnvUnowned, errors};
 use serde_json::{Value, json};
 
@@ -286,45 +286,74 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_redo<'local>(
 //      and Typst layout costs ~400 ms for a few pages — far too long to
 //      hold the UI thread without an ANR. Taking text lets the caller
 //      copy the string on the UI thread and rasterise on a worker.
-//   2. The renderer is mathed's own (`mathed_mini::render_doc`), which
-//      is the same engine `velysterm/crates/mathed_android` blits. The
-//      pad's document syntax *is* mathed's marker syntax, so no
-//      conversion is needed.
+//   2. The renderer is mathed's own (`mathed_mini`), which is the same
+//      engine `velysterm/crates/mathed_android` blits. The pad's
+//      document syntax *is* mathed's marker syntax, so no conversion is
+//      needed.
+//
+// Paged, not one giant raster: the layout is Typst's own page model —
+// the PDF-viewer unit `mathed_android` shows one page at a time — so a
+// long document streams page by page and scrolling the preview never
+// re-rasterises. A chunk (`start`, `max_pages`) is the transport unit:
+// every page of a long document in one response would be megabytes of
+// base64 across the JNI string boundary.
 
-/// Renders `doc_text` at `width_pt` points wide.
+/// Upper bound on one response's page count whatever the caller asks
+/// for — a runaway request cannot balloon the JNI string.
+const MAX_CHUNK_PAGES: usize = 8;
+
+/// Renders pages `start..start + max_pages` of `doc_text`'s paged
+/// layout at `scale` pixels per point (`max_pages` is clamped to
+/// `1..=`[`MAX_CHUNK_PAGES`]; a non-positive or non-finite `scale` is
+/// the engine's own 1.0 fallback).
 ///
-/// Returns `{ "width", "height", "rgba" }` with `rgba` base64-encoded
-/// RGBA8 — the same one-value transport mathed_android uses for its
-/// screenshots.
-fn render_text(doc_text: &str, width_pt: f64) -> Result<String, String> {
+/// Returns `{ "total", "start", "pages": [ { "width", "height",
+/// "rgba" }, … ] }` with each `rgba` base64-encoded RGBA8 — the same
+/// one-value transport mathed_android uses for its screenshots.
+/// `total` is the document's full page count, so the caller knows how
+/// many chunks there are; a `start` past `total` yields an empty
+/// `pages` array ("nothing more to load"), not an error.
+fn render_pages(
+    doc_text: &str,
+    start: usize,
+    max_pages: usize,
+    scale: f32,
+) -> Result<String, String> {
     use base64::Engine as _;
+    use mathed_core::transform::TransformOptions;
 
-    let width_pt = if width_pt.is_finite() && width_pt > 0.0 {
-        width_pt
-    } else {
-        600.0
-    };
-
-    // `imaging::RgbaImage` carries its dimensions as fields and its
-    // pixels in `data` (RGBA8), the same shape engine.rs samples from.
-    // `RenderError` is `Debug`-only (a sibling crate's type; not widened
-    // here), so the diagnostic uses `{:?}`.
-    let img = mathed_mini::render_doc(doc_text, width_pt).map_err(|e| format!("render: {e:?}"))?;
-    let (w, h) = (img.width, img.height);
-    if w == 0 || h == 0 {
-        return Err("render: empty raster".to_string());
+    // `PageLayout::image` is an `imaging::RgbaImage` carrying its
+    // dimensions as fields and its pixels in `data` (RGBA8), the same
+    // shape engine.rs samples from. `RenderError` is `Debug`-only (a
+    // sibling crate's type; not widened here), so the diagnostic uses
+    // `{:?}`.
+    let pages = mathed_mini::layout_doc_paged_scaled(doc_text, &TransformOptions::default(), scale)
+        .map_err(|e| format!("render: {e:?}"))?;
+    let total = pages.len();
+    if total == 0 {
+        return Err("render: no pages".to_string());
     }
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&img.data);
-    Ok(json!({ "width": w, "height": h, "rgba": b64 }).to_string())
+    let chunk: Vec<Value> = pages
+        .iter()
+        .skip(start)
+        .take(max_pages.clamp(1, MAX_CHUNK_PAGES))
+        .map(|p| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&p.image.data);
+            json!({ "width": p.image.width, "height": p.image.height, "rgba": b64 })
+        })
+        .collect();
+    Ok(json!({ "total": total, "start": start, "pages": chunk }).to_string())
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_emthin_pad_DocBridge_renderText<'local>(
+pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPages<'local>(
     mut unowned_env: EnvUnowned<'local>,
     _class: JClass<'local>,
     doc_text: JString<'local>,
-    width_pt: jint,
+    start: jint,
+    max_pages: jint,
+    scale: jfloat,
 ) -> JString<'local> {
     unowned_env
         .with_env(|env| -> errors::Result<JString<'local>> {
@@ -332,7 +361,12 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderText<'local>(
             // A failed render is data, not a crash: the pad keeps
             // editing and shows the diagnostic instead of dying on a
             // half-typed expression.
-            let json = match render_text(&text, width_pt.max(1) as f64) {
+            let json = match render_pages(
+                &text,
+                start.max(0) as usize,
+                max_pages.max(0) as usize,
+                scale as f32,
+            ) {
                 Ok(ok) => ok,
                 Err(e) => json!({ "error": e }).to_string(),
             };
@@ -432,12 +466,12 @@ mod tests {
         assert_eq!(v["segments"][0]["span"], json!([2, 7]));
     }
 
-    /// The render seam actually produces pixels, and the base64 half of
-    /// the contract decodes back to exactly `width * height * 4` RGBA
-    /// bytes — the invariant the Java side relies on before handing the
-    /// buffer to a `Bitmap`.
+    /// The page seam actually produces pixels: each returned page's
+    /// base64 half decodes back to exactly `width * height * 4` RGBA
+    /// bytes — the invariant the Java side relies on before handing a
+    /// buffer to a `Bitmap` — and `total` counts the whole document.
     #[test]
-    fn render_text_returns_a_decodable_rgba_raster() {
+    fn render_pages_returns_decodable_rgba_rasters() {
         use base64::Engine as _;
 
         // The app's real starter document (MainActivity.STARTER),
@@ -445,33 +479,89 @@ mod tests {
         // pins what the pad actually opens with.
         let starter = String::from("#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n")
             + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
-        let v: Value = serde_json::from_str(&render_text(&starter, 200.0)
-            .expect("the starter document must render"))
-            .unwrap();
+        let v: Value = serde_json::from_str(
+            &render_pages(&starter, 0, 8, 1.0).expect("the starter document must render"),
+        )
+        .unwrap();
 
         assert!(v.get("error").is_none(), "unexpected render error: {v}");
-        let (w, h) = (v["width"].as_u64().unwrap(), v["height"].as_u64().unwrap());
-        assert!(w > 0 && h > 0, "empty raster {w}x{h}");
-
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(v["rgba"].as_str().unwrap())
-            .expect("rgba must be base64");
-        assert_eq!(bytes.len() as u64, w * h * 4, "RGBA8 is 4 bytes/px");
+        let total = v["total"].as_u64().unwrap();
+        assert!(total >= 1, "the starter document has pages: {v}");
+        let pages = v["pages"].as_array().unwrap();
+        assert_eq!(pages.len() as u64, total.min(8), "one entry per page in range");
+        for p in pages {
+            let (w, h) = (p["width"].as_u64().unwrap(), p["height"].as_u64().unwrap());
+            assert!(w > 0 && h > 0, "empty raster {w}x{h}");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(p["rgba"].as_str().unwrap())
+                .expect("rgba must be base64");
+            assert_eq!(bytes.len() as u64, w * h * 4, "RGBA8 is 4 bytes/px");
+        }
     }
 
-    /// A non-positive width falls back to the default instead of
-    /// erroring, so a caller passing a not-yet-measured view width
-    /// (0 before first layout) still gets a raster.
-    ///
-    /// Asserted by *equivalence with an explicit 600pt* rather than by
-    /// pixel width: `render_doc` trims the raster to ink, so the width
-    /// follows the content, not the request (measured: "hello mathed"
-    /// comes back 59x8 at the default width).
+    /// Chunking is a transport detail, not a change of document:
+    /// consecutive chunks both see the same `total` and together cover
+    /// the document's pages in order, and a `start` past the end
+    /// returns an empty `pages` ("nothing more"), not an error.
     #[test]
-    fn render_text_falls_back_on_a_non_positive_width() {
-        let fallback = render_text("hello mathed", 0.0).expect("width 0 must fall back, not fail");
-        let explicit = render_text("hello mathed", 600.0).expect("600pt must render");
-        assert_eq!(fallback, explicit, "0pt must be treated as the 600pt default");
-        assert!(!fallback.contains("\"error\""), "unexpected: {fallback}");
+    fn render_pages_chunks_cover_the_document_in_order() {
+        // ~40 figure slots flow well past one A4 page (each `\app`
+        // reserves its w×h box), so this exercises real pagination.
+        // Raw strings: the document syntax is full of backslashes and
+        // quotes and must not be double-escaped into a different doc.
+        let mut doc = String::new();
+        for i in 0..40u32 {
+            let m = 1000 + i;
+            doc.push_str(&format!(r#"#{i} block{i} #{m} \app(#{i}, #{m}, 300, 100, "w{i}")"#));
+            doc.push('\n');
+        }
+
+        let chunk = |start: usize, max: usize| -> Value {
+            serde_json::from_str(&render_pages(&doc, start, max, 1.0).expect("chunk renders"))
+                .unwrap()
+        };
+        let first = chunk(0, 2);
+        let total = first["total"].as_u64().unwrap();
+        assert!(total >= 3, "40 slots must paginate: {total} page(s) only");
+        assert_eq!(first["pages"].as_array().unwrap().len(), 2);
+
+        let second = chunk(2, 2);
+        assert_eq!(second["total"].as_u64().unwrap(), total, "total is document-wide");
+        assert_eq!(second["start"], json!(2));
+        assert_eq!(second["pages"].as_array().unwrap().len(), 2);
+
+        // Past the end: empty pages, same total — the "stop loading"
+        // signal the Java side keys its scroll streaming on.
+        let tail = chunk(total as usize + 1, 2);
+        assert_eq!(tail["total"].as_u64().unwrap(), total);
+        assert!(tail["pages"].as_array().unwrap().is_empty(), "past the end: no pages");
+    }
+
+    /// Bad inputs fall back instead of failing: a non-positive or
+    /// non-finite `scale` is the engine's own 1.0 fallback
+    /// (`rasterize_at`'s contract), and `max_pages` clamps to at least
+    /// 1 — a 0-page response would strand the preview with nothing to
+    /// show. Asserted by *byte-equality with the explicit call*: both
+    /// routes must produce the identical document view.
+    #[test]
+    fn render_pages_falls_back_on_bad_scale_and_clamps_the_chunk() {
+        let doc = "hello mathed";
+        let one = render_pages(doc, 0, 1, 1.0).expect("1.0 renders");
+        assert!(one.contains("\"total\":1"), "a short note is one page: {one}");
+        assert_eq!(
+            render_pages(doc, 0, 1, 0.0).expect("scale 0 falls back"),
+            one,
+            "0.0 must be treated as the 1.0 default"
+        );
+        assert_eq!(
+            render_pages(doc, 0, 1, f32::NAN).expect("NaN scale falls back"),
+            one,
+            "a bad device density must not take the render down"
+        );
+        assert_eq!(
+            render_pages(doc, 0, 0, 1.0).expect("0 pages clamps to 1"),
+            one,
+            "max_pages 0 must clamp to 1, not return an empty chunk"
+        );
     }
 }

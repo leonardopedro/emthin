@@ -62,3 +62,43 @@ S1–S4 executed 2026-10-18. `check-all-gates` **33 passed / 0 failed / 0 gaps**
 ## 6. Recommended next (owner)
 
 The un-run device tier is the one real hole: `scripts/waydroid-sudo-fixes.sh` exists for exactly this and needs one root invocation. Beyond it, the pad's preview renders the whole document on one raster; the natural next step is `mathed_android`'s approach — page-by-page frames — so a long document scrolls rather than re-rasterises.
+
+## 7. Execution note (2026-10-19) — §6's page-by-page preview landed
+
+The §6 follow-on is done: the pad's preview is **page frames, not one
+raster**. `renderText(docText, widthPt)` is gone; `renderPages(docText,
+start, maxPages, scale)` serves Typst's own page model — the same
+`layout_doc_paged_scaled` unit `mathed_android` shows — in chunks capped
+at 8 pages per response so the base64 payload stays bounded.
+`MainActivity` stacks a caption + image per page and streams the next
+chunk when the scroll reaches the loaded end: a long document scrolls
+rather than re-rasterises, and scrolling never re-lays-out what is
+already stacked. The stateless contract and the errors-are-data
+contract are unchanged (the `DocBridge` javadoc now says "paged on
+purpose" so the chunking cannot be "simplified" away either).
+
+Round 5's two render tests became three: the starter document's
+per-page RGBA base64 contract (`total` included), chunk continuity
+across a genuinely paginated document (40 `\app` slots, ≥ 3 pages), and
+the fallback contract (0/NaN scale ≡ explicit 1.0 by byte-equality,
+`maxPages` 0 clamps to 1). Measured after the change: **23 / 0 host
+tests** (`cargo test` in `emthin-android/`), and the APK (24.4 MB)
+built and debug-signed from the final tree via `build-apk.sh` — javac
+d8/aapt2 all green, so the Java half compiles under the real toolchain.
+The device tier stays a `[gap]` (unchanged, root-gated); the host tiers
+above stand in for it.
+
+Counts re-measured and claim sites updated in the same pass: emthin's
+status block (22 → 23, dated 2026-10-19 as a sub-claim), the R15
+rows in `scripts/testing-depths.md`, and the pad's AGENTS
+"Rendering"/"Verification" subsections (which now describe the page
+frame design instead of `render_doc`'s ink-trimmed raster).
+
+**Also closed:** round-4 §9(a)'s remaining half — australVM's
+`safestos/pkg` engine (108 passed / 5 ignored, 6 binaries, re-measured
+2026-10-19) now has its own CI job (`avm-pkg` in
+`build-and-test.yml`). Round 4 found it "green but claimed by nobody";
+round 5 wired the two Android lanes into CI but this one stayed open.
+The job is standalone (the avm-pkg workspace has no cross-repo path
+deps by design), runs the exact `cargo test --workspace` command the
+README's Verification snippet names, and is YAML-validated.

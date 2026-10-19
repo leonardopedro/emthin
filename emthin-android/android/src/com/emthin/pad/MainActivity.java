@@ -47,12 +47,20 @@ public class MainActivity extends Activity {
     /** Translucent highlight over ranges the model resolved to segments. */
     private static final int SEGMENT_HIGHLIGHT = 0x3346B883;
 
+    /** Pages per render request — bounded so one JNI response stays small. */
+    private static final int CHUNK = 3;
+    /** Nominal A4 page width in points — Typst's default page size. */
+    private static final float PAGE_WIDTH_PT = 595.28f;
+    /** Vertical gap between page frames (dp). */
+    private static final int PAGE_GAP_DP = 12;
+
     private long handle;
     private EditText editor;
     private Button undoButton;
     private Button redoButton;
     private TextView status;
-    private ImageView preview;
+    /** One caption + {@link ImageView} per rendered page, stacked. */
+    private LinearLayout previewPages;
     private TextView previewError;
     /** True while we mutate the EditText ourselves (suppresses sync). */
     private boolean applying;
@@ -62,6 +70,12 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Bumped per edit; a worker result is dropped if a newer edit won. */
     private int renderGeneration;
+    /** Pages currently stacked in the preview. */
+    private int pagesLoaded;
+    /** The document's full page count, from the latest chunk. */
+    private int totalPages;
+    /** One chunk in flight at a time (the renderer is single-threaded). */
+    private boolean chunkInFlight;
     /** Debounce handle, so a burst of keystrokes rasterises once. */
     private final Runnable renderNow = new Runnable() {
         @Override
@@ -180,10 +194,13 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
         // mathed preview: the document typeset by the same engine
-        // velysterm's mathed_android blits (mathed_mini::render_doc), so
-        // what the pad shows agrees with what a real mathed frontend
-        // would produce. The editor keeps 1f of the height and the
-        // preview takes what is left, so typing never hides it.
+        // velysterm's mathed_android blits (mathed_mini's paged
+        // layout), so what the pad shows agrees with what a real mathed
+        // frontend would produce. Page-by-page frames — mathed_android's
+        // unit — so a long document streams in as the scroll reaches the
+        // loaded end and scrolling never re-rasterises. The editor keeps
+        // 1f of the height and the preview takes what is left, so
+        // typing never hides it.
         TextView previewLabel = new TextView(this);
         previewLabel.setText("mathed render");
         previewLabel.setTextColor(Color.parseColor("#6E7A87"));
@@ -192,9 +209,8 @@ public class MainActivity extends Activity {
         root.addView(previewLabel, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        preview = new ImageView(this);
-        preview.setAdjustViewBounds(true);
-        preview.setBackgroundColor(Color.parseColor("#FAFBFC")); // mathed's paper white
+        previewPages = new LinearLayout(this);
+        previewPages.setOrientation(LinearLayout.VERTICAL);
 
         previewError = new TextView(this);
         previewError.setTextColor(Color.parseColor("#E06C75"));
@@ -203,7 +219,7 @@ public class MainActivity extends Activity {
 
         LinearLayout previewBox = new LinearLayout(this);
         previewBox.setOrientation(LinearLayout.VERTICAL);
-        previewBox.addView(preview, new LinearLayout.LayoutParams(
+        previewBox.addView(previewPages, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         previewBox.addView(previewError, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -211,6 +227,22 @@ public class MainActivity extends Activity {
         ScrollView previewScroll = new ScrollView(this);
         previewScroll.setFillViewport(true);
         previewScroll.addView(previewBox);
+        // Streaming pages in on scroll: when the scroll reaches the
+        // loaded end (and the document has more), the next chunk is
+        // requested. The whole point of paging is that this never
+        // re-rasterises the pages already stacked below.
+        previewScroll.setOnScrollChangeListener(new View.OnScrollChangeListener() {
+            @Override
+            public void onScrollChange(View v, int x, int y, int oldX, int oldY) {
+                if (previewPages.getChildCount() == 0) {
+                    return;
+                }
+                View last = previewPages.getChildAt(previewPages.getChildCount() - 1);
+                if (y + v.getHeight() >= last.getBottom() - dp(PAGE_GAP_DP)) {
+                    requestChunk(editor.getText().toString(), pagesLoaded);
+                }
+            }
+        });
         root.addView(previewScroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -230,24 +262,46 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Rasterises {@code text} on the worker thread and applies it only if
-     * no newer edit superseded it while Typst was laying out.
+     * Starts a fresh page-frame render of {@code text}: the stacked
+     * pages are dropped and chunk 0 streams in, unless a newer edit
+     * supersedes the request while Typst is laying out.
      */
     private void startRender(final String text) {
-        final int generation = ++renderGeneration;
-        // ~2 view-widths at the engine's ~1.2 px/pt keeps text legible
-        // without rasterising a page wider than the screen.
-        final int widthPt = Math.max(240, editor.getWidth() / 2);
+        renderGeneration++;
+        pagesLoaded = 0;
+        totalPages = 0;
+        chunkInFlight = false;
+        previewPages.removeAllViews();
+        requestChunk(text, 0);
+    }
+
+    /**
+     * Renders pages {@code start..start + CHUNK} on the worker thread
+     * and stacks them only if no newer edit superseded the request. At
+     * most one chunk is in flight (the renderer is single-threaded), so
+     * chunks always append in order.
+     */
+    private void requestChunk(final String text, final int start) {
+        if (chunkInFlight || (totalPages > 0 && start >= totalPages)) {
+            return; // one in flight already, or nothing left to load
+        }
+        final int generation = renderGeneration;
+        chunkInFlight = true;
+        // Fit the A4 page raster to the preview width at ≥ 1 px/pt so
+        // text stays legible; the ImageView scales it the rest of the
+        // way down. (Before the first layout the width is 0 → 1.0.)
+        final float scale = Math.min(2.5f, Math.max(1.0f, previewPages.getWidth() / PAGE_WIDTH_PT));
 
         renderer.execute(new Runnable() {
             @Override
             public void run() {
-                final String json = DocBridge.renderText(text, widthPt);
+                final String json = DocBridge.renderPages(text, start, CHUNK, scale);
                 main.post(new Runnable() {
                     @Override
                     public void run() {
+                        chunkInFlight = false;
                         if (generation == renderGeneration) {
-                            applyPreview(json);
+                            applyChunk(json);
                         }
                     }
                 });
@@ -255,34 +309,61 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** Decodes the bridge's {width,height,rgba} into the preview ImageView. */
-    private void applyPreview(String json) {
+    /**
+     * Shows a render diagnostic and stops the page stream until the next
+     * edit (a half-typed expression must not retry per scroll tick).
+     */
+    private void showPreviewError(String message) {
+        previewError.setText(message);
+        previewError.setVisibility(View.VISIBLE);
+        totalPages = pagesLoaded;
+    }
+
+    /** Decodes one chunk of {width,height,rgba} pages into page frames. */
+    private void applyChunk(String json) {
         try {
             JSONObject o = new JSONObject(json);
             String error = o.optString("error", "");
             if (!error.isEmpty()) {
-                previewError.setText("render: " + error);
-                previewError.setVisibility(View.VISIBLE);
+                showPreviewError("render: " + error);
                 return;
             }
 
-            int w = o.getInt("width");
-            int h = o.getInt("height");
-            byte[] rgba = Base64.decode(o.getString("rgba"), Base64.DEFAULT);
-            if (rgba.length != w * h * 4 || w <= 0 || h <= 0) {
-                throw new IllegalStateException("bad raster " + w + "x" + h
-                        + " (" + rgba.length + " bytes)");
-            }
+            totalPages = o.getInt("total");
+            JSONArray pages = o.getJSONArray("pages");
+            for (int i = 0; i < pages.length(); i++) {
+                JSONObject p = pages.getJSONObject(i);
+                int w = p.getInt("width");
+                int h = p.getInt("height");
+                byte[] rgba = Base64.decode(p.getString("rgba"), Base64.DEFAULT);
+                if (rgba.length != w * h * 4 || w <= 0 || h <= 0) {
+                    throw new IllegalStateException("bad raster " + w + "x" + h
+                            + " (" + rgba.length + " bytes)");
+                }
 
-            Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-            // ARGB_8888's native buffer is RGBA byte order, which is what
-            // the bridge encodes — a straight copy, no swizzle.
-            bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba));
-            preview.setImageBitmap(bmp);
+                Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                // ARGB_8888's native buffer is RGBA byte order, which is
+                // what the bridge encodes — a straight copy, no swizzle.
+                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba));
+
+                TextView caption = new TextView(this);
+                caption.setText("page " + (pagesLoaded + 1) + " / " + totalPages);
+                caption.setTextColor(Color.parseColor("#6E7A87"));
+                caption.setTextSize(10f);
+                caption.setPadding(0, dp(PAGE_GAP_DP), 0, dp(2));
+                previewPages.addView(caption);
+
+                ImageView pageView = new ImageView(this);
+                pageView.setAdjustViewBounds(true);
+                pageView.setBackgroundColor(Color.parseColor("#FAFBFC")); // mathed's paper white
+                pageView.setImageBitmap(bmp);
+                previewPages.addView(pageView);
+
+                pagesLoaded++;
+            }
             previewError.setVisibility(View.GONE);
         } catch (Exception e) {
-            previewError.setText("render: " + e.getMessage());
-            previewError.setVisibility(View.VISIBLE);
+            showPreviewError("render: " + e.getMessage());
         }
     }
 
