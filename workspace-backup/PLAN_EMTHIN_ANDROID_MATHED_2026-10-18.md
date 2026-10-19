@@ -213,3 +213,54 @@ and the below-fold glyph capture (needs adb `input`/`screencap` —
 the pad's `ScrollView`). `scripts/waydroid-sudo-fixes.sh` section D
 is the lane for both, alongside the reboot-when-convenient
 kernel-drift note.
+
+## 10. Execution note (2026-10-19, visual debug) — citations vanished from the rendered page
+
+The requested visual pass — references/citations, collapsibles
+(keyboard interaction + dynamic), and math notation — was run as an
+actual looking-at-pixels loop: a torture document through the real
+`mathed_android` App engine at five caret positions, frames shot
+before and after the fix and read back with OCR.
+
+**What the frames showed (before):** every citation was gone. "This
+cites a segment: alpha claim and continues" — no `[1]`; "see for
+details" — no `[1, 2]`. The cause is one line at each render entry
+point: the transform hides every `\cite(...)` token and splices its
+visible `[N]` label **only** when the caller supplies the document's
+`ReferenceEntry`s, and both `mathed_android`'s `Engine::relayout` and
+the pad's `renderPages` JNI passed `TransformOptions::default()` —
+an empty list. Both consumers silently rendered a document with the
+citations deleted.
+
+**The fix** (both entry points) threads `scan_references` into the
+options, and `Engine::relayout` additionally wires the caret-driven
+half of the collapsible contract: `expand` = the
+`reveal_span_in` span, so the caret anywhere inside a special-rendered
+part (a marker segment's statement, a translator's code) keeps that
+part expanded — the same split `mathed_mini`'s own simulator wires
+(`app.rs`: `expand: panel, reveal: sel_reveal`).
+
+**After (same frames):** "alpha claim [1]" and "see [2, 3]" render as
+labels; the caret moving into `#3 omega body #4 \model(#3,#4)` expands
+the raw `\model(#3,#4)` statement for editing and moving out collapses
+it back (dynamic, not sticky); the caret on a `\cite` shows the raw
+token and the label steps aside; the translator's code expands under
+the caret (its page reads `#let translate(b) = { … }`); and math
+notation keeps its two-state behaviour — typeset `x²+y²=z²` with the
+caret away, literal `$ x^2 + y^2 = z^2 $` source with the caret on it.
+
+**Pinned by two new tests** (the third visual artifact — the scratch
+frame driver — was deleted after the loop): `mathed_android`'s
+`relayout_options_splice_cite_labels_and_expand_the_carets_segment`
+pins the wiring itself (label present collapsed, raw token expanded,
+label yields — and yields back), and `emthin-pad`'s
+`render_pages_splices_cite_labels_into_the_raster` pins the raster by
+byte-equivalence (a `\cite` must render exactly like its literal
+`[1]`). Re-measured after: `emthin-android` **25 / 0**,
+`mathed_android` **30 / 0** (21 lib + 9 bin); claim sites (AGENTS,
+emthin README, `scripts/testing-depths.md`) updated in the same pass.
+The GUI-only surfaces the request names — cite popups (Ctrl+N), the
+references panel (Ctrl+0), the kernel menu's Space fold — live in
+`mathed_mini`/`mathed`, not the pad's render path, and are covered by
+their own suites (`cite_popup`, `references_panel`,
+`app.rs::down_arrow_enters_traverses_and_exits_a_collapsed_translator`).
