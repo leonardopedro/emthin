@@ -626,14 +626,21 @@ does not rediscover them:
 - **Input arrives as a mouse, not a touch**: taps work, but wheel
   events are dropped and a drag is a *selection* gesture, so
   `xdotool` cannot scroll a `ScrollView` — preview checks that need
-  scrolling are not automatable over XTEST alone.
-- **`adb` over TCP stops at `unauthorized`** and this build never
-  surfaces the RSA dialog (reconnects, notification shade,
-  package-only activity launch all measured). Key provisioning
-  (`adb_keys`, `ro.adb.secure`, `logcat`, `bugreport`) all exec into
-  the container and need euid 0; the owner-run launch proof is
-  `../scripts/waydroid-sudo-fixes.sh` section D (installed, launched,
-  `Displayed`, crash-free, process alive).
+  scrolling are not automatable over XTEST alone. Once adb is
+  authorized, `adb shell input swipe` injects real touch events and
+  scrolls the `ScrollView` normally (measured 2026-10-19), so those
+  checks are automatable over the adb lane.
+- **`adb` over TCP can be authorized with no root**: this build
+  never surfaces the RSA dialog (reconnects, notification shade,
+  package-only activity launch all measured), but the container's
+  `/data` is a plain user-owned host directory
+  (`waydroid.host_data_path` → `~/.local/share/waydroid/data`), so
+  appending the host's `~/.android/adbkey.pub` to
+  `data/misc/adb/adb_keys` (mode 640) and reconnecting (`adb
+  kill-server; adb connect <ip>:5555`) flips `unauthorized` → `device`
+  (measured 2026-10-19). `waydroid shell`, `logcat` and `bugreport`
+  stay root-gated; the owner-run launch proof is
+  `../scripts/waydroid-sudo-fixes.sh` section D.
 
 ---
 
