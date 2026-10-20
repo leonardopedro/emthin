@@ -21,16 +21,22 @@ use emthin::xwayland_satellite::{
 // -----------------------------------------------------------------
 // helpers
 
-/// Pick a high, process-unique starting display to avoid clashing with
-/// whatever the dev machine already has on `:0..:9`. Uses nanotime bits
-/// so parallel test runs collide only with astronomical probability.
+/// Pick a starting display that cannot collide with another test in
+/// this binary, nor (barring PID reuse) with a concurrent run.
+///
+/// The old formula hashed nanotime into only 1000 slots; two tests that
+/// drew the same start fought over one lock path, and the loser's scan
+/// walked past its own fixture (`stale_lock_with_corrupt_content_*`
+/// saw display 269 when its corrupt lock sat at :267 — another test had
+/// already claimed that slot with a live lock). A per-process counter
+/// gives every test a disjoint block of 10 displays; the PID block
+/// separates simultaneous suite runs, and 1000+ stays clear of any
+/// real X server on a dev machine.
 fn test_display_start() -> u32 {
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    // Display >= 100 is well clear of any real X server on a dev machine.
-    100 + ((ns as u32 ^ std::process::id()) % 1000)
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
+    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+    1000 + (std::process::id() % 900) * 100 + slot * 10
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -158,6 +164,74 @@ fn stale_lock_with_corrupt_content_gets_cleaned_up() {
 
     let sockets = setup_connection(start).expect("corrupt lock should be reclaimed as stale");
     assert_eq!(sockets.display, start);
+}
+
+#[test]
+fn claimed_lock_carries_a_parseable_pid_immediately() {
+    // The lock must be readable as "live" from the moment it exists.
+    // It used to be created 0444 and then written via a *second* open
+    // (EACCES, silently ignored), so the body was empty until a later
+    // write through the claim fd — a concurrent scanner read "empty ⇒
+    // corrupt ⇒ stale", reclaimed the live claim and unlinked its unix
+    // socket (the `spawner_exit_triggers_rearm_via_channel` ENOENT flake).
+    let start = test_display_start();
+    let sockets = setup_connection(start).expect("setup_connection should succeed");
+
+    let contents = fs::read_to_string(sockets.lock_path()).expect("lock body must be readable");
+    let pid = contents
+        .trim()
+        .parse::<u32>()
+        .expect("lock body must parse as a PID the instant the claim exists");
+    assert_eq!(pid, std::process::id());
+}
+
+#[test]
+fn fresh_empty_lock_is_a_claim_in_progress_not_stale() {
+    // An empty lock may be mid-creation (path visible, PID body not yet
+    // written). Reclaiming it unlinks a live claim's socket, so a young
+    // empty lock must be *respected* and the scan must advance past it.
+    let start = test_display_start();
+    let lock = PathBuf::from(x11_lock_path(start));
+    let _ = fs::remove_file(&lock);
+    fs::write(&lock, "").unwrap();
+    let _cleanup = Unlink::new(lock.clone());
+
+    let sockets = setup_connection(start).expect("scan should advance past a fresh empty lock");
+    assert!(
+        sockets.display > start,
+        "fresh empty lock at :{start} must be respected; got :{}",
+        sockets.display
+    );
+    assert!(lock.exists(), "the fresh empty lock must not be deleted");
+}
+
+#[test]
+fn aged_empty_lock_is_reclaimed_as_stale() {
+    // Converse of the grace rule: an empty lock older than the claim
+    // window is a crashed claimer's leftover and must be reclaimed, so
+    // the grace can't permanently burn display slots.
+    use std::fs::FileTimes;
+    let start = test_display_start();
+    let lock = PathBuf::from(x11_lock_path(start));
+    let _ = fs::remove_file(&lock);
+    fs::write(&lock, "").unwrap();
+    let _cleanup = Unlink::new(lock.clone());
+
+    // Backdate mtime past the grace window (10s old, grace is 5s).
+    let old = std::time::SystemTime::now() - Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old))
+        .expect("backdate empty lock mtime");
+
+    let sockets = setup_connection(start).expect("aged empty lock should be reclaimed as stale");
+    assert_eq!(
+        sockets.display, start,
+        "aged empty lock at :{start} should be reclaimed, got :{}",
+        sockets.display
+    );
 }
 
 #[test]

@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{SocketAddr, UnixListener};
@@ -20,6 +20,12 @@ const X11_TMP_UNIX_DIR: &str = "/tmp/.X11-unix";
 /// genuinely full system fails fast.
 const MAX_DISPLAY_ATTEMPTS: u32 = 256;
 const MAX_SOCKET_BIND_RETRIES: u32 = 50;
+/// How long an *empty* `/tmp/.X<n>-lock` is treated as a claim in
+/// progress before it counts as a stale leftover. See
+/// [`is_stale_lock`]: the lock path becomes visible before the PID body
+/// is written, and reclaiming a mid-creation lock deletes the unix
+/// socket of a claim that is only microseconds old.
+const EMPTY_LOCK_GRACE_SECS: u64 = 5;
 
 /// Filesystem path of the `/tmp/.X<n>-lock` file for display `:n`.
 pub fn x11_lock_path(n: u32) -> String {
@@ -179,15 +185,24 @@ fn try_claim_slot(n: u32) -> Result<Option<(fs::File, Unlink)>, SetupError> {
 }
 
 fn try_create_lock(lock_path: &str) -> std::io::Result<(fs::File, Unlink)> {
-    let fd = fs::OpenOptions::new()
+    let mut fd = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o444)
         .open(lock_path)?;
     // Write our own PID so a future peer scanning this slot can stale-
-    // check us in reverse. Best-effort — the lock-as-flag is what
-    // matters for mutual exclusion.
-    let _ = fs::write(lock_path, format_lock_body(std::process::id()));
+    // check us in reverse. The write must go through *this* fd: the file
+    // was created 0444, so a second open (the old `fs::write` here) fails
+    // EACCES and the lock sat on disk EMPTY until setup_connection wrote
+    // through this fd — an empty lock parses as "corrupt ⇒ stale", so a
+    // concurrent scanner in the same test binary reclaimed a live claim
+    // and unlinked its unix socket (measured flake:
+    // `spawner_exit_triggers_rearm_via_channel` failed with ENOENT under
+    // parallel load, 2026-10-20). Rewind so any write through the
+    // returned fd (setup_connection's own pid write) overwrites in place
+    // instead of appending a second body that no longer parses.
+    fd.write_all(format_lock_body(std::process::id()).as_bytes())?;
+    fd.seek(std::io::SeekFrom::Start(0))?;
     Ok((fd, Unlink(PathBuf::from(lock_path))))
 }
 
@@ -200,9 +215,26 @@ fn is_stale_lock(path: &str) -> bool {
         // Can't even read the file (permissions? race?) — don't delete.
         return false;
     };
-    let Some(pid) = contents.trim().parse::<u32>().ok().filter(|p| *p > 0) else {
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        if contents.is_empty() {
+            // An empty lock can be a claim that is *mid-creation* (path
+            // visible, PID body not yet written) rather than a corrupt
+            // leftover. Reclaiming it unlinks a live claim's unix socket.
+            // Grace: only an empty lock older than the claim window is
+            // considered stale. Non-empty garbage keeps its
+            // immediately-stale treatment (see the corrupt-lock test).
+            return fs::metadata(path)
+                .and_then(|m| m.modified())
+                .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                .is_ok_and(|age| age > std::time::Duration::from_secs(EMPTY_LOCK_GRACE_SECS));
+        }
+        // Non-empty content that doesn't parse: a corrupt leftover that
+        // no live process considers its own anymore.
         return true;
     };
+    if pid == 0 {
+        return true;
+    }
     !pid_alive(pid)
 }
 
