@@ -10,12 +10,14 @@
 # host compositor support required.
 #
 # Every wtype invocation installs its own synthetic keymap on its own virtual
-# keyboard, which makes the host swap the active keyboard (Leave + Enter on the
-# focused surface). winit drops keys that arrive in that gap — the first press
-# of an invocation is lost — so every invocation here leads with `-s <ms>` to
-# let the swap settle before the first key. (A plain `wtype -- x` loses the
-# press and delivers only the orphan release; `wtype -k Return` alone therefore
-# does nothing.)
+# keyboard, which makes the host swap the seat's keyboard (its capability even
+# flaps). The host drops the burst's first key during the re-attach —
+# wire-proven: the press never reaches the client, only the orphan release
+# does — so every invocation here leads with `-s <ms>` to let the swap settle
+# before the first key. (A plain `wtype -- x` loses the press and delivers
+# only the release; `wtype -k Return` alone therefore does nothing.) See
+# docs/virtual-keyboard-first-key-drop.md — INJECT_SWAP_SETTLE_MS=0 is the
+# regression probe for the upstream fixes.
 #
 # Modifiers and named keys are wtype commands too (`-M/-m <mod>`, `-k <keysym>`
 # with an xkb keysym name) — note `ctrl+a` is *not* a keysym name and makes
@@ -48,27 +50,38 @@ inject_note() {
 
 # Lead-in before the first key of an invocation: covers the host's
 # Leave/Enter around the virtual keyboard's keymap swap (see header).
-# Integer milliseconds — wtype's -s atoi()s it and rejects <= 0.
+# Integer milliseconds — wtype's -s atoi()s it and rejects <= 0
+# ("Invalid sleep time"), so a zero settle omits the flag entirely:
+# INJECT_SWAP_SETTLE_MS=0 is how the lane A/B-tests the winit key-drop
+# fix (vendor/winit-0.30.13) without the workaround.
 WTYPE_SWAP_SETTLE_MS="${INJECT_SWAP_SETTLE_MS:-150}"
 
+wtype_lead() {
+  if [ "$WTYPE_SWAP_SETTLE_MS" -gt 0 ] 2>/dev/null; then
+    wtype -s "$WTYPE_SWAP_SETTLE_MS" "$@"
+  else
+    wtype "$@"
+  fi
+}
+
 inject_type() {
-  wtype -s "$WTYPE_SWAP_SETTLE_MS" -- "$1" >/dev/null 2>&1 \
+  wtype_lead -- "$1" >/dev/null 2>&1 \
     || { warn "wtype could not deliver: $1"; return 1; }
   sleep "${INJECT_SETTLE:-0.2}"
 }
 
 inject_key() {
   case "$1" in
-    Return)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -k Return       >/dev/null 2>&1 ;;
-    Escape)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -k Escape       >/dev/null 2>&1 ;;
-    BackSpace) wtype -s "$WTYPE_SWAP_SETTLE_MS" -k BackSpace    >/dev/null 2>&1 ;;
-    Page_Down) wtype -s "$WTYPE_SWAP_SETTLE_MS" -k Page_Down    >/dev/null 2>&1 ;;
-    End)       wtype -s "$WTYPE_SWAP_SETTLE_MS" -k End         >/dev/null 2>&1 ;;
-    ctrl+c)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -M ctrl -k c -m ctrl >/dev/null 2>&1 ;;
-    ctrl+v)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -M ctrl -k v -m ctrl >/dev/null 2>&1 ;;
-    ctrl+x)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -M ctrl -k x -m ctrl >/dev/null 2>&1 ;;
-    ctrl+a)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -M ctrl -k a -m ctrl >/dev/null 2>&1 ;;
-    ctrl+z)    wtype -s "$WTYPE_SWAP_SETTLE_MS" -M ctrl -k z -m ctrl >/dev/null 2>&1 ;;
+    Return)    wtype_lead -k Return              >/dev/null 2>&1 ;;
+    Escape)    wtype_lead -k Escape              >/dev/null 2>&1 ;;
+    BackSpace) wtype_lead -k BackSpace           >/dev/null 2>&1 ;;
+    Page_Down) wtype_lead -k Page_Down           >/dev/null 2>&1 ;;
+    End)       wtype_lead -k End                 >/dev/null 2>&1 ;;
+    ctrl+c)    wtype_lead -M ctrl -k c -m ctrl   >/dev/null 2>&1 ;;
+    ctrl+v)    wtype_lead -M ctrl -k v -m ctrl   >/dev/null 2>&1 ;;
+    ctrl+x)    wtype_lead -M ctrl -k x -m ctrl   >/dev/null 2>&1 ;;
+    ctrl+a)    wtype_lead -M ctrl -k a -m ctrl   >/dev/null 2>&1 ;;
+    ctrl+z)    wtype_lead -M ctrl -k z -m ctrl   >/dev/null 2>&1 ;;
     *) warn "wtype has no mapping for '$1'"; return 1 ;;
   esac || { warn "wtype could not deliver: $1"; return 1; }
   sleep "${INJECT_SETTLE:-0.2}"

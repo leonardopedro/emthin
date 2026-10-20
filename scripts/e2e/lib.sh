@@ -260,6 +260,12 @@ start_emthin() {
   # accident.
   local -a prefix=()
   [ "${E2E_NO_X:-0}" = "1" ] && prefix=(env -u DISPLAY)
+  # Rotate the log: every reader of it (clipboard_backend, the clean-shutdown
+  # probe, post-mortems) assumes it describes THIS run, and the redirection
+  # below appends — a stale "X11 clipboard sync initialized" line from any
+  # past run made clipboard_backend report x11 forever (measured). Keep the
+  # previous run for post-mortem.
+  [ -f "$E2E_ROOT/emthin.log" ] && mv "$E2E_ROOT/emthin.log" "$E2E_ROOT/emthin.log.prev"
   ( setsid "${prefix[@]}" "$E2E_EMTHIN" --wayland-socket "$E2E_CLIENT_DISPLAY" \
       --session-file "$E2E_DOC" --ipc-path "$E2E_IPC" "$@" \
       </dev/null >>"$E2E_ROOT/emthin.log" 2>&1 & )
