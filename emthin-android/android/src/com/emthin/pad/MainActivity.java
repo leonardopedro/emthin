@@ -225,7 +225,15 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
         ScrollView previewScroll = new ScrollView(this);
-        previewScroll.setFillViewport(true);
+        // fillViewport(false) is load-bearing: with fillViewport(true) the
+        // ScrollView re-measures previewBox with EXACTLY(viewport), so the
+        // LinearLayout hands its children AT_MOST caps — adjustViewBounds
+        // clamps the full-height page raster (1892 x 2674) to the ~428px
+        // remainder and fitCenter squeezes text to sub-pixel (black screen).
+        // Unclamped, the wrap-content image measures its true height and the
+        // ScrollView simply scrolls.
+        previewScroll.setFillViewport(false);
+        previewScroll.setBackgroundColor(Color.parseColor("#14181D"));
         previewScroll.addView(previewBox);
         // Streaming pages in on scroll: when the scroll reaches the
         // loaded end (and the document has more), the next chunk is
@@ -284,6 +292,14 @@ public class MainActivity extends Activity {
         main.postDelayed(renderNow, 300);
     }
 
+    // Round-6 agent feedback: D-level render/state trace so the device
+    // loop can see what the UI thread actually did (logcat -s emthin-pad:D).
+    private void trace(String what, Object... kv) {
+        StringBuilder b = new StringBuilder(what);
+        for (Object o : kv) { b.append(' ').append(o); }
+        android.util.Log.d("emthin-pad", b.toString());
+    }
+
     /**
      * Starts a fresh page-frame render of {@code text}: the stacked
      * pages are dropped and chunk 0 streams in, unless a newer edit
@@ -295,6 +311,8 @@ public class MainActivity extends Activity {
         totalPages = 0;
         chunkInFlight = false;
         previewPages.removeAllViews();
+        trace("startRender", "gen", renderGeneration, "textLen", text.length(),
+                "head", text.substring(0, Math.min(24, text.length())));
         requestChunk(text, 0);
     }
 
@@ -357,6 +375,7 @@ public class MainActivity extends Activity {
 
             totalPages = o.getInt("total");
             JSONArray pages = o.getJSONArray("pages");
+            trace("applyChunk", "total", totalPages, "pages", pages.length());
             for (int i = 0; i < pages.length(); i++) {
                 JSONObject p = pages.getJSONObject(i);
                 int w = p.getInt("width");
@@ -371,6 +390,13 @@ public class MainActivity extends Activity {
                 // ARGB_8888's native buffer is RGBA byte order, which is
                 // what the bridge encodes — a straight copy, no swizzle.
                 bmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgba));
+                int visible = 0;
+                int[] row = new int[w];
+                for (int yy = 0; yy < h; yy += 4) {
+                    bmp.getPixels(row, 0, w, 0, yy, w, 1);
+                    for (int px : row) { if ((px >>> 24) != 0) visible++; }
+                }
+                trace("pageRaster", "wh", w + "x" + h, "visiblePx~", visible * 4);
 
                 TextView caption = new TextView(this);
                 caption.setText("page " + (pagesLoaded + 1) + " / " + totalPages);
@@ -380,7 +406,6 @@ public class MainActivity extends Activity {
                 previewPages.addView(caption);
 
                 ImageView pageView = new ImageView(this);
-                pageView.setAdjustViewBounds(true);
                 // mathed's canvas, not "paper white": the page raster is
                 // white text on transparent (THEME_PRELUDE sets fill:
                 // white) with tinted figure slots, so it must sit on the
@@ -388,7 +413,25 @@ public class MainActivity extends Activity {
                 // (BG #14181D) or the text is invisible.
                 pageView.setBackgroundColor(Color.parseColor("#14181D"));
                 pageView.setImageBitmap(bmp);
-                previewPages.addView(pageView);
+                // Explicit EXACTLY height, not adjustViewBounds: on the
+                // device (waydroid API 33) adjustViewBounds(true) +
+                // wrap-content measured ~428px for a 1489x2105 raster
+                // (~1/6 of the aspect-correct 2674), squeezing text to
+                // sub-pixel = black screen. A LayoutParams pixel height
+                // gives the child an EXACTLY spec, bypassing ImageView's
+                // own bounds adjustment; FIT_CENTER does the (aspect-
+                // preserving, full-bleed) fit into it.
+                int pw = previewPages.getWidth();
+                if (pw <= 0) {
+                    // pre-layout fallback: full display width minus the
+                    // root's 14px side margins (FIT_CENTER letterboxes a
+                    // few px if slightly off; the exact value is cosmetic)
+                    pw = Math.max(1, getResources().getDisplayMetrics().widthPixels - 28);
+                }
+                int ih = Math.max(1, Math.round(pw * (float) h / w));
+                previewPages.addView(pageView, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, ih));
+                trace("pageLayout", "raster", w + "x" + h, "pw", pw, "ih", ih);
 
                 pagesLoaded++;
             }
@@ -412,6 +455,8 @@ public class MainActivity extends Activity {
             JSONObject o = new JSONObject(json);
 
             String text = o.getString("text");
+            trace("applyState", "setCaret", setCaret, "rev", o.optLong("revision"),
+                    "textLen", text.length(), "canUndo", o.optBoolean("canUndo"));
             boolean diverged = !text.contentEquals(editor.getText());
             if (diverged) {
                 applying = true;

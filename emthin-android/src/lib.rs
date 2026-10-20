@@ -472,6 +472,32 @@ mod tests {
     }
 
     #[test]
+    fn undo_restores_a_session_base_not_the_empty_document() {
+        // Device shape (round-6 visual loop, 2026-10-20): the model is
+        // created with the session's non-empty starter text, the fresh
+        // EditText caret sits at 0, and `input text` prepends — so the
+        // minimal diff is a *whole-document* replace. One undo (the
+        // rapid keystrokes merged into one group) must restore the
+        // starter, not blank the document. The other undo tests all
+        // start from "" and cannot see this.
+        let base = "#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n";
+        let mut m = DocModel::new(base);
+        // Caret-0 insertion with the caret advancing per char (what the
+        // EditText does as `input text` lands at the fresh cursor).
+        let mut typed = String::new();
+        for ch in "undoProbe".chars() {
+            typed.push(ch);
+            let full = format!("{typed}{base}");
+            sync_text(&mut m, &full, typed.len());
+        }
+        assert!(m.text().starts_with("undoProbe"));
+        assert!(m.undo(), "undo must have something to revert");
+        assert_eq!(m.text(), base, "undo must restore the session base");
+        assert!(m.redo(), "redo must re-apply the merged group");
+        assert!(m.text().starts_with("undoProbe"));
+    }
+
+    #[test]
     fn sync_handles_multibyte_edits() {
         let mut m = DocModel::new("ab");
         sync_text(&mut m, "a👋b", 3);
@@ -525,6 +551,39 @@ mod tests {
                 .decode(p["rgba"].as_str().unwrap())
                 .expect("rgba must be base64");
             assert_eq!(bytes.len() as u64, w * h * 4, "RGBA8 is 4 bytes/px");
+        }
+    }
+
+    /// Round-6 device-loop regression (2026-10-20): after an undo the
+    /// caret can sit *inside* the starter's `\app(...)` label (byte 9 =
+    /// "terminal"), and the pad's reveal-on-caret render came back a
+    /// blank page on device (preview stayed black for 26 s, no error,
+    /// caption "page 1 / 2" — measured with the visual loop). A render
+    /// at any caret must keep visible pixels, not just a well-formed
+    /// empty raster.
+    #[test]
+    fn render_with_caret_inside_the_starter_label_is_not_blank() {
+        use base64::Engine as _;
+
+        let starter = String::from("#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n")
+            + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
+        for (caret, scale) in [(0usize, 1.0f32), (9, 1.0), (30, 1.0), (9, 2.5), (0, 2.5)] {
+            let v: Value = serde_json::from_str(
+                &render_pages(&starter, 0, 3, scale, caret).expect("the starter document must render"),
+            )
+            .unwrap();
+            assert!(v.get("error").is_none(), "caret {caret}: unexpected render error: {v}");
+            let pages = v["pages"].as_array().unwrap();
+            assert!(!pages.is_empty(), "caret {caret}: no page: {v}");
+            let p = &pages[0];
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(p["rgba"].as_str().unwrap())
+                .expect("rgba must be base64");
+            let visible = bytes.chunks_exact(4).filter(|px| px[3] > 0).count();
+            assert!(
+                visible > 1_000,
+                "caret {caret} scale {scale}: page raster nearly blank ({visible} visible px)"
+            );
         }
     }
 
@@ -634,6 +693,38 @@ mod tests {
             mathed_android::engine::BG[0],
             mathed_android::engine::BG[1],
             mathed_android::engine::BG[2],
+        );
+    }
+
+    /// Round-6 pin (2026-10-20): the page ImageView must be laid out at
+    /// an explicit pixel height (an EXACTLY spec), never via
+    /// `adjustViewBounds` — on the device (waydroid API 33)
+    /// adjustViewBounds(true) + wrap-content measured ~428px for a
+    /// 1489x2105 raster, about 1/6 of the aspect-correct 2675, which
+    /// squeezed the typeset page to sub-pixel and read as a black
+    /// preview. `fillViewport(false)` is pinned for the same failure
+    /// class: fillViewport(true) hands the ScrollView's children
+    /// viewport-capped measure specs. Reads the shipped Java source, so
+    /// it guards what `build-apk.sh` compiles.
+    #[test]
+    fn page_view_uses_explicit_height_and_unfilled_scroll() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+
+        assert!(
+            java.contains("previewPages.addView(pageView, new LinearLayout.LayoutParams("),
+            "the page ImageView must be added with an explicit LayoutParams height (EXACTLY spec)"
+        );
+        assert!(
+            !java.contains("setAdjustViewBounds(true)"),
+            "adjustViewBounds measured ~428px for a full page raster on device (round 6); keep the explicit height"
+        );
+        assert!(
+            java.contains("previewScroll.setFillViewport(false)"),
+            "fillViewport(true) caps child measurement at the viewport — the same squeeze class"
         );
     }
 

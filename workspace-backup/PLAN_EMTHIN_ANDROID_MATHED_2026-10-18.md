@@ -172,6 +172,66 @@ ran from that build. With this, the device tier is closed end to end:
 built → installed → launched → drawn → typeset text legible on the
 canvas.
 
+## 9. Execution note (2026-10-20, round 6) — the undo "black preview": two stacked causes, one view bug fixed
+
+A round-6 device loop reported the preview reading **black after
+undo** while the render itself was provably rich (logcat
+`pageRaster`: page 1 carries ~1.74 M visible px after undo). The
+investigation separated two causes that had been stacked on top of
+each other; only the first was a bug.
+
+**Cause 1 — the view layer squeezed every page to ~1/6 height
+(fixed).** `adjustViewBounds(true)` + wrap-content measured the
+1489×2105 raster at **428 px** tall on device (an EXACTLY-width of
+1892 would give 2675) — `fitCenter` then scaled text to sub-pixel,
+which is why the screen read black at any caret position whose slice
+held only small glyphs. The first hypothesis (fillViewport's
+viewport-capped measure specs) was falsified on device — with
+`fillViewport(false)` the ImageView still measured 428 — and the fix
+bypasses ImageView's own bounds adjustment entirely: `applyChunk`
+adds the page view with an **explicit `LayoutParams(MATCH_PARENT,
+round(pw·h/w))`** — an EXACTLY spec — plus `fillViewport(false)` and a
+`pageLayout` D-trace. Measured on device: `pageLayout raster
+1489x2105 pw 1892 ih 2675`, and the view tree shows the ImageView
+clipped at the ScrollView viewport (content 32+2675+32+2675 = 5414 px
+in a 460 px window — the page-frame scroll of §7 now actually
+scrolls; `input swipe 960 1000→700` moves it). A source-pinning host
+test (`page_view_uses_explicit_height_and_unfilled_scroll`, the W4
+canvas pin's style) reads the shipped `MainActivity.java` so the
+squeeze class cannot return.
+
+**Cause 2 — the starter document's page 1 is genuinely near-empty at
+the top (documented, not a bug).** With the squeeze gone, the undone
+state still showed an empty preview — faithfully: the starter
+document's page 1 is two large reserved `\app` slots (600×300 and
+400×300 pt; the boxes fill with a near-canvas tint and their captions
+land ~y1050, below the 460 px fold). Host-render correspondence, same
+renderer, same caret, same scale: caret-0 page 1's top-460 slice is
+light=433/mid=158 (label + box tint) against the device's
+light=0/mid=117 — the same nearly-inkless slice. The typed state
+looked "rendered" only because its prepended `traceUndo` line is real
+ink at the very top (device preview light 4548); undo removes that
+line and the honest page top returns.
+
+**Undo itself verified end to end (the round-6 claim under test):**
+typing drives `rev 8→10` (textLen 96→98); the undo lands
+`applyState setCaret true rev 11 textLen 89 canUndo false` — the
+starter's exact length — and the editor's restored text is visible in
+pixels (editor-region light 2436 ≈ base 2460, vs 2802 while typed).
+The model, the editor, and the render all agree after undo; what the
+preview shows is the document's own layout.
+
+**Device-loop operations, re-confirmed this round:** a FROZEN
+container still answers `adb get-state` with `device` while every
+exec hangs — probe with `adb shell true`, thaw rootlessly via
+`systemctl --user restart waydroid-session` (~25 s), and keep every
+drive to one chained script (the container idle-freezes again within
+~1 min; a mid-script idle turned three captures into launcher
+frames). `input text` still injects without raising the IME (the
+round-5 confound), and the pad's host surface re-measured **29 / 0**
+(fmt and clippy carry pre-existing failures at HEAD in untouched
+lines — recorded, not widened).
+
 ## 9. Execution note (2026-10-19, close) — the visual loop's last two pins, and the adb wall measured twice
 
 Two host-tier repairs landed after §8's capture, both pinned by tests
