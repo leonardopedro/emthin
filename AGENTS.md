@@ -521,8 +521,8 @@ model the desktop compositor drives, behind a JNI bridge instead of IPC.
 - `emthin-pad` is a **standalone workspace**: its `Cargo.toml` carries an
   empty `[workspace]` table on purpose, so it does not join the emthin
   workspace even though it lives inside this checkout (it path-depends on
-  `velysterm` and produces its own release artifacts). **Its tests are not
-  in the workspace's 347** — see the verification lane below.
+  `velysterm` and produces its own release artifacts).**Its tests are not
+in the workspace's 353** — see the verification lane below.
 - `src/lib.rs` is a `cdylib` (`libemthin_pad.so`, loaded via
   `System.loadLibrary("emthin_pad")`); `android/src/com/emthin/pad/`
   holds `MainActivity.java` + `DocBridge.java` (the JNI surface).
@@ -696,13 +696,17 @@ are marked **rewritten**.
   switches. `--xkb-layout`/`--xkb-variant` and
   `EMTHIN_DISABLE_HOST_KEYMAP=1` pin the compiled keymap instead. Env
   vars (`XKB_DEFAULT_*`) are unreliable on KDE Wayland.
-- winit drops keys that arrive during a host keymap swap: it clears the
-  focused window between the seat's `Leave` and `Enter` around the swap,
-  and `key_input` silently discards keys in that gap. A physical
-  keyboard never swaps the host keymap mid-keystroke, but virtual
-  keyboards (`wtype`, on-screen keyboards) do — their first press is
-  lost. The e2e `wtype` lane leads every injection with `wtype -s` to
-  outwait the swap; a real fix belongs in winit.
+- Virtual keyboards lose their first key: installing a
+  `zwp_virtual_keyboard_v1` keymap swaps the seat's keyboard (its
+  capability even flaps), and sway/wlroots drops the burst's first key
+  during the re-attach — wire-proven (`WAYLAND_DEBUG=1`): the press
+  never reaches the client, only the orphan release does. One-shot
+  injectors (`wtype`) hit it every invocation; a physical keyboard never
+  swaps the seat keyboard. The e2e `wtype` lane leads every injection
+  with `wtype -s` to outwait the swap. Full analysis + upstream issue
+  drafts (wlroots and winit) in `docs/virtual-keyboard-first-key-drop.md`;
+  `INJECT_SWAP_SETTLE_MS=0` is the regression probe for the upstream
+  fixes.
 
 ## Custom elements and textures
 

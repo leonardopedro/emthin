@@ -58,14 +58,14 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 347 cargo (workspace, nix develop) + 5/5 run.sh E2E green (2026-10-18 re-verified once; the five-consecutive-run campaign was 2026-10-15 — harness hardened against stale state, see scripts/e2e/README "Stale state" post-mortem; the tier-1 replay scenario and the E2E both run in CI) + 25 emthin-pad host tests (re-measured 2026-10-19; see AGENTS.md #emthin-android) | last_verified: 2026-10-18 -->
+<!-- status: verified | tests: 353 cargo (workspace, nix develop; recounted 2026-10-20 — +3 host-keymap tests from 08b2abc landed after the 10-18 measurement, +3 xwayland lock-regression tests from the round-5 flake fix) + 5/5 run.sh E2E green (re-run 2026-10-20; the five-consecutive-run campaign was 2026-10-15 — harness hardened against stale state, see scripts/e2e/README "Stale state" post-mortem; the tier-1 replay scenario and the E2E both run in CI) + 26 emthin-pad host tests (re-measured 2026-10-20; see AGENTS.md #emthin-android) | last_verified: 2026-10-20 -->
 
 ## Verification
 
 ```sh
 nix develop -c bash -c 'cargo fmt --all --check && \
   cargo clippy --workspace --all-targets -- -D warnings && \
-  cargo test --workspace'          # 347 passed, 2 ignored
+  cargo test --workspace'          # 353 passed, 2 ignored
 
 ./scripts/e2e/run.sh --config xdotool   # 5/5, exit 0
 
