@@ -182,7 +182,7 @@ public class MainActivity extends Activity {
         root.addView(bar, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        editor = new EditText(this);
+        editor = new CaretEditText(this);
         editor.setTypeface(android.graphics.Typeface.MONOSPACE);
         editor.setTextColor(Color.parseColor("#E6EDF3"));
         editor.setHintTextColor(Color.parseColor("#4E5965"));
@@ -253,6 +253,29 @@ public class MainActivity extends Activity {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
+    /**
+     * An {@link EditText} that re-renders the preview when the caret moves
+     * (reveal-on-caret): a tap or arrow-key caret move does not change the
+     * text, so no {@link TextWatcher} fires, but the preview must still
+     * re-typeset to expand the token under the new caret.
+     */
+    private final class CaretEditText extends EditText {
+        CaretEditText(android.content.Context context) {
+            super(context);
+        }
+
+        @Override
+        protected void onSelectionChanged(int selStart, int selEnd) {
+            super.onSelectionChanged(selStart, selEnd);
+            // `applying` guards the programmatic setText in applyState
+            // (which schedules its own render); handle == 0 is the
+            // pre-create window before the model exists.
+            if (!applying && handle != 0) {
+                scheduleRender();
+            }
+        }
+    }
+
     // ----- mathed rendering --------------------------------------------
 
     /** Debounces: a burst of keystrokes rasterises once, ~300 ms after the last. */
@@ -287,6 +310,9 @@ public class MainActivity extends Activity {
         }
         final int generation = renderGeneration;
         chunkInFlight = true;
+        // Reveal-on-caret: read the caret here on the UI thread, right
+        // alongside the text it indexes, so the two stay consistent.
+        final int caret = editor.getSelectionStart();
         // Fit the A4 page raster to the preview width at ≥ 1 px/pt so
         // text stays legible; the ImageView scales it the rest of the
         // way down. (Before the first layout the width is 0 → 1.0.)
@@ -295,7 +321,7 @@ public class MainActivity extends Activity {
         renderer.execute(new Runnable() {
             @Override
             public void run() {
-                final String json = DocBridge.renderPages(text, start, CHUNK, scale);
+                final String json = DocBridge.renderPages(text, start, CHUNK, scale, caret);
                 main.post(new Runnable() {
                     @Override
                     public void run() {

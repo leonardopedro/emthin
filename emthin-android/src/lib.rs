@@ -305,7 +305,8 @@ const MAX_CHUNK_PAGES: usize = 8;
 /// Renders pages `start..start + max_pages` of `doc_text`'s paged
 /// layout at `scale` pixels per point (`max_pages` is clamped to
 /// `1..=`[`MAX_CHUNK_PAGES`]; a non-positive or non-finite `scale` is
-/// the engine's own 1.0 fallback).
+/// the engine's own 1.0 fallback). `caret_utf16` is the editor caret
+/// as a UTF-16 index, driving reveal-on-caret exactly like the engine.
 ///
 /// Returns `{ "total", "start", "pages": [ { "width", "height",
 /// "rgba" }, … ] }` with each `rgba` base64-encoded RGBA8 — the same
@@ -318,18 +319,32 @@ fn render_pages(
     start: usize,
     max_pages: usize,
     scale: f32,
+    caret_utf16: usize,
 ) -> Result<String, String> {
     use base64::Engine as _;
     use mathed_core::transform::TransformOptions;
 
-    // Citations render as their visible `[N]` label only when the
-    // transform is handed the document's reference entries: the
-    // `\cite(...)` token itself is hidden, so the default (empty)
-    // options list made every citation disappear from the preview
-    // (found by the 2026-10-19 visual loop). The preview has no caret,
-    // so it renders the collapsed view — labels shown, tokens hidden.
+    // The caret as a UTF-8 byte offset (Java owns UTF-16 indexes; the
+    // transform works in bytes, the same conversion `sync` uses).
+    let caret = utf16_to_byte(doc_text, caret_utf16);
+
+    // Reveal-on-caret, wired exactly like `mathed_android::Engine::relayout`:
+    // `reveal` surfaces the raw token under the caret, and `expand` keeps
+    // the caret's collapsible (a marker segment or a translator's code)
+    // open so the keyboard can edit it. Citations still splice their
+    // visible `[N]` label via `references` (the `\cite(...)` token is
+    // hidden and only labelled when the reference entries are handed
+    // over; found by the 2026-10-19 visual loop). With the caret parked
+    // on plain prose both `reveal` and `expand` are empty and the
+    // preview shows the collapsed view.
     let scan = mathed_core::markers::scan(doc_text);
+    let segments = mathed_core::markers::resolve_segments(&scan);
+    let expand = mathed_mini::render::reveal_span_in(&scan, &segments, caret)
+        .into_iter()
+        .collect();
     let opts = TransformOptions {
+        reveal: vec![caret..caret],
+        expand,
         references: mathed_core::markers::scan_references(&scan),
         ..TransformOptions::default()
     };
@@ -366,6 +381,7 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPages<'local>(
     start: jint,
     max_pages: jint,
     scale: jfloat,
+    caret_utf16: jint,
 ) -> JString<'local> {
     unowned_env
         .with_env(|env| -> errors::Result<JString<'local>> {
@@ -378,6 +394,7 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPages<'local>(
                 start.max(0) as usize,
                 max_pages.max(0) as usize,
                 scale as f32,
+                caret_utf16.max(0) as usize,
             ) {
                 Ok(ok) => ok,
                 Err(e) => json!({ "error": e }).to_string(),
@@ -492,7 +509,7 @@ mod tests {
         let starter = String::from("#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n")
             + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
         let v: Value = serde_json::from_str(
-            &render_pages(&starter, 0, 8, 1.0).expect("the starter document must render"),
+            &render_pages(&starter, 0, 8, 1.0, 0).expect("the starter document must render"),
         )
         .unwrap();
 
@@ -529,7 +546,7 @@ mod tests {
         }
 
         let chunk = |start: usize, max: usize| -> Value {
-            serde_json::from_str(&render_pages(&doc, start, max, 1.0).expect("chunk renders"))
+            serde_json::from_str(&render_pages(&doc, start, max, 1.0, 0).expect("chunk renders"))
                 .unwrap()
         };
         let first = chunk(0, 2);
@@ -558,20 +575,20 @@ mod tests {
     #[test]
     fn render_pages_falls_back_on_bad_scale_and_clamps_the_chunk() {
         let doc = "hello mathed";
-        let one = render_pages(doc, 0, 1, 1.0).expect("1.0 renders");
+        let one = render_pages(doc, 0, 1, 1.0, 0).expect("1.0 renders");
         assert!(one.contains("\"total\":1"), "a short note is one page: {one}");
         assert_eq!(
-            render_pages(doc, 0, 1, 0.0).expect("scale 0 falls back"),
+            render_pages(doc, 0, 1, 0.0, 0).expect("scale 0 falls back"),
             one,
             "0.0 must be treated as the 1.0 default"
         );
         assert_eq!(
-            render_pages(doc, 0, 1, f32::NAN).expect("NaN scale falls back"),
+            render_pages(doc, 0, 1, f32::NAN, 0).expect("NaN scale falls back"),
             one,
             "a bad device density must not take the render down"
         );
         assert_eq!(
-            render_pages(doc, 0, 0, 1.0).expect("0 pages clamps to 1"),
+            render_pages(doc, 0, 0, 1.0, 0).expect("0 pages clamps to 1"),
             one,
             "max_pages 0 must clamp to 1, not return an empty chunk"
         );
@@ -629,13 +646,36 @@ mod tests {
     /// changes the raster and fails here.
     #[test]
     fn render_pages_splices_cite_labels_into_the_raster() {
-        let cited = "#1 alpha claim #2 \\cite(#1,#2)";
-        let literal = "#1 alpha claim #2 [1]";
-        let a = render_pages(cited, 0, 8, 1.0).expect("cited renders");
-        let b = render_pages(literal, 0, 8, 1.0).expect("literal renders");
+        // Trailing plain prose so the caret has a neutral parking spot
+        // (on prose nothing is revealed or expanded, which is the
+        // collapsed view this test pins).
+        let cited = "#1 alpha claim #2 \\cite(#1,#2)\n\nprose tail";
+        let literal = "#1 alpha claim #2 [1]\n\nprose tail";
+        let a = render_pages(cited, 0, 8, 1.0, cited.find("prose").unwrap())
+            .expect("cited renders");
+        let b = render_pages(literal, 0, 8, 1.0, literal.find("prose").unwrap())
+            .expect("literal renders");
         assert_eq!(
             a, b,
             "a \\cite must rasterise exactly like its visible [1] label"
+        );
+    }
+
+    /// Reveal-on-caret through the pad's real render path, mirroring
+    /// `mathed_android::Engine::relayout`: parking the caret on plain
+    /// prose shows the collapsed view (cite label), while moving it
+    /// into the cite segment expands the collapsible (raw `\\cite(...)`
+    /// token, label stepped aside) and changes the raster.
+    #[test]
+    fn render_pages_reveals_the_carets_segment() {
+        let doc = "#1 alpha claim #2 \\cite(#1,#2)\n\nprose tail";
+        let collapsed = render_pages(doc, 0, 8, 1.0, doc.find("prose").unwrap())
+            .expect("caret on prose renders");
+        let expanded = render_pages(doc, 0, 8, 1.0, doc.find("cite").unwrap())
+            .expect("caret in segment renders");
+        assert_ne!(
+            collapsed, expanded,
+            "moving the caret into the segment must change the render"
         );
     }
 }

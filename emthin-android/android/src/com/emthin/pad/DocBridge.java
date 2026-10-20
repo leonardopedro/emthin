@@ -46,6 +46,12 @@ public final class DocBridge {
      * a preview never re-rasterises. {@code scale} is pixels per point
      * (non-positive falls back to 1.0); {@code maxPages} is clamped to
      * 1..8 per call.
+     *
+     * <p>{@code caretUtf16} is the editor caret as a UTF-16 index. It drives
+     * reveal-on-caret exactly like the engine: the raw token under the caret
+     * and the caret's collapsible expand, while a caret on plain prose keeps
+     * the collapsed view (cite labels shown, tokens hidden).
      */
-    public static native String renderPages(String docText, int start, int maxPages, float scale);
+    public static native String renderPages(String docText, int start, int maxPages,
+                                            float scale, int caretUtf16);
 }
