@@ -82,6 +82,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         hints.push(BackendHint::X11);
 
+        // Test hook: `EMTHIN_CLIPBOARD_BACKEND=data_control|wl_data_device|x11`
+        // forces exactly one link so each is exercisable on a host that
+        // would otherwise settle on an earlier one (the e2e's headless sway
+        // always picks data_control, which would leave the wl_data_device
+        // serial snoop untested). Note wl_data_device needs an input-event
+        // serial for set_selection: forcing it on a headless seat that has
+        // seen no input yet defers the client→host direction until the
+        // first key ("no input serial yet, deferring").
+        if let Ok(forced) = std::env::var("EMTHIN_CLIPBOARD_BACKEND") {
+            let is_forced = |h: &BackendHint| {
+                matches!(
+                    (forced.as_str(), h),
+                    ("data_control", BackendHint::DataControl)
+                        | ("wl_data_device", BackendHint::WlDataDevice { .. })
+                        | ("x11", BackendHint::X11)
+                )
+            };
+            let forced_hints: Vec<BackendHint> = hints.into_iter().filter(is_forced).collect();
+            if forced_hints.is_empty() {
+                tracing::warn!(
+                    "EMTHIN_CLIPBOARD_BACKEND={forced:?} unknown or unavailable here; \
+                     using the fallback chain"
+                );
+                hints = vec![BackendHint::DataControl];
+                if let Some(ptr) = util::host_wl_display_ptr(&state) {
+                    // SAFETY: same contract as the block above.
+                    hints.push(unsafe { BackendHint::wl_data_device(ptr) });
+                }
+                hints.push(BackendHint::X11);
+            } else {
+                hints = forced_hints;
+                tracing::info!("EMTHIN_CLIPBOARD_BACKEND={forced}: forcing this clipboard backend");
+            }
+        }
+
         state.selection.clipboard = emthin_clipboard::init(&hints);
         if let Some(ref clipboard) = state.selection.clipboard {
             register_clipboard_source(&mut event_loop, clipboard.as_ref())?;

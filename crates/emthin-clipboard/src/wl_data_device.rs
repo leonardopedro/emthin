@@ -153,7 +153,13 @@ impl WlDataDeviceProxy {
 
         if let (Some(ref manager), Some(ref seat)) = (&inner.manager, &inner.seat) {
             inner.device = Some(manager.get_data_device(seat, &qh, ()));
-            inner.keyboard = Some(seat.get_keyboard(&qh, ()));
+            // The wl_keyboard (serial snoop) is created by the seat's
+            // Capabilities handler below, never unconditionally:
+            // get_keyboard on a seat without the Keyboard capability is
+            // wl_seat_error.missing_capability, a protocol error on the
+            // *shared* foreign connection — it poisons winit's display
+            // along with this proxy (measured on a headless seat that
+            // gains its keyboard only when a virtual keyboard appears).
         }
         if let (Some(ref mgr), Some(ref seat)) = (&inner.primary_device_mgr, &inner.seat) {
             inner.primary_device = Some(mgr.get_device(seat, &qh, ()));
@@ -454,13 +460,25 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
-        _: &mut Self,
-        _: &wl_seat::WlSeat,
-        _: wl_seat::Event,
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let capabilities = wl_seat::Capability::from_bits_truncate(capabilities.into());
+            if capabilities.contains(wl_seat::Capability::Keyboard) {
+                if state.keyboard.is_none() {
+                    state.keyboard = Some(seat.get_keyboard(qh, ()));
+                }
+            } else if let Some(keyboard) = state.keyboard.take() {
+                if keyboard.version() >= 3 {
+                    keyboard.release();
+                }
+            }
+        }
     }
 }
 
