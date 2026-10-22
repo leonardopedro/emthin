@@ -581,7 +581,7 @@ owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **25 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **29 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, and the mathed page seam — the app's actual starter
   document rendered page-by-page with the RGBA base64 contract the Java

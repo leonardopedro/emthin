@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+# check-elf-interpreters — dead-binary gate (PLAN_CROSS_PROJECT_REVIEW_2026-10-21.md P1).
+#
+# Why this gate exists (round 6, arrival state):
+#
+#   On 2026-10-21 six executables across unfer/ and velysterm/ --
+#   including `mathed_mini` (the agent loop's engine) and `unfer_agent`
+#   (the smoke-gate target) -- died with "required file not found" and
+#   nothing else. Root cause: they were built inside `nix develop`, their
+#   PT_INTERP named a /nix/store/...-glibc-2.42-67 loader, a flake update
+#   moved the devshell to a newer glibc, `nix store gc` collected the old
+#   store path, and the binaries were left pointing at a loader that no
+#   longer exists. The build dirs, the gates that shell out to `cargo
+#   test` (which re-runs cached binaries fine until it doesn't) and every
+#   source file stayed green-looking; the only symptom is an exec error
+#   that names no library and no path.
+#
+#   australVM's Makefile documents its own loader mismatch (X4(b)), and
+#   `preview.sh` notes the failure mode, but nothing *checks* it. This
+#   gate reads PT_INTERP directly, so a GC'd loader is caught by the
+#   workspace sweep instead of by a human watching an agent loop fail.
+#
+# What it checks:
+#
+#   For every checkout, every directory named `target` or `_build` (any
+#   depth: workspace targets, emthin-android's standalone workspace,
+#   velysterm's target/android cargo home, australVM's dune _build) is
+#   walked; each *executable* ELF file that carries a PT_INTERP program
+#   header must have that interpreter path present on this host. Files
+#   without the exec bit are never opened -- a gate that opens every
+#   rlib in a target tree takes 39 s (measured), one that opens only
+#   runnable binaries takes under 2 s.
+#
+# What it deliberately does NOT claim:
+#
+#   - DT_NEEDED resolution: a missing or version-stale shared library
+#     behind an existing loader fails with a legible dynamic-linker
+#     message ("version `GLIBC_2.39' not found"), which is the error a
+#     human can act on -- this gate exists for the silent class only.
+#   - Anything outside build dirs: release artifacts are covered by
+#     unfer_data::release's manifest golden, not here.
+#   - An ELF with no PT_INTERP (static binary, .so, .o) is skipped by
+#     construction; non-ELF build products never get opened.
+#
+# Usage:  scripts/check-elf-interpreters   (wired in by check-all-gates'
+# `check-*` auto-discovery; no runner edit needed).
+# Exit:   0 every interpreter present and at least one was checked,
+#         1 one or more broken interpreters (each printed with remedy),
+#         2 nothing to scan -- an empty scan is never a pass (same
+#           doctrine as check-shebangs).
+
+import os
+import sys
+
+# Directories that never contain the build trees this gate cares about,
+# and whose traversal cost is real (git object stores, Lean/Node/vendor
+# trees). Mirrors the prune list of check-shebangs, minus the build dirs:
+# target/ and _build/ are exactly what we descend into here.
+PRUNE = {
+    ".git",
+    ".lake",
+    "node_modules",
+    "vendor",
+    "workspace-backup",
+    ".direnv",
+    "result",
+    ".venv",
+    "__pycache__",
+    ".github_bk",
+    "ol10",
+}
+
+CHECKOUTS = (
+    "australVM",
+    "dynamic-arctic",
+    "emthin",
+    "unfer",
+    "test",
+    "timepiece",
+    "velysterm",
+)
+
+PT_INTERP = 3
+EI_NIDENT = 16
+E_PHOFF_32 = 28
+E_PHOFF_64 = 32
+# ELF32 puts e_phentsize/e_phnum at 42/44; ELF64 at 54/56. Using the
+# 32-bit offsets for a 64-bit binary reads garbage from e_shoff and
+# yields phnum=0 -- measured: every real binary looked interp-less.
+E_PHENTSIZE_32 = 42
+E_PHNUM_32 = 44
+E_PHENTSIZE_64 = 54
+E_PHNUM_64 = 56
+PHDR32_SIZE = 32
+PHDR64_SIZE = 56
+
+
+def read_exact(f, off, size):
+    f.seek(off)
+    data = f.read(size)
+    if len(data) != size:
+        raise EOFError("short read")
+    return data
+
+
+def interp_of(path):
+    """Return the PT_INTERP string, '' if none, or None if not an ELF
+    file / not parseable (skipped, never failed)."""
+    try:
+        with open(path, "rb") as f:
+            ident = f.read(EI_NIDENT)
+            if len(ident) < EI_NIDENT or ident[:4] != b"\x7fELF":
+                return ""
+            elf_class = ident[4]  # 1 = 32-bit, 2 = 64-bit
+            if elf_class not in (1, 2):
+                return ""
+            if elf_class == 2:
+                hdr = read_exact(f, 0, 64)
+                (phoff,) = __import__("struct").unpack_from("<Q", hdr, E_PHOFF_64)
+                (phentsize,) = __import__("struct").unpack_from(
+                    "<H", hdr, E_PHENTSIZE_64
+                )
+                (phnum,) = __import__("struct").unpack_from("<H", hdr, E_PHNUM_64)
+                off_pos, size_pos = 8, 32
+            else:
+                hdr = read_exact(f, 0, 52)
+                (phoff,) = __import__("struct").unpack_from("<I", hdr, E_PHOFF_32)
+                (phentsize,) = __import__("struct").unpack_from(
+                    "<H", hdr, E_PHENTSIZE_32
+                )
+                (phnum,) = __import__("struct").unpack_from("<H", hdr, E_PHNUM_32)
+                off_pos, size_pos = 4, 16
+            if phnum == 0 or phoff == 0 or phentsize < 4:
+                return ""
+            if phentsize > 4096 or phnum > 4096:
+                return ""  # absurd headers: not our binary, skip
+            table = read_exact(f, phoff, phentsize * phnum)
+            unpack = __import__("struct").unpack_from
+            for i in range(phnum):
+                base = i * phentsize
+                (p_type,) = unpack("<I", table, base)
+                if p_type != PT_INTERP:
+                    continue
+                (p_offset,) = unpack("<Q" if elf_class == 2 else "<I",
+                                     table, base + off_pos)
+                (p_filesz,) = unpack("<Q" if elf_class == 2 else "<I",
+                                     table, base + size_pos)
+                if p_filesz == 0 or p_filesz > 4096:
+                    return ""
+                raw = read_exact(f, p_offset, p_filesz)
+                return raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    except (OSError, EOFError, IndexError, ValueError):
+        return None  # unreadable/truncated: skip, never fail
+    return ""
+
+
+def build_dirs(root):
+    """Yield every `target` or `build`-named... (target/_build) directory
+    under the checkouts, found by walking with pruning; the found trees
+    are then walked fully by scan()."""
+    found = []
+    for repo in CHECKOUTS:
+        repo_root = os.path.join(root, repo)
+        if not os.path.isdir(repo_root):
+            continue
+        for dirpath, dirnames, _ in os.walk(repo_root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d not in PRUNE]
+            base = os.path.basename(dirpath)
+            if base in ("target", "_build") and dirpath != repo_root:
+                found.append(dirpath)
+                dirnames[:] = []  # fully handled by scan(); don't nest-walk
+    return found
+
+
+def scan(dirpath):
+    """Walk one build tree; return (checked, broken) where checked counts
+    ELFs that carry a PT_INTERP and broken is a list of (file, interp)."""
+    checked = 0
+    broken = []
+    for dirpath, dirnames, filenames in os.walk(dirpath, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in PRUNE]
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            # Exec bit first: it is the cheap filter that keeps this gate
+            # in the seconds range (a target tree is mostly rlibs, .d and
+            # fingerprint files, none of which a gate ever execs).
+            if not stat_is_exec(st) or not stat_is_reg(st) or not stat_is_elfish(st):
+                continue
+            interp = interp_of(p)
+            if not interp:
+                continue
+            checked += 1
+            if not os.path.exists(interp):
+                broken.append((p, interp))
+    return checked, broken
+
+
+def stat_is_reg(st):
+    import stat as s
+
+    return s.S_ISREG(st.st_mode)
+
+
+def stat_is_exec(st):
+    return bool(st.st_mode & 0o111)
+
+
+def stat_is_elfish(st):
+    # ELF binaries produced by a build are at least 64 bytes.
+    return st.st_size >= 64
+
+
+def main():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dirs = build_dirs(root)
+    total_checked = 0
+    all_broken = []
+    for d in dirs:
+        checked, broken = scan(d)
+        total_checked += checked
+        for path, interp in broken:
+            repo = os.path.relpath(path, root).split(os.sep, 1)[0]
+            all_broken.append((repo, path, interp))
+
+    if total_checked == 0:
+        print(
+            "check-elf-interpreters: nothing scanned (no build tree with an "
+            "interpreter-bearing ELF). An empty scan is never a pass -- build "
+            "first, or the scan paths have drifted.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if all_broken:
+        print(
+            "check-elf-interpreters: %d executable(s) point at a loader this "
+            "host no longer has (nix store gc after a devshell move is the "
+            "measured cause, 2026-10-21):" % len(all_broken)
+        )
+        for repo, path, interp in all_broken:
+            rel = os.path.relpath(path, root)
+            print("  FAIL %s" % rel)
+            print("       PT_INTERP %s does not exist" % interp)
+        print(
+            "  fix: rebuild the affected binaries in the repo's dev shell "
+            "(rm the binary, then the same build command as the gate that "
+            "uses it) -- the new link picks up the current glibc. For a "
+            "whole tree: nix develop -c cargo clean && nix develop -c "
+            "cargo build (cheap for the crates that matter)."
+        )
+        return 1
+
+    print(
+        "check-elf-interpreters: %d interpreter-bearing ELF(s) across %d "
+        "build tree(s): every PT_INTERP exists on this host."
+        % (total_checked, len(dirs))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

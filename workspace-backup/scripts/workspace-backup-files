@@ -18,6 +18,7 @@ PLAN_CROSS_PROJECT_REVIEW_2026-10-13.md
 PLAN_CROSS_PROJECT_REVIEW_2026-10-15.md
 PLAN_CROSS_PROJECT_REVIEW_2026-10-18.md
 PLAN_CROSS_PROJECT_REVIEW_2026-10-20.md
+PLAN_CROSS_PROJECT_REVIEW_2026-10-21.md
 PLAN_EMTHIN_ANDROID_MATHED_2026-10-18.md
 PLAN_FEDERATION_IMPROVEMENT_2026-10-09.md
 PLAN_MATHED_NATIVE_AND_IMPROVEMENT.md
@@ -28,6 +29,7 @@ scripts/README.md
 scripts/check-all-gates
 scripts/check-attribution
 scripts/check-book-sync
+scripts/check-elf-interpreters
 scripts/check-error-catalog
 scripts/check-scenario-ledgers
 scripts/check-status

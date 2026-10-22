@@ -34,7 +34,7 @@ the gap culture and is inherited here, not re-litigated.
 
 | lane | surface | evidence |
 |---|---|---|
-| module + composition | the workspace suite (1797) | `cargo test --workspace --exclude fock_sirk` (README Verification) |
+| module + composition | the workspace suite (1846, recounted 2026-10-21 — was 1797 when this row was first written) | `cargo test --workspace --exclude fock_sirk` (README Verification) |
 | boundary | `ops_e2e` (real socket), the fuzz lane | `cargo test -p unfer_ffi --test ops_e2e`; `.github/workflows/fuzz.yml` |
 | conformance | physics/SIRK goldens against Cadabra2 CHECKs (462 across 64 binaries, 2026-10-18; the README's per-suite prose keeps its own dated history) | `cargo test -p fock_sirk --release`; heavy lane `scripts/run_heavy_tests.sh` + `.github/workflows/heavy-tests.yml` (weekly) |
 | conformance | decide calibration report pinned to its run | `decide_report` golden gate (D6 in ci.yml) |
@@ -44,12 +44,12 @@ the gap culture and is inherited here, not re-litigated.
 
 | lane | surface | evidence |
 |---|---|---|
-| module | the workspace suite (347): docui, keymap, session serde, figure binding, IPC protocol units | `nix develop -c cargo test --workspace` |
+| module | the workspace suite (353): docui, keymap, session serde, figure binding, IPC protocol units | `nix develop -c cargo test --workspace` |
 | boundary | clipboard/dbus crate against a real session bus; xwayland supervisor timing | the `emthin-dbus` suites inside the same run |
 | boundary | the tier-1 replay scenario: sandboxed `doc` → `apply` edit script → closed-vocab `expect` (13 asserts, ~0.8 s; the scenario cannot skip a check it was written to make) | `./scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt` (CI `e2e` job, first step) |
 | acceptance | the §6 step-7 E2E: XTEST keystrokes → document, clipboard both ways, `list_state`, SIGTERM | `./scripts/e2e/run.sh --config xdotool` (5 checks; CI `e2e` job) |
 | named skip | IME commit (needs the host's fcitx *engaged*, not merely installed) | `scripts/e2e/README.md`; clipboard-free rerun is `E2E_NO_X=1` |
-| module | `emthin-pad`'s 25 host tests against the real `DocModel` — sync/undo, UTF-16 conversion, and the mathed page seam (`mathed_mini`'s paged layout), incl. the per-page RGBA base64 contract the Java side decodes, chunk continuity across pagination, the scale/chunk fallbacks, the canvas pin (Java `pageView` bg == `mathed_android::engine::BG`), and the cite-label raster pin (a `\cite` rasterises byte-identical to its literal `[1]` label) (standalone workspace — **not** in the 347 above) | `cargo test` inside `emthin-android/` |
+| module | `emthin-pad`'s 29 host tests against the real `DocModel` — sync/undo, UTF-16 conversion, and the mathed page seam (`mathed_mini`'s paged layout), incl. the per-page RGBA base64 contract the Java side decodes, chunk continuity across pagination, the scale/chunk fallbacks, the canvas pin (Java `pageView` bg == `mathed_android::engine::BG`), and the cite-label raster pin (a `\cite` rasterises byte-identical to its literal `[1]` label) (standalone workspace — **not** in the 353 above) | `cargo test` inside `emthin-android/` |
 | module | `mathed_android`'s 30 host tests: the engine (incl. the cite-label/collapsible transform-wiring pin), the agent-loop debug protocol and `mathed_probe` (also its own workspace, outside the 996) | `cargo test --manifest-path crates/mathed_android/Cargo.toml` |
 | boundary | `mathed_probe --local shot` — the frame the window *would* blit, rasterised on the host with no device (semantic tier: `summary`/`figures`/`layout`) | `crates/mathed_android/target/debug/mathed_probe --local …` |
 | named skip | the APK build + waydroid run | `emthin-android/build-apk.sh` hard-pins four Nix store paths (SDK/build-tools/NDK/JDK); root-side checks in `scripts/waydroid-sudo-fixes.sh` — owner-run, no CI |
@@ -108,3 +108,22 @@ the gap culture and is inherited here, not re-litigated.
 - Adding a verification surface? Give it a lane row here in the same
   change — the row is small, and its absence is the drift this catalog
   exists to prevent.
+
+## Execution discipline (measured 2026-10-21)
+
+Three ways a test run itself lied on this host, kept here because each
+one hid a real failure behind a green-looking shell:
+
+- **Run one workspace suite at a time, with a job cap.** Two concurrent
+  `cargo test --workspace --all-targets` (velysterm + unfer, default
+  jobs) OOM-crashed this 14 GiB host twice. Sequential with `-j 4`
+  passes both comfortably; memory, not CPU, is the scarce resource.
+- **Pipefail or it didn't happen.** `cargo test | tail` without
+  `set -o pipefail` reports `tail`'s status: it masked two real
+  regressions (the velysterm `solve_ms` golden flake, the australVM
+  loader mismatch) behind exit-0 until round 6 re-ran with pipefail.
+- **A backgrounded `… &` from a transient shell does not survive** —
+  the process group dies with it and the log stays empty (two runs lost
+  this way before switching to a supervised background process). A
+  zero-byte log after "started" is a dead run, not a quiet one; check
+  the PID before believing the file.
