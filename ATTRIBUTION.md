@@ -11,6 +11,7 @@ cross-repo table — including what was deliberately **not** adopted — is
 | velyst (git dep, tag `v0.0.1`) | see upstream | page rasterisation for the document layer | `doc_render.rs` |
 | **EWM** — the original emthin (`emskin/emskin`, fork parent of `leonardopedro/emthin`; identified by the owner) | GPL-3.0 (verified from the clone at `../emskin/`) | the pre-fork upstream this compositor derives from | `crates/emthin/src/protocols/workspace.rs` (diff-based workspace refresh) |
 | niri (github.com/YaLTeR/niri) | GPL-3.0-or-later | xwayland-satellite socket setup + spawn/watch helpers ported; per-function attribution in the submodules | `crates/emthin/src/xwayland_satellite/` |
+| **REA** — `rea-agents` (morluto/rea; tree not currently checked out) | MIT — as cited at the use sites (`rea/docs/reconstruction-obligation-ledgers.md`, MIT); row restored from the reviewed workspace-ledger table (preserved at `workspace-backup/ATTRIBUTION.md`) 2026-10-28 | patterns only, no source vendored: the tagged error contract (`{code, message}` with category/retryability/remediation decidable without parsing prose — a client branches on `code`, never on `message`), the E2E scenario contract shape (precondition, steps, expected observation, and explicitly verified / structurally broken / not exercised), and obligation-ledger closure (a claim closes only when a verifier of comparable authority runs and its result is recorded) | `crates/emthin/src/ipc/messages.rs`, `docs/error-contract.md`, `scripts/e2e/SCENARIOS.md` |
 
 ## Notes
 
