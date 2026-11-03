@@ -23,6 +23,8 @@
 #[path = "../../crates/emthin/src/docui/model.rs"]
 pub mod model;
 
+pub mod jit;
+
 use jni::objects::{JClass, JString};
 use jni::sys::{jfloat, jint, jlong};
 use jni::{EnvUnowned, errors};
@@ -168,6 +170,27 @@ fn sync_text(m: &mut DocModel, new_text: &str, caret_utf16: usize) {
 // `EnvUnowned` captures the raw JNI env; `with_env` upgrades it (and
 // installs the panic/error policy), `resolve` maps errors/panics to a
 // Java `RuntimeException` plus a `Default` return value.
+
+/// The australVM Cranelift lane: compile a CPS constant-return program,
+/// execute it in the JIT, and answer with `{"ok": n, "entry": "run_k"}`
+/// — or `{"error": "…"}`. A failed JIT is data, not a crash, matching
+/// `renderPages`. Safe off the UI thread: the engine is per-thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_jitRoundtrip<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    value: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let json = match jit::jit_roundtrip(value) {
+                Ok((entry, result)) => json!({ "ok": result, "entry": entry }).to_string(),
+                Err(e) => json!({ "error": e }).to_string(),
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_create<'local>(

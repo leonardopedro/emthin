@@ -11,6 +11,7 @@ import android.text.Spannable;
 import android.text.TextWatcher;
 import android.text.style.BackgroundColorSpan;
 import android.util.Base64;
+import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -99,6 +100,12 @@ public class MainActivity extends Activity {
         buildUi();
         handle = DocBridge.create(initial);
         applyState(DocBridge.state(handle), true);
+
+        // The australVM Cranelift lane: one compile+execute roundtrip at
+        // startup. The logcat line is the device-tier proof that the JIT
+        // compiled, finalised (RW->RX over its arena) and ran code in
+        // this process — AGENTS.md "#emthin-android".
+        Log.i("emthin-pad", "cranelift roundtrip: " + DocBridge.jitRoundtrip(42));
 
         editor.addTextChangedListener(new TextWatcher() {
             @Override

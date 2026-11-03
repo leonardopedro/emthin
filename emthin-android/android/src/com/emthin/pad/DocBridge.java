@@ -54,4 +54,18 @@ public final class DocBridge {
      */
     public static native String renderPages(String docText, int start, int maxPages,
                                             float scale, int caretUtf16);
+
+    /**
+     * Compiles a CPS constant-return program with the australVM
+     * Cranelift JIT and executes it in-process, returning
+     * {@code {"ok": <result>, "entry": "run_<n>"}} — or
+     * {@code {"error": "…"}} if the compile or run fails (a failed JIT
+     * is data, not a crash, like {@link #renderPages}).
+     *
+     * <p><b>Safe off the UI thread</b>: the JIT engine is per-thread, so
+     * two concurrent calls each get their own engine. The auth gate
+     * stays at its secure DenyAll default — these programs make no
+     * calls, so nothing here relaxes policy to make the smoke pass.
+     */
+    public static native String jitRoundtrip(long value);
 }

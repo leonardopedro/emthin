@@ -31,6 +31,16 @@ mathed_mini = { path = "../../velysterm/crates/mathed_mini", default-features = 
 base64 = "0.22"
 unicode-segmentation = "1"
 
+# The australVM Cranelift JIT bridge — the on-device execution lane
+# (AGENTS.md "#emthin-android"). `default-features = false` drops
+# `unfer-kernel`: unfer_ffi's dependency tree is the one already
+# documented in this file as not building for Android (the same reason
+# mathed_mini's `kernel` feature is off). `cedar` keeps the JIT-time
+# call-policy checks and `tier1-rs` the reference `rs_*` namespace; the
+# bridge's build.rs compiles australVM/safestos/runtime/*.c through cc,
+# which build-apk.sh already points at the NDK clang via CC_*.
+austral_cranelift_bridge = { path = "../../australVM/safestos/cranelift", default-features = false, features = ["cedar", "tier1-rs"] }
+
 # Tests only: the preview's pageView canvas must equal mathed_android's
 # engine `BG` (the paint its frames sit on), so the pin test compares
 # the Java colour literal against the real constant rather than a copy.
