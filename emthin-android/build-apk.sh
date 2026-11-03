@@ -7,21 +7,79 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SDK=/nix/store/zsjpyy4w6ya7f6hsaq5h145d1kc1zspp-androidsdk/libexec/android-sdk
-BT="$SDK/build-tools/37.0.0"
-NDK="$SDK/ndk/30.0.14904198-rc1"
-JDK=/nix/store/1arq9a57sqrn2z5ac362y2233dhcqgkc-openjdk-headless-21.0.12.1+1
-ANDROID_JAR="$SDK/platforms/android-37.0/android.jar"
+# Toolchain resolution: environment → .toolchain/env.sh (written by
+# setup-box64-toolchain.sh) → the pinned Nix store paths below. The pins
+# are only a fallback for a host that can exec the x86_64 SDK binaries
+# directly; on an aarch64 box they go stale on `nix flake update`, so run
+# ./setup-box64-toolchain.sh instead of editing them.
+if [[ -z "${ANDROID_SDK_ROOT:-}" && -f .toolchain/env.sh ]]; then
+    # shellcheck disable=SC1091
+    . .toolchain/env.sh
+fi
 
-API=33
+SDK=${ANDROID_SDK_ROOT:-/nix/store/q5isg1d6fixgyfrdgx5xax6wvy9gya3s-androidsdk/libexec/android-sdk}
+BT="$SDK/build-tools/${ANDROID_BUILD_TOOLS:-37.0.0}"
+NDK="$SDK/ndk/30.0.14904198-rc1"
+JDK=${JAVA_HOME:-/nix/store/mp9lqgch671kqq9qad0gsmw5r373izcn-openjdk-headless-21.0.12.1+1}
+# Glob rather than pin the platform directory: the API level a flake
+# bump lands on should not need a script edit.
+ANDROID_JAR=$(ls -d "$SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1 || true)
+
+API=${ANDROID_API:-33}
 TARGET=x86_64-linux-android
 # Android's APK ABI directory name (≠ the Rust target triple).
 ABI=x86_64
 LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-CLANG="$LLVM/x86_64-linux-android$API-clang"
+
+if [[ -n "${TOOLCHAIN_BIN:-}" ]]; then
+    # The shims carry the --target flag and run the NDK's x86_64 LLVM
+    # under box64; the raw NDK binaries cannot exec on an aarch64 host.
+    CLANG="$TOOLCHAIN_BIN/clang"
+    AR="$TOOLCHAIN_BIN/llvm-ar"
+else
+    CLANG="$LLVM/x86_64-linux-android$API-clang"
+    AR="$LLVM/llvm-ar"
+fi
 
 export JAVA_HOME="$JDK"
-export PATH="$JDK/bin:$BT:$PATH"
+if [[ -n "${TOOLCHAIN_BIN:-}" ]]; then
+    export PATH="$TOOLCHAIN_BIN:$JDK/bin:$BT:$PATH"
+else
+    export PATH="$JDK/bin:$BT:$PATH"
+fi
+
+[ -n "$ANDROID_JAR" ] || {
+    echo "error: no platforms/android-*/android.jar under $SDK" >&2
+    exit 1
+}
+# A raw x86_64 SDK binary on this aarch64 host does not run: the shell
+# reports ENOEXEC as status 126 instead. Catch that here, with a pointer at
+# the setup script, rather than a bare "cannot execute binary file" from
+# whichever step happens to run aapt2 first. Any other status is the
+# tool's own answer on purpose (e.g. `zipalign -h` exits 2).
+probe_tool() { # <name> [probe args...]
+    local t=$1 rc
+    shift
+    command -v "$t" >/dev/null || {
+        echo "error: $t not found — run ./setup-box64-toolchain.sh, or set ANDROID_SDK_ROOT and JAVA_HOME" >&2
+        exit 1
+    }
+    "$t" "$@" >/dev/null 2>&1 || rc=$?
+    if [[ "${rc:-0}" == 126 || "${rc:-0}" == 127 ]]; then
+        echo "error: $t at $(command -v "$t") cannot execute on this host (status $rc) —" >&2
+        echo "       it is an x86_64 binary; run ./setup-box64-toolchain.sh for box64 shims" >&2
+        exit 1
+    fi
+}
+probe_tool aapt2 version
+probe_tool zipalign -h
+probe_tool java -version
+for t in javac apksigner keytool jar; do
+    command -v "$t" >/dev/null || {
+        echo "error: $t not found — run ./setup-box64-toolchain.sh, or set JAVA_HOME" >&2
+        exit 1
+    }
+done
 
 # cargo linker (cargo's own env vars are underscore-only)
 export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CLANG"
@@ -33,8 +91,8 @@ echo "==> [1/6] cargo build --release --target $TARGET"
 env \
     "CC_$TARGET=$CLANG" \
     "CC_${TARGET//-/_}=$CLANG" \
-    "AR_$TARGET=$LLVM/llvm-ar" \
-    "AR_${TARGET//-/_}=$LLVM/llvm-ar" \
+    "AR_$TARGET=$AR" \
+    "AR_${TARGET//-/_}=$AR" \
     cargo build --release --target "$TARGET"
 
 BUILD=build

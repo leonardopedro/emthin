@@ -573,11 +573,26 @@ render never overwrites a newer frame.
 `build-apk.sh` does the whole chain: cargo cross-compiles the `.so` for
 `x86_64-linux-android` (the waydroid ABI), `javac` + `d8` produce
 `classes.dex`, `aapt2` links the manifest, then `zipalign` + `apksigner`
-debug-sign. **It hard-pins Nix store paths** for the SDK, build-tools
-(37.0.0), NDK (30.0.14904198-rc1) and JDK (21.0.12.1+1): a `nix flake
-update` that moves any of those four store paths breaks the script until
-the hashes are refreshed. That fragility is why the APK build is an
-owner-run lane, not a gate.
+debug-sign.
+
+On an aarch64 host the SDK's `aapt2`/`zipalign` and the NDK's LLVM are
+**x86_64 ELF** and fail with ENOEXEC, so run
+**`./setup-box64-toolchain.sh` once** first. It resolves the SDK
+(build-tools 37.0.0, NDK 30.0.14904198-rc1), the JDK, **box64** and an
+x86_64 glibc/libcxx/libgcc/zlib sysroot from nixpkgs, builds a symlink
+farm plus box64 shims under `.toolchain/` (git-ignored), GC-roots the
+resolved paths, and writes `.toolchain/env.sh`. It is idempotent and
+needs no edit after `nix flake update` because nothing is hash-pinned.
+
+`build-apk.sh` resolves its toolchain as **environment →
+`.toolchain/env.sh` → hard-pinned store paths** — the pins are only a
+fallback for a host that can exec the SDK binaries natively, and they do
+go stale on a flake update. Overridable: `ANDROID_SDK_ROOT`, `JAVA_HOME`,
+`TOOLCHAIN_BIN`, `ANDROID_BUILD_TOOLS`, `ANDROID_API`. The platform
+`android.jar` is globbed (`platforms/android-*`), so a new API level
+needs no edit. A missing `aapt2`/`zipalign`/`javac`/`apksigner` fails
+with a pointer at the setup script instead of an ENOEXEC from a raw
+x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
 
 ## Verification lane
 
@@ -593,9 +608,10 @@ owner-run lane, not a gate.
   must rasterise byte-identical to its literal `[1]` label, the wiring
   the 2026-10-19 visual loop found missing), a few seconds, with no NDK
   and no emulator. This is the cheap lane an LLM can drive.
-- **boundary** — the APK build + `../scripts/waydroid-sudo-fixes.sh`
-  (root-side waydroid checks). Neither is wired into CI: the NDK pin and
-  the root requirement both make it an owner-run surface.
+- **boundary** — the APK build (after `./setup-box64-toolchain.sh`)
+  + `../scripts/waydroid-sudo-fixes.sh` (root-side waydroid checks).
+  Neither is wired into CI: the x86_64 toolchain and the root
+  requirement both make it an owner-run surface.
 
 ## Device tier — waydroid (measured 2026-10-19)
 

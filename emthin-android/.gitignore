@@ -1,1 +1,3 @@
 build/
+# Box64 shims + x86_64 sysroot, provisioned by setup-box64-toolchain.sh.
+.toolchain/
