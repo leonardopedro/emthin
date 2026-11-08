@@ -947,4 +947,38 @@ mod tests {
             "a touch on the preview must release a retained scroll target"
         );
     }
+
+    /// A cold launch rebuilds DocModel from its initial text. Without the
+    /// autosave the pad always reopened the starter and every edit was lost
+    /// when Android killed the process.
+    #[test]
+    fn the_document_survives_a_cold_launch() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+
+        assert!(
+            java.contains("getSharedPreferences(PREFS, MODE_PRIVATE)")
+                && java.contains("getString(PREF_DOC, null)"),
+            "onCreate must load the autosaved document before creating the model"
+        );
+        assert!(
+            java.contains(".putString(PREF_DOC, editor.getText().toString())")
+                && java.contains("protected void onPause()"),
+            "edits and onPause must save the editor text"
+        );
+        assert!(
+            java.contains(".putInt(PREF_CARET, Math.max(0, editor.getSelectionStart()))")
+                && java.contains(".putInt(PREF_SCROLL, readingY())"),
+            "savePosition must persist the caret and preview reading offset"
+        );
+        assert!(
+            java.contains("DocBridge.sync(handle, initial, savedCaret)")
+                && java.contains("restoreScrollY = savedScroll")
+                && java.contains("bringPointIntoView(caret)"),
+            "a cold launch must restore the caret, scroll it into view, and restore the reading offset"
+        );
+    }
 }

@@ -1,6 +1,9 @@
 package com.emthin.pad;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.DialogInterface;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.drawable.BitmapDrawable;
@@ -17,6 +20,7 @@ import android.util.Base64;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
@@ -48,6 +52,12 @@ public class MainActivity extends Activity {
     private static final String STARTER =
             "#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n"
                     + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
+
+    /** Where the pad keeps the document between process launches. */
+    private static final String PREFS = "emthin-pad";
+    private static final String PREF_DOC = "docText";
+    private static final String PREF_CARET = "caret";
+    private static final String PREF_SCROLL = "scrollY";
 
     /** Translucent highlight over ranges the model resolved to segments. */
     private static final int SEGMENT_HIGHLIGHT = 0x3346B883;
@@ -115,17 +125,64 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         String initial = STARTER;
+        int savedCaret = prefs.getInt(PREF_CARET, -1);
+        int savedScroll = prefs.getInt(PREF_SCROLL, -1);
+        boolean restoring = false;
         if (savedInstanceState != null) {
-            String saved = savedInstanceState.getString("docText");
+            String saved = savedInstanceState.getString(PREF_DOC);
             if (saved != null) {
                 initial = saved;
+                restoring = true;
+            }
+            savedCaret = savedInstanceState.getInt(PREF_CARET, savedCaret);
+            savedScroll = savedInstanceState.getInt(PREF_SCROLL, savedScroll);
+        } else {
+            String saved = prefs.getString(PREF_DOC, null);
+            if (saved != null) {
+                initial = saved;
+                restoring = true;
             }
         }
 
         buildUi();
         handle = DocBridge.create(initial);
-        applyState(DocBridge.state(handle), true);
+        // Restore the caret in the model before the first state is applied.
+        // Same text means this only moves the caret, so it adds no undo step.
+        String state = restoring && savedCaret >= 0
+                ? DocBridge.sync(handle, initial, savedCaret)
+                : DocBridge.state(handle);
+        applyState(state, true);
+        if (restoring) {
+            // A restored document opens where it was left, not at the first
+            // caption. startRender keeps restoreScrollY and reapplies it
+            // once the pages have been rebuilt.
+            firstRender = false;
+            if (savedScroll >= 0) {
+                restoreScrollY = savedScroll;
+            }
+            // The editor starts at the top; a long document's restored
+            // caret would otherwise be off-screen. Wait for layout, then
+            // bring the caret line into view without focusing (no IME).
+            if (savedCaret >= 0) {
+                final int caret = editor.getSelectionStart();
+                editor.getViewTreeObserver().addOnGlobalLayoutListener(
+                        new ViewTreeObserver.OnGlobalLayoutListener() {
+                            @Override
+                            public void onGlobalLayout() {
+                                editor.getViewTreeObserver()
+                                        .removeOnGlobalLayoutListener(this);
+                                if (editor.getSelectionStart() == caret) {
+                                    boolean moved = editor.bringPointIntoView(caret);
+                                    trace("restoreCaretView", "caret", caret,
+                                            "scrollY", editor.getScrollY(),
+                                            "moved", moved);
+                                }
+                            }
+                        });
+            }
+        }
 
         // The australVM Cranelift lane: one compile+execute roundtrip at
         // startup. The logcat line is the device-tier proof that the JIT
@@ -156,8 +213,49 @@ public class MainActivity extends Activity {
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         if (editor != null) {
-            outState.putString("docText", editor.getText().toString());
+            outState.putString(PREF_DOC, editor.getText().toString());
+            outState.putInt(PREF_CARET, Math.max(0, editor.getSelectionStart()));
+            outState.putInt(PREF_SCROLL, readingY());
         }
+    }
+
+    @Override
+    protected void onPause() {
+        saveDocument();
+        savePosition();
+        super.onPause();
+    }
+
+    /** Writes the current editor text so a cold launch resumes the document. */
+    private void saveDocument() {
+        if (editor == null) {
+            return;
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_DOC, editor.getText().toString())
+                .apply();
+    }
+
+    /**
+     * Writes the caret and preview offset for the next launch. During a
+     * rebuild the pages are briefly removed and the ScrollView clamps to
+     * 0, so fall back to the retained target until the pages are back.
+     */
+    private void savePosition() {
+        if (editor == null || previewScroll == null) {
+            return;
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putInt(PREF_CARET, Math.max(0, editor.getSelectionStart()))
+                .putInt(PREF_SCROLL, readingY())
+                .apply();
+    }
+
+    /** The live preview offset, or the retained target while pages rebuild. */
+    private int readingY() {
+        return previewPages.getChildCount() > 0
+                ? previewScroll.getScrollY()
+                : Math.max(0, restoreScrollY);
     }
 
     @Override
@@ -181,6 +279,15 @@ public class MainActivity extends Activity {
 
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button newButton = new Button(this);
+        newButton.setText("New");
+        newButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                confirmNewDocument();
+            }
+        });
 
         undoButton = new Button(this);
         undoButton.setText("Undo");
@@ -209,6 +316,7 @@ public class MainActivity extends Activity {
         statusLp.leftMargin = dp(12);
         status.setPadding(0, dp(14), 0, 0);
 
+        bar.addView(newButton);
         bar.addView(undoButton);
         bar.addView(redoButton);
         bar.addView(status, statusLp);
@@ -310,6 +418,40 @@ public class MainActivity extends Activity {
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    private void confirmNewDocument() {
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("New document")
+                .setMessage("Replace the current text with the starter document?"
+                        + " This can be undone.")
+                .setPositiveButton("New", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        newDocument();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Replaces the text with the starter and reopens the preview at its caption. */
+    private void newDocument() {
+        if (handle == 0) {
+            return;
+        }
+        // A New document starts over instead of inheriting the old reading
+        // position if the process dies before onPause saves the new one.
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .remove(PREF_CARET)
+                .remove(PREF_SCROLL)
+                .apply();
+        firstRender = true;
+        applyState(DocBridge.sync(handle, STARTER, 0), true);
+        // Run the initial render now, so a quick Undo cannot inherit the
+        // first-paint caret/scroll special case meant for this replacement.
+        main.removeCallbacks(renderNow);
+        renderNow.run();
     }
 
     /**
@@ -625,6 +767,7 @@ public class MainActivity extends Activity {
             undoButton.setEnabled(o.getBoolean("canUndo"));
             redoButton.setEnabled(o.getBoolean("canRedo"));
             refreshSegments(o);
+            saveDocument();
             scheduleRender();
         } catch (Exception e) {
             status.setText("state error: " + e.getMessage());

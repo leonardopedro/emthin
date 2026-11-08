@@ -33,11 +33,15 @@
 #   screencap F  capture the screen to file F (prefix-stripped PNG)
 #   logcat F     dump the pad's logcat to F
 #   swipe        one drag inside the preview ScrollView
+#   persistence  edit -> force-stop -> relaunch autosave proof (used by e2e)
+#   new-reset    New confirmation -> starter reset -> Undo restore proof
+#                (used by e2e)
 #   scroll-anchor  cold-launch starter -> page-2 -> one-page collapse ->
 #                undo reading-position proof (used by e2e)
 #   e2e          authorize, connect, build, install, launch, screencap,
-#                swipe, screencap, logcat, scroll-anchor, pull +
-#                byte-identity (the repeatable device proof)
+#                swipe, screencap, logcat, persistence, new-reset,
+#                scroll-anchor, pull + byte-identity (the repeatable
+#                device proof)
 #
 # Env overrides:
 #   DEVICE       adb serial (default: waydroid status IP + :5555; an explicit
@@ -82,7 +86,9 @@ say()  { printf '%s\n' "$*"; }
 pass() { printf 'ok   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
 
-usage() { sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() {
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
 
 # Resolve DEVICE from `waydroid status` when not given (no root needed).
 resolve_device() {
@@ -196,6 +202,17 @@ cmd_launch() {
         pass "am start -W $ACTIVITY"
     else
         fail "am start -W $ACTIVITY"
+    fi
+}
+
+# The pad now autosaves. Device checks that assert the starter document
+# must clear that saved text first or they inherit the previous run.
+cmd_clear_data() {
+    if D shell pm clear "$PKG" >/dev/null 2>&1; then
+        pass "cleared pad app data"
+    else
+        fail "pm clear $PKG"
+        return 1
     fi
 }
 
@@ -371,6 +388,197 @@ last_restore() {
     ' "$1"
 }
 
+cmd_persistence() {
+    local log="$OUTDIR/persistence-logcat.txt"
+    local ui="$OUTDIR/persistence-ui.xml"
+    local focus shot
+
+    say "==> persistence: edit -> force-stop -> relaunch"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "starter document did not render two pages"; return; }
+    wait_for_log "$log" 'captionScroll' \
+        || { fail "starter document did not open at the first caption"; return; }
+    pass "cold-launched the starter"
+
+    cmd_uidump "$ui" || return
+    tap_editor_end || { fail "editor not found in UI hierarchy"; return; }
+    sleep 1.0
+    if keyboard_shown; then
+        D shell input keyevent KEYCODE_BACK >/dev/null 2>&1
+        sleep 0.4
+        pass "closed the IME"
+    fi
+    focus=$(D shell dumpsys window 2>/dev/null | tr -d '\r' | grep -m1 'mCurrentFocus' || true)
+    case "$focus" in
+        *com.emthin.pad*) ;;
+        *) fail "activity left the foreground before typing: ${focus:-no focus}"; return ;;
+    esac
+
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input text X >/dev/null 2>&1
+    wait_for_log "$log" 'applyState setCaret false .*textLen 90' \
+        || { fail "typed probe did not reach the model"; return; }
+
+    # Move one grapheme back from the document end. The first-paint
+    # fallback uses text.length() (90); a restored caret is 89, so the
+    # log line distinguishes a real restore from the fallback.
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input keyevent KEYCODE_DPAD_LEFT >/dev/null 2>&1
+    wait_for_log "$log" 'startRender .*textLen 90 caret 89' \
+        || { fail "caret probe did not move to 89"; return; }
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "caret probe did not render two pages"; return; }
+    sleep 0.5
+
+    # Move the preview into page 2's content, then background the app so
+    # onPause saves the caret and reading offset. A plain force-stop
+    # would not run onPause.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        cmd_swipe
+        sleep 0.25
+    done
+    D shell input keyevent KEYCODE_HOME >/dev/null 2>&1
+    sleep 1.2
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    sleep 0.3
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyState setCaret true .*textLen 90' \
+        || { fail "relaunch lost the saved 90-byte document"; return; }
+    pass "relaunch restored the edited document (textLen 90)"
+    wait_for_log "$log" 'startRender .*textLen 90 caret 89' \
+        || { fail "relaunch did not restore the caret at 89"; return; }
+    pass "relaunch restored the caret at 89"
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "restored document did not render two pages"; return; }
+    wait_for_log "$log" 'restoreScroll' \
+        || { fail "relaunch did not restore the preview reading position"; return; }
+    read -r restored_y restored_actual < <(last_restore "$log")
+    if [ "$restored_y" -le 0 ]; then
+        fail "relaunch did not save a positive reading offset"
+        return
+    fi
+    if [ "$restored_y" -ne "$restored_actual" ]; then
+        fail "relaunch restored y $restored_y but landed at $restored_actual"
+        return
+    fi
+    pass "relaunch restored reading y $restored_y"
+    sleep 0.6
+    pass "restored document rendered"
+
+    if shot=$(cmd_screencap "$OUTDIR/persistence-after-restart.png"); then
+        say "    captured $shot"
+    fi
+}
+
+cmd_new_reset() {
+    local log="$OUTDIR/new-reset-logcat.txt"
+    local ui="$OUTDIR/new-reset-ui.xml"
+    local b focus shot
+
+    say "==> new document: reset -> undo"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "starter document did not render two pages"; return; }
+    wait_for_log "$log" 'captionScroll' \
+        || { fail "starter document did not open at the first caption"; return; }
+    pass "cold-launched the starter for New"
+
+    cmd_uidump "$ui" || return
+    tap_editor_end || { fail "editor not found in UI hierarchy"; return; }
+    sleep 1.0
+    if keyboard_shown; then
+        D shell input keyevent KEYCODE_BACK >/dev/null 2>&1
+        sleep 0.4
+        pass "closed the IME"
+    else
+        say "info IME was already hidden"
+    fi
+    focus=$(D shell dumpsys window 2>/dev/null | tr -d '\r' | grep -m1 'mCurrentFocus' || true)
+    case "$focus" in
+        *com.emthin.pad*) pass "activity still focused after closing the IME" ;;
+        *) fail "activity left the foreground after closing the IME: ${focus:-no focus}"; return ;;
+    esac
+
+    # Change the document so New has something real to discard and Undo
+    # has a step to restore. The starter is 89 bytes; X makes it 90.
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input text X >/dev/null 2>&1
+    wait_for_log "$log" 'applyState setCaret false .*textLen 90' \
+        || { fail "New probe did not reach the model"; return; }
+    wait_for_log "$log" 'startRender .*textLen 90' \
+        || { fail "New probe did not render"; return; }
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "New probe did not render two pages"; return; }
+    pass "typed the 90-byte probe"
+
+    # Open the confirmation through the actual toolbar button, assert its
+    # title, and capture the dark dialog before confirming it.
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="New"') \
+        || { fail "New not found in UI hierarchy"; return; }
+    tap_center "$b"
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    if ! grep -q 'text="New document"' "$ui"; then
+        fail "New confirmation did not open"
+        return
+    fi
+    pass "New confirmation opened"
+    if shot=$(cmd_screencap "$OUTDIR/new-dialog.png"); then
+        say "    captured $shot"
+    fi
+
+    b=$(node_bounds 'resource-id="android:id/button1"') \
+        || { fail "New confirmation has no positive button"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'applyState setCaret true .*textLen 89 canUndo true' \
+        || { fail "New did not reset the document to 89 bytes"; return; }
+    pass "New reset the document to 89 bytes"
+    wait_for_log "$log" 'startRender .*textLen 89' \
+        || { fail "New reset did not render"; return; }
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "New reset did not render two pages"; return; }
+    wait_for_log "$log" 'captionScroll' \
+        || { fail "New reset did not reopen at the first caption"; return; }
+    sleep 0.5
+
+    # The confirmation is only useful if the reset is undoable.
+    cmd_uidump "$ui" || return
+    if ! grep -q 'text="Undo"[^>]*enabled="true"' "$ui"; then
+        fail "Undo was not enabled after New"
+        return
+    fi
+    pass "Undo is enabled after New"
+    if shot=$(cmd_screencap "$OUTDIR/new-reset-after-new.png"); then
+        say "    captured $shot"
+    fi
+
+    D logcat -c >/dev/null 2>&1 || true
+    b=$(node_bounds 'text="Undo"') \
+        || { fail "Undo not found in UI hierarchy"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'applyState setCaret true .*textLen 90' \
+        || { fail "Undo did not restore the 90-byte document"; return; }
+    pass "Undo restored the 90-byte edited document"
+    wait_for_log "$log" 'startRender .*textLen 90' \
+        || { fail "Undo restore did not render"; return; }
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "Undo restore did not render two pages"; return; }
+    sleep 0.5
+    if shot=$(cmd_screencap "$OUTDIR/new-reset-after-undo.png"); then
+        say "    captured $shot"
+    fi
+}
+
 cmd_scroll_anchor() {
     local log="$OUTDIR/scroll-anchor-logcat.txt"
     local ui="$OUTDIR/scroll-anchor-ui.xml"
@@ -380,10 +588,10 @@ cmd_scroll_anchor() {
     say "==> scroll anchor: page 2 -> one-page collapse -> undo"
     mkdir -p "$OUTDIR"
 
-    # Self-contained start: a previous failed run may have left the
-    # trailing space in the document, so cold-launch the 89-byte starter
-    # instead of inheriting whatever state the app is in.
-    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    # Self-contained start: a previous run or the persistence check may
+    # have left text behind, so clear app data and cold-launch the
+    # 89-byte starter instead of inheriting whatever state the app is in.
+    cmd_clear_data || return
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch || return
     wait_for_log "$log" 'applyChunk total 2 pages 2' \
@@ -504,8 +712,9 @@ cmd_e2e() {
     fi
     cmd_install || { say "install failed; aborting e2e"; return; }
 
-    # Cold start so the first frame is this launch's.
-    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    # Cold start so the first frame is this launch's. Autosave means the
+    # previous session's text would otherwise survive this launch.
+    cmd_clear_data || return
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch
     sleep 3
@@ -549,8 +758,10 @@ cmd_e2e() {
         fail "captionScroll missing from $log"
     fi
 
-    # The reading-position proof cold-launches the starter itself:
-    # page 2 -> collapse to one page -> undo back to page 2.
+    # Autosave, New/Undo, then the reading-position proof. Each check
+    # clears app data itself, so it still cold-launches the 89-byte starter.
+    cmd_persistence
+    cmd_new_reset
     cmd_scroll_anchor
 
     # Byte-identity of the installed APK, the launch proof's companion.
@@ -578,6 +789,8 @@ case "$cmd" in
     screencap) cmd_screencap "${2:-}"; echo ;;
     logcat)    cmd_logcat "${2:-}" ;;
     swipe)     cmd_swipe ;;
+    persistence) cmd_persistence ;;
+    new-reset) cmd_new_reset ;;
     scroll-anchor) cmd_scroll_anchor ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;

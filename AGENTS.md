@@ -515,6 +515,12 @@ calloop / mio / tokio all work the same. Tests use plain
 
 An Android app that embeds emthin's `DocModel` verbatim — the same Rust
 model the desktop compositor drives, behind a JNI bridge instead of IPC.
+It is a single-document editor: New (confirmed) resets to the starter,
+Undo/Redo drive the model, and state changes plus `onPause` autosave the
+text, caret, and preview reading offset to SharedPreferences; a cold
+launch restores all three and scrolls the editor to the restored caret
+(without opening the IME). The New confirmation uses the dark platform
+dialog theme so it matches the pad.
 
 ## Layout and the seam
 
@@ -605,9 +611,10 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **36 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **37 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
-  conversion, and the mathed page seam — the app's actual starter
+  conversion, the Java autosave source assertions, and the mathed page
+  seam — the app's actual starter
   document rendered page-by-page with the RGBA base64 contract the Java
   side decodes, chunk continuity across a genuinely paginated document,
   the scale/chunk fallbacks, a canvas pin: the Java `pageView`
@@ -625,15 +632,23 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
   device's ABI, installs, cold-launches, writes before/after screenshots
   and `e2e-logcat.txt` under `OUTDIR`, asserts the JIT roundtrip, a
   rendered chunk and the first-caption scroll in that log, and
-  md5-checks the installed base APK against the build. It then
-  cold-launches the starter again and runs `scroll-anchor`: scrolls to
-  page 2, focuses the editor, adds a trailing space (two pages -> one),
-  and taps Undo, asserting the logged `restoreScroll` target is clamped
-  by the collapse and restored exactly by Undo. The check finds the
-  editor and Undo bounds with `uiautomator dump`, so its taps do not
-  depend on pixel constants. The preview drag is sized from `wm size`
-  unless `SWIPE_*` is set. `SKIP_BUILD=1` reuses the current APK for a
-  capture-only visual rerun; `DEVICE`/`ADB` override the target.
+  md5-checks the installed base APK against the build. Since the pad
+  autosaves, the lane clears app data before every cold start. It first
+  types a probe, moves the caret off the document end, backgrounds the
+  app so `onPause` saves, force-stops, relaunches, and asserts the edited
+  90-byte document, caret 89, and a positive reading offset came back
+  from SharedPreferences. It then runs `new-reset`: types the 90-byte
+  probe, opens New, captures the confirmation, asserts the reset rendered
+  89 bytes with Undo enabled, taps Undo, and asserts the 90-byte document
+  returned. Finally it cold-launches the starter and runs
+  `scroll-anchor`: scrolls to page 2, focuses the editor, adds a trailing
+  space (two pages -> one), and taps Undo, asserting the logged
+  `restoreScroll` target is clamped by the collapse and restored exactly
+  by Undo. The check finds the editor, New, the dialog's positive button,
+  and Undo bounds with `uiautomator dump`, so its taps do not depend on
+  pixel constants. The preview drag is sized from `wm size` unless `SWIPE_*`
+  is set. `SKIP_BUILD=1` reuses the current APK for a capture-only visual
+  rerun; `DEVICE`/`ADB` override the target.
 
 ## Device tier — waydroid (measured 2026-10-19)
 
