@@ -605,7 +605,7 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **35 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **36 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, and the mathed page seam — the app's actual starter
   document rendered page-by-page with the RGBA base64 contract the Java

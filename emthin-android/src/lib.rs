@@ -907,4 +907,30 @@ mod tests {
             "the caption scroll must be one-shot, not jump on every edit"
         );
     }
+
+    /// An edit rebuilds every page, so the ScrollView loses its offset.
+    /// The pad keeps the pre-render offset and reapplies it once the new
+    /// pages are in place; otherwise the first keystroke snaps the user
+    /// back to the page margin above the caption.
+    #[test]
+    fn edits_restore_the_preview_scroll_position() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+
+        assert!(
+            java.contains("restoreScrollY = openAtCaption ? -1 : previewScroll.getScrollY();"),
+            "an edit must capture the old offset before the page rebuild"
+        );
+        assert!(
+            java.contains("restorePreviewScroll();"),
+            "the rebuilt chunk must restore the captured offset"
+        );
+        assert!(
+            java.contains("previewScroll.scrollTo(0, target);"),
+            "restoring the offset must scroll the rebuilt preview"
+        );
+    }
 }

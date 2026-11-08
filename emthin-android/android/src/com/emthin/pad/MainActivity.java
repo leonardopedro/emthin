@@ -3,10 +3,13 @@ package com.emthin.pad;
 import android.app.Activity;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
+import android.text.InputType;
 import android.text.Spannable;
 import android.text.TextWatcher;
 import android.text.style.BackgroundColorSpan;
@@ -66,6 +69,8 @@ public class MainActivity extends Activity {
     private TextView previewError;
     /** One-shot: scroll the first render to the first caption's layout y. */
     private boolean scrollToFirstCaption;
+    /** Scroll offset to restore after replacing pages, or -1 for the first paint. */
+    private int restoreScrollY = -1;
     /** True while we mutate the EditText ourselves (suppresses sync). */
     private boolean applying;
 
@@ -207,6 +212,11 @@ public class MainActivity extends Activity {
 
         editor = new CaretEditText(this);
         editor.setTypeface(android.graphics.Typeface.MONOSPACE);
+        // Markup, not prose: keep the IME from red-underlining \\app(...)
+        // and numbers or autocorrecting tokens.
+        editor.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         editor.setTextColor(Color.parseColor("#E6EDF3"));
         editor.setHintTextColor(Color.parseColor("#4E5965"));
         editor.setHint("#1 caption #2 \\app(#1, #2, w, h)");
@@ -339,7 +349,11 @@ public class MainActivity extends Activity {
         totalPages = 0;
         chunkInFlight = false;
         scrollToFirstCaption = openAtCaption;
-        previewPages.removeAllViews();
+        // Dropping the pages clamps the ScrollView to 0. Keep the reading
+        // position across the rebuild; the first paint has no position yet
+        // and scrolls to the caption instead.
+        restoreScrollY = openAtCaption ? -1 : previewScroll.getScrollY();
+        releasePageBitmaps();
         trace("startRender", "gen", renderGeneration, "textLen", text.length(),
                 "caret", caret,
                 "head", text.substring(0, Math.min(24, text.length())));
@@ -489,10 +503,59 @@ public class MainActivity extends Activity {
                     });
                 }
             }
+            restorePreviewScroll();
             previewError.setVisibility(View.GONE);
         } catch (Exception e) {
             showPreviewError("render: " + e.getMessage());
         }
+    }
+
+    /**
+     * Drops the old page rasters before the rebuild. removeAllViews()
+     * alone leaves the bitmaps for a later GC; on the pad's large pages
+     * that is roughly 25 MB of Java heap held while the new render (and
+     * its own base64 payload) is in flight.
+     */
+    private void releasePageBitmaps() {
+        int released = 0;
+        for (int i = previewPages.getChildCount() - 1; i >= 0; i--) {
+            View child = previewPages.getChildAt(i);
+            if (!(child instanceof ImageView)) {
+                continue;
+            }
+            ImageView page = (ImageView) child;
+            Drawable drawable = page.getDrawable();
+            page.setImageDrawable(null);
+            if (drawable instanceof BitmapDrawable) {
+                Bitmap bmp = ((BitmapDrawable) drawable).getBitmap();
+                if (bmp != null && !bmp.isRecycled()) {
+                    bmp.recycle();
+                    released++;
+                }
+            }
+        }
+        previewPages.removeAllViews();
+        trace("releasePages", "bitmaps", released);
+    }
+
+    /** Reapplies the pre-render offset once the rebuilt pages are in place. */
+    private void restorePreviewScroll() {
+        if (restoreScrollY < 0) {
+            return;
+        }
+        final int target = restoreScrollY;
+        final int generation = renderGeneration;
+        restoreScrollY = -1;
+        previewScroll.post(new Runnable() {
+            @Override
+            public void run() {
+                if (generation != renderGeneration || previewPages.getChildCount() == 0) {
+                    return;
+                }
+                previewScroll.scrollTo(0, target);
+                trace("restoreScroll", "gen", generation, "y", target);
+            }
+        });
     }
 
     // ----- state -------------------------------------------------------
