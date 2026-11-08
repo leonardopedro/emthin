@@ -570,25 +570,34 @@ render never overwrites a newer frame.
 
 ## Build (gradle-free)
 
-`build-apk.sh` does the whole chain: cargo cross-compiles the `.so` for
-`x86_64-linux-android` (the waydroid ABI), `javac` + `d8` produce
+`build-apk.sh` does the whole chain: it picks the device ABI (explicit
+`ANDROID_ABI`, else `adb shell getprop ro.product.cpu.abi`, else the
+provisioned toolchain ABI — `x86_64` without one), maps it to the Rust
+target (`arm64-v8a` →
+`aarch64-linux-android`, `x86_64` → `x86_64-linux-android`, …), and
+cargo cross-compiles the `.so` for that target; `javac` + `d8` produce
 `classes.dex`, `aapt2` links the manifest, then `zipalign` + `apksigner`
 debug-sign.
 
 On an aarch64 host the SDK's `aapt2`/`zipalign` and the NDK's LLVM are
 **x86_64 ELF** and fail with ENOEXEC, so run
-**`./setup-box64-toolchain.sh` once** first. It resolves the SDK
-(build-tools 37.0.0, NDK 30.0.14904198-rc1), the JDK, **box64** and an
-x86_64 glibc/libcxx/libgcc/zlib sysroot from nixpkgs, builds a symlink
-farm plus box64 shims under `.toolchain/` (git-ignored), GC-roots the
-resolved paths, and writes `.toolchain/env.sh`. It is idempotent and
-needs no edit after `nix flake update` because nothing is hash-pinned.
+**`ANDROID_ABI=<abi> ./setup-box64-toolchain.sh` once** first; use
+`ANDROID_ABI=arm64-v8a` for an arm64 Waydroid image (the default stays
+`x86_64`). It resolves the SDK (build-tools 37.0.0, NDK
+30.0.14904198-rc1), the JDK, **box64** and an x86_64
+glibc/libcxx/libgcc/zlib sysroot from nixpkgs, builds a symlink farm
+plus box64 shims under `.toolchain/` (git-ignored), GC-roots the
+resolved paths, and writes `.toolchain/env.sh`. The clang shims carry
+the chosen ABI's `--target`, so rerun setup when switching device ABIs.
+It is idempotent and needs no edit after `nix flake update` because
+nothing is hash-pinned.
 
 `build-apk.sh` resolves its toolchain as **environment →
 `.toolchain/env.sh` → hard-pinned store paths** — the pins are only a
 fallback for a host that can exec the SDK binaries natively, and they do
 go stale on a flake update. Overridable: `ANDROID_SDK_ROOT`, `JAVA_HOME`,
-`TOOLCHAIN_BIN`, `ANDROID_BUILD_TOOLS`, `ANDROID_API`. The platform
+`TOOLCHAIN_BIN`, `ANDROID_CLANG`, `ANDROID_AR`, `ANDROID_ABI`,
+`ANDROID_BUILD_TOOLS`, `ANDROID_API`, `ADB` (for ABI detection). The platform
 `android.jar` is globbed (`platforms/android-*`), so a new API level
 needs no edit. A missing `aapt2`/`zipalign`/`javac`/`apksigner` fails
 with a pointer at the setup script instead of an ENOEXEC from a raw
@@ -596,7 +605,7 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **29 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **35 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, and the mathed page seam — the app's actual starter
   document rendered page-by-page with the RGBA base64 contract the Java
@@ -612,6 +621,14 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
   + `../scripts/waydroid-sudo-fixes.sh` (root-side waydroid checks).
   Neither is wired into CI: the x86_64 toolchain and the root
   requirement both make it an owner-run surface.
+- **device lane** — `./device-lane.sh e2e` builds for the connected
+  device's ABI, installs, cold-launches, writes before/after screenshots
+  and `e2e-logcat.txt` under `OUTDIR`, asserts the JIT roundtrip, a
+  rendered chunk and the first-caption scroll in that log, and
+  md5-checks the installed base APK against the build. The preview drag
+  is sized from `wm size` unless `SWIPE_*` is set. `SKIP_BUILD=1` reuses
+  the current APK for a capture-only visual rerun; `DEVICE`/`ADB`
+  override the target.
 
 ## Device tier — waydroid (measured 2026-10-19)
 

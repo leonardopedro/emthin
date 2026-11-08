@@ -11,8 +11,10 @@
 #   ./setup-box64-toolchain.sh          # (re)provision; idempotent
 #   . .toolchain/env.sh && ./build-apk.sh
 #
-# Overridable: ANDROID_API (33), ANDROID_PLATFORM (37.0),
-# ANDROID_BUILD_TOOLS (37.0.0), ANDROID_NDK_VERSION (30.0.14904198-rc1).
+# Overridable: ANDROID_ABI (x86_64), ANDROID_API (33),
+# ANDROID_PLATFORM (37.0), ANDROID_BUILD_TOOLS (37.0.0),
+# ANDROID_NDK_VERSION (30.0.14904198-rc1). Set ANDROID_ABI=arm64-v8a
+# when the device is an arm64 Waydroid image; the shims carry that target.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,7 +22,14 @@ API=${ANDROID_API:-33}
 PLATFORM=${ANDROID_PLATFORM:-37.0}
 BUILD_TOOLS=${ANDROID_BUILD_TOOLS:-37.0.0}
 NDK_VERSION=${ANDROID_NDK_VERSION:-30.0.14904198-rc1}
-TARGET=x86_64-linux-android
+ABI=${ANDROID_ABI:-x86_64}
+case "$ABI" in
+    arm64-v8a)   TARGET=aarch64-linux-android ;;
+    armeabi-v7a) TARGET=armv7a-linux-androideabi ;;
+    x86)         TARGET=i686-linux-android ;;
+    x86_64)      TARGET=x86_64-linux-android ;;
+    *) echo "error: unsupported ANDROID_ABI '$ABI'" >&2; exit 2 ;;
+esac
 
 TC=.toolchain
 
@@ -179,6 +188,10 @@ export ANDROID_SDK_ROOT="$SDK"
 export ANDROID_NDK_ROOT="$SDK/ndk/$NDK_VERSION"
 export ANDROID_BUILD_TOOLS="$BUILD_TOOLS"
 export ANDROID_API="$API"
+# The shims, not the APK, are what this records: build-apk.sh still asks
+# the connected device for its ABI and uses this only as the no-device
+# fallback / mismatch check.
+export EMTHIN_TOOLCHAIN_ABI="$ABI"
 export JAVA_HOME="$JDK"
 # Box64 shims for the x86_64 aapt2/zipalign/LLVM; must precede the
 # build-tools directory on PATH or the raw ELFs win and fail with ENOEXEC.
@@ -197,6 +210,6 @@ echo "==> [4/4] self-check"
 echo "    aapt2 / clang execute"
 
 echo
-echo "OK: toolchain in $TC/"
+echo "OK: toolchain in $TC/ (ABI $ABI, target $TARGET)"
 echo "    use it with:  . .toolchain/env.sh && ./build-apk.sh"
 echo "    (build-apk.sh also sources $TC/env.sh on its own)"

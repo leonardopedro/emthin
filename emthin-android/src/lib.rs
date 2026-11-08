@@ -332,11 +332,16 @@ const MAX_CHUNK_PAGES: usize = 8;
 /// as a UTF-16 index, driving reveal-on-caret exactly like the engine.
 ///
 /// Returns `{ "total", "start", "pages": [ { "width", "height",
-/// "rgba" }, … ] }` with each `rgba` base64-encoded RGBA8 — the same
-/// one-value transport mathed_android uses for its screenshots.
-/// `total` is the document's full page count, so the caller knows how
-/// many chunks there are; a `start` past `total` yields an empty
-/// `pages` array ("nothing more to load"), not an error.
+/// "rgba", "textTop" }, … ] }` with each `rgba` base64-encoded RGBA8 —
+/// the same one-value transport mathed_android uses for its screenshots.
+/// `textTop` is the first text band's y in page points at or after the
+/// first resolved caption span: the pad opens the preview there, so the
+/// caption is visible immediately instead of below a tall figure. It is
+/// `null` for a page before that caption or with no text; a document
+/// with no marker segments falls back to its first text. `total` is the
+/// document's full page count, so the caller knows how many chunks there
+/// are; a `start` past `total` yields an empty `pages` array ("nothing
+/// more to load"), not an error.
 fn render_pages(
     doc_text: &str,
     start: usize,
@@ -372,6 +377,17 @@ fn render_pages(
         ..TransformOptions::default()
     };
 
+    // The document opens on its first caption, not the page margin. The
+    // paged layout's glyph index is the authority for where that caption
+    // landed: the first resolved segment's span gives a document byte,
+    // and the page's first glyph at/after it gives that line's band. A
+    // plain-prose document (no segments) falls back to its first text
+    // band, and pages before a known caption report null.
+    let caption_start = segments
+        .iter()
+        .filter_map(|s| s.span.as_ref().map(|span| span.start))
+        .min();
+
     // `PageLayout::image` is an `imaging::RgbaImage` carrying its
     // dimensions as fields and its pixels in `data` (RGBA8), the same
     // shape engine.rs samples from. `RenderError` is `Debug`-only (a
@@ -390,7 +406,30 @@ fn render_pages(
         .take(max_pages.clamp(1, MAX_CHUNK_PAGES))
         .map(|p| {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&p.image.data);
-            json!({ "width": p.image.width, "height": p.image.height, "rgba": b64 })
+            // With a known caption span, a page before the caption must
+            // report `null` rather than its own prose, or the pad would
+            // open on an earlier paragraph. Only a document with no
+            // segments falls back to its first text.
+            let text_top = match caption_start {
+                Some(start) => p
+                    .glyphs
+                    .entries
+                    .iter()
+                    .find(|e| e.doc_byte >= start)
+                    .and_then(|e| p.glyphs.bands.get(e.band as usize)),
+                None => p
+                    .glyphs
+                    .entries
+                    .first()
+                    .and_then(|e| p.glyphs.bands.get(e.band as usize)),
+            }
+            .map(|band| band.top);
+            json!({
+                "width": p.image.width,
+                "height": p.image.height,
+                "rgba": b64,
+                "textTop": text_top,
+            })
         })
         .collect();
     Ok(json!({ "total": total, "start": start, "pages": chunk }).to_string())
@@ -610,6 +649,33 @@ mod tests {
         }
     }
 
+    /// The preview scrolls to the first caption on open, so the render
+    /// must report where that caption typeset. On the starter document
+    /// the 600x300 figure slot comes first, so the caption is below it
+    /// (and below the A4 top margin), not at y=0.
+    #[test]
+    fn render_pages_reports_the_first_caption_top() {
+        let starter = String::from("#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n")
+            + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
+        let v: Value = serde_json::from_str(
+            &render_pages(&starter, 0, 8, 1.0, starter.len()).expect("the starter renders"),
+        )
+        .unwrap();
+        let page = &v["pages"][0];
+        let top = page["textTop"]
+            .as_f64()
+            .expect("page 1 must report the caption's y");
+        let height = page["height"].as_f64().unwrap();
+        assert!(
+            top > 300.0,
+            "the starter's first caption sits below its 300pt figure slot, got y={top}"
+        );
+        assert!(
+            top < height,
+            "caption top {top} must be inside the {height}pt page"
+        );
+    }
+
     /// Chunking is a transport detail, not a change of document:
     /// consecutive chunks both see the same `total` and together cover
     /// the document's pages in order, and a `start` past the end
@@ -790,6 +856,55 @@ mod tests {
         assert_ne!(
             collapsed, expanded,
             "moving the caret into the segment must change the render"
+        );
+    }
+
+    /// Opening the pad must show the typeset document, not the first
+    /// statement's raw markers. The editor's caret starts at 0, which
+    /// reveal-on-caret reads as the first segment's start; the first
+    /// render parks its *render* caret at the document end instead. The
+    /// editor caret itself is untouched, so typing still starts at 0.
+    #[test]
+    fn first_render_parks_the_render_caret_at_the_document_end() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+
+        assert!(
+            java.contains("int caret = firstRender ? text.length() : editor.getSelectionStart();"),
+            "the first render must use the document end as its caret so the startup preview is collapsed"
+        );
+        assert!(
+            java.contains("requestChunk(text, 0, caret);"),
+            "startRender must pass the first render's parked caret into chunk 0"
+        );
+    }
+
+    /// The first paint must show the first caption, not the empty page
+    /// margin above it. The renderer reports the caption's layout y in
+    /// points; the pad maps it through the page's displayed width and
+    /// scrolls once, at the first page in the stream that has the caption.
+    #[test]
+    fn first_paint_scrolls_to_the_rendered_caption() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+
+        assert!(
+            java.contains("p.optDouble(\"textTop\", -1)"),
+            "the pad must read the renderer's caption top"
+        );
+        assert!(
+            java.contains("previewScroll.scrollTo(0, y);"),
+            "the first paint must scroll the preview to the caption"
+        );
+        assert!(
+            java.contains("scrollToFirstCaption = false;"),
+            "the caption scroll must be one-shot, not jump on every edit"
         );
     }
 }

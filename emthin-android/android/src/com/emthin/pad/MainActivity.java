@@ -62,7 +62,10 @@ public class MainActivity extends Activity {
     private TextView status;
     /** One caption + {@link ImageView} per rendered page, stacked. */
     private LinearLayout previewPages;
+    private ScrollView previewScroll;
     private TextView previewError;
+    /** One-shot: scroll the first render to the first caption's layout y. */
+    private boolean scrollToFirstCaption;
     /** True while we mutate the EditText ourselves (suppresses sync). */
     private boolean applying;
 
@@ -77,11 +80,24 @@ public class MainActivity extends Activity {
     private int totalPages;
     /** One chunk in flight at a time (the renderer is single-threaded). */
     private boolean chunkInFlight;
+    /**
+     * The first paint shows the document itself. The editor opens with
+     * its caret at 0, which reveal-on-caret would read as the first
+     * statement's boundary and expand its raw `#1 … #2 \\app(…)` form.
+     * Park the initial *render* caret at the document end (outside the
+     * last statement for a newline-terminated document) so the preview
+     * opens collapsed; the editor's own caret stays at 0.
+     */
+    private boolean firstRender = true;
     /** Debounce handle, so a burst of keystrokes rasterises once. */
     private final Runnable renderNow = new Runnable() {
         @Override
         public void run() {
-            startRender(editor.getText().toString());
+            String text = editor.getText().toString();
+            boolean initial = firstRender;
+            int caret = firstRender ? text.length() : editor.getSelectionStart();
+            firstRender = false;
+            startRender(text, caret, initial);
         }
     };
 
@@ -231,7 +247,7 @@ public class MainActivity extends Activity {
         previewBox.addView(previewError, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        ScrollView previewScroll = new ScrollView(this);
+        previewScroll = new ScrollView(this);
         // fillViewport(false) is load-bearing: with fillViewport(true) the
         // ScrollView re-measures previewBox with EXACTLY(viewport), so the
         // LinearLayout hands its children AT_MOST caps — adjustViewBounds
@@ -254,7 +270,8 @@ public class MainActivity extends Activity {
                 }
                 View last = previewPages.getChildAt(previewPages.getChildCount() - 1);
                 if (y + v.getHeight() >= last.getBottom() - dp(PAGE_GAP_DP)) {
-                    requestChunk(editor.getText().toString(), pagesLoaded);
+                    requestChunk(editor.getText().toString(), pagesLoaded,
+                            editor.getSelectionStart());
                 }
             }
         });
@@ -311,16 +328,22 @@ public class MainActivity extends Activity {
      * Starts a fresh page-frame render of {@code text}: the stacked
      * pages are dropped and chunk 0 streams in, unless a newer edit
      * supersedes the request while Typst is laying out.
+     *
+     * @param openAtCaption true for the first paint: scroll to the first
+     *                      rendered caption page instead of leaving the
+     *                      page margin at the top of the preview.
      */
-    private void startRender(final String text) {
+    private void startRender(final String text, final int caret, final boolean openAtCaption) {
         renderGeneration++;
         pagesLoaded = 0;
         totalPages = 0;
         chunkInFlight = false;
+        scrollToFirstCaption = openAtCaption;
         previewPages.removeAllViews();
         trace("startRender", "gen", renderGeneration, "textLen", text.length(),
+                "caret", caret,
                 "head", text.substring(0, Math.min(24, text.length())));
-        requestChunk(text, 0);
+        requestChunk(text, 0, caret);
     }
 
     /**
@@ -329,15 +352,12 @@ public class MainActivity extends Activity {
      * most one chunk is in flight (the renderer is single-threaded), so
      * chunks always append in order.
      */
-    private void requestChunk(final String text, final int start) {
+    private void requestChunk(final String text, final int start, final int caret) {
         if (chunkInFlight || (totalPages > 0 && start >= totalPages)) {
             return; // one in flight already, or nothing left to load
         }
         final int generation = renderGeneration;
         chunkInFlight = true;
-        // Reveal-on-caret: read the caret here on the UI thread, right
-        // alongside the text it indexes, so the two stay consistent.
-        final int caret = editor.getSelectionStart();
         // Fit the A4 page raster to the preview width at ≥ 1 px/pt so
         // text stays legible; the ImageView scales it the rest of the
         // way down. (Before the first layout the width is 0 → 1.0.)
@@ -387,6 +407,7 @@ public class MainActivity extends Activity {
                 JSONObject p = pages.getJSONObject(i);
                 int w = p.getInt("width");
                 int h = p.getInt("height");
+                double textTop = p.optDouble("textTop", -1);
                 byte[] rgba = Base64.decode(p.getString("rgba"), Base64.DEFAULT);
                 if (rgba.length != w * h * 4 || w <= 0 || h <= 0) {
                     throw new IllegalStateException("bad raster " + w + "x" + h
@@ -438,9 +459,35 @@ public class MainActivity extends Activity {
                 int ih = Math.max(1, Math.round(pw * (float) h / w));
                 previewPages.addView(pageView, new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT, ih));
-                trace("pageLayout", "raster", w + "x" + h, "pw", pw, "ih", ih);
+                trace("pageLayout", "raster", w + "x" + h, "pw", pw, "ih", ih,
+                        "textTop", textTop);
 
                 pagesLoaded++;
+                // The first caption may not be on page 1 when a leading
+                // figure fills the page; the renderer reports null for
+                // pages before it, so take the first page that has one.
+                if (scrollToFirstCaption && textTop >= 0) {
+                    scrollToFirstCaption = false;
+                    final ImageView firstPage = pageView;
+                    final float captionTopPt = (float) textTop;
+                    final int fallbackWidth = pw;
+                    final int captionPage = pagesLoaded;
+                    previewScroll.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (firstPage.getParent() == null) {
+                                return; // a newer render replaced the pages
+                            }
+                            int width = firstPage.getWidth() > 0
+                                    ? firstPage.getWidth() : fallbackWidth;
+                            int offset = Math.round(captionTopPt * width / PAGE_WIDTH_PT);
+                            int y = Math.max(0, firstPage.getTop() + offset - dp(4));
+                            previewScroll.scrollTo(0, y);
+                            trace("captionScroll", "page", captionPage,
+                                    "topPt", captionTopPt, "px", offset, "scrollY", y);
+                        }
+                    });
+                }
             }
             previewError.setVisibility(View.GONE);
         } catch (Exception e) {

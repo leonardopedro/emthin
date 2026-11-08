@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build emthin-pad.apk without Gradle:
-#   1. cargo cross-compiles libemthin_pad.so for x86_64-linux-android (waydroid ABI)
+#   1. pick the device ABI (explicit ANDROID_ABI, else adb getprop, else the
+#      provisioned toolchain ABI) and cargo cross-compiles the .so for it
 #   2. javac + d8 produce classes.dex
 #   3. aapt2 links the manifest, jar drops in dex + .so
 #   4. zipalign + apksigner produce a debug-signed APK
@@ -12,9 +13,20 @@ cd "$(dirname "$0")"
 # are only a fallback for a host that can exec the x86_64 SDK binaries
 # directly; on an aarch64 box they go stale on `nix flake update`, so run
 # ./setup-box64-toolchain.sh instead of editing them.
+#
+# Keep an explicit ABI across the env.sh source. The generated env records
+# the shim target in EMTHIN_TOOLCHAIN_ABI, not as ANDROID_ABI: otherwise a
+# toolchain provisioned for x86_64 would silently suppress the device
+# probe when an arm64 device is connected.
+EXPLICIT_ANDROID_ABI=${ANDROID_ABI:-}
 if [[ -z "${ANDROID_SDK_ROOT:-}" && -f .toolchain/env.sh ]]; then
     # shellcheck disable=SC1091
     . .toolchain/env.sh
+fi
+if [[ -n "$EXPLICIT_ANDROID_ABI" ]]; then
+    ANDROID_ABI=$EXPLICIT_ANDROID_ABI
+else
+    unset ANDROID_ABI
 fi
 
 SDK=${ANDROID_SDK_ROOT:-/nix/store/q5isg1d6fixgyfrdgx5xax6wvy9gya3s-androidsdk/libexec/android-sdk}
@@ -26,19 +38,75 @@ JDK=${JAVA_HOME:-/nix/store/mp9lqgch671kqq9qad0gsmw5r373izcn-openjdk-headless-21
 ANDROID_JAR=$(ls -d "$SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1 || true)
 
 API=${ANDROID_API:-33}
-TARGET=x86_64-linux-android
-# Android's APK ABI directory name (≠ the Rust target triple).
-ABI=x86_64
+
+# The APK lane must match the device, not this host: an arm64 Waydroid
+# image cannot load an x86_64 .so. ANDROID_ABI is the APK directory name
+# (arm64-v8a, x86_64, ...), which is deliberately not the Rust triple.
+detect_device_abi() {
+    local adb_bin=${ADB:-adb} serial abi
+    command -v "$adb_bin" >/dev/null 2>&1 || return 0
+    if [[ -n "${DEVICE:-}" ]]; then
+        abi=$("$adb_bin" -s "$DEVICE" shell getprop ro.product.cpu.abi 2>/dev/null \
+            | tr -d '\r\n' || true)
+    else
+        serial=$("$adb_bin" devices 2>/dev/null \
+            | awk 'NR > 1 && $2 == "device" { print $1; exit }' || true)
+        [[ -n "$serial" ]] || return 0
+        abi=$("$adb_bin" -s "$serial" shell getprop ro.product.cpu.abi 2>/dev/null \
+            | tr -d '\r\n' || true)
+    fi
+    printf '%s' "${abi:-}"
+}
+
+if [[ -z "${ANDROID_ABI:-}" ]]; then
+    ANDROID_ABI=$(detect_device_abi)
+    if [[ -n "$ANDROID_ABI" ]]; then
+        echo "==> device ABI: $ANDROID_ABI"
+    else
+        ANDROID_ABI=${EMTHIN_TOOLCHAIN_ABI:-x86_64}
+        echo "==> no adb device; defaulting ABI=$ANDROID_ABI (set ANDROID_ABI to override)"
+    fi
+fi
+ABI=$ANDROID_ABI
+case "$ABI" in
+    arm64-v8a)       TARGET=aarch64-linux-android ;;
+    armeabi-v7a)     TARGET=armv7a-linux-androideabi ;;
+    x86)             TARGET=i686-linux-android ;;
+    x86_64)          TARGET=x86_64-linux-android ;;
+    *)
+        echo "error: unsupported ANDROID_ABI '$ABI' (expected arm64-v8a, armeabi-v7a, x86, or x86_64)" >&2
+        exit 2
+        ;;
+esac
+if [[ -z "${ANDROID_CLANG:-}" && -n "${TOOLCHAIN_BIN:-}" \
+        && -z "${EMTHIN_TOOLCHAIN_ABI:-}" && "$ABI" != "x86_64" ]]; then
+    # Env files from before ABI tracking are x86_64-only; using their
+    # shims would put an x86_64 .so under lib/$ABI.
+    echo "error: $TOOLCHAIN_BIN predates ABI tracking (its clang targets x86_64)" >&2
+    echo "       rerun: ANDROID_ABI=$ABI ./setup-box64-toolchain.sh" >&2
+    exit 2
+fi
+if [[ -z "${ANDROID_CLANG:-}" && -n "${TOOLCHAIN_BIN:-}" \
+        && -n "${EMTHIN_TOOLCHAIN_ABI:-}" && "$EMTHIN_TOOLCHAIN_ABI" != "$ABI" ]]; then
+    echo "error: .toolchain was provisioned for $EMTHIN_TOOLCHAIN_ABI, but the requested ABI is $ABI" >&2
+    echo "       rerun: ANDROID_ABI=$ABI ./setup-box64-toolchain.sh" >&2
+    exit 2
+fi
 LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-if [[ -n "${TOOLCHAIN_BIN:-}" ]]; then
+if [[ -n "${ANDROID_CLANG:-}" ]]; then
+    # Explicit native driver (e.g. a host clang with the NDK sysroot).
+    CLANG=$ANDROID_CLANG
+    AR=${ANDROID_AR:-$LLVM/llvm-ar}
+elif [[ -n "${TOOLCHAIN_BIN:-}" ]]; then
     # The shims carry the --target flag and run the NDK's x86_64 LLVM
     # under box64; the raw NDK binaries cannot exec on an aarch64 host.
+    # Regenerate them with the same ANDROID_ABI when switching devices.
     CLANG="$TOOLCHAIN_BIN/clang"
     AR="$TOOLCHAIN_BIN/llvm-ar"
 else
-    CLANG="$LLVM/x86_64-linux-android$API-clang"
-    AR="$LLVM/llvm-ar"
+    CLANG="$LLVM/$TARGET$API-clang"
+    AR=${ANDROID_AR:-$LLVM/llvm-ar}
 fi
 
 export JAVA_HOME="$JDK"
@@ -82,12 +150,13 @@ for t in javac apksigner keytool jar; do
 done
 
 # cargo linker (cargo's own env vars are underscore-only)
-export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CLANG"
+TARGET_ENV=$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')
+export "CARGO_TARGET_${TARGET_ENV}_LINKER=$CLANG"
 
-# cc-rs wants `CC_x86_64-linux-android` — dashes aren't valid bash
-# identifiers, so hand them to cargo via `env` (both dash and
-# underscore spellings, cc-rs checks each).
-echo "==> [1/6] cargo build --release --target $TARGET"
+# cc-rs wants `CC_<target>` — dashes aren't valid bash identifiers,
+# so hand them to cargo via `env` (both dash and underscore spellings,
+# cc-rs checks each).
+echo "==> [1/6] cargo build --release --target $TARGET (ABI $ABI)"
 env \
     "CC_$TARGET=$CLANG" \
     "CC_${TARGET//-/_}=$CLANG" \
