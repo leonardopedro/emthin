@@ -625,10 +625,15 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
   device's ABI, installs, cold-launches, writes before/after screenshots
   and `e2e-logcat.txt` under `OUTDIR`, asserts the JIT roundtrip, a
   rendered chunk and the first-caption scroll in that log, and
-  md5-checks the installed base APK against the build. The preview drag
-  is sized from `wm size` unless `SWIPE_*` is set. `SKIP_BUILD=1` reuses
-  the current APK for a capture-only visual rerun; `DEVICE`/`ADB`
-  override the target.
+  md5-checks the installed base APK against the build. It then
+  cold-launches the starter again and runs `scroll-anchor`: scrolls to
+  page 2, focuses the editor, adds a trailing space (two pages -> one),
+  and taps Undo, asserting the logged `restoreScroll` target is clamped
+  by the collapse and restored exactly by Undo. The check finds the
+  editor and Undo bounds with `uiautomator dump`, so its taps do not
+  depend on pixel constants. The preview drag is sized from `wm size`
+  unless `SWIPE_*` is set. `SKIP_BUILD=1` reuses the current APK for a
+  capture-only visual rerun; `DEVICE`/`ADB` override the target.
 
 ## Device tier — waydroid (measured 2026-10-19)
 

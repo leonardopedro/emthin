@@ -15,6 +15,7 @@ import android.text.TextWatcher;
 import android.text.style.BackgroundColorSpan;
 import android.util.Base64;
 import android.util.Log;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -69,7 +70,11 @@ public class MainActivity extends Activity {
     private TextView previewError;
     /** One-shot: scroll the first render to the first caption's layout y. */
     private boolean scrollToFirstCaption;
-    /** Scroll offset to restore after replacing pages, or -1 for the first paint. */
+    /**
+     * Desired scroll offset to reapply after replacing pages, or -1 when the
+     * view owns the position. Retained when a shorter rebuild clamps the
+     * view, so a later undo can return to it.
+     */
     private int restoreScrollY = -1;
     /** True while we mutate the EditText ourselves (suppresses sync). */
     private boolean applying;
@@ -285,6 +290,18 @@ public class MainActivity extends Activity {
                 }
             }
         });
+        // A touch means the user owns the reading position now. Drop a
+        // target retained from a render the view could not reach; otherwise
+        // the next rebuild would jump back to it after the user scrolled.
+        previewScroll.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    restoreScrollY = -1;
+                }
+                return false;
+            }
+        });
         root.addView(previewScroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
@@ -351,8 +368,15 @@ public class MainActivity extends Activity {
         scrollToFirstCaption = openAtCaption;
         // Dropping the pages clamps the ScrollView to 0. Keep the reading
         // position across the rebuild; the first paint has no position yet
-        // and scrolls to the caption instead.
-        restoreScrollY = openAtCaption ? -1 : previewScroll.getScrollY();
+        // and scrolls to the caption instead. A retained target means the
+        // previous render was too short to reach it (page count shrank) —
+        // keep the original reading position, not the clamped one, so an
+        // undo that restores the pages can return to it.
+        if (openAtCaption) {
+            restoreScrollY = -1;
+        } else if (restoreScrollY < 0) {
+            restoreScrollY = previewScroll.getScrollY();
+        }
         releasePageBitmaps();
         trace("startRender", "gen", renderGeneration, "textLen", text.length(),
                 "caret", caret,
@@ -545,15 +569,28 @@ public class MainActivity extends Activity {
         }
         final int target = restoreScrollY;
         final int generation = renderGeneration;
-        restoreScrollY = -1;
         previewScroll.post(new Runnable() {
             @Override
             public void run() {
-                if (generation != renderGeneration || previewPages.getChildCount() == 0) {
+                // A touch or a newer render may have superseded this target
+                // between the post and this runnable.
+                if (generation != renderGeneration
+                        || previewPages.getChildCount() == 0
+                        || restoreScrollY != target) {
                     return;
                 }
                 previewScroll.scrollTo(0, target);
-                trace("restoreScroll", "gen", generation, "y", target);
+                int actual = previewScroll.getScrollY();
+                if (actual == target) {
+                    restoreScrollY = -1;
+                } else {
+                    // The rebuilt document is shorter than the retained
+                    // position. Keep the desired offset: the next render
+                    // (e.g. undo restoring the page count) should retry it,
+                    // rather than anchoring on this clamped maximum.
+                    restoreScrollY = target;
+                }
+                trace("restoreScroll", "gen", generation, "y", target, "actual", actual);
             }
         });
     }

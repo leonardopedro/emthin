@@ -921,7 +921,7 @@ mod tests {
         .expect("MainActivity.java must be readable");
 
         assert!(
-            java.contains("restoreScrollY = openAtCaption ? -1 : previewScroll.getScrollY();"),
+            java.contains("restoreScrollY = previewScroll.getScrollY();"),
             "an edit must capture the old offset before the page rebuild"
         );
         assert!(
@@ -931,6 +931,20 @@ mod tests {
         assert!(
             java.contains("previewScroll.scrollTo(0, target);"),
             "restoring the offset must scroll the rebuilt preview"
+        );
+        // A page-count collapse clamps scrollTo to the new, shorter maximum.
+        // The pad must retain the *desired* target so an undo that restores
+        // the pages can return to the original reading position.
+        assert!(
+            java.contains("int actual = previewScroll.getScrollY();")
+                && java.contains("restoreScrollY = target;"),
+            "a clamped restore must keep the desired offset for the next render"
+        );
+        // ... but only until the user takes over the reading position.
+        assert!(
+            java.contains("previewScroll.setOnTouchListener")
+                && java.contains("event.getActionMasked() == MotionEvent.ACTION_DOWN"),
+            "a touch on the preview must release a retained scroll target"
         );
     }
 }

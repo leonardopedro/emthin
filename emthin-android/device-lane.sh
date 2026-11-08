@@ -33,9 +33,11 @@
 #   screencap F  capture the screen to file F (prefix-stripped PNG)
 #   logcat F     dump the pad's logcat to F
 #   swipe        one drag inside the preview ScrollView
+#   scroll-anchor  cold-launch starter -> page-2 -> one-page collapse ->
+#                undo reading-position proof (used by e2e)
 #   e2e          authorize, connect, build, install, launch, screencap,
-#                swipe, screencap, logcat, pull + byte-identity (the
-#                repeatable device proof)
+#                swipe, screencap, logcat, scroll-anchor, pull +
+#                byte-identity (the repeatable device proof)
 #
 # Env overrides:
 #   DEVICE       adb serial (default: waydroid status IP + :5555; an explicit
@@ -68,6 +70,8 @@ SWIPE_X="${SWIPE_X:-}"
 SWIPE_FROM_Y="${SWIPE_FROM_Y:-}"
 SWIPE_TO_Y="${SWIPE_TO_Y:-}"
 SWIPE_MS="${SWIPE_MS:-500}"
+UI_DUMP_REMOTE=/data/local/tmp/emthin-ui.xml
+UI_XML="$OUTDIR/ui.xml"
 
 FAILURES=0
 DEVICE="${DEVICE:-}"
@@ -281,6 +285,187 @@ cmd_swipe() {
     fi
 }
 
+# ---- reading-position proof ------------------------------------------
+
+# Dump the live hierarchy so the check taps the actual editor and Undo
+# button instead of hard-coded pixels. /sdcard is unreliable on this
+# image; /data/local/tmp is not.
+cmd_uidump() {
+    local out="${1:-$UI_XML}"
+    UI_XML="$out"
+    mkdir -p "$(dirname "$out")"
+    if ! D shell uiautomator dump "$UI_DUMP_REMOTE" >/dev/null 2>&1; then
+        fail "uiautomator dump"
+        return 1
+    fi
+    if ! D exec-out cat "$UI_DUMP_REMOTE" >"$out" 2>/dev/null; then
+        fail "read $UI_DUMP_REMOTE"
+        return 1
+    fi
+    tr -d '\r' <"$out" >"$out.tmp" && mv "$out.tmp" "$out"
+    if ! grep -q '<hierarchy' "$out"; then
+        fail "uiautomator dump missing hierarchy"
+        return 1
+    fi
+    pass "uiautomator hierarchy -> $out"
+}
+
+# Bounds of the first node whose opening tag contains PATTERN, as
+# "x1 y1 x2 y2".
+node_bounds() {
+    local pattern="$1" node
+    node=$(grep -o "<node[^>]*${pattern}[^>]*>" "$UI_XML" 2>/dev/null | head -1 || true)
+    [ -n "$node" ] || return 1
+    printf '%s\n' "$node" | sed -n \
+        's/.*bounds="\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\]".*/\1 \2 \3 \4/p'
+}
+
+tap_center() {
+    local b="$1" x1 y1 x2 y2
+    read -r x1 y1 x2 y2 <<EOF
+$b
+EOF
+    D shell input tap "$(( (x1 + x2) / 2 ))" "$(( (y1 + y2) / 2 ))" >/dev/null 2>&1
+}
+
+# Tap below the starter's two source lines so the caret lands at the
+# document end. Tapping the text itself would put it at the tap's char.
+tap_editor_end() {
+    local b x1 y1 x2 y2
+    b=$(node_bounds 'class="android.widget.EditText"') || return 1
+    read -r x1 y1 x2 y2 <<EOF
+$b
+EOF
+    D shell input tap "$(( (x1 + x2) / 2 ))" "$(( y1 + (y2 - y1) * 2 / 3 ))" >/dev/null 2>&1
+}
+
+keyboard_shown() {
+    D shell dumpsys input_method 2>/dev/null | tr -d '\r' \
+        | grep -q 'mInputShown=true'
+}
+
+wait_for_log() {
+    local out="$1" pattern="$2" tries=0
+    while [ "$tries" -lt 25 ]; do
+        D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$out"
+        if grep -q "$pattern" "$out"; then
+            return 0
+        fi
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# Last restoreScroll's "y actual" pair.
+last_restore() {
+    awk '
+        /restoreScroll/ {
+            y = -1; a = -1;
+            for (i = 1; i <= NF; i++) {
+                if ($i == "y") y = $(i + 1) + 0;
+                else if ($i == "actual") a = $(i + 1) + 0;
+            }
+        }
+        END { if (y < 0) y = 0; if (a < 0) a = 0; print y, a }
+    ' "$1"
+}
+
+cmd_scroll_anchor() {
+    local log="$OUTDIR/scroll-anchor-logcat.txt"
+    local ui="$OUTDIR/scroll-anchor-ui.xml"
+    local target collapse_actual undo_y undo_actual
+    local b focus i shot
+
+    say "==> scroll anchor: page 2 -> one-page collapse -> undo"
+    mkdir -p "$OUTDIR"
+
+    # Self-contained start: a previous failed run may have left the
+    # trailing space in the document, so cold-launch the 89-byte starter
+    # instead of inheriting whatever state the app is in.
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "starter document did not render two pages"; return; }
+    wait_for_log "$log" 'captionScroll' \
+        || { fail "starter document did not open at the first caption"; return; }
+    pass "cold-launched two-page starter at the first caption"
+
+    # Put the caret at the document end and close the IME *before*
+    # scrolling. The space then inserts at the end without a keyboard
+    # resize changing the preview height or its clamped maximum.
+    cmd_uidump "$ui" || return
+    tap_editor_end || { fail "editor not found in UI hierarchy"; return; }
+    sleep 1.0
+    if keyboard_shown; then
+        D shell input keyevent KEYCODE_BACK >/dev/null 2>&1
+        sleep 0.4
+        pass "closed the IME"
+    else
+        say "info IME was already hidden"
+    fi
+    focus=$(D shell dumpsys window 2>/dev/null | tr -d '\r' | grep -m1 'mCurrentFocus' || true)
+    case "$focus" in
+        *com.emthin.pad*) pass "activity still focused after closing the IME" ;;
+        *) fail "activity left the foreground after closing the IME: ${focus:-no focus}"; return ;;
+    esac
+
+    # Eight drags put the reading position past the height of a one-page
+    # document; further drags at the end of the range are harmless.
+    for i in 1 2 3 4 5 6 7 8; do
+        cmd_swipe
+        sleep 0.25
+    done
+
+    # Clear the log here: the collapse's own startRender captures the
+    # pre-edit position, and its restoreScroll reports both the retained
+    # target and the shorter document's clamped maximum.
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input keyevent KEYCODE_SPACE >/dev/null 2>&1
+    wait_for_log "$log" 'applyChunk total 1 pages 1' \
+        || { fail "space did not collapse the document to one page"; return; }
+    sleep 0.6
+    D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"
+    read -r target collapse_actual < <(last_restore "$log")
+    if [ "$target" -le 0 ]; then
+        fail "collapse did not report a pre-edit scroll target"
+        return
+    fi
+    if [ "$collapse_actual" -ge "$target" ]; then
+        fail "collapse did not clamp (actual=$collapse_actual target=$target)"
+        return
+    fi
+    if ! grep -q 'startRender .*caret 90' "$log"; then
+        fail "space was not inserted at the document end"
+        return
+    fi
+    pass "collapse retained y $target (clamped to $collapse_actual)"
+    cp "$log" "$OUTDIR/scroll-anchor-collapse-logcat.txt"
+
+    # Start a fresh log for the undo, so the post-undo assertions cannot
+    # match the pre-collapse two-page render.
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="Undo"') \
+        || { fail "Undo not found in UI hierarchy"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+        || { fail "undo did not restore the two-page document"; return; }
+    sleep 0.6
+    D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"
+    read -r undo_y undo_actual < <(last_restore "$log")
+    if [ "$undo_y" -ne "$target" ] || [ "$undo_actual" -ne "$target" ]; then
+        fail "undo did not return to y $target (y=$undo_y actual=$undo_actual)"
+        return
+    fi
+    pass "undo restored y $target"
+
+    if shot=$(cmd_screencap "$OUTDIR/scroll-anchor-after.png"); then
+        say "    captured $shot"
+    fi
+}
+
 # Dump the app's debug log (cold-start proof: JIT + render chunks).
 cmd_logcat() {
     local out="${1:-$OUTDIR/logcat.txt}" raw
@@ -364,6 +549,10 @@ cmd_e2e() {
         fail "captionScroll missing from $log"
     fi
 
+    # The reading-position proof cold-launches the starter itself:
+    # page 2 -> collapse to one page -> undo back to page 2.
+    cmd_scroll_anchor
+
     # Byte-identity of the installed APK, the launch proof's companion.
     cmd_pull
 }
@@ -389,6 +578,7 @@ case "$cmd" in
     screencap) cmd_screencap "${2:-}"; echo ;;
     logcat)    cmd_logcat "${2:-}" ;;
     swipe)     cmd_swipe ;;
+    scroll-anchor) cmd_scroll_anchor ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;
 esac
