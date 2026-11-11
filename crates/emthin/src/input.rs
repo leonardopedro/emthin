@@ -292,6 +292,11 @@ impl EmthinState {
     /// page places the caret.
     fn handle_left_click(&mut self, pos: Point<f64, Logical>) {
         let Some(figure) = self.doc.figure_at(pos).cloned() else {
+            if let Some(number) = self.doc.citation_at(pos) {
+                if let Err(error) = self.doc.toggle_citation(number) { tracing::debug!("citation: {error}"); }
+                self.needs_redraw = true;
+                return;
+            }
             // The document. Place the caret where the user clicked so the
             // next keystroke lands where they expected.
             let hit = self.doc.layout().screen_to_doc(pos).and_then(|p| {
@@ -386,7 +391,9 @@ impl EmthinState {
             Action::LineStart | Action::LineEnd => {
                 self.move_caret_linewise(action == Action::LineStart)
             }
-            Action::FocusDocument => self.focus_document(),
+            Action::FocusDocument => {
+                if !self.doc.close_citation() { self.focus_document(); }
+            }
             Action::OpenLauncher => self.open_launcher(),
             Action::CloneFigure => self.clone_focused_figure(),
             Action::VoiceTurn => {
@@ -574,7 +581,10 @@ impl EmthinState {
     /// A single keystroke is one loop iteration behind the model; a burst is
     /// one typeset for the whole burst.
     fn edit_document_key(&mut self, keysym: u32) -> bool {
-        self.edit_document_key_inner(keysym)
+        let revision = self.doc.model().revision();
+        let handled = self.edit_document_key_inner(keysym);
+        if self.doc.model().revision() != revision { self.doc.clear_citations(); }
+        handled
     }
 
     /// Returns `true` if the key was consumed. This is ordinary text
@@ -659,6 +669,13 @@ impl EmthinState {
         // Ctrl+C/X/V take `&mut self`, so they're handled before the model
         // borrow rather than inside the match.
         match keysym {
+            keysyms::KEY_1..=keysyms::KEY_9 => {
+                let number = u64::from(keysym - keysyms::KEY_1 + 1);
+                if let Err(error) = self.doc.toggle_citation(number) {
+                    tracing::debug!("citation: {error}");
+                }
+                self.needs_redraw = true;
+            }
             keysyms::KEY_c => self.copy_selection(),
             keysyms::KEY_x => self.cut_selection(),
             keysyms::KEY_v => self.paste_clipboard(),
@@ -790,19 +807,9 @@ impl EmthinState {
     }
 
     fn prev_grapheme(text: &str, pos: usize) -> usize {
-        let end = pos.min(text.len());
-        let mut start = end;
-        while start > 0 {
-            start -= 1;
-            if !text.is_char_boundary(start) {
-                continue;
-            }
-            if let Some((offset, _)) = text[..start].grapheme_indices(true).next_back() {
-                return offset;
-            }
-            return 0;
-        }
-        0
+        let mut end = pos.min(text.len());
+        while !text.is_char_boundary(end) { end -= 1; }
+        text[..end].grapheme_indices(true).next_back().map_or(0, |(offset, _)| offset)
     }
 
     /// The character a printable keysym stands for.
@@ -868,5 +875,19 @@ impl EmthinState {
         };
         let serial = SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, Some(saved), serial);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmthinState;
+
+    #[test]
+    fn left_moves_one_grapheme_including_combining_and_emoji_sequences() {
+        let text = "ab e\u{301} 👩‍💻";
+        assert_eq!(EmthinState::prev_grapheme("abc", 3), 2);
+        assert_eq!(EmthinState::prev_grapheme(text, text.len()), text.find('👩').unwrap());
+        let end = text.find(' ').unwrap() + 1 + "e\u{301}".len();
+        assert_eq!(EmthinState::prev_grapheme(text, end), text.find('e').unwrap());
     }
 }

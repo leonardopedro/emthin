@@ -1094,11 +1094,16 @@ version = "0.1.0"
 dependencies = [
  "austral_cranelift_bridge",
  "base64 0.22.1",
+ "hayagriva",
  "jni",
  "mathed_android",
+ "mathed_biblio",
  "mathed_core",
  "mathed_mini",
+ "png",
  "serde_json",
+ "typst",
+ "typst-layout",
  "unicode-segmentation",
 ]
 

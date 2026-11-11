@@ -214,6 +214,7 @@ pub struct EmthinState {
     /// compositor rather than by `docui` because it needs a live
     /// `GlesRenderer` to import into, and only the render pass has one.
     pub doc_page: crate::doc_render::DocPageTexture,
+    pub citation_page: crate::doc_render::DocPageTexture,
 
     /// Rasterized dormant-figure labels. Same reasoning as `doc_page`: it needs
     /// a renderer to upload into, and it is compositor state rather than
@@ -346,6 +347,7 @@ impl EmthinState {
             host: host::HostState::new(),
             doc: crate::docui::DocUi::new(),
             doc_page: crate::doc_render::DocPageTexture::new(),
+            citation_page: crate::doc_render::DocPageTexture::new(),
             dormant_labels: crate::dormant_label::LabelCache::default(),
             host_keymap: None,
             applied_host_keymap: None,

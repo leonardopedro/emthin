@@ -120,10 +120,8 @@ fn collect_layer_surfaces(
 /// Build the [`CustomElement`]s for every bound figure on the visible
 /// page, plus the caret/selection overlays.
 ///
-/// Ordering is bottom-up: the page raster goes in first (added by the
-/// caller, see `winit.rs::render_frame`), then one group per figure
-/// (figures later in the document are drawn over earlier ones, matching
-/// reading order), then the document's own overlays.
+/// Figure groups are front-to-back, with later figures above earlier ones.
+/// Each Wayland surface tree retains Smithay's front-to-back traversal order.
 pub fn build_figure_elements(
     state: &mut EmthinState,
     renderer: &mut GlesRenderer,
@@ -133,7 +131,7 @@ pub fn build_figure_elements(
     let mut elements = Vec::new();
     let current_page = state.doc.current_page();
 
-    for figure in state.doc.figures().figures() {
+    for figure in state.doc.figures().figures().iter().rev() {
         // Only figures on the visible page are composited.
         if figure.page != Some(current_page) {
             continue;
@@ -392,7 +390,7 @@ fn focused_figure_key(state: &EmthinState) -> Option<String> {
 /// `SolidColorRenderElement` is placed in physical coords like every
 /// other custom element, so the rect is scaled here rather than relying
 /// on the caller's `scale`.
-fn solid(
+pub(crate) fn solid(
     _id: &str,
     rect: Rectangle<i32, Logical>,
     scale: f64,

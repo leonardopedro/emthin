@@ -16,6 +16,7 @@
 //! policy anywhere else in the compositor.
 
 pub mod edit;
+pub mod citations;
 pub mod figures;
 pub mod formals;
 pub mod keymap;
@@ -52,6 +53,7 @@ pub struct DocUi {
     /// `${EMTHIN_VOICE_BIN}` or `$PATH`, plus the one turn in flight.
     /// Replies land in the transcript through [`DocUi::poll_voice`].
     voice: VoiceBridge,
+    citation_popup: citations::CitationPopup,
     /// Where the session is persisted (`None` = don't persist).
     session_file: Option<std::path::PathBuf>,
     last_autosave: Instant,
@@ -74,6 +76,7 @@ impl DocUi {
             figures: FigureManager::new(),
             formals: FormalVerifier::new(),
             voice: VoiceBridge::new(),
+            citation_popup: citations::CitationPopup::default(),
             session_file: None,
             last_autosave: Instant::now(),
             last_error: None,
@@ -86,6 +89,34 @@ impl DocUi {
 
     pub fn model_mut(&mut self) -> &mut DocModel {
         &mut self.model
+    }
+
+    pub fn citation_popup(&self) -> &citations::CitationPopup { &self.citation_popup }
+
+    pub fn toggle_citation(&mut self, number: u64) -> Result<(), String> {
+        self.citation_popup.toggle(self.model.text(), self.model.revision(), number)
+    }
+
+    pub fn close_citation(&mut self) -> bool { self.citation_popup.close() }
+
+    pub fn clear_citations(&mut self) { self.citation_popup.clear(); }
+
+    /// Hit-test the rendered citation label rather than the hidden source.
+    pub fn citation_at(&self, point: Point<f64, Logical>) -> Option<u64> {
+        let pos = self.layout.screen_to_doc(point)?;
+        let glyphs = self.layout.glyphs()?;
+        let glyph = glyphs.entries.iter().find(|entry| {
+            let Some(band) = glyphs.bands.get(entry.band as usize) else { return false };
+            let x = pos.x as f32;
+            let y = pos.y as f32;
+            x >= entry.x.min(entry.x + entry.advance) && x <= entry.x.max(entry.x + entry.advance)
+                && y >= band.top && y <= band.bottom
+        })?;
+        let scan = self.model.scan();
+        model::citation_references(scan).into_iter().find_map(|reference| {
+            let range = &scan.stmts[reference.stmt_idx].range;
+            range.contains(&glyph.doc_byte).then(|| reference.numbers.first().copied()).flatten()
+        })
     }
 
     /// The verifier behind every `\formal` verdict in this document.
@@ -178,6 +209,7 @@ impl DocUi {
     /// Load the document: `path` wins, else the session snapshot, else
     /// an empty document.
     pub fn load(&mut self, path: Option<&std::path::Path>, session_file: Option<&std::path::Path>) {
+        self.citation_popup.clear();
         if let Some(path) = path {
             match std::fs::read_to_string(path) {
                 Ok(text) => {
@@ -229,6 +261,7 @@ impl DocUi {
     /// Returns the apps whose figure disappeared (their `\app` statement
     /// was deleted) so the caller can close them.
     pub fn relayout(&mut self) -> Vec<u64> {
+        self.citation_popup.clear_if_stale(self.model.revision());
         if !self.model.is_dirty() {
             return Vec::new();
         }
@@ -529,14 +562,33 @@ mod relaunch_tests {
     use super::*;
     use smithay::utils::Size;
 
+    #[test]
+    fn rendered_citation_label_is_clickable() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 1600)));
+        let text = "#a cited text #b \\cite(#a,#b) tail";
+        ui.model_mut().replace(0..0, text);
+        ui.model_mut().set_caret(text.len());
+        ui.relayout();
+        let start = text.find("\\cite").unwrap();
+        let glyphs = ui.layout().glyphs().unwrap();
+        let glyph = glyphs.entries.iter().find(|g| g.doc_byte == start).expect("citation glyph");
+        let band = &glyphs.bands[glyph.band as usize];
+        let point = ui.layout().doc_to_screen(Point::from((
+            f64::from(glyph.x + glyph.advance / 2.0),
+            f64::from((band.top + band.bottom) / 2.0),
+        )));
+        assert_eq!(ui.citation_at(point.to_f64()), Some(1));
+    }
+
     /// Two `\app` figures on page 0, with a remembered command for each.
     fn doc_with_two_figures() -> DocUi {
         let mut ui = DocUi::new();
         ui.set_viewport(Size::from((1200, 1600)));
         ui.model_mut().replace(
             0..0,
-            "#1 first #2 \\app(#1, #2, 600, 300, \"first\", launch: \"foot -T\")\n\
-             #3 second #4 \\app(#3, #4, 600, 300, \"second\", launch: \"alacritty\")\n",
+            "#1 first #2 \\app(#1, #2, 300, 120, \"first\", launch: \"foot -T\")\n\
+             #3 second #4 \\app(#3, #4, 300, 120, \"second\", launch: \"alacritty\")\n",
         );
         ui.relayout();
         ui

@@ -4,11 +4,7 @@
 //! on transparent — see its `THEME_PRELUDE`); this module owns that
 //! buffer's trip to the GPU and its invalidation.
 //!
-//! Re-uploading a full A4 page every frame would be ~8 MB/frame of PCIe
-//! traffic for a mostly-static document, so the texture is cached and
-//! only re-imported when the page's pixels actually change (a layout
-//! pass, a page switch, or a caret-reveal toggle that re-typesets a
-//! statement).
+//! The owned buffer is reused until the page or document revision changes.
 
 use smithay::{
     backend::{
@@ -30,7 +26,7 @@ use crate::element::CustomElement;
 ///
 /// `Key` is everything that can change the pixels: the page index (so a
 /// page switch re-imports even if the layout didn't change) and the
-/// document revision (so any edit re-imports).
+/// successful layout generation (so non-text rendering changes re-import too).
 #[derive(Default)]
 pub struct DocPageTexture {
     /// The page's pixels, owned. `MemoryRenderBuffer` copies the slice into an
@@ -53,7 +49,7 @@ pub struct PagePixels<'a> {
     pub height: u32,
     /// 0-based page index.
     pub page: usize,
-    /// Document revision — bumped by any edit.
+    /// Generation of the pixels, bumped when a layout succeeds.
     pub revision: u64,
     /// Where the page sits in output-local logical px.
     pub rect: Rectangle<i32, Logical>,
@@ -89,11 +85,13 @@ impl DocPageTexture {
         // released when the previous buffer is dropped.
         self.buffer = Some(MemoryRenderBuffer::from_slice(
             pixels.rgba,
-            Fourcc::Rgba8888,
+            // DRM's little-endian ABGR8888 has RGBA bytes in memory and is
+            // supported by Smithay's GLES memory importer.
+            Fourcc::Abgr8888,
             size,
             // Buffer scale and transform describe the pixels themselves, not
             // where they land on screen; the element's `size` places them.
-            256,
+            1,
             Transform::Normal,
             None,
         ));
@@ -124,8 +122,8 @@ impl DocPageTexture {
     ///
     /// This used to be `Box::leak(pixels.rgba.to_vec())` per re-import, because
     /// `import_memory` borrows the slice for the texture's lifetime and wants a
-    /// `&'static [u8]`. The re-import key is the document *revision*, which every
-    /// keystroke bumps, and an A4 page at 1px/pt is 595x842x4 B — about 2 MB —
+    /// `&'static [u8]`. The re-import key is the rendered page generation, which can change on
+    /// editing or caret-driven reveal, and an A4 page at 1px/pt is 595x842x4 B — about 2 MB —
     /// so that leaked roughly 2 MB per character typed and the comment's estimate
     /// of "a few hundred MB over a long session" was out by orders of magnitude.
     ///
@@ -147,10 +145,11 @@ impl DocPageTexture {
             pixels.rect.loc.to_f64().to_physical(pixels.scale),
             buffer,
             Some(1.0),
-            None,
+            Some(Rectangle::from_size((pixels.width as f64, pixels.height as f64).into())),
             Some(pixels.rect.size),
             Kind::Unspecified,
         )
+        .map_err(|error| tracing::warn!("document texture import failed: {error}"))
         .ok()
         .map(Into::into)
     }

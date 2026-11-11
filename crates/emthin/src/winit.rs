@@ -112,7 +112,7 @@ fn render_frame(
                 width: page.width,
                 height: page.height,
                 page: state.doc.current_page(),
-                revision: state.doc.model().revision(),
+                revision: state.doc.layout().generation(),
                 rect: state.doc.layout().page_rect(),
                 scale,
             };
@@ -127,18 +127,39 @@ fn render_frame(
         // `render_output` paints custom elements *above* space elements
         // and `Space::map_element` re-stacks to the top, so anything in
         // the `Space` would cover the page and fight the z-order.
+        let figure_start = extras.len();
         extras.extend(crate::figure_render::build_figure_elements(
             state, renderer, scale,
         ));
 
         // --- 3. the document's own overlays ---
+        let overlay_start = extras.len();
         extras.extend(crate::figure_render::build_overlay_elements(
             state, renderer, scale,
         ));
 
+        // Citation details are a derived overlay, kept separate from the
+        // document pixels and the CRDT. The texture cache owns its buffer.
+        let citation_start = extras.len();
+        if let Some(image) = state.doc.citation_popup().raster.as_ref() {
+            let viewport = state.doc.layout().viewport();
+            let width = (image.width as i32).min((viewport.w - 24).max(1));
+            let height = (image.height as i32).min((viewport.h - 24).max(1));
+            let rect = Rectangle::new(((viewport.w - width) / 2, (viewport.h - height) / 2).into(),
+                (width, height).into());
+            extras.push(crate::figure_render::solid("citation-background", rect, scale,
+                [0.10, 0.14, 0.18, 0.98]));
+            let pixels = crate::doc_render::PagePixels {
+                rgba: &image.rgba, width: image.width, height: image.height,
+                page: 0, revision: state.doc.citation_popup().revision, rect, scale,
+            };
+            if let Some(element) = state.citation_page.element(renderer, &pixels) { extras.push(element); }
+        }
+
         // --- 4. software cursor (topmost) ---
         // Surface cursors (GTK3/Electron) can't be forwarded via
         // winit's CursorIcon API, so they're composited here.
+        let cursor_start = extras.len();
         state.cursor.ensure_alive();
         if let CursorImageStatus::Surface(surface) = state.cursor.status() {
             if let Some(pointer) = state.seat.get_pointer() {
@@ -182,6 +203,20 @@ fn render_frame(
                 }
             }
         }
+
+        // Smithay consumes elements front-to-back. Figure surface trees are
+        // already in that order; the other groups were assembled bottom-up.
+        let mut cursor = extras.split_off(cursor_start);
+        let mut citation = extras.split_off(citation_start);
+        citation.reverse();
+        let mut overlay = extras.split_off(overlay_start);
+        overlay.reverse();
+        let figures = extras.split_off(figure_start);
+        cursor.extend(citation);
+        cursor.extend(overlay);
+        cursor.extend(figures);
+        cursor.extend(extras);
+        let extras = cursor;
 
         if let Err(e) = render_output::<GlesRenderer, CustomElement<GlesRenderer>, Window, _>(
             output,

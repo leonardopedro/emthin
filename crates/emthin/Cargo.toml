@@ -18,6 +18,8 @@ emthin-dbus = { path = "../emthin-dbus" }
 # it lays out. Path deps into the sibling velysterm checkout — see
 # docs/REWRITE_PLAN.md (D1).
 mathed_core = { path = "../../../velysterm/crates/mathed_core" }
+mathed_biblio = { path = "../../../velysterm/crates/mathed_biblio" }
+hayagriva = "0.10"
 # `default-features = false` drops mathed_mini's `gui` feature: emthin
 # renders the document itself (CPU raster → GPU texture) and owns the
 # window, so the winit/softbuffer/accesskit/arboard frontend is dead

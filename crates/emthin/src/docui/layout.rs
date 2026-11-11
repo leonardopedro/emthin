@@ -45,6 +45,8 @@ pub struct PlacedFigure {
 #[derive(Default)]
 pub struct DocLayoutCache {
     pages: Vec<PageLayout>,
+    /// Changes after every successful raster rebuild, even without a text edit.
+    generation: u64,
     /// Size of one page in logical px (from the first page's raster).
     page_size: Size<i32, Logical>,
     /// Output size the letterbox was computed for.
@@ -65,6 +67,7 @@ impl DocLayoutCache {
         opts: &mathed_core::TransformOptions,
     ) -> Result<(), RenderError> {
         self.pages = layout_doc_paged(doc_text, opts)?;
+        self.generation = self.generation.wrapping_add(1);
         self.page_size = self
             .pages
             .first()
@@ -75,6 +78,11 @@ impl DocLayoutCache {
             self.current_page = self.page_count().saturating_sub(1);
         }
         Ok(())
+    }
+
+    /// Revision of the rendered pixels, independent of the Loro revision.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn page_count(&self) -> usize {
@@ -302,6 +310,18 @@ fn translate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_rebuilds_invalidate_rendered_page_even_without_loro_edits() {
+        let mut cache = DocLayoutCache::new();
+        let opts = mathed_core::TransformOptions::default();
+        cache.rebuild("First document", &opts).unwrap();
+        let generation = cache.generation();
+        let first = cache.page().unwrap().image.data.clone();
+        cache.rebuild("A different document", &opts).unwrap();
+        assert_ne!(cache.generation(), generation);
+        assert_ne!(cache.page().unwrap().image.data, first);
+    }
 
     #[test]
     fn letterbox_centres_and_never_upscales() {

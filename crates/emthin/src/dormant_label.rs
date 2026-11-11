@@ -114,9 +114,9 @@ pub fn element(
     // per-frame rather than once.
     let buffer = MemoryRenderBuffer::from_slice(
         &image.rgba,
-        Fourcc::Rgba8888,
+        Fourcc::Abgr8888,
         size,
-        scale as i32 * 256,
+        1,
         smithay::utils::Transform::Normal,
         None,
     );

@@ -24,6 +24,10 @@
 pub mod model;
 
 pub mod jit;
+pub mod modifiers;
+
+#[path = "../../crates/emthin/src/docui/citations.rs"]
+pub mod citations;
 
 use jni::objects::{JClass, JString};
 use jni::sys::{jfloat, jint, jlong};
@@ -69,11 +73,31 @@ fn state_json(m: &DocModel) -> String {
             json!({
                 "prop": s.prop,
                 "kind": format!("{:?}", s.kind),
+                "startId": s.start_id,
+                "endId": s.end_id,
                 "span": s.span.as_ref().map(|r| vec![r.start, r.end]),
                 "stmt": s.stmt,
             })
         })
         .collect();
+    let modifier_links: Vec<Value> = modifiers::links(m).into_iter().map(|link| {
+        let source = modifiers::source_range(m, &link.start_id, &link.end_id);
+        let target_ids = link.target_ids.clone().or_else(|| modifiers::legacy_target_pair(m, &link.target));
+        json!({
+            "startId": link.start_id,
+            "endId": link.end_id,
+            "source": source.as_ref().map(|r| vec![byte_to_utf16(m.text(), r.start), byte_to_utf16(m.text(), r.end)]),
+            "target": [byte_to_utf16(m.text(), link.target.start), byte_to_utf16(m.text(), link.target.end)],
+            "targetIds": target_ids,
+            "legacy": link.target_ids.is_none(),
+            "resolved": link.resolved,
+        })
+    }).collect();
+    let markers: Vec<Value> = m.scan().markers.iter().map(|marker| json!({
+        "id": marker.id,
+        "start": byte_to_utf16(m.text(), marker.range.start),
+        "end": byte_to_utf16(m.text(), marker.range.end),
+    })).collect();
 
     json!({
         "text": m.text(),
@@ -82,8 +106,50 @@ fn state_json(m: &DocModel) -> String {
         "canUndo": m.can_undo(),
         "canRedo": m.can_redo(),
         "segments": segments,
+        "modifierLinks": modifier_links,
+        "markers": markers,
     })
     .to_string()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_setMarkerTargets<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, handle: jlong,
+    start_id: JString<'local>, end_id: JString<'local>, targets: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        // SAFETY: the handle is confined to the UI thread.
+        let model = unsafe { model_mut(handle) };
+        let result = match modifiers::set_marker_targets(model, &start_id.to_string(),
+                &end_id.to_string(), &targets.to_string()) {
+            Ok(()) => state_json(model),
+            Err(message) => json!({"error": message}).to_string(),
+        };
+        JString::from_str(env, result)
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_setModifier<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    start_id: JString<'local>,
+    end_id: JString<'local>,
+    start_utf16: jint,
+    end_utf16: jint,
+    enabled: jint,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        // SAFETY: the handle is confined to the UI thread.
+        let model = unsafe { model_mut(handle) };
+        let start = utf16_to_byte(model.text(), start_utf16.max(0) as usize);
+        let end = utf16_to_byte(model.text(), end_utf16.max(0) as usize);
+        let ok = modifiers::set_link(model, &start_id.to_string(), &end_id.to_string(),
+                                     start.min(end)..start.max(end), enabled != 0);
+        let result = if ok { state_json(model) } else { json!({"error": "Invalid modifier or selection"}).to_string() };
+        JString::from_str(env, result)
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 // ----- text-coordinate conversion ------------------------------------
@@ -118,6 +184,33 @@ fn byte_to_utf16(text: &str, byte: usize) -> usize {
         adjusted -= 1;
     }
     text[..adjusted].chars().map(|c| c.len_utf16()).sum()
+}
+
+/// Resolve a newly typed `#` using mathed's marker naming rules.
+fn typed_marker(text: &str, offset_utf16: usize) -> Option<String> {
+    let at = utf16_to_byte(text, offset_utf16);
+    if text.as_bytes().get(at) != Some(&b'#') {
+        return None;
+    }
+    let mut without_typed = text.to_owned();
+    without_typed.remove(at);
+    mathed_core::markers::auto_marker_token(&without_typed, at)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_typedMarker<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    offset_utf16: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let token =
+                typed_marker(&text.to_string(), offset_utf16.max(0) as usize).unwrap_or_default();
+            JString::from_str(env, token)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 // ----- editing --------------------------------------------------------
@@ -202,6 +295,274 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_create<'local>(
         .with_env(|_env| -> errors::Result<jlong> {
             let text = initial.to_string();
             Ok(new_handle(&text))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Restore only a snapshot that corresponds to the separately saved text.
+fn model_from_snapshot(encoded: &str, expected: &str) -> Option<DocModel> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let model = DocModel::from_snapshot(&bytes).ok()?;
+    (model.text() == expected).then_some(model)
+}
+
+fn search_ranges(text: &str, query: &str) -> Value {
+    json!(mathed_core::search::find_matches(text, query).into_iter()
+        .map(|range| [byte_to_utf16(text, range.start), byte_to_utf16(text, range.end)])
+        .collect::<Vec<_>>())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_search<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, query: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        JString::from_str(env, search_ranges(&text.to_string(), &query.to_string()).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+fn word_boundary_utf16(text: &str, caret: usize, direction: i32) -> usize {
+    let pos = utf16_to_byte(text, caret);
+    let scan = mathed_core::markers::scan(text);
+    let mut atomic = mathed_core::transform::math_span_ranges(text);
+    atomic.extend(scan.markers.iter().map(|marker| marker.range.clone()));
+    let result = if direction < 0 {
+        mathed_core::wordnav::word_boundary_left(text, pos, &atomic)
+    } else {
+        mathed_core::wordnav::word_boundary_right(text, pos, &atomic)
+    };
+    byte_to_utf16(text, result)
+}
+
+fn math_completion(text: &str, caret: usize) -> Value {
+    let offset = utf16_to_byte(text, caret);
+    match mathed_core::completion::completion_at(text, offset) {
+        Some(c) => json!({"start": byte_to_utf16(text, c.replace.start),
+            "end": byte_to_utf16(text, c.replace.end), "text": c.with, "preview": c.preview}),
+        None => Value::Null,
+    }
+}
+
+fn citation_index(text: &str) -> Value {
+    let scan = mathed_core::markers::scan(text);
+    json!(model::citation_references(&scan).iter().map(|reference| {
+        let span = &scan.stmts[reference.stmt_idx].range;
+        json!({"start": byte_to_utf16(text, span.start), "end": byte_to_utf16(text, span.end),
+            "numbers": reference.numbers, "label": mathed_core::markers::cite_label_text(reference)})
+    }).collect::<Vec<_>>())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_citationIndex<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        JString::from_str(env, citation_index(&text.to_string()).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+fn citation_detail(text: &str, number: u64, width: f64, scale: f32) -> Value {
+    use base64::Engine as _;
+    use mathed_mini::cite_popup::{resolve_popup_body, PopupBody};
+    let scan = mathed_core::markers::scan(text);
+    let references = model::citation_references(&scan);
+    let Some(reference) = references.iter().find(|r| r.numbers.contains(&number)) else {
+        return json!({"error": "Citation no longer exists"});
+    };
+    let upstream = mathed_core::markers::scan_references(&scan);
+    let upstream_number = upstream.iter().find(|r| r.stmt_idx == reference.stmt_idx)
+        .and_then(|r| r.numbers.first()).copied().unwrap_or(number);
+    let Some(body) = resolve_popup_body(text, upstream_number) else {
+        return json!({"error": "Citation no longer exists"});
+    };
+    match body {
+        PopupBody::Bibliography { keys, .. } => {
+            match citations::bibliography_detail(text, number) {
+                Ok((citation, entries)) => json!({"kind":"bibliography", "text":citation,
+                    "entries":entries, "resolved":true}),
+                Err(error) => json!({"kind":"bibliography", "text":format!("[{}]", keys.join(", ")),
+                    "resolved":false, "errorDetail":error}),
+            }
+        },
+        PopupBody::DocumentRef { body_text, body_markup } => {
+            let body_markup = if body_text.is_empty() { body_markup } else {
+                let scan = mathed_core::markers::scan(&body_text);
+                let segments = mathed_core::markers::resolve_segments(&scan);
+                let options = mathed_core::transform::TransformOptions {
+                    references: model::citation_references(&scan), ..Default::default()
+                };
+                mathed_core::transform::to_render_text(&body_text, &scan, &segments, &options).text
+            };
+            let world = mathed_mini::MiniWorld::new(format!("{DOCUMENT_THEME}{body_markup}"));
+            let image = world.eval_main().and_then(|content| {
+                use typst::layout::{Abs, Axes, Region, Size};
+                world.layout(&content, Region::new(Size::new(Abs::pt(width), Abs::pt(2048.0)), Axes::splat(false)))
+            }).and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
+            match image {
+                Some(image) => match png_page(image.width, image.height, &image.data) {
+                    Ok(png) => json!({"kind":"document", "text":body_text, "width":image.width,
+                        "height":image.height, "png":base64::engine::general_purpose::STANDARD.encode(png)}),
+                    Err(error) => json!({"error":error}),
+                },
+                None => json!({"error":"Could not render cited text", "text":body_text}),
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_citationDetail<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
+    number: jint, width: jfloat, scale: jfloat,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let width = if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 };
+        let scale = if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 };
+        JString::from_str(env, citation_detail(&text.to_string(), number.max(0) as u64, width, scale).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_mathCompletion<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, caret: jint,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        JString::from_str(env, math_completion(&text.to_string(), caret.max(0) as usize).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_wordBoundary<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, caret: jint, direction: jint,
+) -> jint {
+    unowned_env.with_env(|_env| -> errors::Result<jint> {
+        Ok(word_boundary_utf16(&text.to_string(), caret.max(0) as usize, direction) as jint)
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+const DOCUMENT_THEME: &str = "#set text(fill: white, size: 17pt, font: \"DejaVu Sans Mono\", kerning: false, bottom-edge: \"descender\", ligatures: false)\n";
+
+fn modifier_fragment(model: &DocModel, range: std::ops::Range<usize>, excluded: Option<(&str, &str)>, width: f64, scale: f32) -> Value {
+    use base64::Engine as _;
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut boundaries: Vec<usize> = model.text().grapheme_indices(true).map(|(i, _)| i).collect();
+    boundaries.push(model.len());
+    let start = boundaries.iter().copied().take_while(|i| *i <= range.start).last().unwrap_or(0);
+    let end = boundaries.iter().copied().find(|i| *i >= range.end).unwrap_or(model.len());
+    let range = start..end;
+    let scan = mathed_core::markers::scan(model.text());
+    let segments = mathed_core::markers::resolve_segments(&scan);
+    let options = mathed_core::transform::TransformOptions {
+        references: model::citation_references(&scan),
+        block_splices: modifiers::typst_splices_in(model, range.clone(), excluded),
+        ..Default::default()
+    };
+    let fragment = mathed_core::transform::to_render_text_range(model.text(), &scan, &segments, range, &options);
+    // Match mathed_mini's document theme and rasterize at device density;
+    // enlarging a 1 px/pt snippet makes its glyphs visibly pixelated.
+    let markup = format!("{DOCUMENT_THEME}{}", fragment.text);
+    let world = mathed_mini::MiniWorld::new(markup);
+    let image = world.eval_main().and_then(|content| {
+        use typst::layout::{Abs, Axes, Region, Size};
+        let region = Region::new(Size::new(Abs::pt(width), Abs::pt(2048.0)), Axes::splat(false));
+        world.layout(&content, region)
+    }).and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
+    match image {
+        Some(image) => json!({"width": image.width, "height": image.height,
+            "rgba": base64::engine::general_purpose::STANDARD.encode(&image.data)}),
+        None => json!({"error": "Could not render comparison"}),
+    }
+}
+
+fn modifier_comparisons(model: &DocModel, start_id: &str, end_id: &str, width: f64, scale: f32) -> Value {
+    let Some(source) = modifiers::source_range(model, start_id, end_id) else {
+        return json!({"error": "Modifier markers no longer exist"});
+    };
+    let mut incoming = Vec::new();
+    let mut outgoing = Vec::new();
+    for link in modifiers::links(model) {
+        if !link.resolved { continue; }
+        if link.target.start < source.end && source.start < link.target.end {
+            let label = modifiers::source_range(model, &link.start_id, &link.end_id)
+                .map(|r| model.text()[r].trim().to_owned())
+                .unwrap_or_else(|| "Missing modifier".to_string());
+            incoming.push(json!({"label": label,
+                "without": modifier_fragment(model, source.clone(), Some((&link.start_id, &link.end_id)), width, scale)}));
+        }
+        if link.start_id == start_id && link.end_id == end_id {
+            outgoing.push(json!({
+                "start": byte_to_utf16(model.text(), link.target.start),
+                "end": byte_to_utf16(model.text(), link.target.end),
+                "legacy": link.target_ids.is_none(),
+                "with": modifier_fragment(model, link.target.clone(), None, width, scale),
+                "without": modifier_fragment(model, link.target, Some((start_id, end_id)), width, scale),
+            }));
+        }
+    }
+    json!({"incoming": incoming, "outgoing": outgoing})
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_modifierComparisons<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, snapshot: JString<'local>,
+    start_id: JString<'local>, end_id: JString<'local>, width: jfloat, scale: jfloat,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let text = text.to_string();
+        let value = match model_from_snapshot(&snapshot.to_string(), &text) {
+            Some(model) => modifier_comparisons(&model, &start_id.to_string(), &end_id.to_string(),
+                if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 },
+                if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 }),
+            None => json!({"error": "Could not restore document"}),
+        };
+        JString::from_str(env, value.to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_createFromSnapshot<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: JString<'local>,
+    expected: JString<'local>,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> errors::Result<jlong> {
+            Ok(model_from_snapshot(&snapshot.to_string(), &expected.to_string())
+                .map_or(0, |m| Box::into_raw(Box::new(m)) as jlong))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_openSnapshot<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, snapshot: JString<'local>,
+) -> jlong {
+    use base64::Engine as _;
+    unowned_env.with_env(|_env| -> errors::Result<jlong> {
+        let model = base64::engine::general_purpose::STANDARD.decode(snapshot.to_string())
+            .ok().and_then(|bytes| DocModel::from_snapshot(&bytes).ok());
+        Ok(model.map_or(0, |m| Box::into_raw(Box::new(m)) as jlong))
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_snapshot<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    use base64::Engine as _;
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: the handle is owned by the UI thread until onDestroy.
+            let bytes = unsafe { model_mut(handle).math_doc().snapshot() };
+            JString::from_str(env, base64::engine::general_purpose::STANDARD.encode(bytes))
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
@@ -342,12 +703,100 @@ const MAX_CHUNK_PAGES: usize = 8;
 /// document's full page count, so the caller knows how many chunks there
 /// are; a `start` past `total` yields an empty `pages` array ("nothing
 /// more to load"), not an error.
+/// Typeset all pages, but rasterize only the requested chunk. At device
+/// resolution an A4 page can occupy tens of megabytes, so rasterizing the
+/// whole document for every chunk would exhaust memory on long documents.
+fn layout_page_chunk(
+    text: &str, opts: &mathed_core::transform::TransformOptions,
+    scale: f32, start: usize, max_pages: usize,
+) -> Result<(usize, Vec<mathed_mini::PageLayout>), mathed_mini::RenderError> {
+    let render = mathed_mini::doc_to_render_with(text, opts);
+    let world = mathed_mini::MiniWorld::new(format!("{DOCUMENT_THEME}{}", render.text));
+    let document = typst::compile::<typst_layout::PagedDocument>(&world)
+        .output.map_err(|_| mathed_mini::RenderError::Eval)?;
+    let total = document.pages().len();
+    let pages = document.pages().iter().skip(start).take(max_pages.clamp(1, MAX_CHUNK_PAGES))
+        .map(|page| {
+            let glyphs = mathed_core::glyphs::build_glyph_index(
+                &page.frame, world.main_source(), &render.map, DOCUMENT_THEME.len());
+            let figures = mathed_core::figures::figures_in_frame(&page.frame);
+            let image = mathed_mini::rasterize_at(&page.frame, scale)?;
+            let (width, height) = (image.width, image.height);
+            Ok(mathed_mini::PageLayout { image, glyphs, figures, width, height })
+        }).collect::<Result<Vec<_>, _>>()?;
+    Ok((total, pages))
+}
+
+fn png_page(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>, String> {
+    // The rasterizer uses premultiplied RGBA; PNG expects straight alpha.
+    let mut straight = pixels.to_vec();
+    for pixel in straight.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        if alpha > 0 && alpha < 255 {
+            for component in &mut pixel[..3] {
+                *component = ((*component as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        writer.write_image_data(&straight).map_err(|e| e.to_string())?;
+    }
+    Ok(encoded)
+}
+
 fn render_pages(
     doc_text: &str,
     start: usize,
     max_pages: usize,
     scale: f32,
     caret_utf16: usize,
+) -> Result<String, String> {
+    render_pages_with_model(doc_text, start, max_pages, scale, caret_utf16, None)
+}
+
+fn render_pages_with_model(
+    doc_text: &str,
+    start: usize,
+    max_pages: usize,
+    scale: f32,
+    caret_utf16: usize,
+    model: Option<&DocModel>,
+) -> Result<String, String> {
+    render_pages_with_options(doc_text, start, max_pages, scale, caret_utf16, model, false, false)
+}
+
+fn marker_reveal_ranges(scan: &mathed_core::markers::MarkerScan, caret: usize, show: bool) -> Vec<std::ops::Range<usize>> {
+    let on_marker = scan.markers.iter().any(|m| m.range.start <= caret && caret <= m.range.end);
+    let mut reveal = if !show && on_marker { Vec::new() } else { vec![caret..caret] };
+    if show {
+        reveal.extend(scan.markers.iter().map(|marker| marker.range.clone()));
+    }
+    reveal
+}
+
+fn render_pages_with_options(
+    doc_text: &str,
+    start: usize,
+    max_pages: usize,
+    scale: f32,
+    caret_utf16: usize,
+    model: Option<&DocModel>,
+    show_markers: bool,
+    rendered_only: bool,
+) -> Result<String, String> {
+    render_pages_with_options_expanded(doc_text, start, max_pages, scale, caret_utf16,
+        model, show_markers, rendered_only, &[])
+}
+
+fn render_pages_with_options_expanded(
+    doc_text: &str, start: usize, max_pages: usize, scale: f32, caret_utf16: usize,
+    model: Option<&DocModel>, show_markers: bool, rendered_only: bool,
+    expanded_pairs: &[(String, String)],
 ) -> Result<String, String> {
     use base64::Engine as _;
     use mathed_core::transform::TransformOptions;
@@ -367,13 +816,26 @@ fn render_pages(
     // preview shows the collapsed view.
     let scan = mathed_core::markers::scan(doc_text);
     let segments = mathed_core::markers::resolve_segments(&scan);
-    let expand = mathed_mini::render::reveal_span_in(&scan, &segments, caret)
-        .into_iter()
-        .collect();
-    let opts = TransformOptions {
-        reveal: vec![caret..caret],
+    let expand = if rendered_only {
+        segments.iter().filter(|s| expanded_pairs.iter().any(|(a, b)| &s.start_id == a && &s.end_id == b))
+            .filter_map(|s| s.span.clone()).collect()
+    } else {
+        mathed_mini::render::reveal_span_in(&scan, &segments, caret).into_iter().collect()
+    };
+    // A caret on a marker normally reveals that token in mathed. This
+    // frontend's explicit marker toggle promises hidden markers even at
+    // the caret, while still revealing other token kinds as before.
+    let reveal = if rendered_only {
+        if show_markers { scan.markers.iter().map(|m| m.range.clone()).collect() }
+        else { Vec::new() }
+    } else {
+        marker_reveal_ranges(&scan, caret, show_markers)
+    };
+    let mut opts = TransformOptions {
+        reveal,
         expand,
-        references: mathed_core::markers::scan_references(&scan),
+        references: model::citation_references(&scan),
+        block_splices: model.map(modifiers::typst_splices).unwrap_or_default(),
         ..TransformOptions::default()
     };
 
@@ -393,19 +855,52 @@ fn render_pages(
     // shape engine.rs samples from. `RenderError` is `Debug`-only (a
     // sibling crate's type; not widened here), so the diagnostic uses
     // `{:?}`.
-    let pages = mathed_mini::layout_doc_paged_scaled(doc_text, &opts, scale)
-        .map_err(|e| format!("render: {e:?}"))?;
-    let total = pages.len();
+    let mut warnings = Vec::new();
+    let (total, pages) = match layout_page_chunk(doc_text, &opts, scale, start, max_pages) {
+        Ok(pages) => pages,
+        Err(original) => {
+            let Some(model) = model else {
+                return Err(format!("Could not typeset the document ({original:?})"));
+            };
+            let pairs: std::collections::BTreeSet<(String, String)> = modifiers::links(model)
+                .into_iter().map(|link| (link.start_id, link.end_id)).collect();
+            if pairs.is_empty() {
+                return Err(format!("Could not typeset the document ({original:?})"));
+            }
+            // Isolate failing modifiers against the actual document and the
+            // modifiers already accepted. Never modify the Loro document.
+            let mut excluded: std::collections::HashSet<_> = pairs.iter().cloned().collect();
+            opts.block_splices.clear();
+            let mut pages = layout_page_chunk(doc_text, &opts, scale, start, max_pages)
+                .map_err(|_| format!("Could not typeset the document ({original:?})"))?;
+            for pair in pairs {
+                excluded.remove(&pair);
+                opts.block_splices = modifiers::typst_splices_excluding(model, 0..model.len(), &excluded);
+                match layout_page_chunk(doc_text, &opts, scale, start, max_pages) {
+                    Ok(next) => pages = next,
+                    Err(_) => {
+                        excluded.insert(pair.clone());
+                        let name = modifiers::source_range(model, &pair.0, &pair.1)
+                            .map(|r| model.text()[r].trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| format!("#{} … #{}", pair.0, pair.1));
+                        warnings.push(format!("Could not apply modifier ‘{name}’; expected a valid Typst content function."));
+                    }
+                }
+            }
+            pages
+        }
+    };
     if total == 0 {
         return Err("render: no pages".to_string());
     }
 
     let chunk: Vec<Value> = pages
         .iter()
-        .skip(start)
-        .take(max_pages.clamp(1, MAX_CHUNK_PAGES))
-        .map(|p| {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&p.image.data);
+        .map(|p| -> Result<Value, String> {
+            let bytes = if rendered_only { png_page(p.image.width, p.image.height, &p.image.data)? }
+                else { p.image.data.clone() };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             // With a known caption span, a page before the caption must
             // report `null` rather than its own prose, or the pad would
             // open on an earlier paragraph. Only a document with no
@@ -424,15 +919,49 @@ fn render_pages(
                     .and_then(|e| p.glyphs.bands.get(e.band as usize)),
             }
             .map(|band| band.top);
-            json!({
+            let hits: Vec<Value> = p.glyphs.entries.iter().filter_map(|e| {
+                let band = p.glyphs.bands.get(e.band as usize)?;
+                Some(json!([e.x, band.top, e.x + e.advance, band.bottom,
+                    byte_to_utf16(doc_text, e.doc_byte)]))
+            }).collect();
+            let mut result = json!({
                 "width": p.image.width,
                 "height": p.image.height,
-                "rgba": b64,
                 "textTop": text_top,
-            })
+                "hasFigures": !p.figures.is_empty(),
+                "hits": hits,
+            });
+            result[if rendered_only { "png" } else { "rgba" }] = json!(b64);
+            Ok(result)
         })
-        .collect();
-    Ok(json!({ "total": total, "start": start, "pages": chunk }).to_string())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({ "total": total, "start": start, "pages": chunk, "warnings": warnings }).to_string())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPagesWithSnapshot<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    doc_text: JString<'local>,
+    snapshot: JString<'local>,
+    start: jint,
+    max_pages: jint,
+    scale: jfloat,
+    caret_utf16: jint,
+    show_markers: jint,
+    expanded: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let text = doc_text.to_string();
+        let model = model_from_snapshot(&snapshot.to_string(), &text);
+        let expanded: Vec<(String, String)> = serde_json::from_str(&expanded.to_string()).unwrap_or_default();
+        let result = match model {
+            Some(model) => render_pages_with_options_expanded(&text, start.max(0) as usize,
+                max_pages.max(0) as usize, scale as f32, caret_utf16.max(0) as usize, Some(&model), show_markers != 0, true, &expanded),
+            None => Err("Could not restore document for preview".to_string()),
+        };
+        JString::from_str(env, result.unwrap_or_else(|e| json!({"error": e}).to_string()))
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -474,6 +1003,254 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPages<'local>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_markers_use_mathed_names_and_respect_escapes_and_utf16() {
+        let first = typed_marker("#", 0).unwrap();
+        assert_eq!(
+            first,
+            format!("#{}", mathed_core::markers::auto_marker_id(1))
+        );
+        let text = format!("👋 {first} #");
+        let offset = text[..text.len() - 1].encode_utf16().count();
+        let second = typed_marker(&text, offset).unwrap();
+        assert_eq!(
+            second,
+            format!("#{}", mathed_core::markers::auto_marker_id(2))
+        );
+        assert_eq!(typed_marker("\\#", 1), None);
+        assert!(typed_marker("\\\\#", 2).is_some());
+        assert_eq!(typed_marker("hello", 0), None);
+    }
+
+    #[test]
+    fn preview_hit_positions_are_document_utf16_offsets() {
+        let doc = "👋 hello";
+        let json = render_pages(doc, 0, 1, 1.0, 0).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let hits = value["pages"][0]["hits"].as_array().unwrap();
+        assert!(hits.iter().any(|h| h[4] == 3), "h begins at UTF-16 offset 3");
+        assert!(hits.iter().all(|h| h[1].as_f64().unwrap() < h[3].as_f64().unwrap()));
+    }
+
+    #[test]
+    fn search_uses_mathed_case_rules_and_android_utf16_offsets() {
+        assert_eq!(search_ranges("👋 Alpha α ALPHA", "alpha"), json!([[3, 8], [11, 16]]));
+        assert_eq!(search_ranges("👋 Alpha α ALPHA", "Alpha"), json!([[3, 8]]));
+        assert_eq!(search_ranges("👋 Alpha α ALPHA", "α"), json!([[9, 10]]));
+    }
+
+    #[test]
+    fn word_navigation_uses_mathed_boundaries_with_utf16_positions() {
+        let text = "👋 alpha beta";
+        assert_eq!(word_boundary_utf16(text, 3, 1), 8);
+        assert_eq!(word_boundary_utf16(text, 13, -1), 9);
+        assert_eq!(word_boundary_utf16("#abc text", 2, 1), 4);
+    }
+
+    #[test]
+    fn math_completion_uses_mathed_table_and_utf16_positions() {
+        let text = "👋 $\\alpha";
+        let completion = math_completion(text, text.encode_utf16().count());
+        assert_eq!(completion["start"], 4);
+        assert_eq!(completion["text"], "α");
+        assert!(math_completion("\\alpha", 6).is_null());
+    }
+
+    #[test]
+    fn citation_details_resolve_hayagriva_and_document_references() {
+        let doc = "#1 crazy-rich:\n    type: Book\n    title: Crazy Rich Asians\n    author: Kwan, Kevin\n    date: 2014\n    publisher: Anchor Books\n#2 \\bibliography(#1,#2, refs)\n#3 x #4 \\cite(#3,#4, \"crazy-rich\", bib: \"refs\")";
+        let detail = citation_detail(doc, 1, 300.0, 1.0);
+        assert_eq!(detail["kind"], "bibliography");
+        assert_eq!(detail["resolved"], true);
+        assert!(detail["text"].as_str().unwrap().contains("Kwan"));
+        assert!(detail["text"].as_str().unwrap().contains("2014"), "citation year missing: {detail}");
+        assert!(detail["entries"][0].as_str().unwrap().contains("Crazy Rich Asians"));
+        let bare = "#1 crazy-rich:\n    type: Book\n    title: Crazy Rich Asians\n    author: Kwan, Kevin\n    date: 2014\n#2 \\bibliography(#1,#2, refs)\n\\cite(\"crazy-rich\", bib: \"refs\") \\cite(#1,#2)";
+        let index = citation_index(bare);
+        assert_eq!(index[0]["numbers"], json!([1]));
+        assert_eq!(index[1]["numbers"], json!([2]));
+        assert_eq!(citation_detail(bare, 1, 300.0, 1.0)["resolved"], true);
+        let misspelled = bare.replace("\"crazy-rich\", bib", "\"Kwn14\", bib");
+        let detail = citation_detail(&misspelled, 1, 300.0, 1.0);
+        assert_eq!(detail["resolved"], false);
+        assert!(detail["errorDetail"].as_str().unwrap().contains("crazy-rich"));
+        let bibtex = "#a @book{kwan:2014, title={Crazy Rich Asians}, author={Kwan, Kevin}, year={2014}} #b \\bibliography(#a,#b, refs, format: \"bibtex\") \\cite(\"kwan:2014\", bib: \"refs\")";
+        let bibtex_detail = citation_detail(bibtex, 1, 300.0, 1.0);
+        assert_eq!(bibtex_detail["resolved"], true, "{bibtex_detail}");
+        assert!(bibtex_detail["text"].as_str().unwrap().contains("2014"));
+        let reference = "#a Hello $x^2$ #b \\cite(#a,#b)";
+        let index = citation_index(reference);
+        assert_eq!(index[0]["numbers"], json!([1]));
+        let page: Value = serde_json::from_str(&render_pages_with_options(
+            reference, 0, 1, 1.0, 0, None, false, true).unwrap()).unwrap();
+        let cite_start = index[0]["start"].as_u64().unwrap();
+        assert!(page["pages"][0]["hits"].as_array().unwrap().iter()
+            .any(|hit| hit[4].as_u64() == Some(cite_start)), "citation label must be tappable");
+        let detail = citation_detail(reference, 1, 300.0, 2.0);
+        assert_eq!(detail["kind"], "document");
+        assert!(detail["png"].is_string());
+    }
+
+    #[test]
+    fn explicit_fold_expands_only_the_selected_translator() {
+        let text = "before #3 #let translate(b) = { \"[]\" } #4 \\translator(#3,#4, name: \"ho\")";
+        let collapsed: Value = serde_json::from_str(&render_pages_with_options_expanded(
+            text, 0, 1, 1.0, 0, None, false, true, &[]).unwrap()).unwrap();
+        let expanded: Value = serde_json::from_str(&render_pages_with_options_expanded(
+            text, 0, 1, 1.0, 0, None, false, true, &[("3".into(), "4".into())]).unwrap()).unwrap();
+        assert_ne!(collapsed["pages"][0]["png"], expanded["pages"][0]["png"]);
+        let hits = collapsed["pages"][0]["hits"].as_array().unwrap();
+        let marker = byte_to_utf16(text, text.find("#3").unwrap());
+        let span = marker + 2;
+        assert!(hits.iter().any(|h| h[4] == marker || h[4] == span));
+    }
+
+    #[test]
+    fn marker_visibility_changes_the_preview_without_changing_the_document() {
+        let doc = "#a alpha #b tail";
+        let hidden: Value = serde_json::from_str(&render_pages_with_options(
+            doc, 0, 1, 1.0, doc.len(), None, false, true).unwrap()).unwrap();
+        let shown: Value = serde_json::from_str(&render_pages_with_options(
+            doc, 0, 1, 1.0, doc.len(), None, true, true).unwrap()).unwrap();
+        assert_ne!(hidden["pages"][0]["png"], shown["pages"][0]["png"]);
+    }
+
+    #[test]
+    fn rendered_editor_does_not_expand_source_when_caret_enters_a_figure() {
+        let doc = "#a caption #b \\app(#a,#b,100,60)";
+        let open: Value = serde_json::from_str(&render_pages_with_options(
+            doc, 0, 1, 1.0, doc.find("caption").unwrap(), None, false, true).unwrap()).unwrap();
+        let elsewhere: Value = serde_json::from_str(&render_pages_with_options(
+            doc, 0, 1, 1.0, doc.len(), None, false, true).unwrap()).unwrap();
+        assert!(open["pages"][0]["png"].is_string());
+        assert_eq!(open["pages"][0]["png"], elsewhere["pages"][0]["png"]);
+    }
+
+    #[test]
+    fn rendered_editor_transports_a_decodable_full_resolution_page() {
+        use base64::Engine as _;
+        let result: Value = serde_json::from_str(&render_pages_with_options(
+            "Visible text", 0, 1, 2.0, 0, None, false, true).unwrap()).unwrap();
+        let page = &result["pages"][0];
+        let bytes = base64::engine::general_purpose::STANDARD.decode(page["png"].as_str().unwrap()).unwrap();
+        let reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        assert_eq!(reader.info().width, page["width"].as_u64().unwrap() as u32);
+        assert_eq!(reader.info().height, page["height"].as_u64().unwrap() as u32);
+    }
+
+    #[test]
+    fn hidden_marker_stays_hidden_even_when_caret_touches_it() {
+        let doc = "#a alpha #zz";
+        let scan = mathed_core::markers::scan(doc);
+        let segments = mathed_core::markers::resolve_segments(&scan);
+        let make = |shown| {
+            let options = mathed_core::transform::TransformOptions {
+                reveal: marker_reveal_ranges(&scan, doc.len(), shown),
+                ..Default::default()
+            };
+            mathed_core::transform::to_render_text(doc, &scan, &segments, &options).text
+        };
+        assert!(!make(false).contains("zz"));
+        assert!(make(true).contains("zz"));
+    }
+
+    #[test]
+    fn saved_snapshot_preserves_loro_marks_and_rejects_mismatched_text() {
+        use base64::Engine as _;
+        let mut model = DocModel::new("a👋b");
+        model.math_doc_mut().mark_segment(1..5, "prop:bold", "example");
+        model.math_doc_mut().commit();
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(model.math_doc().snapshot());
+        let restored = model_from_snapshot(&encoded, "a👋b").unwrap();
+        assert_eq!(restored.math_doc().segment_marks(), vec![(1..5, "prop:bold".into())]);
+        assert!(model_from_snapshot(&encoded, "different").is_none());
+        assert!(model_from_snapshot("not-base64", "a👋b").is_none());
+    }
+
+    #[test]
+    fn loro_modifier_changes_the_real_page_raster() {
+        let mut model = DocModel::new("#a bold #b hello");
+        let at = model.text().find("hello").unwrap();
+        assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
+        let plain: Value = serde_json::from_str(&render_pages(model.text(), 0, 1, 1.0, 0).unwrap()).unwrap();
+        let styled: Value = serde_json::from_str(&render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap()).unwrap();
+        assert_ne!(plain["pages"][0]["rgba"], styled["pages"][0]["rgba"]);
+    }
+
+    #[test]
+    fn modifier_comparisons_render_with_and_without_the_link() {
+        let mut model = DocModel::new("#a bold #b hello");
+        let at = model.text().find("hello").unwrap();
+        assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
+        let result = modifier_comparisons(&model, "a", "b", 250.0, 2.0);
+        let rows = result["outgoing"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["with"]["rgba"].is_string());
+        assert!(rows[0]["without"]["rgba"].is_string());
+        assert_ne!(rows[0]["with"]["rgba"], rows[0]["without"]["rgba"]);
+    }
+
+    #[test]
+    fn incoming_modifier_is_listed_for_the_marked_target() {
+        let mut model = DocModel::new("#a bold #b #c hello #d");
+        let at = model.text().find("hello").unwrap();
+        assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
+        let result = modifier_comparisons(&model, "c", "d", 250.0, 2.0);
+        let rows = result["incoming"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["label"], "bold");
+        assert!(rows[0]["without"]["rgba"].is_string());
+    }
+
+    #[test]
+    fn comparison_rasters_follow_density_and_wrap_at_column_width() {
+        let text = "a longer passage that wraps across several lines";
+        let model = DocModel::new(text);
+        let one = modifier_fragment(&model, 0..text.len(), None, 100.0, 1.0);
+        let dense = modifier_fragment(&model, 0..text.len(), None, 100.0, 2.0);
+        assert!(one["height"].as_u64().unwrap() > 30);
+        for dimension in ["width", "height"] {
+            let expected = one[dimension].as_u64().unwrap() * 2;
+            assert!(dense[dimension].as_u64().unwrap().abs_diff(expected) <= 1);
+        }
+    }
+
+    #[test]
+    fn crossing_loro_modifiers_render_in_typst() {
+        let mut model = DocModel::new("#a bold #b #c italic #d abcdefgh");
+        let at = model.text().find("abcdefgh").unwrap();
+        assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
+        assert!(modifiers::set_link(&mut model, "c", "d", at + 3..at + 8, true));
+        assert!(render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).is_ok());
+    }
+
+    #[test]
+    fn invalid_modifier_does_not_hide_the_document_or_valid_modifier() {
+        let mut model = DocModel::new("\n#ad bold #am\n#i fgh #o\n \n    ");
+        let bold = model.text().find("bold").unwrap();
+        let target = model.text().find("fgh").unwrap();
+        assert!(modifiers::set_link(&mut model, "ad", "am", target..target + 3, true));
+        let expected: Value = serde_json::from_str(
+            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap()
+        ).unwrap();
+        assert!(modifiers::set_link(&mut model, "i", "o", bold..bold + 4, true));
+        let actual: Value = serde_json::from_str(
+            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap()
+        ).unwrap();
+        assert_eq!(actual["pages"][0]["rgba"], expected["pages"][0]["rgba"]);
+        assert!(actual["warnings"][0].as_str().unwrap().contains("fgh"));
+        assert_eq!(modifiers::links(&model).len(), 2, "rendering must not remove links");
+    }
+
+    #[test]
+    fn typst_function_expression_can_modify_an_interval() {
+        let mut model = DocModel::new("#a text.with(fill: red) #b hello");
+        let at = model.text().find("hello").unwrap();
+        assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
+        assert!(render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).is_ok());
+    }
 
     #[test]
     fn utf16_byte_round_trip() {
@@ -835,8 +1612,10 @@ mod tests {
             .expect("cited renders");
         let b = render_pages(literal, 0, 8, 1.0, literal.find("prose").unwrap())
             .expect("literal renders");
+        let a: Value = serde_json::from_str(&a).unwrap();
+        let b: Value = serde_json::from_str(&b).unwrap();
         assert_eq!(
-            a, b,
+            a["pages"][0]["rgba"], b["pages"][0]["rgba"],
             "a \\cite must rasterise exactly like its visible [1] label"
         );
     }
@@ -929,7 +1708,7 @@ mod tests {
             "the rebuilt chunk must restore the captured offset"
         );
         assert!(
-            java.contains("previewScroll.scrollTo(0, target);"),
+            java.contains("previewScroll.scrollTo(0, visibleTarget);"),
             "restoring the offset must scroll the rebuilt preview"
         );
         // A page-count collapse clamps scrollTo to the new, shorter maximum.

@@ -20,6 +20,8 @@ crate-type = ["cdylib"]
 jni = "0.22"
 serde_json = "1"
 mathed_core = { path = "../../velysterm/crates/mathed_core" }
+mathed_biblio = { path = "../../velysterm/crates/mathed_biblio" }
+hayagriva = "0.10"
 # The document renderer (Typst paged layout -> CPU raster). `default-features
 # = false` drops `gui` (winit/softbuffer) and `kernel` (the unfer kernel's
 # dependency tree does not build for Android) — the same choice
@@ -30,6 +32,9 @@ mathed_mini = { path = "../../velysterm/crates/mathed_mini", default-features = 
 # matching mathed_android's screenshot transport.
 base64 = "0.22"
 unicode-segmentation = "1"
+typst = "0.15"
+typst-layout = "0.15"
+png = "0.18"
 
 # The australVM Cranelift JIT bridge — the on-device execution lane
 # (AGENTS.md "#emthin-android"). `default-features = false` drops

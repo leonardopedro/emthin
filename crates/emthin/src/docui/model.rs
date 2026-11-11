@@ -15,6 +15,28 @@ use mathed_core::doc::MathDoc;
 use mathed_core::markers::{resolve_segments, scan, MarkerScan, Segment};
 use mathed_core::transform::TransformOptions;
 
+/// Number actual citation keys, excluding named options such as `bib:`.
+/// Mathed's scanner retains literal arguments, including named options, in
+/// bibliography references; those options must not consume citation numbers.
+pub fn citation_references(scan: &MarkerScan) -> Vec<mathed_core::markers::ReferenceEntry> {
+    use mathed_core::markers::ReferenceKind;
+    let mut next = 1u64;
+    let mut references = mathed_core::markers::scan_references(scan);
+    for reference in &mut references {
+        let count = match &mut reference.kind {
+            ReferenceKind::DocumentRef { .. } => 1,
+            ReferenceKind::Bibliography { keys } => {
+                keys.retain(|key| !key.split_once(':').is_some_and(|(name, _)|
+                    matches!(name.trim(), "bib" | "style")));
+                keys.len().max(1)
+            }
+        };
+        reference.numbers = (next..next + count as u64).collect();
+        next += count as u64;
+    }
+    references
+}
+
 /// Document text + derived state + caret.
 ///
 /// Not `Debug`: `MathDoc` is a whole Loro document and isn't `Debug`
@@ -110,9 +132,21 @@ impl DocModel {
         self.caret
     }
 
+    /// Whether caret/selection placement can affect the rendered source.
+    fn has_revealable_content(&self) -> bool {
+        !self.scan.markers.is_empty()
+            || !self.scan.stmts.is_empty()
+            || self.text().contains("  ")
+            || !mathed_core::transform::math_span_ranges(self.text()).is_empty()
+    }
+
     /// Move the caret, collapsing any selection.
     pub fn set_caret(&mut self, pos: usize) {
-        self.caret = pos.min(self.doc.len());
+        let pos = pos.min(self.doc.len());
+        if (self.caret != pos || self.anchor.is_some()) && self.has_revealable_content() {
+            self.dirty = true;
+        }
+        self.caret = pos;
         self.anchor = None;
     }
 
@@ -121,6 +155,9 @@ impl DocModel {
     pub fn extend_selection_to(&mut self, pos: usize) {
         let pos = pos.min(self.doc.len());
         let anchor = self.anchor.unwrap_or(self.caret);
+        if (self.caret != pos || self.anchor != Some(anchor)) && self.has_revealable_content() {
+            self.dirty = true;
+        }
         self.anchor = Some(anchor);
         self.caret = pos;
     }
@@ -130,6 +167,9 @@ impl DocModel {
     /// caret its start — so drag-selection that goes backwards reads
     /// the same as the forward one.
     pub fn set_selection(&mut self, range: Range<usize>) {
+        if self.has_revealable_content() {
+            self.dirty = true;
+        }
         let end = range.end.min(self.len());
         let start = range.start.min(self.len());
         if start <= end {
@@ -142,6 +182,9 @@ impl DocModel {
     }
 
     pub fn clear_selection(&mut self) {
+        if self.anchor.is_some() && self.has_revealable_content() {
+            self.dirty = true;
+        }
         self.anchor = None;
     }
 
@@ -259,9 +302,11 @@ impl DocModel {
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(_) = self.doc.undo() else {
+        let revision = self.doc.revision();
+        self.doc.undo();
+        if self.doc.revision() == revision {
             return false;
-        };
+        }
         self.caret = self.caret.min(self.doc.len());
         self.anchor = None;
         self.rescan();
@@ -269,9 +314,11 @@ impl DocModel {
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(_) = self.doc.redo() else {
+        let revision = self.doc.revision();
+        self.doc.redo();
+        if self.doc.revision() == revision {
             return false;
-        };
+        }
         self.caret = self.caret.min(self.doc.len());
         self.anchor = None;
         self.rescan();
@@ -336,6 +383,7 @@ impl DocModel {
     pub fn transform_options(&self) -> TransformOptions {
         TransformOptions {
             reveal: self.reveal_spans(),
+            references: citation_references(&self.scan),
             ..Default::default()
         }
     }
@@ -388,6 +436,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn layout_options_include_numbered_citations() {
+        let mut doc = DocModel::new("#a referenced #b \\cite(#a,#b) text");
+        doc.set_caret(doc.len());
+        let options = doc.transform_options();
+        assert_eq!(options.references.len(), 1);
+        assert_eq!(mathed_core::markers::cite_label_text(&options.references[0]), "[1]");
+    }
+
+    #[test]
     fn insert_moves_the_caret_and_dirties() {
         let mut m = DocModel::new("");
         m.take_dirty();
@@ -420,6 +477,20 @@ mod tests {
         assert_eq!(m.selection(), Some(6..11));
         assert_eq!(m.selected_text(), "world");
         assert_eq!(m.caret(), 11);
+    }
+
+    #[test]
+    fn caret_and_selection_changes_invalidate_the_reveal_layout() {
+        let mut model = DocModel::new("#a hello #b");
+        model.take_dirty();
+        model.set_caret(3);
+        assert!(model.take_dirty());
+        model.extend_selection_to(5);
+        assert!(model.take_dirty());
+        model.clear_selection();
+        assert!(model.take_dirty());
+        model.set_caret(5);
+        assert!(!model.is_dirty());
     }
 
     #[test]
@@ -501,6 +572,20 @@ mod tests {
         assert!(m.redo());
         assert_eq!(m.text(), "abc");
         assert!(!m.redo(), "nothing left to redo");
+    }
+
+    #[test]
+    fn undo_and_redo_invalidate_after_mark_only_changes() {
+        let mut m = DocModel::new("hello");
+        m.math_doc_mut().mark_segment(0..5, "prop:bold", "test");
+        m.math_doc_mut().commit();
+        m.take_dirty();
+        assert!(m.undo());
+        assert!(m.math_doc().segment_marks().is_empty());
+        assert!(m.take_dirty());
+        assert!(m.redo());
+        assert_eq!(m.math_doc().segment_marks(), vec![(0..5, "prop:bold".into())]);
+        assert!(m.take_dirty());
     }
 
     #[test]

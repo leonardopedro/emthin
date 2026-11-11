@@ -17,12 +17,45 @@ public final class DocBridge {
 
     public static native long create(String initialText);
 
+    /** Returns zero for a corrupt snapshot or one that does not match the text. */
+    public static native long createFromSnapshot(String snapshot, String expectedText);
+
+    /** Open a Loro snapshot from a document file. Returns zero on invalid data. */
+    public static native long openSnapshot(String snapshot);
+
+    public static native String snapshot(long handle);
+
     public static native void free(long handle);
 
     public static native String state(long handle);
 
+    /** Mathed's incremental search, returned as UTF-16 ranges. */
+    public static native String search(String text, String query);
+
+    public static native int wordBoundary(String text, int caret, int direction);
+
+    public static native String mathCompletion(String text, int caret);
+
+    /** Citation index and expandable details, resolved from document text. */
+    public static native String citationIndex(String text);
+    public static native String citationDetail(String text, int number, float width, float scale);
+
     /** Pushes {@code text} into the model (one undo step) and moves the caret. */
     public static native String sync(long handle, String text, int caretUtf16);
+
+    /** Returns mathed's generated marker for a typed #, or empty if escaped. */
+    public static native String typedMarker(String text, int offsetUtf16);
+
+    public static native String setModifier(long handle, String startId, String endId,
+                                            int start, int end, int enabled);
+
+    public static native String setMarkerTargets(long handle, String startId, String endId,
+                                                 String markerPairs);
+
+    /** Stateless comparison rendering; safe to call on a worker. */
+    public static native String modifierComparisons(String text, String snapshot,
+                                                    String startId, String endId,
+                                                    float width, float scale);
 
     public static native String undo(long handle);
 
@@ -54,6 +87,9 @@ public final class DocBridge {
      */
     public static native String renderPages(String docText, int start, int maxPages,
                                             float scale, int caretUtf16);
+
+    public static native String renderPagesWithSnapshot(String docText, String snapshot,
+            int start, int maxPages, float scale, int caretUtf16, int showMarkers, String expanded);
 
     /**
      * Compiles a CPS constant-return program with the australVM
