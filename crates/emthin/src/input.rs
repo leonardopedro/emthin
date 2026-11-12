@@ -392,7 +392,19 @@ impl EmthinState {
                 self.move_caret_linewise(action == Action::LineStart)
             }
             Action::FocusDocument => {
-                if !self.doc.close_citation() { self.focus_document(); }
+                // The find bar closes first: while it is open Escape means
+                // "stop searching", not "leave this figure".
+                if !self.doc.close_find() && !self.doc.close_citation() {
+                    self.focus_document();
+                }
+            }
+            Action::Find => self.doc.open_find(),
+            Action::FindNext | Action::FindPrevious => {
+                // F3 works with the bar closed too: the last query keeps
+                // steering, which is how every editor behaves.
+                if self.doc.find_step(action == Action::FindNext).is_none() {
+                    tracing::debug!("find: no match for {:?}", self.doc.find().query());
+                }
             }
             Action::OpenLauncher => self.open_launcher(),
             Action::CloneFigure => self.clone_focused_figure(),
@@ -591,6 +603,11 @@ impl EmthinState {
     /// editing — the same set any editor has — so it lives in one place
     /// rather than being scattered through the input path.
     fn edit_document_key_inner(&mut self, keysym: u32) -> bool {
+        // An open find bar owns the keyboard: its query is being typed, so a
+        // character must not land in the document behind it.
+        if self.doc.find().is_open() {
+            return self.edit_find_key(keysym);
+        }
         // Ctrl+Home/End are in the global table (LineStart/LineEnd); reuse
         // the same implementation rather than spelling them twice.
         if keymap::classify(keysym, KeyState::Pressed, false, false, false)
@@ -655,6 +672,32 @@ impl EmthinState {
                 }
             }
         }
+        true
+    }
+
+    /// A key while the find bar is open: text edits the query, Backspace
+    /// shortens it, Return steps. Everything else falls through, so paging and
+    /// the global bindings keep working over an open bar.
+    fn edit_find_key(&mut self, keysym: u32) -> bool {
+        match keysym {
+            keysyms::KEY_BackSpace => {
+                self.doc.find_backspace();
+            }
+            keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                if self.doc.find_step(true).is_some() {
+                    self.needs_redraw = true;
+                }
+            }
+            _ => {
+                let Some(text) = Self::char_for_keysym(keysym) else {
+                    return false;
+                };
+                for ch in text.chars() {
+                    self.doc.find_push(ch);
+                }
+            }
+        }
+        self.needs_redraw = true;
         true
     }
 

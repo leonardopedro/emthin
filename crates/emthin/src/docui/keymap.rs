@@ -53,6 +53,11 @@ pub enum Action {
     VoiceTurn,
     /// Drop keyboard focus from the figure back to the document caret.
     FocusDocument,
+    /// `Ctrl+F`: open the find bar at the caret.
+    Find,
+    /// `F3` / `Shift+F3`: the next / previous match, selecting it.
+    FindNext,
+    FindPrevious,
 }
 
 /// Classify a key press into a global [`Action`].
@@ -86,6 +91,9 @@ pub fn classify(sym: u32, pressed: KeyState, ctrl: bool, shift: bool, alt: bool)
         keysyms::KEY_End if !ctrl && !alt => Some(Action::DocumentEnd),
         keysyms::KEY_m | keysyms::KEY_M if ctrl && shift => Some(Action::CloneFigure),
         keysyms::KEY_v | keysyms::KEY_V if ctrl && shift => Some(Action::VoiceTurn),
+        keysyms::KEY_f | keysyms::KEY_F if ctrl => Some(Action::Find),
+        keysyms::KEY_F3 if shift => Some(Action::FindPrevious),
+        keysyms::KEY_F3 => Some(Action::FindNext),
         _ => None,
     }
 }
@@ -103,8 +111,10 @@ pub const DOCUMENTED_KEYMAP: &[(&str, &str)] = &[
     ),
     (
         "Escape / Ctrl+G",
-        "return focus from a figure to the document",
+        "close the find bar, else return focus from a figure to the document",
     ),
+    ("Ctrl+F", "find in the document"),
+    ("F3 / Shift+F3", "next / previous match"),
 ];
 
 #[cfg(test)]
@@ -194,6 +204,32 @@ mod tests {
         assert_eq!(
             classify(keysyms::KEY_Page_Down, KeyState::Released, NO.0, NO.1, NO.2),
             None
+        );
+    }
+
+    #[test]
+    fn find_is_ctrl_f_and_stepping_is_f3() {
+        assert_eq!(
+            classify(keysyms::KEY_f, KeyState::Pressed, true, false, false),
+            Some(Action::Find)
+        );
+        assert_eq!(
+            classify(keysyms::KEY_F, KeyState::Pressed, true, true, false),
+            Some(Action::Find),
+            "the real path delivers the modified keysym"
+        );
+        assert_eq!(
+            classify(keysyms::KEY_F3, KeyState::Pressed, false, false, false),
+            Some(Action::FindNext)
+        );
+        assert_eq!(
+            classify(keysyms::KEY_F3, KeyState::Pressed, false, true, false),
+            Some(Action::FindPrevious)
+        );
+        assert_eq!(
+            classify(keysyms::KEY_f, KeyState::Pressed, false, false, false),
+            None,
+            "a plain f is text"
         );
     }
 

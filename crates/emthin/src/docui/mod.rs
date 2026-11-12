@@ -22,6 +22,7 @@ pub mod formals;
 pub mod keymap;
 pub mod layout;
 pub mod model;
+pub mod search;
 pub mod voice;
 
 use std::time::{Duration, Instant};
@@ -54,6 +55,10 @@ pub struct DocUi {
     /// Replies land in the transcript through [`DocUi::poll_voice`].
     voice: VoiceBridge,
     citation_popup: citations::CitationPopup,
+    /// The find bar: a query over the document text, with the match ranges
+    /// `mathed_core::search` finds. It owns no rendering yet — see
+    /// [`search::FindBar`].
+    find: search::FindBar,
     /// Where the session is persisted (`None` = don't persist).
     session_file: Option<std::path::PathBuf>,
     last_autosave: Instant,
@@ -77,6 +82,7 @@ impl DocUi {
             formals: FormalVerifier::new(),
             voice: VoiceBridge::new(),
             citation_popup: citations::CitationPopup::default(),
+            find: search::FindBar::new(),
             session_file: None,
             last_autosave: Instant::now(),
             last_error: None,
@@ -99,7 +105,56 @@ impl DocUi {
 
     pub fn close_citation(&mut self) -> bool { self.citation_popup.close() }
 
+    /// The find bar, for a renderer that wants its status or current match.
+    pub fn find(&self) -> &search::FindBar {
+        &self.find
+    }
+
+    /// `Ctrl+F`: open the bar with the search starting at the caret.
+    pub fn open_find(&mut self) {
+        let origin = self.model.caret();
+        self.find.open_at(origin);
+    }
+
+    /// Close the bar; `false` when it was already closed, so `Escape` can fall
+    /// through to whatever it means with no bar open.
+    pub fn close_find(&mut self) -> bool {
+        self.find.close()
+    }
+
+    /// Type into the query. The search runs against the live text, so a match
+    /// list never describes a previous revision of the document.
+    pub fn find_push(&mut self, ch: char) {
+        let text = self.model.text().to_owned();
+        self.find.push(&text, ch);
+    }
+
+    pub fn find_backspace(&mut self) {
+        let text = self.model.text().to_owned();
+        self.find.backspace(&text);
+    }
+
+    /// Step to the next/previous match and select it, so the caret lands on the
+    /// match and the status line moves with it.
+    pub fn find_step(&mut self, forward: bool) -> Option<std::ops::Range<usize>> {
+        let text = self.model.text().to_owned();
+        let range = self.find.step(&text, forward)?;
+        self.model.set_selection(range.clone());
+        Some(range)
+    }
+
+    /// What the status line should show for the bar, if it is open.
+    pub fn find_status(&self) -> Option<String> {
+        self.find.status()
+    }
+
     pub fn clear_citations(&mut self) { self.citation_popup.clear(); }
+
+    /// Re-run the open query after the document changed.
+    pub fn find_on_edit(&mut self) {
+        let text = self.model.text().to_owned();
+        self.find.on_doc_changed(&text);
+    }
 
     /// Hit-test the rendered citation label rather than the hidden source.
     pub fn citation_at(&self, point: Point<f64, Logical>) -> Option<u64> {
