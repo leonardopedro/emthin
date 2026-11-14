@@ -8,9 +8,9 @@
 //! string, so it is tested without a compositor (the same split as
 //! [`crate::docui::citations`]).
 //!
-//! The bar does not draw itself yet: the caller reads [`FindBar::status`] and
-//! [`FindBar::current_range`]. Rendering the query and the match highlights is
-//! the remaining half of the desktop parity item.
+//! The bar's pixels are a compositor overlay (`crate::find_bar`), not part of
+//! this logic: the caller reads [`FindBar::status`] and [`FindBar::matches`],
+//! and `figure_render` draws the query, status, and match ranges.
 
 use std::ops::Range;
 
@@ -39,10 +39,13 @@ impl FindBar {
 
     /// Close the bar. Returns whether it was open, so a caller can give
     /// `Escape` to the bar first and only then to whatever else Escape does.
+    ///
+    /// The query and match list survive closing: F3 keeps stepping after
+    /// `Escape`, which is what the input layer and every editor promise.
+    /// Opening the bar again (`open_at`) starts a fresh query.
     pub fn close(&mut self) -> bool {
         let was = self.open;
         self.open = false;
-        self.state.start(0);
         was
     }
 
@@ -59,6 +62,18 @@ impl FindBar {
     #[must_use]
     pub fn match_count(&self) -> usize {
         self.state.matches.len()
+    }
+
+    /// Every match, in document order, for the page renderer's highlights.
+    #[must_use]
+    pub fn matches(&self) -> &[Range<usize>] {
+        &self.state.matches
+    }
+
+    /// Index into [`Self::matches`] of the match the bar is on.
+    #[must_use]
+    pub fn current_index(&self) -> Option<usize> {
+        self.state.current
     }
 
     /// The match the bar is on, as a byte range the document can select.
@@ -123,7 +138,7 @@ impl FindBar {
     /// stepping through ranges computed against a stale text would select the
     /// wrong bytes.
     pub fn step(&mut self, text: &str, forward: bool) -> Option<Range<usize>> {
-        if !self.open || self.state.query.is_empty() {
+        if self.state.query.is_empty() {
             return None;
         }
         let query = self.state.query.clone();
@@ -217,14 +232,19 @@ mod tests {
     }
 
     #[test]
-    fn closing_resets_the_query() {
+    fn closing_hides_the_bar_but_keeps_the_query_for_f3() {
         let mut bar = FindBar::new();
         bar.open_at(0);
         bar.set_query(DOC, "alpha");
         assert!(bar.close());
         assert!(!bar.close());
-        assert_eq!(bar.query(), "");
+        assert_eq!(bar.query(), "alpha");
+        assert_eq!(bar.status(), None);
+        // F3 after Escape still steps the last query.
+        assert_eq!(bar.step(DOC, true), Some(17..22));
+        // Reopening starts a fresh query at the caret.
         bar.open_at(0);
+        assert_eq!(bar.query(), "");
         assert_eq!(bar.status().as_deref(), Some(""));
     }
 

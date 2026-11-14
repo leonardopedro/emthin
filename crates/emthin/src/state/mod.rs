@@ -87,6 +87,63 @@ pub struct FocusState {
     pub last_app_focus: Option<crate::KeyboardFocusTarget>,
 }
 
+/// The last document click, for double/triple-click word and line selection.
+#[derive(Debug, Clone, Copy)]
+pub struct TextClick {
+    pub time: u32,
+    pub position: Point<f64, Logical>,
+    /// 1 = single, 2 = double, 3 = triple. A fourth click starts over.
+    pub count: u8,
+}
+
+/// A left-button drag that began on the document's rendered text.
+#[derive(Debug, Clone, Copy)]
+pub struct TextSelectionDrag {
+    pub start: Point<f64, Logical>,
+    /// Set after the pointer travels beyond the click slop. A press that never
+    /// moves leaves the click's caret/word/line selection untouched.
+    pub moved: bool,
+}
+
+/// Pointer selection state. The model owns the actual anchor and caret; this
+/// only remembers whether a drag is in progress and how clicks group.
+#[derive(Default)]
+pub struct TextSelectionState {
+    pub drag: Option<TextSelectionDrag>,
+    pub last_click: Option<TextClick>,
+    /// The one touch slot driving a selection. Additional fingers are ignored
+    /// so a second contact cannot fight the anchor.
+    pub touch_slot: Option<i32>,
+}
+
+/// A middle-button drag panning the zoomed page.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewPanDrag {
+    pub last: Point<f64, Logical>,
+}
+
+/// One active touch contact.
+#[derive(Debug, Clone, Copy)]
+pub struct TouchPoint {
+    pub slot: i32,
+    pub position: Point<f64, Logical>,
+}
+
+/// A two-finger pan of the zoomed page.
+#[derive(Debug, Clone, Copy)]
+pub struct TouchPan {
+    pub slots: [i32; 2],
+    pub last_center: Point<f64, Logical>,
+}
+
+/// Active touch contacts plus the pan gesture, so lifting one finger does not
+/// let the remaining one start a stray text selection.
+#[derive(Default)]
+pub struct TouchGestureState {
+    pub points: Vec<TouchPoint>,
+    pub pan: Option<TouchPan>,
+}
+
 impl FocusState {
     /// Save `current` as the focus to restore when this override exits.
     /// **Always overwrites.**
@@ -136,6 +193,9 @@ pub struct SelectionState {
     /// `(mime_types, data)` — `send_selection` writes `data` into
     /// the fd when the requested mime_type matches.
     pub clipboard_cache: Option<(Vec<String>, Vec<u8>)>,
+    /// Last text published to the host PRIMARY selection, so a selection that
+    /// did not change is not written again on every keystroke.
+    pub primary_cache: Option<String>,
 }
 
 /// Smithay Wayland protocol state — pure bookkeeping for compositor protocols.
@@ -210,6 +270,15 @@ pub struct EmthinState {
     /// toplevels.
     pub doc: crate::docui::DocUi,
 
+    /// Rendered-text pointer selection (drag, double/triple click).
+    pub text_selection: TextSelectionState,
+
+    /// Middle-button drag panning the zoomed page.
+    pub view_pan_drag: Option<ViewPanDrag>,
+
+    /// Touch contacts and the two-finger pan gesture.
+    pub touch: TouchGestureState,
+
     /// The current page's raster, cached on the GPU. Owned by the
     /// compositor rather than by `docui` because it needs a live
     /// `GlesRenderer` to import into, and only the render pass has one.
@@ -220,6 +289,15 @@ pub struct EmthinState {
     /// a renderer to upload into, and it is compositor state rather than
     /// document state because only the compositor knows what is bound.
     pub dormant_labels: crate::dormant_label::LabelCache,
+
+    /// Rasterized find-bar label, keyed by the query/status text. Like the
+    /// dormant labels this is compositor presentation state, not document
+    /// state: the search itself lives in `docui::search`.
+    pub find_bar: crate::find_bar::FindBarCache,
+
+    /// Rasterized math-completion preview, keyed by the glyph. The pending
+    /// replacement is document UI state in `DocUi`; only the pixels live here.
+    pub completion_hint: crate::completion_hint::CompletionHintCache,
 
     /// Host-keymap snoop (separate wayland-client piggybacking on
     /// winit's host connection) + the last keymap applied to the seat.
@@ -346,9 +424,14 @@ impl EmthinState {
             // emthin specific
             host: host::HostState::new(),
             doc: crate::docui::DocUi::new(),
+            text_selection: TextSelectionState::default(),
+            view_pan_drag: None,
+            touch: TouchGestureState::default(),
             doc_page: crate::doc_render::DocPageTexture::new(),
             citation_page: crate::doc_render::DocPageTexture::new(),
             dormant_labels: crate::dormant_label::LabelCache::default(),
+            find_bar: crate::find_bar::FindBarCache::default(),
+            completion_hint: crate::completion_hint::CompletionHintCache::default(),
             host_keymap: None,
             applied_host_keymap: None,
             selection: SelectionState::default(),

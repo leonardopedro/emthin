@@ -27,6 +27,19 @@ runs unchanged under any of them.
 
 The clipboard half needs no keys, so it runs in **every** configuration.
 
+## Per-document preferences and touch panning
+
+Before the keyboard checks, `document-preferences.sh` seeds two documents with
+distinct view zoom, citation style/locale, page and reading size. It switches
+them through the real `open_doc` IPC method, then asserts both the live
+`page`/`text_size` from `list_state` and the values left in `session.json` after
+autosave. No injection backend is involved.
+
+That check also drives `touch.py`, a two-finger pan through the `inject_touch`
+control method. XTEST, wtype and ydotool cannot synthesize multitouch, so the
+contacts go through the same touch handlers the seat uses; the script fails if
+the live view pan did not move.
+
 ## What each one actually requires, measured
 
 **`ydotool` cannot reach a nested compositor.** This is the counter-intuitive

@@ -15,8 +15,9 @@
 //! The document is the layout authority; there is no window-management
 //! policy anywhere else in the compositor.
 
-pub mod edit;
+pub mod ascii_interchange;
 pub mod citations;
+pub mod edit;
 pub mod figures;
 pub mod formals;
 pub mod keymap;
@@ -56,11 +57,25 @@ pub struct DocUi {
     voice: VoiceBridge,
     citation_popup: citations::CitationPopup,
     /// The find bar: a query over the document text, with the match ranges
-    /// `mathed_core::search` finds. It owns no rendering yet — see
-    /// [`search::FindBar`].
+    /// `mathed_core::search` finds. The compositor draws its query and the
+    /// match highlights — see [`search::FindBar`] and `crate::find_bar`.
     find: search::FindBar,
+    /// The pending ASCII→Unicode completion in math. The preview is drawn by
+    /// `crate::completion_hint`; nothing is written until a non-run key commits
+    /// it, exactly like mathed's own frontends.
+    completion: mathed_mini::completion_ui::CompletionUi,
+    /// `(revision, caret)` for a preview the user dismissed with Escape. A
+    /// relayout refreshes completion state, so without this the cancelled
+    /// preview would reappear on the next tick. Any edit or caret move changes
+    /// the key and lets completion resume.
+    completion_dismissed: Option<(u64, usize)>,
+    /// The view geometry (viewport, zoom, pan, visible page) changed. Unlike a
+    /// text edit this needs no Typst rebuild, only a figure re-sync.
+    geometry_dirty: bool,
     /// Where the session is persisted (`None` = don't persist).
     session_file: Option<std::path::PathBuf>,
+    /// Stable identity of the open document, used to key its preferences.
+    document_key: Option<String>,
     last_autosave: Instant,
     /// Set when the layout failed (a Typst syntax error mid-typing, say)
     /// so the caller can surface it without losing the document.
@@ -83,7 +98,11 @@ impl DocUi {
             voice: VoiceBridge::new(),
             citation_popup: citations::CitationPopup::default(),
             find: search::FindBar::new(),
+            completion: mathed_mini::completion_ui::CompletionUi::new(),
+            completion_dismissed: None,
+            geometry_dirty: false,
             session_file: None,
+            document_key: None,
             last_autosave: Instant::now(),
             last_error: None,
         }
@@ -105,7 +124,23 @@ impl DocUi {
 
     pub fn close_citation(&mut self) -> bool { self.citation_popup.close() }
 
-    /// The find bar, for a renderer that wants its status or current match.
+    /// Cycle the presentation style of the open citation without editing the
+    /// document. Returns the newly selected style.
+    pub fn cycle_citation_style(&mut self) -> Result<String, String> {
+        self.citation_popup.cycle_style()
+    }
+
+    /// Cycle the presentation locale of the open citation.
+    pub fn cycle_citation_locale(&mut self) -> Result<String, String> {
+        self.citation_popup.cycle_locale()
+    }
+
+    /// Drop citation presentation overrides, back to the document's defaults.
+    pub fn reset_citation_format(&mut self) -> Result<bool, String> {
+        self.citation_popup.reset_format()
+    }
+
+    /// The find bar, for the overlay renderer's status, query, and matches.
     pub fn find(&self) -> &search::FindBar {
         &self.find
     }
@@ -114,6 +149,9 @@ impl DocUi {
     pub fn open_find(&mut self) {
         let origin = self.model.caret();
         self.find.open_at(origin);
+        // The find bar owns the keyboard now; a math preview behind it would
+        // both mislead and linger after a query edit.
+        self.completion.cancel();
     }
 
     /// Close the bar; `false` when it was already closed, so `Escape` can fall
@@ -139,6 +177,16 @@ impl DocUi {
     pub fn find_step(&mut self, forward: bool) -> Option<std::ops::Range<usize>> {
         let text = self.model.text().to_owned();
         let range = self.find.step(&text, forward)?;
+        // Bring the page holding the selected glyph into view. A match in
+        // hidden marker text has no page and leaves the viewport alone.
+        if let Some(page) = self.layout.page_for_range(range.clone()) {
+            if page != self.current_page() {
+                self.layout.set_current_page(page);
+                // A page switch invalidates figure rects; let the next tick
+                // relayout and re-sync them, as `goto_page` does.
+                self.model.mark_dirty();
+            }
+        }
         self.model.set_selection(range.clone());
         Some(range)
     }
@@ -148,12 +196,85 @@ impl DocUi {
         self.find.status()
     }
 
+    /// The pending math completion, if the caret is at the end of an ASCII
+    /// run inside a `$..$` fence.
+    pub fn completion(&self) -> Option<&mathed_core::completion::Completion> {
+        self.completion.pending.as_ref()
+    }
+
+    /// Recompute the pending completion against the current text + caret.
+    /// Called after edits, caret moves, and external document changes.
+    pub fn refresh_completion(&mut self) {
+        let key = (self.model.revision(), self.model.caret());
+        if self.find.is_open() || self.completion_dismissed == Some(key) {
+            self.completion.cancel();
+            return;
+        }
+        self.completion_dismissed = None;
+        self.completion.refresh(self.model.text(), self.model.caret());
+    }
+
+    /// Replace the pending ASCII run with its glyph as one document edit.
+    /// Returns `false` when nothing is pending.
+    pub fn commit_completion(&mut self) -> bool {
+        let Some(completion) = self.completion.pending.clone() else {
+            return false;
+        };
+        self.completion.cancel();
+        self.completion_dismissed = None;
+        self.model.replace(completion.replace, &completion.with);
+        true
+    }
+
+    /// Drop a pending completion without touching the document. Returns
+    /// whether there was one, so Escape can fall through when there wasn't.
+    pub fn cancel_completion(&mut self) -> bool {
+        let pending = self.completion.pending.is_some();
+        if pending {
+            self.completion_dismissed = Some((self.model.revision(), self.model.caret()));
+        }
+        self.completion.cancel();
+        pending
+    }
+
     pub fn clear_citations(&mut self) { self.citation_popup.clear(); }
 
     /// Re-run the open query after the document changed.
     pub fn find_on_edit(&mut self) {
         let text = self.model.text().to_owned();
         self.find.on_doc_changed(&text);
+    }
+
+    /// Jump the caret to a document reference's target (`Ctrl+click` on its
+    /// rendered label). A bibliography reference has no document target, and
+    /// a dangling document reference has no body; both are errors here.
+    pub fn goto_citation(&mut self, number: u64) -> Result<(), String> {
+        use mathed_core::markers::ReferenceKind;
+
+        let scan = self.model.scan();
+        let reference = model::citation_references(scan)
+            .into_iter()
+            .find(|reference| reference.numbers.contains(&number))
+            .ok_or_else(|| format!("No citation [{number}]"))?;
+        let body = match reference.kind {
+            ReferenceKind::DocumentRef { body: Some(body), .. } => body,
+            ReferenceKind::DocumentRef { body: None, .. } => {
+                return Err(format!("Citation [{number}] is dangling"));
+            }
+            ReferenceKind::Bibliography { .. } => {
+                return Err(format!("Citation [{number}] is a bibliography entry"));
+            }
+        };
+        self.citation_popup.close();
+        let page = self.layout.page_for_range(body.clone());
+        self.model.set_caret(body.start);
+        if let Some(page) = page {
+            if page != self.current_page() {
+                self.layout.set_current_page(page);
+                self.model.mark_dirty();
+            }
+        }
+        Ok(())
     }
 
     /// Hit-test the rendered citation label rather than the hidden source.
@@ -172,6 +293,58 @@ impl DocUi {
             let range = &scan.stmts[reference.stmt_idx].range;
             range.contains(&glyph.doc_byte).then(|| reference.numbers.first().copied()).flatten()
         })
+    }
+
+    /// The document byte under a screen point on the visible page.
+    ///
+    /// `None` outside the page or before the first layout. Used by pointer
+    /// selection so a click and its drag share one hit test.
+    pub fn byte_at(&self, point: Point<f64, Logical>) -> Option<usize> {
+        let pos = self.layout.screen_to_doc(point)?;
+        self.layout
+            .glyphs()?
+            .byte_for_point(mathed_core::glyphs::V2::new(pos.x as f32, pos.y as f32))
+            .map(|(byte, _after)| byte)
+    }
+
+    /// Select the word containing `byte` (a double-click selection).
+    ///
+    /// Math spans are atomic, so a double-click inside a formula selects the
+    /// whole formula rather than one character of its source. Returns false
+    /// when the range is empty, letting the caller fall back to a caret.
+    pub fn select_word_at(&mut self, byte: usize) -> bool {
+        let text = self.model.text().to_string();
+        let atomic = mathed_core::transform::math_span_ranges(&text);
+        let range = mathed_core::wordnav::word_range_at(&text, byte, &atomic);
+        // Word navigation treats the newline as the terminator *and* includes
+        // it in the right boundary. A selected newline has no rendered glyph,
+        // so it would show as an empty sliver past the line's last word.
+        let end = range.start
+            + text[range.clone()]
+                .trim_end_matches(['\n', '\r'])
+                .len();
+        if end <= range.start {
+            return false;
+        }
+        self.model.set_selection(range.start..end);
+        true
+    }
+
+    /// Select the source line containing `byte` (a triple-click selection).
+    ///
+    /// The newline itself is not selected: it is not rendered, so highlighting
+    /// it would show a selection edge with no glyph. Returns false only for an
+    /// empty document.
+    pub fn select_line_at(&mut self, byte: usize) -> bool {
+        let text = self.model.text().to_string();
+        let byte = byte.min(text.len());
+        let start = text[..byte].rfind('\n').map_or(0, |i| i + 1);
+        let end = text[byte..].find('\n').map_or(text.len(), |i| byte + i);
+        if start == end {
+            return false;
+        }
+        self.model.set_selection(start..end);
+        true
     }
 
     /// The verifier behind every `\formal` verdict in this document.
@@ -265,11 +438,15 @@ impl DocUi {
     /// an empty document.
     pub fn load(&mut self, path: Option<&std::path::Path>, session_file: Option<&std::path::Path>) {
         self.citation_popup.clear();
+        self.document_key = None;
         if let Some(path) = path {
             match std::fs::read_to_string(path) {
                 Ok(text) => {
                     self.model = DocModel::new(&text);
+                    self.document_key = Some(stable_document_key(path));
                     self.session_file = session_file.map(std::path::Path::to_path_buf);
+                    self.relayout();
+                    self.restore_preferences_beside(session_file);
                     self.relayout();
                     return;
                 }
@@ -282,6 +459,7 @@ impl DocUi {
             if let Ok(bytes) = std::fs::read(file) {
                 if let Ok(model) = DocModel::from_snapshot(&bytes) {
                     self.model = model;
+                    self.document_key = Some(stable_document_key(file));
                     self.session_file = Some(file.to_path_buf());
                     self.relayout();
                     self.restore_page_beside(file);
@@ -290,13 +468,70 @@ impl DocUi {
             }
         }
         self.session_file = session_file.map(std::path::Path::to_path_buf);
+        self.document_key = session_file.map(stable_document_key);
         self.model = DocModel::new("");
         self.relayout();
     }
 
-    /// Restore the current page from the `session.json` beside `snapshot`.
+    /// Replace the open document from a path, carrying the current document's
+    /// preferences back to the session before switching and applying the
+    /// target document's saved view and citation format.
+    pub fn open_document(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        self.save();
+        self.citation_popup.clear();
+        self.find.close();
+        self.completion.cancel();
+        self.completion_dismissed = None;
+        self.model = DocModel::new(&text);
+        self.document_key = Some(stable_document_key(path));
+        self.relayout();
+        let session_file = self.session_file.clone();
+        self.restore_preferences_beside(session_file.as_deref());
+        self.relayout();
+        Ok(())
+    }
+
+    /// Project the document to mathed's ASCII-only Typst interchange form.
     ///
-    /// Best-effort by design: a missing or unreadable file leaves the page at 0
+    /// This is the same projection `mathed_mini --export-ascii` writes:
+    /// math glyphs become their Typst names where the canonical table has
+    /// one, and everything else becomes an explicit `\u{...}` literal, so
+    /// the result is total and always ASCII. It is deliberately lossy for
+    /// hidden markers and statements — the projection is the *rendered*
+    /// document, not a second editable source.
+    pub fn export_ascii(&self) -> String {
+        ascii_interchange::export(&self.model.text())
+    }
+
+    /// Replace the document with an ASCII-only interchange projection.
+    ///
+    /// The imported text is the visible document, not a marked-up source:
+    /// markers and `\name(...)` statements do not survive `export_ascii`,
+    /// and this method does not invent them. Non-ASCII input is rejected
+    /// rather than silently accepted, because accepting it would make this
+    /// indistinguishable from [`DocUi::load`] and would let a UTF-8 file
+    /// masquerade as the ASCII interchange form.
+    ///
+    /// The caller re-lays out afterwards (and closes apps whose figures the
+    /// import removed), exactly as `open_doc` does.
+    pub fn import_ascii(&mut self, text: &str) -> Result<(), String> {
+        if !text.is_ascii() {
+            return Err("ASCII interchange import requires ASCII-only text".to_string());
+        }
+        self.citation_popup.clear();
+        self.find.close();
+        self.completion.cancel();
+        self.completion_dismissed = None;
+        self.model = DocModel::new(text);
+        Ok(())
+    }
+
+    /// Restore this document's page, reading size, and presentation
+    /// preferences from the `session.json` beside `snapshot`.
+    ///
+    /// Best-effort by design: a missing or unreadable file leaves the defaults
     /// rather than refusing to open the document.
     ///
     /// Called *after* the document has been laid out, because the page count is
@@ -307,8 +542,59 @@ impl DocUi {
         let Some(json) = session_json_path(snapshot) else {
             return;
         };
-        let page = crate::session::SessionFile::load(&json).current_page;
-        self.layout.set_current_page(page);
+        let session = crate::session::SessionFile::load(&json);
+        let key = self
+            .document_key
+            .clone()
+            .unwrap_or_else(|| stable_document_key(snapshot));
+        self.apply_document_preferences(session.preferences_for(&key));
+    }
+
+    /// Apply the open document's page, reading size, and presentation
+    /// preferences. Used when `--doc` or `open_doc` selects a file.
+    fn restore_preferences_beside(&mut self, session_file: Option<&std::path::Path>) {
+        let Some(file) = session_file else {
+            return;
+        };
+        let Some(json) = session_json_path(file) else {
+            return;
+        };
+        let Some(key) = self.document_key.clone() else {
+            return;
+        };
+        let session = crate::session::SessionFile::load(&json);
+        self.apply_document_preferences(session.preferences_for(&key));
+    }
+
+    fn apply_document_preferences(&mut self, preferences: crate::session::DocumentPreferences) {
+        self.citation_popup.set_saved_format(
+            preferences.citation_style,
+            preferences.citation_locale,
+        );
+        let text_size_changed = self.layout.set_text_size(preferences.text_size);
+        if text_size_changed {
+            self.model.mark_dirty();
+            // Reflow before restoring the page: the saved page is only
+            // meaningful at the saved reading size, and `rebuild` clamps the
+            // old index while the new page count is established.
+            self.relayout();
+        }
+        // Set the page before the view: a page switch resets pan to the top,
+        // so restoring the saved pan first would have it discarded here.
+        let page_changed = self.layout.current_page() != preferences.current_page;
+        self.layout.set_current_page(preferences.current_page);
+        if page_changed {
+            self.geometry_dirty = true;
+        }
+        if self.layout.set_view(
+            preferences.view_zoom,
+            Point::new(preferences.view_pan_x, preferences.view_pan_y),
+        ) {
+            self.geometry_dirty = true;
+        }
+        if self.model.is_dirty() || self.geometry_dirty {
+            self.relayout();
+        }
     }
 
     /// Re-run layout if the document changed, then reconcile figures.
@@ -317,27 +603,124 @@ impl DocUi {
     /// was deleted) so the caller can close them.
     pub fn relayout(&mut self) -> Vec<u64> {
         self.citation_popup.clear_if_stale(self.model.revision());
-        if !self.model.is_dirty() {
+        // An IPC edit can change the document while the bar is open; refresh
+        // the saved ranges before the renderer reads them.
+        self.find_on_edit();
+        // The caret can move without dirtying the document, so the completion
+        // must be recomputed here as well as after a keystroke.
+        self.refresh_completion();
+        let content_dirty = self.model.is_dirty();
+        if !content_dirty && !self.geometry_dirty {
             return Vec::new();
         }
-        // Ask the kernel about every `\formal` before laying out, so the
-        // verdicts ride along with the rest of the annotations.
-        let mut options = self.model.transform_options();
-        self.formals.apply(self.model.text(), &mut options);
-        match self.layout.rebuild(self.model.text(), &options) {
-            Ok(()) => {
-                self.last_error = None;
-                self.model.take_dirty();
-            }
-            Err(e) => {
-                // Keep the previous raster rather than blanking the page:
-                // a half-typed statement must not make the document
-                // disappear mid-keystroke.
-                self.last_error = Some(format!("{e:?}"));
-                self.model.take_dirty();
+        if content_dirty {
+            // Ask the kernel about every `\formal` before laying out, so the
+            // verdicts ride along with the rest of the annotations.
+            let mut options = self.model.transform_options();
+            self.formals.apply(self.model.text(), &mut options);
+            match self.layout.rebuild(self.model.text(), &options) {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.model.take_dirty();
+                }
+                Err(e) => {
+                    // Keep the previous raster rather than blanking the page:
+                    // a half-typed statement must not make the document
+                    // disappear mid-keystroke.
+                    self.last_error = Some(format!("{e:?}"));
+                    self.model.take_dirty();
+                }
             }
         }
+        self.geometry_dirty = false;
         self.figures.sync(&self.model, &mut self.layout)
+    }
+
+    /// The document's reading size, in points.
+    pub fn text_size(&self) -> f32 {
+        self.layout.text_size()
+    }
+
+    /// Set the reading size and, if it changed, reflow the document.
+    ///
+    /// This is a Typst layout property, not a view zoom: larger text uses
+    /// more lines and can add pages. Figures are re-synced by the ordinary
+    /// relayout, so their rects follow the reflow rather than staying at the
+    /// old page positions.
+    pub fn set_text_size(&mut self, pt: f32) -> bool {
+        if !pt.is_finite() || !self.layout.set_text_size(pt) {
+            return false;
+        }
+        self.model.mark_dirty();
+        true
+    }
+
+    /// Step to the next larger/smaller preset reading size.
+    pub fn step_text_size(&mut self, larger: bool) -> f32 {
+        let next = self.layout.next_text_size(larger);
+        self.set_text_size(next);
+        self.layout.text_size()
+    }
+
+    /// Restore the default reading size.
+    pub fn reset_text_size(&mut self) -> bool {
+        self.set_text_size(mathed_mini::DEFAULT_TEXT_SIZE_PT)
+    }
+
+    /// The current view zoom, as a multiplier on the fit-to-window scale.
+    pub fn view_zoom(&self) -> f64 {
+        self.layout.view_zoom()
+    }
+
+    /// The current pan offset in output-logical px.
+    pub fn view_pan(&self) -> smithay::utils::Point<f64, Logical> {
+        self.layout.view_pan()
+    }
+
+    /// Zoom the view one preset step; view-only, so no Typst reflow.
+    pub fn step_view_zoom(&mut self, larger: bool) -> f64 {
+        if self.layout.zoom_view(larger) {
+            self.geometry_dirty = true;
+        }
+        self.layout.view_zoom()
+    }
+
+    /// Zoom by `factor` around `anchor` (output-logical px).
+    pub fn zoom_view_at(&mut self, factor: f64, anchor: Point<f64, Logical>) -> bool {
+        if self.layout.zoom_view_at(factor, anchor) {
+            self.geometry_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pan the zoomed page by an output-logical delta.
+    pub fn pan_view(&mut self, dx: f64, dy: f64) -> bool {
+        if self.layout.pan_view(dx, dy) {
+            self.geometry_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the zoomed page overflows the viewport on either axis, i.e.
+    /// whether a pan gesture can do anything.
+    pub fn view_can_pan(&self) -> bool {
+        let page = self.layout.page_rect();
+        let viewport = self.layout.viewport();
+        page.size.w > viewport.w || page.size.h > viewport.h
+    }
+
+    /// Return to the fit-to-window view.
+    pub fn reset_view(&mut self) -> bool {
+        if self.layout.reset_view() {
+            self.geometry_dirty = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Recompute the letterbox against a new output size.
@@ -351,11 +734,11 @@ impl DocUi {
     /// focus border, stale dormant marks and a stale IME origin until the next
     /// text edit. `figure_render` and the input path read `Figure::rect`.
     ///
-    /// Marking the model dirty is blunt but correct: the alternative is a second
-    /// dirty flag for "the geometry changed", which is the same bit.
+    /// `geometry_dirty` re-syncs figures without re-running the Typst compile;
+    /// only the placement changed, not the document's content.
     pub fn set_viewport(&mut self, size: Size<i32, Logical>) {
         self.layout.set_viewport(size);
-        self.model.mark_dirty();
+        self.geometry_dirty = true;
     }
 
     /// Called by `EmthinState::goto_page`.
@@ -393,7 +776,7 @@ impl DocUi {
     /// dormant labels and the IME origin.
     pub fn on_page_changed(&mut self, page: usize) {
         self.layout.set_current_page(page);
-        self.model.mark_dirty();
+        self.geometry_dirty = true;
     }
 
     /// Record (or clear) an app's title.
@@ -558,16 +941,33 @@ impl DocUi {
             Ok(()) => tracing::debug!("session saved to {}", path.display()),
             Err(e) => tracing::warn!("session save failed {}: {e}", path.display()),
         }
-        // The snapshot is the document; this is the rest — currently just which
-        // page the user was on. Written after the document so a crash between
-        // the two leaves stale bookkeeping rather than a stale document.
-        let session = crate::session::SessionFile {
-            current_page: self.current_page(),
-            ..Default::default()
+        // The snapshot is the document; this is the rest. Load the existing
+        // metadata first so preferences for other documents survive a save,
+        // then key this document's view and citation state by its identity.
+        // Written after the document so a crash between the two leaves stale
+        // bookkeeping rather than a stale document.
+        let Some(json) = session_json_path(&path) else {
+            return;
         };
-        if let Some(json) = session_json_path(&path) {
-            session.save(&json);
-        }
+        let mut session = crate::session::SessionFile::load(&json);
+        let pan = self.layout.view_pan();
+        let key = self
+            .document_key
+            .clone()
+            .unwrap_or_else(|| stable_document_key(&path));
+        session.set_preferences(
+            key,
+            crate::session::DocumentPreferences {
+                view_zoom: self.layout.view_zoom(),
+                view_pan_x: pan.x,
+                view_pan_y: pan.y,
+                citation_style: self.citation_popup.style_override().map(str::to_string),
+                citation_locale: self.citation_popup.locale_override().map(str::to_string),
+                current_page: self.current_page(),
+                text_size: self.text_size(),
+            },
+        );
+        session.save(&json);
     }
 
     /// The caret rect in output-local logical px, for the IME bridge.
@@ -602,6 +1002,24 @@ impl DocUi {
     }
 }
 
+/// A stable path identity for document-scoped preferences. Canonicalising when
+/// the file exists keeps `./notes.doc` and `/home/me/notes.doc` from becoming
+/// two entries; an unsaved snapshot falls back to an absolute path.
+fn stable_document_key(path: &std::path::Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or(absolute)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// The `session.json` beside a given document snapshot.
 ///
 /// §5.10 puts both files in one state dir, so the JSON path is derived from
@@ -616,6 +1034,38 @@ pub fn session_json_path(snapshot: &std::path::Path) -> Option<std::path::PathBu
 mod relaunch_tests {
     use super::*;
     use smithay::utils::Size;
+
+    /// Go-to-definition moves the caret to the referenced body; a
+    /// bibliography reference has no body and must not jump to the citation.
+    #[test]
+    fn a_document_reference_targets_its_body() {
+        use mathed_core::markers::ReferenceKind;
+
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 1600)));
+        let text = "#1 target text #2 \\cite(#1,#2) tail";
+        ui.model_mut().replace(0..0, text);
+        ui.model_mut().set_caret(text.len());
+        ui.relayout();
+        let body = model::citation_references(ui.model().scan())
+            .into_iter()
+            .find_map(|reference| match reference.kind {
+                ReferenceKind::DocumentRef { body, .. } => body,
+                ReferenceKind::Bibliography { .. } => None,
+            })
+            .expect("a document-reference body");
+        assert!(ui.goto_citation(1).is_ok());
+        assert_eq!(ui.model().caret(), body.start);
+    }
+
+    #[test]
+    fn a_bibliography_reference_does_not_have_a_document_target() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 1600)));
+        ui.model_mut().replace(0..0, "\\cite(key)");
+        ui.relayout();
+        assert!(ui.goto_citation(1).is_err());
+    }
 
     #[test]
     fn rendered_citation_label_is_clickable() {
@@ -807,6 +1257,142 @@ mod relaunch_tests {
 }
 
 #[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn ui_with(text: &str) -> DocUi {
+        let mut ui = DocUi::new();
+        ui.model_mut().replace(0..0, text);
+        ui.refresh_completion();
+        ui
+    }
+
+    #[test]
+    fn a_math_run_previews_and_commits_its_glyph() {
+        let mut ui = ui_with("$ x ->");
+        let preview = ui.completion().expect("a pending arrow");
+        assert_eq!(preview.preview, "→");
+        assert_eq!(preview.replace, 4..6);
+        assert!(ui.commit_completion());
+        assert_eq!(ui.model().text(), "$ x →");
+        assert_eq!(ui.model().caret(), "$ x →".len());
+        assert!(ui.completion().is_none());
+        assert!(!ui.commit_completion(), "the completion was consumed");
+    }
+
+    #[test]
+    fn a_unique_prefix_stays_pending_while_the_run_extends() {
+        let ui = ui_with("$ \\al");
+        assert_eq!(ui.completion().expect("alpha preview").preview, "α");
+        assert!(
+            mathed_mini::completion_ui::CompletionUi::extends_run('p'),
+            "'p' continues the run; it must not commit early"
+        );
+    }
+
+    /// The input path's delimiter contract: commit the glyph, then insert the
+    /// delimiter as ordinary text (`-> ` becomes `→ `).
+    #[test]
+    fn a_delimiter_commits_then_inserts() {
+        let mut ui = ui_with("$ x ->");
+        assert!(!mathed_mini::completion_ui::CompletionUi::extends_run(' '));
+        assert!(ui.commit_completion());
+        ui.model_mut().insert_at_caret(" ");
+        assert_eq!(ui.model().text(), "$ x → ");
+        assert_eq!(ui.model().caret(), "$ x → ".len());
+    }
+
+    #[test]
+    fn completion_is_math_only_and_cancels_without_editing() {
+        let ui = ui_with("x ->");
+        assert!(ui.completion().is_none(), "plain prose stays prose");
+
+        let mut ui = ui_with("$ \\alpha");
+        assert!(ui.cancel_completion());
+        assert!(ui.completion().is_none());
+        ui.refresh_completion();
+        assert!(
+            ui.completion().is_none(),
+            "a relayout must not resurrect the dismissed preview"
+        );
+        assert_eq!(ui.model().text(), "$ \\alpha", "cancel mutates nothing");
+        assert!(!ui.cancel_completion(), "nothing left to cancel");
+
+        // Moving the caret is a new context, so completion can resume.
+        let end = ui.model().len();
+        ui.model_mut().set_caret(0);
+        ui.refresh_completion();
+        ui.model_mut().set_caret(end);
+        ui.refresh_completion();
+        assert!(ui.completion().is_some(), "a new caret clears the dismissal");
+    }
+}
+
+#[cfg(test)]
+mod ascii_interchange_tests {
+    use super::*;
+
+    #[test]
+    fn export_is_ascii_only_and_import_accepts_the_projection() {
+        let mut ui = DocUi::new();
+        ui.model_mut()
+            .replace(0..0, "= 数学\n\n$ αβ → ≤ 1 $\n\nA crab 🦀");
+        let exported = ui.export_ascii();
+        assert!(
+            exported.is_ascii(),
+            "projection must be ASCII-only: {exported}"
+        );
+        assert!(
+            exported.contains("\\alpha\\beta"),
+            "math glyphs use their Typst names: {exported}"
+        );
+        assert!(
+            exported.contains("\\u{1F980}"),
+            "unmapped glyphs are flagged, never dropped: {exported}"
+        );
+
+        // Import accepts the projection as the document text. A second
+        // projection need not be byte-identical — the transform normalises
+        // its own Typst markup, such as paragraph breaks — but it must stay
+        // ASCII and keep the glyph names/flags.
+        ui.import_ascii(&exported).expect("utf8 ASCII projection");
+        assert_eq!(ui.model().text(), exported);
+        let again = ui.export_ascii();
+        assert!(again.is_ascii(), "projection must stay ASCII: {again}");
+        assert!(again.contains("\\alpha\\beta"), "glyphs survive: {again}");
+        assert!(again.contains("\\u{1F980}"), "flags survive: {again}");
+    }
+
+    #[test]
+    fn import_rejects_non_ascii_and_leaves_the_document_alone() {
+        let mut ui = DocUi::new();
+        ui.model_mut().replace(0..0, "keep me");
+        let err = ui
+            .import_ascii("$ α $")
+            .expect_err("non-ASCII is not the interchange form");
+        assert!(
+            err.contains("ASCII"),
+            "the reason names the requirement: {err}"
+        );
+        assert_eq!(ui.model().text(), "keep me");
+    }
+
+    #[test]
+    fn import_drops_stale_find_and_completion_state() {
+        let mut ui = DocUi::new();
+        ui.model_mut().replace(0..0, "$ x ->");
+        ui.refresh_completion();
+        assert!(ui.completion().is_some());
+        ui.open_find();
+        assert!(ui.find().is_open());
+
+        ui.import_ascii("$ \\to $").expect("ASCII input");
+        assert!(!ui.find().is_open(), "import closes the old query bar");
+        assert!(ui.completion().is_none());
+        assert_eq!(ui.model().text(), "$ \\to $");
+    }
+}
+
 mod session_tests {
     use super::*;
     use crate::session::SessionFile;
@@ -859,6 +1445,10 @@ mod session_tests {
         assert!(first.page_count() > 1, "the fixture must paginate");
         first.layout.set_current_page(first.page_count() - 1);
         let expected = first.current_page();
+        assert!(first.layout.set_view(3.0, Point::new(10.0, 20.0)));
+        first
+            .citation_popup
+            .set_saved_format(Some("vancouver".into()), Some("de-DE".into()));
         first.save();
 
         // A fresh UI is a relaunch: nothing carried over in memory.
@@ -869,6 +1459,10 @@ mod session_tests {
             expected,
             "the page must come back from session.json"
         );
+        assert_eq!(second.view_zoom(), 3.0, "view zoom is a reading preference");
+        assert_eq!(second.view_pan(), Point::from((10.0, 20.0)));
+        assert_eq!(second.citation_popup.style(), "vancouver");
+        assert_eq!(second.citation_popup.locale(), "de-DE");
     }
 
     /// Without `--session-file` nothing is written at all — §5.10's nested rule.
@@ -946,6 +1540,119 @@ mod session_tests {
             tmp.0.join("session.json").exists(),
             "and the bookkeeping beside it, not somewhere else"
         );
+    }
+
+    /// View, reading size, page, and citation preferences follow the document.
+    /// Opening another file in the same session must not inherit the first
+    /// file's values, and going back must restore the first file's own values.
+    #[test]
+    fn view_reading_and_citation_preferences_are_per_document() {
+        let tmp = TmpDir::new("per-document");
+        let session = tmp.snapshot();
+        let doc_a = tmp.0.join("a.doc");
+        let doc_b = tmp.0.join("b.doc");
+        let long = paged_doc().repeat(2);
+        std::fs::write(&doc_a, &long).expect("write a");
+        std::fs::write(&doc_b, &long).expect("write b");
+
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(Some(&doc_a), Some(&session));
+        assert!(ui.page_count() > 3, "the fixture must paginate");
+        assert!(ui.set_text_size(24.0));
+        ui.relayout();
+        let a_page = 2;
+        ui.layout.set_current_page(a_page);
+        assert_eq!(ui.current_page(), a_page);
+        assert!(ui.layout.set_view(2.0, Point::new(12.0, 24.0)));
+        ui.citation_popup
+            .set_saved_format(Some("vancouver".into()), Some("de-DE".into()));
+        ui.save();
+
+        ui.open_document(&doc_b).expect("open b");
+        assert_eq!(
+            ui.view_zoom(),
+            1.0,
+            "a new document starts at the fit, not the previous document's zoom"
+        );
+        assert_eq!(ui.citation_popup.style(), "apa");
+        assert_eq!(
+            ui.text_size(),
+            mathed_mini::DEFAULT_TEXT_SIZE_PT,
+            "a new document starts at the default reading size"
+        );
+        assert_eq!(ui.current_page(), 0, "and on its first page");
+
+        assert!(ui.set_text_size(14.0));
+        ui.relayout();
+        assert!(ui.page_count() > 3, "the fixture must still paginate");
+        let b_page = 1;
+        ui.layout.set_current_page(b_page);
+        assert_eq!(ui.current_page(), b_page);
+        assert!(ui.layout.set_view(0.8, Point::new(0.0, 0.0)));
+        ui.citation_popup
+            .set_saved_format(Some("mla".into()), Some("fr-FR".into()));
+        ui.save();
+
+        let mut again_a = DocUi::new();
+        again_a.set_viewport(Size::from((1200, 900)));
+        again_a.load(Some(&doc_a), Some(&session));
+        assert_eq!(again_a.view_zoom(), 2.0);
+        assert_eq!(
+            again_a.view_pan(),
+            Point::from((0.0, 24.0)),
+            "pan is clamped to the actual overflow before it is saved"
+        );
+        assert_eq!(again_a.text_size(), 24.0);
+        assert_eq!(again_a.current_page(), a_page);
+        assert_eq!(again_a.citation_popup.style(), "vancouver");
+        assert_eq!(again_a.citation_popup.locale(), "de-DE");
+
+        let mut again_b = DocUi::new();
+        again_b.set_viewport(Size::from((1200, 900)));
+        again_b.load(Some(&doc_b), Some(&session));
+        assert_eq!(again_b.view_zoom(), 0.8);
+        assert_eq!(again_b.text_size(), 14.0);
+        assert_eq!(again_b.current_page(), b_page);
+        assert_eq!(again_b.citation_popup.style(), "mla");
+        assert_eq!(again_b.citation_popup.locale(), "fr-FR");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use smithay::utils::Size;
+
+    fn ui() -> DocUi {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 4000)));
+        ui.model_mut().replace(0..0, "hello world\nsecond line");
+        ui.relayout();
+        ui
+    }
+
+    #[test]
+    fn a_word_selection_stops_at_whitespace() {
+        let mut ui = ui();
+        assert!(ui.select_word_at(8));
+        assert_eq!(ui.model().selected_text(), "world");
+    }
+
+    #[test]
+    fn a_line_selection_stays_on_its_line() {
+        let mut ui = ui();
+        assert!(ui.select_line_at(8));
+        assert_eq!(ui.model().selected_text(), "hello world");
+    }
+
+    #[test]
+    fn an_empty_line_has_no_selection_to_offer() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 4000)));
+        ui.model_mut().replace(0..0, "a\n\nb");
+        ui.relayout();
+        assert!(!ui.select_line_at(2));
     }
 }
 
@@ -1484,10 +2191,14 @@ mod page_tests {
         // Grow the window past the page size: the scale goes to 1.0.
         ui.set_viewport(Size::from((4000, 4000)));
         assert!(
-            ui.model().is_dirty(),
-            "a viewport change must force the next relayout to do work"
+            ui.geometry_dirty,
+            "a viewport change must force the next relayout to re-sync geometry"
         );
         ui.relayout();
+        assert!(
+            !ui.geometry_dirty,
+            "a geometry relayout must clear the re-sync flag"
+        );
 
         let after = ui.figures().figures().first().expect("a figure").rect;
         assert_ne!(
@@ -1546,7 +2257,7 @@ mod page_tests {
 
         ui.on_page_changed(1);
         assert!(
-            ui.model().is_dirty(),
+            ui.geometry_dirty,
             "a page change must force the figure re-sync"
         );
         ui.relayout();

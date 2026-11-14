@@ -36,11 +36,12 @@ change — enum variant and doc row — and that is the point.
 | `app_gone` | unavailable | no | The figure's app exited after binding. Re-`spawn`; the next `figure_bound` re-establishes the mapping. | `focus` |
 | `unknown_figure` | not_found | no | No figure with that key exists — check `list_state`'s `figures` and the figure keys in the document. | `set_figure_size`, `clone_figure` |
 | `voice_failed` | execution_failure | yes | The turn could not be queued (no `\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry. | `voice` (and async turn failures spliced into the transcript) |
-| `io_failed` | io | no | The document path could not be read/written — check the path exists and is writable by the compositor's user. | `open_doc`, `save_doc` |
+| `io_failed` | io | no | The document path could not be read/written — check the path exists and is writable by the compositor's user. | `open_doc`, `save_doc`, `export_ascii`, `import_ascii` |
+| `not_ascii` | malformed_input | no | The file is not the ASCII interchange projection. Re-export it with `export_ascii`, or convert its non-ASCII characters, before importing. | `import_ascii` |
 
 Categories are a closed set too: `not_found`, `unavailable`,
-`execution_failure`, `io` (plus `malformed_input` for the inbound case
-below). Retry is a boolean policy per code; it is never inferred from
+`execution_failure`, `io` (plus `malformed_input` for a rejected
+non-ASCII import and the inbound-frame case below). Retry is a boolean policy per code; it is never inferred from
 the message.
 
 ## Inbound frames (client → compositor)

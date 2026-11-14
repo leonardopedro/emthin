@@ -11,7 +11,11 @@
 #   ./scripts/agent/live.sh close <fig>                  unbind the app (figure goes dormant)
 #   ./scripts/agent/live.sh open <path>                  replace the document
 #   ./scripts/agent/live.sh save <path>                  snapshot the document
+#   ./scripts/agent/live.sh export-ascii <path>          write the ASCII-only Typst projection
+#   ./scripts/agent/live.sh import-ascii <path>          replace the document from that projection
+#   ./scripts/agent/live.sh text-size <pt>               set the reading size (clamped by the document)
 #   ./scripts/agent/live.sh page <n>                     switch page
+#   ./scripts/agent/live.sh touch-pan [dx] [dy]          inject a two-finger pan (requires a zoomed page)
 #   ./scripts/agent/live.sh type <text>                  type into the focused surface (xdotool XTEST)
 #   ./scripts/agent/live.sh key <sym>                    send one key (Return, ctrl+c, Page_Down, …)
 #   ./scripts/agent/live.sh doc                          dump the document text (semantic, over IPC)
@@ -112,9 +116,32 @@ save)
   ipc save_doc "{\"path\":\"${1:?usage: live.sh save <path>}\"}"
   ;;
 
+export-ascii)
+  need python3
+  ipc export_ascii "{\"path\":\"${1:?usage: live.sh export-ascii <path>}\"}"
+  ;;
+
+import-ascii)
+  need python3
+  ipc import_ascii "{\"path\":\"${1:?usage: live.sh import-ascii <path>}\"}"
+  ;;
+
+text-size)
+  need python3
+  ipc set_text_size "{\"pt\":${1:?usage: live.sh text-size <pt>}}"
+  ;;
+
 page)
   need python3
   ipc goto_page "{\"page\":${1:?usage: live.sh page <n>}}"
+  ;;
+
+touch-pan)
+  # Multitouch cannot be synthesized through XTEST, so the contacts go in via
+  # the IPC test seam, which calls the same touch handlers as the seat would.
+  need python3
+  [ -S "$E2E_IPC" ] || die "no session (IPC socket $E2E_IPC missing) — run: live.sh boot"
+  python3 "$REPO/scripts/e2e/touch.py" "$E2E_IPC" "$@"
   ;;
 
 type)
@@ -183,7 +210,7 @@ down)
   ;;
 
 *)
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
   [ -z "$CMD" ] && exit 2 || { echo "FAIL unknown subcommand: $CMD" >&2; exit 2; }
   ;;
 esac

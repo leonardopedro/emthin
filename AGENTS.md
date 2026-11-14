@@ -125,8 +125,10 @@ added/removed/rekeyed/changed + semantic deltas, one line). The
 headless acceptance script is `scripts/agent/replay.sh <scenario>` —
 `doc`/`apply`/`expect` with a closed assertion vocabulary, sandboxed;
 CI runs it before the E2E in the e2e job.
-`scripts/agent/live.sh boot|state|shot|size|open|save|log|down`
+`scripts/agent/live.sh boot|state|shot|size|open|save|touch-pan|log|down`
 wraps the e2e's sway-on-Xvfb session for repeated edit→observe cycles.
+`touch-pan` injects two synthetic contacts through the IPC seam, because
+XTEST has no multitouch; it needs a zoomed page (see `docs/ipc.md`).
 The editing playbook (document cheat-sheet, geometry rules for
 "make it look nice", measured token/latency costs, failure modes) is
 `.agents/skills/emthin-document-editing/SKILL.md`; a runnable sample
@@ -155,12 +157,15 @@ crates/emthin/src/
 │   ├── layout.rs        DocLayoutCache: paged rasters + doc↔screen map
 │   ├── figures.rs       FigureManager: one Figure per \app, app↔figure binding
 │   ├── edit.rs          document edits the compositor makes (resize, append, clone)
+│   ├── ascii_interchange.rs  ASCII-only Typst projection for import/export
 │   ├── formals.rs       \formal verification: ask `logos unf`, splice verdicts
 │   ├── voice.rs         \voice dialogue: drive voice.sh, splice the transcript
 │   └── keymap.rs        the global key bindings
 │
 ├── doc_render.rs        the page raster's trip to the GPU, cached by revision
 ├── figure_render.rs     compositing: app surfaces over figure rects + overlays
+├── find_bar.rs          rasterized find query/status panel, cached
+├── completion_hint.rs   rasterized math-completion glyph preview, cached
 ├── dormant_label.rs     rasterized "app name — click or Return" labels, cached
 │
 ├── winit.rs             winit backend, render_frame, post_render, host events
@@ -169,7 +174,7 @@ crates/emthin/src/
 ├── tick.rs              per-event-loop-iteration work
 ├── element.rs           CustomElement enum + EmthinRenderer trait
 ├── mirror_render.rs     legacy xdg_toplevel-issued mirror views
-├── session.rs           session.json: current page + xwayland display
+├── session.rs           session.json: per-document reading/view state + xwayland display
 │
 ├── ipc/                 JSON-RPC control protocol (docs/ipc.md)
 │   ├── connection.rs    Content-Length framing

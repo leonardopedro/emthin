@@ -94,6 +94,50 @@ file. `save_doc` answers with `doc_saved`.
 {"jsonrpc":"2.0","method":"save_doc","params":{"path":"/tmp/notes.typ"}}
 ```
 
+### `export_ascii` / `import_ascii`
+
+Write the document's ASCII-only Typst interchange projection, or replace
+the document from one. `export_ascii` answers with `ascii_exported`.
+`import_ascii` accepts only the ASCII projection; a UTF-8 file is
+refused with `not_ascii` rather than silently accepted as if it were the
+interchange form. Filesystem failures are `io_failed`.
+
+The projection is the *rendered* document, not a second editable source:
+hidden markers and `\name(...)` statements do not survive the export, so
+an import replaces them with the visible text.
+
+```json
+{"jsonrpc":"2.0","method":"export_ascii","params":{"path":"/tmp/notes-ascii.typ"}}
+{"jsonrpc":"2.0","method":"import_ascii","params":{"path":"/tmp/notes-ascii.typ"}}
+```
+
+### `set_text_size`
+
+Set the document's **reading size** in points. This is a Typst reflow,
+not a view zoom: larger text takes more lines and can add pages, while
+the page stays fitted to the window. The value is clamped to `[8, 32]`;
+any finite value is accepted, and the size that actually took effect is
+reported in `text_size_changed`.
+
+```json
+{"jsonrpc":"2.0","method":"set_text_size","params":{"pt":24}}
+```
+
+### `inject_touch`
+
+Feed one synthetic touch contact into the live gesture handlers. This is a
+testing seam for the live harness: XTEST and the virtual-keyboard protocols
+cannot synthesize multitouch, so a two-finger pan is delivered as a sequence
+of `down` / `motion` / `up` contacts on two slots. It calls the same handlers
+as real touch events, so it exercises the production pan gesture rather than
+a parallel implementation. `x`/`y` are output-local logical pixels.
+
+```json
+{"jsonrpc":"2.0","method":"inject_touch","params":{"phase":"down","slot":0,"x":450,"y":420}}
+{"jsonrpc":"2.0","method":"inject_touch","params":{"phase":"motion","slot":1,"x":550,"y":340}}
+{"jsonrpc":"2.0","method":"inject_touch","params":{"phase":"up","slot":0,"x":450,"y":420}}
+```
+
 ### `list_state`
 
 Dump the whole document and figure list. Answers with `state`.
@@ -155,8 +199,10 @@ protocol).
 | `figure_unbound` | an app left a figure (closed or exited) | `figure`, `window_id` |
 | `app_title_changed` | a bound app's title changed | `window_id`, `title` |
 | `page_changed` | the visible page changed | `page` |
-| `state` | reply to `list_state` | `page`, `page_count`, `doc`, `figures` |
+| `state` | reply to `list_state` | `page`, `page_count`, `text_size`, `view_zoom`, `view_pan_x`, `view_pan_y`, `citation_style`, `citation_locale`, `doc`, `figures` |
 | `doc_saved` | reply to `save_doc` | `path` |
+| `ascii_exported` | reply to `export_ascii` | `path` |
+| `text_size_changed` | reply to `set_text_size` | `pt`, `page_count` |
 | `voice_result` | a `voice` turn finished and was spliced into its block | `block`, `utterance`, `reply` |
 | `x_wayland_ready` | the XWayland socket is bound | `display` |
 | `dbus_router_rule_added` | a DBus routing rule was added | `id`, `rule` |
@@ -174,6 +220,11 @@ A `rule` is `{id, priority, destination?, interface?, method?, target}`, where
 `"isolated"` or `"deny"`.
 
 `state.figures` is a list of:
+
+`state.text_size` is the reading size in points. `state.view_zoom` and
+`state.view_pan_x` / `view_pan_y` are the presentation-only view transform.
+`state.citation_style` / `citation_locale` are the open popup's overrides, or
+`null` when the document's defaults apply.
 
 ```json
 {

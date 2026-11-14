@@ -22,6 +22,10 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
         }
         IncomingMessage::OpenDoc { path } => ipc_open_doc(state, &path),
         IncomingMessage::SaveDoc { path } => ipc_save_doc(state, &path),
+        IncomingMessage::ExportAscii { path } => ipc_export_ascii(state, &path),
+        IncomingMessage::ImportAscii { path } => ipc_import_ascii(state, &path),
+        IncomingMessage::SetTextSize { pt } => ipc_set_text_size(state, pt),
+        IncomingMessage::InjectTouch { phase, slot, x, y } => state.inject_touch(phase, slot, x, y),
         IncomingMessage::ListState => ipc_list_state(state),
         IncomingMessage::Voice { text, block } => ipc_voice(state, block, text.as_deref()),
         IncomingMessage::DbusRouterAddRule { rule } => {
@@ -160,18 +164,13 @@ fn ipc_voice(state: &mut EmthinState, block: Option<usize>, text: Option<&str>) 
 
 fn ipc_open_doc(state: &mut EmthinState, path: &str) {
     let path = std::path::PathBuf::from(path);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            *state.doc.model_mut() = crate::docui::DocModel::new(&text);
+    match state.doc.open_document(&path) {
+        Ok(()) => {
             state.relayout_document();
             state.needs_redraw = true;
             tracing::info!("opened document {}", path.display());
         }
-        Err(e) => error(
-            state,
-            IpcErrorCode::IoFailed,
-            format!("could not read {}: {e}", path.display()),
-        ),
+        Err(reason) => error(state, IpcErrorCode::IoFailed, reason),
     }
 }
 
@@ -192,10 +191,81 @@ fn ipc_save_doc(state: &mut EmthinState, path: &str) {
     }
 }
 
+fn ipc_export_ascii(state: &mut EmthinState, path: &str) {
+    let path = std::path::PathBuf::from(path);
+    match std::fs::write(&path, state.doc.export_ascii()) {
+        Ok(()) => {
+            tracing::info!("exported ASCII projection {}", path.display());
+            state.ipc.send(OutgoingMessage::AsciiExported {
+                path: path.display().to_string(),
+            });
+        }
+        Err(e) => error(
+            state,
+            IpcErrorCode::IoFailed,
+            format!("could not write {}: {e}", path.display()),
+        ),
+    }
+}
+
+fn ipc_import_ascii(state: &mut EmthinState, path: &str) {
+    let path = std::path::PathBuf::from(path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            return error(
+                state,
+                IpcErrorCode::IoFailed,
+                format!("could not read {}: {e}", path.display()),
+            );
+        }
+    };
+    match state.doc.import_ascii(&text) {
+        Ok(()) => {
+            state.relayout_document();
+            state.needs_redraw = true;
+            tracing::info!("imported ASCII projection {}", path.display());
+        }
+        Err(reason) => error(state, IpcErrorCode::NotAscii, reason),
+    }
+}
+
+/// Set the reading size. Clamping is the document's policy; this shim
+/// reports the size that actually took effect, even when it was unchanged.
+fn ipc_set_text_size(state: &mut EmthinState, pt: f32) {
+    let changed = state.doc.set_text_size(pt);
+    if changed {
+        state.relayout_document();
+        state.needs_redraw = true;
+    }
+    let pt = state.doc.text_size();
+    tracing::info!(
+        "IPC set_text_size {pt}pt ({} pages, changed={changed})",
+        state.doc.page_count()
+    );
+    state.ipc.send(OutgoingMessage::TextSizeChanged {
+        pt,
+        page_count: state.doc.page_count(),
+    });
+}
+
 fn ipc_list_state(state: &mut EmthinState) {
     let doc = state.doc.model().text().to_string();
     let page = state.doc.current_page();
     let page_count = state.doc.page_count();
+    let text_size = state.doc.text_size();
+    let view_zoom = state.doc.view_zoom();
+    let pan = state.doc.view_pan();
+    let citation_style = state
+        .doc
+        .citation_popup()
+        .style_override()
+        .map(str::to_string);
+    let citation_locale = state
+        .doc
+        .citation_popup()
+        .locale_override()
+        .map(str::to_string);
     let figures = state
         .doc
         .figures()
@@ -233,6 +303,12 @@ fn ipc_list_state(state: &mut EmthinState) {
     state.ipc.send(OutgoingMessage::State {
         page,
         page_count,
+        text_size,
+        view_zoom,
+        view_pan_x: pan.x,
+        view_pan_y: pan.y,
+        citation_style,
+        citation_locale,
         doc,
         figures,
     });

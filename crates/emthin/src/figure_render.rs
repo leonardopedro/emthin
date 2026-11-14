@@ -262,6 +262,28 @@ pub fn build_overlay_elements(
         }
     }
 
+    // Find matches: every hit faintly, the current one more strongly. Drawn
+    // after the normal selection, because stepping a find sets the selection
+    // to the current match and the search colour is the useful one then.
+    if state.doc.find().is_open() {
+        let current = state.doc.find().current_index();
+        for (i, range) in state.doc.find().matches().iter().enumerate() {
+            let rgba = if current == Some(i) {
+                [1.0, 0.72, 0.15, 0.52]
+            } else {
+                [1.0, 0.90, 0.35, 0.24]
+            };
+            for rect in state.doc.layout().selection_rects(range.clone()) {
+                out.push(solid(
+                    &format!("emthin-find-{i}-{}", out.len()),
+                    rect,
+                    scale,
+                    rgba,
+                ));
+            }
+        }
+    }
+
     // Focused figure border: a visible tint so the user always knows
     // which figure keystrokes are going to.
     if let Some(key) = focused {
@@ -355,6 +377,58 @@ pub fn build_overlay_elements(
     if doc_has_focus {
         if let Some(rect) = state.doc.caret_rect() {
             out.push(solid("emthin-caret", rect, scale, [1.0, 1.0, 1.0, 0.9]));
+        }
+    }
+
+    // Math completion preview: the glyph a delimiter would commit, drawn just
+    // after the caret. Only while the document owns the keyboard, for the same
+    // reason the caret is.
+    if doc_has_focus {
+        if let Some(completion) = state.doc.completion().cloned() {
+            if let Some(caret) = state.doc.caret_rect() {
+                if let Some(image) = state.completion_hint.get(&completion.preview) {
+                    let x = caret.loc.x + caret.size.w + 2;
+                    let y = caret.loc.y - 2;
+                    let w = image.width as i32;
+                    let h = image.height as i32;
+                    out.push(solid(
+                        "emthin-completion-bg",
+                        Rectangle::new((x - 2, y - 1).into(), (w + 4, h + 2).into()),
+                        scale,
+                        [0.06, 0.09, 0.12, 0.94],
+                    ));
+                    if let Some(element) = crate::completion_hint::draw(renderer, image, x, y, scale)
+                    {
+                        out.push(element);
+                    }
+                }
+            }
+        }
+    }
+
+    // The find bar sits on top. Its raster is cached by query/status, so
+    // redraws while typing only re-raster when the text actually changed.
+    if let Some(status) = state.doc.find_status() {
+        let query = state.doc.find().query().to_owned();
+        if let Some(image) = state.find_bar.get(&query, &status) {
+            let x = 12;
+            let y = 12;
+            let w = image.width as i32;
+            let h = image.height as i32;
+            let pad_x = 8;
+            let pad_y = 6;
+            out.push(solid(
+                "emthin-find-bg",
+                Rectangle::new(
+                    (x - pad_x, y - pad_y).into(),
+                    (w + pad_x * 2, h + pad_y * 2).into(),
+                ),
+                scale,
+                [0.06, 0.09, 0.12, 0.94],
+            ));
+            if let Some(element) = crate::find_bar::draw(renderer, image, x, y, scale) {
+                out.push(element);
+            }
         }
     }
 

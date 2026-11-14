@@ -9,8 +9,12 @@
 #
 # Run via ./run.sh --config <name>.
 
-# shellcheck source=lib.sh
-. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
+# run.sh sources this file after lib.sh; sourcing lib again would reset the
+# assertion counters that already include the per-document preference checks.
+if ! declare -F check >/dev/null 2>&1; then
+  # shellcheck source=lib.sh
+  . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
+fi
 
 HOST_WAYLAND="${E2E_HOST_WAYLAND:-wayland-0}"
 

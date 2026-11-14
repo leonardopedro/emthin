@@ -6,7 +6,9 @@ pub mod messages;
 use std::os::unix::net::UnixListener;
 
 use connection::IpcConn;
-pub use messages::{IncomingMessage, IpcErrorCode, IpcRect, OutgoingMessage, StateFigure};
+pub use messages::{
+    IncomingMessage, IpcErrorCode, IpcRect, OutgoingMessage, StateFigure, TouchPhase,
+};
 
 /// IPC server: listens for a single control-client connection and exchanges
 /// JSON messages.

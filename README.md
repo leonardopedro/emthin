@@ -117,6 +117,14 @@ figure to the end of the document, captioned with the app's title.
 | `Ctrl+Home` / `Ctrl+End` | start / end of the line |
 | `Ctrl+Shift+M` | clone the focused figure (add a mirror) |
 | `Ctrl+Shift+V` | voice turn for the `\voice` block at the caret |
+| `Ctrl++` / `Ctrl+-` | larger / smaller reading size (reflows the document) |
+| `Ctrl+0` | reset the reading size |
+| `Ctrl+Shift++` / `Ctrl+Shift+-` | zoom the view in / out (no reflow) |
+| `Ctrl+Shift+0` | reset the view zoom and pan |
+| `Ctrl+wheel` / `Ctrl+two-finger scroll` | zoom the view around the pointer |
+| `Alt+Left` / `Alt+Right` / `Alt+Up` / `Alt+Down` | pan the zoomed page |
+| `Ctrl+Shift+S` / `Ctrl+Shift+L` | cycle the open citation's CSL style / locale |
+| `Ctrl+Shift+R` | reset the open citation's style and locale |
 | `Escape` / `Ctrl+G` | return focus from a figure to the document |
 | `XF86WakeUp` | toggle focus between the focused figure and the document |
 
@@ -127,6 +135,29 @@ select, `Ctrl` by word), `Ctrl+A` selects all, `Ctrl+Z` undoes and
 use the host clipboard. A shift chord arrives as the *uppercase*
 keysym, so the redo arm accepts both cases — matching only lowercase
 made `Ctrl+Shift+Z` unreachable from a real keyboard.
+
+On the rendered page, click to place the caret, drag to select,
+double-click to select a word and triple-click to select a line. A
+formula is one word for this purpose. Touch works the same way: drag to
+select, double-tap a word and triple-tap a line. Two fingers pan a
+zoomed page, taking over from the one-finger selection gesture. The
+selection feeds the same `Ctrl+C` / `Ctrl+X` / `Ctrl+V` path as keyboard
+selection, and a non-empty selection is also published as the host
+PRIMARY selection (middle-click paste in another app); clearing the
+selection clears it.
+
+View zoom is separate from reading size: it scales the letterboxed page
+without reflowing the document. `Ctrl+wheel` (or `Ctrl` plus two-finger
+trackpad scroll) zooms around the pointer, `Alt+Arrows` pan, and
+middle-drag or a two-finger touch drag pans a zoomed page. Zoom, pan,
+reading size, the visible page and the citation style/locale are stored per
+document in the session, so switching files does not carry one document's
+view or place into another.
+Citation popups (`Ctrl+click` a numbered reference) render through
+Hayagriva; while one is open, `Ctrl+Shift+S` and `Ctrl+Shift+L` cycle
+its bundled CSL style and locale and `Ctrl+Shift+R` returns to the
+document's defaults. These are presentation overrides, not document
+edits.
 
 ### Figures
 

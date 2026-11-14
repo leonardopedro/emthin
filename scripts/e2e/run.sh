@@ -32,6 +32,8 @@ cd "$REPO"
 
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
+# shellcheck source=document-preferences.sh
+. "$HERE/document-preferences.sh"
 
 # Re-enter the flake if needed. Must come before anything that touches a tool.
 ensure_devshell "$@"
@@ -127,6 +129,7 @@ if [ "$COMPOSITOR_MODE" = headless ]; then
   # configurations.
   supervise_compositor
 fi
+prepare_document_preferences
 start_emthin
 
 cleanup() {
@@ -148,6 +151,8 @@ trap cleanup EXIT
 
 # Give the seat a moment so the first keystroke is not swallowed by focus.
 sleep 1
+
+document_preferences_checks
 
 # shellcheck disable=SC1090
 . "$HERE/step7.sh"

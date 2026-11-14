@@ -116,6 +116,10 @@ figure disappeared".
 ./scripts/agent/live.sh size f0 500 350      # rewrite a figure's \app args
 ./scripts/agent/live.sh open notes.typ       # replace the document
 ./scripts/agent/live.sh save out.typ         # snapshot the document
+./scripts/agent/live.sh export-ascii out-ascii.typ  # ASCII-only Typst projection
+./scripts/agent/live.sh import-ascii out-ascii.typ  # replace from that projection
+./scripts/agent/live.sh text-size 24          # reading size (reflows the document)
+./scripts/agent/live.sh touch-pan 0 -80      # two-finger pan (page must be zoomed)
 ./scripts/agent/live.sh down                 # graceful teardown (session saved)
 ```
 

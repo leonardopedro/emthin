@@ -1,11 +1,13 @@
 pub mod activation;
 pub mod cli;
 pub mod clipboard_bridge;
+pub mod completion_hint;
 pub mod doc_render;
 pub mod docui;
 pub mod dormant_label;
 pub mod element;
 pub mod figure_render;
+pub mod find_bar;
 pub mod grabs;
 pub mod handlers;
 pub mod host_keymap;

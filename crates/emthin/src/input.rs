@@ -1,8 +1,7 @@
-use mathed_core::glyphs::V2;
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent, TouchEvent,
     },
     input::{
         keyboard::{keysyms, Keysym},
@@ -16,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::docui::keymap;
 use crate::docui::keymap::Action;
-use crate::state::EmthinState;
+use crate::state::{EmthinState, TextClick, TextSelectionDrag, TouchPan, TouchPoint, ViewPanDrag};
 
 impl EmthinState {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -134,6 +133,16 @@ impl EmthinState {
                 let new_abs = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
                 let delta = self.cursor.consume_raw_location(new_abs);
                 let time_msec = event.time_msec();
+                if let Some(pan) = self.view_pan_drag {
+                    let dx = new_abs.x - pan.last.x;
+                    let dy = new_abs.y - pan.last.y;
+                    self.view_pan_drag = Some(ViewPanDrag { last: new_abs });
+                    if self.doc.pan_view(dx, dy) {
+                        self.relayout_document();
+                        self.needs_redraw = true;
+                    }
+                }
+                self.drag_text_selection(new_abs);
                 let new_under = self.surface_under(new_abs);
 
                 let serial = SERIAL_COUNTER.next_serial();
@@ -196,7 +205,16 @@ impl EmthinState {
                     let under_surface = under.map(|(s, _)| s);
 
                     if event.button() == Some(MouseButton::Left) {
-                        self.handle_left_click(pos);
+                        self.handle_left_click(pos, event.time_msec());
+                    } else if event.button() == Some(MouseButton::Middle)
+                        && under_surface.is_none()
+                        && self.doc.layout().screen_to_doc(pos).is_some()
+                    {
+                        // Middle-drag pans the document background. Over an
+                        // app surface the button still belongs to the client
+                        // (and to primary-selection paste).
+                        self.view_pan_drag = Some(ViewPanDrag { last: pos });
+                        self.text_selection.drag = None;
                     }
 
                     // Clicking inside a figure focuses its app; clicking
@@ -227,6 +245,19 @@ impl EmthinState {
                     }
                 }
 
+                if event.button() == Some(MouseButton::Left)
+                    && button_state == ButtonState::Released
+                {
+                    // The drag's selection stays; only the gesture ends.
+                    self.text_selection.drag = None;
+                    self.sync_primary_selection();
+                }
+                if event.button() == Some(MouseButton::Middle)
+                    && button_state == ButtonState::Released
+                {
+                    self.view_pan_drag = None;
+                }
+
                 pointer.button(
                     self,
                     &ButtonEvent {
@@ -253,6 +284,30 @@ impl EmthinState {
                 });
                 let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
                 let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
+
+                // Ctrl+wheel and Ctrl+two-finger scroll zoom the document
+                // around the pointer. Over an app surface the gesture belongs
+                // to the client, exactly like the wheel itself.
+                let pointer_pos = pointer.current_location();
+                let ctrl = self
+                    .seat
+                    .get_keyboard()
+                    .is_some_and(|keyboard| keyboard.modifier_state().ctrl);
+                let vertical_notches = vertical_amount_discrete
+                    .map(|discrete| discrete / 120.0)
+                    .unwrap_or(vertical_amount / 15.0);
+                if ctrl
+                    && vertical_notches.abs() > 0.01
+                    && self.surface_under(pointer_pos).is_none()
+                {
+                    let factor = wheel_zoom_factor(vertical_notches);
+                    if self.doc.zoom_view_at(factor, pointer_pos) {
+                        self.relayout_document();
+                        self.needs_redraw = true;
+                    }
+                    pointer.frame(self);
+                    return;
+                }
 
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 if horizontal_amount != 0.0 {
@@ -281,38 +336,327 @@ impl EmthinState {
                 pointer.frame(self);
             }
 
+            InputEvent::TouchDown { event, .. } => {
+                let Some(output) = self.page.active_space.outputs().next() else {
+                    return;
+                };
+                let Some(output_geo) = self.page.active_space.output_geometry(output) else {
+                    return;
+                };
+                let slot = i32::from(event.slot());
+                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                self.handle_touch_down(slot, pos, event.time_msec());
+            }
+
+            InputEvent::TouchMotion { event, .. } => {
+                let slot = i32::from(event.slot());
+                let Some(output) = self.page.active_space.outputs().next() else {
+                    return;
+                };
+                let Some(output_geo) = self.page.active_space.output_geometry(output) else {
+                    return;
+                };
+                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                self.handle_touch_motion(slot, pos);
+            }
+
+            InputEvent::TouchUp { event, .. } => {
+                self.handle_touch_up(i32::from(event.slot()));
+            }
+
+            InputEvent::TouchCancel { event, .. } => {
+                self.handle_touch_cancel(i32::from(event.slot()));
+            }
+
             _ => {}
         }
+    }
+
+    /// Feed a synthetic touch contact from the IPC test seam. The live harness
+    /// uses this because XTEST cannot synthesize multitouch; it goes through
+    /// the same handlers as a real `TouchDown`/`TouchMotion`/`TouchUp`.
+    pub fn inject_touch(&mut self, phase: crate::ipc::TouchPhase, slot: i32, x: f64, y: f64) {
+        let pos = Point::new(x, y);
+        match phase {
+            crate::ipc::TouchPhase::Down => self.handle_touch_down(slot, pos, 0),
+            crate::ipc::TouchPhase::Motion => self.handle_touch_motion(slot, pos),
+            crate::ipc::TouchPhase::Up => self.handle_touch_up(slot),
+            crate::ipc::TouchPhase::Cancel => self.handle_touch_cancel(slot),
+        }
+        self.relayout_document();
+        self.needs_redraw = true;
+    }
+
+    fn handle_touch_down(&mut self, slot: i32, pos: Point<f64, Logical>, time_msec: u32) {
+        self.touch.points.retain(|point| point.slot != slot);
+        self.touch.points.push(TouchPoint {
+            slot,
+            position: pos,
+        });
+
+        // Two fingers on a zoomed page pan it. Turning the one-finger
+        // selection into a pan as soon as the second contact lands is
+        // what keeps the gestures from fighting: from here until the
+        // contacts lift, neither slot is a selection anchor.
+        if self.touch.points.len() == 2 && self.touch.pan.is_none() && self.doc.view_can_pan() {
+            let a = self.touch.points[0].position;
+            let b = self.touch.points[1].position;
+            self.touch.pan = Some(TouchPan {
+                slots: [self.touch.points[0].slot, self.touch.points[1].slot],
+                last_center: Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0),
+            });
+            self.text_selection.touch_slot = None;
+            self.text_selection.drag = None;
+            self.needs_redraw = true;
+            return;
+        }
+        if self.touch.points.len() > 1 || self.text_selection.touch_slot.is_some() {
+            // A second finger must not fight the selection anchor, and
+            // once a pan has ended the remaining contact stays inert
+            // until it lifts.
+            return;
+        }
+        self.text_selection.touch_slot = Some(slot);
+        // Touch is a document gesture here. A touch on a figure or a
+        // rendered citation keeps the mouse rules (which would start a
+        // resize/relaunch or popup) out of the way.
+        if self.doc.figure_at(pos).is_none() && self.doc.citation_at(pos).is_none() {
+            self.focus_document();
+            self.start_text_selection(pos, time_msec);
+            self.sync_primary_selection();
+            self.needs_redraw = true;
+        }
+    }
+
+    fn handle_touch_motion(&mut self, slot: i32, pos: Point<f64, Logical>) {
+        if let Some(point) = self
+            .touch
+            .points
+            .iter_mut()
+            .find(|point| point.slot == slot)
+        {
+            point.position = pos;
+        }
+        if let Some(pan) = self.touch.pan {
+            if !pan.slots.contains(&slot) {
+                return;
+            }
+            let first = self
+                .touch
+                .points
+                .iter()
+                .find(|point| point.slot == pan.slots[0]);
+            let second = self
+                .touch
+                .points
+                .iter()
+                .find(|point| point.slot == pan.slots[1]);
+            let (Some(first), Some(second)) = (first, second) else {
+                return;
+            };
+            let center = Point::new(
+                (first.position.x + second.position.x) / 2.0,
+                (first.position.y + second.position.y) / 2.0,
+            );
+            let dx = center.x - pan.last_center.x;
+            let dy = center.y - pan.last_center.y;
+            if let Some(pan) = self.touch.pan.as_mut() {
+                pan.last_center = center;
+            }
+            if self.doc.pan_view(dx, dy) {
+                tracing::debug!("touch pan: {dx:+.0},{dy:+.0}");
+                self.relayout_document();
+                self.needs_redraw = true;
+            }
+            return;
+        }
+        if self.text_selection.touch_slot != Some(slot) {
+            return;
+        }
+        self.drag_text_selection(pos);
+        self.sync_primary_selection();
+        self.needs_redraw = true;
+    }
+
+    fn handle_touch_up(&mut self, slot: i32) {
+        self.touch.points.retain(|point| point.slot != slot);
+        if let Some(pan) = self.touch.pan {
+            if pan.slots.contains(&slot) {
+                self.touch.pan = None;
+                self.needs_redraw = true;
+            }
+            return;
+        }
+        if self.text_selection.touch_slot != Some(slot) {
+            return;
+        }
+        self.text_selection.touch_slot = None;
+        self.text_selection.drag = None;
+        self.sync_primary_selection();
+        self.needs_redraw = true;
+    }
+
+    fn handle_touch_cancel(&mut self, slot: i32) {
+        self.touch.points.retain(|point| point.slot != slot);
+        if let Some(pan) = self.touch.pan {
+            if pan.slots.contains(&slot) {
+                self.touch.pan = None;
+                self.needs_redraw = true;
+            }
+            return;
+        }
+        if self.text_selection.touch_slot != Some(slot) {
+            return;
+        }
+        self.text_selection.touch_slot = None;
+        self.text_selection.drag = None;
+        self.needs_redraw = true;
+    }
+
+    /// Publish the current document selection as PRIMARY, or clear it when the
+    /// selection collapsed. Cached so ordinary typing does not re-own the host
+    /// selection on every keystroke.
+    pub fn sync_primary_selection(&mut self) {
+        let text = self.doc.model().selected_text();
+        if text.is_empty() {
+            // Do not clear another app's PRIMARY just because typing in emthin
+            // collapsed an already-empty document selection. Only retire a
+            // selection emthin actually published.
+            let owned_text = self
+                .selection
+                .primary_cache
+                .as_deref()
+                .is_some_and(|cached| !cached.is_empty());
+            if owned_text {
+                crate::clipboard_bridge::set_host_primary(self, "");
+            }
+            return;
+        }
+        if self.selection.primary_cache.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        crate::clipboard_bridge::set_host_primary(self, &text);
+    }
+
+    /// Start a document selection gesture at `pos`.
+    ///
+    /// One click places the caret and arms a drag; a second click within
+    /// 400 ms and 4 px selects the word; a third selects the source line. The
+    /// gesture state is reset by a click on a figure or citation and by the
+    /// next click elsewhere, so double-click counting never leaks across
+    /// unrelated targets.
+    fn start_text_selection(&mut self, pos: Point<f64, Logical>, time: u32) {
+        let Some(byte) = self.doc.byte_at(pos) else {
+            self.doc.model_mut().clear_selection();
+            self.text_selection.drag = None;
+            self.text_selection.last_click = None;
+            self.sync_primary_selection();
+            return;
+        };
+
+        let count = match self.text_selection.last_click {
+            Some(last)
+                if time.saturating_sub(last.time) <= 400
+                    && (pos.x - last.position.x).abs() <= 4.0
+                    && (pos.y - last.position.y).abs() <= 4.0 =>
+            {
+                // 1 → 2 → 3 → 1: a fourth click starts a new group rather
+                // than selecting ever-larger regions.
+                last.count % 3 + 1
+            }
+            _ => 1,
+        };
+        self.text_selection.last_click = Some(TextClick {
+            time,
+            position: pos,
+            count,
+        });
+        tracing::debug!("text selection: click count={count} byte={byte}");
+
+        let selected = match count {
+            2 => self.doc.select_word_at(byte),
+            3 => self.doc.select_line_at(byte),
+            _ => false,
+        };
+        if selected {
+            self.text_selection.drag = None;
+        } else {
+            self.doc.model_mut().set_caret(byte);
+            self.text_selection.drag = Some(TextSelectionDrag {
+                start: pos,
+                moved: false,
+            });
+        }
+        self.sync_primary_selection();
+    }
+
+    /// Extend an in-progress document drag. A small movement is click slop:
+    /// the press's caret must survive a shaky hand.
+    fn drag_text_selection(&mut self, pos: Point<f64, Logical>) {
+        let Some(drag) = self.text_selection.drag else {
+            return;
+        };
+        if !drag.moved {
+            let dx = pos.x - drag.start.x;
+            let dy = pos.y - drag.start.y;
+            if dx * dx + dy * dy < 9.0 {
+                return;
+            }
+            // Re-borrow after the check: `drag` is a copy, the state is not.
+            if let Some(drag) = self.text_selection.drag.as_mut() {
+                drag.moved = true;
+            }
+        }
+        let Some(byte) = self.doc.byte_at(pos) else {
+            return;
+        };
+        // The anchor is the caret set by the press; extending keeps it fixed
+        // while the pointer moves in either direction.
+        self.doc.model_mut().extend_selection_to(byte);
+        self.sync_primary_selection();
+        tracing::debug!("text selection: extend to byte={byte}");
+        self.needs_redraw = true;
     }
 
     /// Left click: figure hit-test first, then the document.
     ///
     /// A figure's **edge** starts a resize grab (which rewrites the
     /// `\app` args); its interior focuses its app; anywhere else on the
-    /// page places the caret.
-    fn handle_left_click(&mut self, pos: Point<f64, Logical>) {
+    /// page starts a text selection.
+    fn handle_left_click(&mut self, pos: Point<f64, Logical>, time: u32) {
         let Some(figure) = self.doc.figure_at(pos).cloned() else {
             if let Some(number) = self.doc.citation_at(pos) {
-                if let Err(error) = self.doc.toggle_citation(number) { tracing::debug!("citation: {error}"); }
+                self.text_selection.drag = None;
+                self.text_selection.last_click = None;
+                let ctrl = self
+                    .seat
+                    .get_keyboard()
+                    .is_some_and(|keyboard| keyboard.modifier_state().ctrl);
+                if ctrl {
+                    // Ctrl+click is go-to-definition. A bibliography or a
+                    // dangling document reference has no target, so fall
+                    // back to the details popup rather than doing nothing.
+                    if let Err(error) = self.doc.goto_citation(number) {
+                        tracing::debug!("citation goto: {error}");
+                        if let Err(error) = self.doc.toggle_citation(number) {
+                            tracing::debug!("citation: {error}");
+                        }
+                    }
+                } else if let Err(error) = self.doc.toggle_citation(number) {
+                    tracing::debug!("citation: {error}");
+                }
                 self.needs_redraw = true;
                 return;
             }
-            // The document. Place the caret where the user clicked so the
-            // next keystroke lands where they expected.
-            let hit = self.doc.layout().screen_to_doc(pos).and_then(|p| {
-                self.doc
-                    .layout()
-                    .glyphs()
-                    .and_then(|g| g.byte_for_point(V2::new(p.x as f32, p.y as f32)))
-            });
-            match hit {
-                Some((byte, _after_space)) => self.doc.model_mut().set_caret(byte),
-                None => self.doc.model_mut().clear_selection(),
-            }
+            // The document. Group the click, then place the caret or select
+            // the word/line under it; a single-click drag extends from there.
+            self.start_text_selection(pos, time);
             self.needs_redraw = true;
             return;
         };
 
+        self.text_selection.drag = None;
+        self.text_selection.last_click = None;
         let edge = crate::grabs::FigureResizeGrab::edge_at(&figure.rect, pos);
         if edge != smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge::None
     {
@@ -392,10 +736,76 @@ impl EmthinState {
                 self.move_caret_linewise(action == Action::LineStart)
             }
             Action::FocusDocument => {
-                // The find bar closes first: while it is open Escape means
-                // "stop searching", not "leave this figure".
-                if !self.doc.close_find() && !self.doc.close_citation() {
+                // A completion preview is the innermost transient state, then
+                // the find bar, then a citation popup. Escape only leaves the
+                // figure once none of them is open.
+                if !self.doc.cancel_completion()
+                    && !self.doc.close_find()
+                    && !self.doc.close_citation()
+                {
                     self.focus_document();
+                }
+            }
+            Action::TextLarger | Action::TextSmaller => {
+                let size = self.doc.step_text_size(action == Action::TextLarger);
+                tracing::info!("reading size: {size}pt");
+            }
+            Action::TextReset => {
+                self.doc.reset_text_size();
+                tracing::info!("reading size reset to {}pt", self.doc.text_size());
+            }
+            Action::ViewLarger | Action::ViewSmaller => {
+                let zoom = self.doc.step_view_zoom(action == Action::ViewLarger);
+                tracing::info!("view zoom: {zoom:.2}x");
+            }
+            Action::ViewReset => {
+                self.doc.reset_view();
+                tracing::info!("view reset to fit ({}x)", self.doc.view_zoom());
+            }
+            Action::ViewPanLeft
+            | Action::ViewPanRight
+            | Action::ViewPanUp
+            | Action::ViewPanDown => {
+                const PAN_STEP: f64 = 48.0;
+                let (dx, dy) = match action {
+                    Action::ViewPanLeft => (-PAN_STEP, 0.0),
+                    Action::ViewPanRight => (PAN_STEP, 0.0),
+                    Action::ViewPanUp => (0.0, -PAN_STEP),
+                    _ => (0.0, PAN_STEP),
+                };
+                if self.doc.pan_view(dx, dy) {
+                    tracing::debug!("view pan: {dx:+.0},{dy:+.0}");
+                }
+            }
+            Action::CitationStyleNext => {
+                if self.doc.citation_popup().is_open() {
+                    match self.doc.cycle_citation_style() {
+                        Ok(style) => tracing::info!("citation style: {style}"),
+                        Err(error) => tracing::warn!("citation style: {error}"),
+                    }
+                } else {
+                    tracing::debug!("citation style: no citation is open");
+                }
+            }
+            Action::CitationLocaleNext => {
+                if self.doc.citation_popup().is_open() {
+                    match self.doc.cycle_citation_locale() {
+                        Ok(locale) => tracing::info!("citation locale: {locale}"),
+                        Err(error) => tracing::warn!("citation locale: {error}"),
+                    }
+                } else {
+                    tracing::debug!("citation locale: no citation is open");
+                }
+            }
+            Action::CitationReset => {
+                if self.doc.citation_popup().is_open() {
+                    match self.doc.reset_citation_format() {
+                        Ok(true) => tracing::info!("citation format reset"),
+                        Ok(false) => tracing::debug!("citation format already default"),
+                        Err(error) => tracing::warn!("citation format: {error}"),
+                    }
+                } else {
+                    tracing::debug!("citation format: no citation is open");
                 }
             }
             Action::Find => self.doc.open_find(),
@@ -419,6 +829,7 @@ impl EmthinState {
                 }
             }
         }
+        self.sync_primary_selection();
         self.relayout_document();
         self.needs_redraw = true;
     }
@@ -596,6 +1007,12 @@ impl EmthinState {
         let revision = self.doc.model().revision();
         let handled = self.edit_document_key_inner(keysym);
         if self.doc.model().revision() != revision { self.doc.clear_citations(); }
+        if handled {
+            // Backspace, arrows and typing all move the caret or the run; the
+            // preview must describe the new position, not the previous key's.
+            self.doc.refresh_completion();
+            self.sync_primary_selection();
+        }
         handled
     }
 
@@ -658,6 +1075,18 @@ impl EmthinState {
                 // place and clear the anchor. Deleted first, so a `#` scan
                 // below also sees the words the deletion freed as reusable.
                 self.doc.model_mut().take_selection();
+                // A non-run key (space, comma, punctuation, …) commits the
+                // pending glyph before inserting itself: `-> ` becomes `→ `.
+                // A run character instead extends the ASCII run, so the
+                // preview is refreshed by the wrapper rather than committed.
+                self.doc.refresh_completion();
+                let extends = text
+                    .chars()
+                    .next()
+                    .is_some_and(mathed_mini::completion_ui::CompletionUi::extends_run);
+                if !extends {
+                    self.doc.commit_completion();
+                }
                 if text == "#" {
                     // A typed `#` is a marker position, not a character: it
                     // becomes the RFC 1751 word for the lowest free marker
@@ -885,6 +1314,10 @@ impl EmthinState {
     /// is released here too (bundled with keyboard until winit gives us
     /// separate `CursorLeft` events — YAGNI for now).
     pub fn on_focus_leave(&mut self) {
+        // The button-up may never arrive once the host window loses focus.
+        self.text_selection.drag = None;
+        self.text_selection.touch_slot = None;
+        self.view_pan_drag = None;
         let serial = SERIAL_COUNTER.next_serial();
         if let Some(keyboard) = self.seat.get_keyboard() {
             self.focus
@@ -921,9 +1354,22 @@ impl EmthinState {
     }
 }
 
+/// One wheel notch is 1/5 of an e-fold. Wayland axis deltas are positive
+/// downwards, so wheel-up (a negative delta) must increase the zoom.
+fn wheel_zoom_factor(vertical_notches: f64) -> f64 {
+    (-vertical_notches * 0.2).exp()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::EmthinState;
+    use super::{wheel_zoom_factor, EmthinState};
+
+    #[test]
+    fn wheel_up_zooms_in_and_wheel_down_zooms_out() {
+        assert!(wheel_zoom_factor(-1.0) > 1.0);
+        assert!(wheel_zoom_factor(1.0) < 1.0);
+        assert!((wheel_zoom_factor(0.0) - 1.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn left_moves_one_grapheme_including_combining_and_emoji_sequences() {

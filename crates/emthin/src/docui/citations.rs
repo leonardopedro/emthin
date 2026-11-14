@@ -1,8 +1,59 @@
 //! Shared bibliography formatting for desktop and Android.
 
+/// The CSL locale used when the user has not selected another one.
+pub const DEFAULT_CITATION_LOCALE: &str = "en-US";
+
+/// Styles offered by `Ctrl+Shift+S`. Every name is an independent style in
+/// Hayagriva's bundled archive.
+pub const CITATION_STYLES: &[&str] = &[
+    "apa",
+    "chicago-author-date",
+    "mla",
+    "vancouver",
+    "ieee",
+    "harvard-cite-them-right",
+];
+
+/// Locales offered by `Ctrl+Shift+L`. The archive carries more; these are the
+/// common choices in a stable order.
+pub const CITATION_LOCALES: &[&str] = &[
+    "en-US",
+    "en-GB",
+    "de-DE",
+    "fr-FR",
+    "es-ES",
+    "zh-CN",
+    "ja-JP",
+];
+
+/// Resolve one rendered CSL locale from Hayagriva's bundled archive.
+fn citation_locale(name: &str) -> Result<hayagriva::citationberg::Locale, String> {
+    use std::sync::OnceLock;
+    static LOCALES: OnceLock<Vec<hayagriva::citationberg::Locale>> = OnceLock::new();
+    let all = LOCALES.get_or_init(hayagriva::archive::locales);
+    all.iter()
+        .find(|locale| {
+            locale
+                .lang
+                .as_ref()
+                .is_some_and(|lang| lang.0.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .ok_or_else(|| format!("Unknown citation locale: {name}"))
+}
+
 /// Resolve the selected cite against its actual bibliography binding and
 /// include Hayagriva's full reference entries, not just its short label.
-pub fn bibliography_detail(text: &str, number: u64) -> Result<(String, Vec<String>), String> {
+///
+/// `style_override` is presentation state: when set it wins over the
+/// document's `\cite`/`\bibliography` style, without rewriting the document.
+/// `locale` selects the CSL locale used for terms and dates.
+pub fn bibliography_detail(
+    text: &str,
+    number: u64,
+    style_override: Option<&str>,
+    locale: &str,
+) -> Result<(String, Vec<String>), String> {
     use mathed_core::markers::{Arg, PropKind, ReferenceKind};
     use mathed_core::semantics::SemanticIndex;
     let scan = mathed_core::markers::scan(text);
@@ -41,14 +92,16 @@ pub fn bibliography_detail(text: &str, number: u64) -> Result<(String, Vec<Strin
     let library = if bib.format.as_deref() == Some("bibtex") {
         mathed_biblio::load_bibtex(&bib.body_text)
     } else { mathed_biblio::load_yaml(&bib.body_text) }.map_err(|e| e.to_string())?;
-    let style_name = cite_style.as_deref().or(bib.style.as_deref()).unwrap_or(mathed_biblio::DEFAULT_STYLE);
+    let style_name = style_override
+        .or(cite_style.as_deref())
+        .or(bib.style.as_deref())
+        .unwrap_or(mathed_biblio::DEFAULT_STYLE);
     let style = hayagriva::archive::ArchivedStyle::by_name(style_name)
         .ok_or_else(|| format!("Unknown citation style: {style_name}"))?;
     let hayagriva::citationberg::Style::Independent(style) = style.get() else {
         return Err(format!("Citation style {style_name} is dependent; select its parent style"));
     };
-    let locale = hayagriva::citationberg::LocaleFile::from_xml(include_str!("../../../../emthin-android/assets/locales-en-US.xml"))
-        .map_err(|e| format!("Invalid CSL locale: {e}"))?.into();
+    let locale = citation_locale(locale)?;
     let locales = [locale];
     let selected = keys.iter().map(|key| library.get(key)
         .ok_or_else(|| {
@@ -116,10 +169,19 @@ pub struct CitationPopup {
     pub raster: Option<PopupRaster>,
     pub revision: u64,
     document_revision: u64,
+    /// Presentation-only CSL style override. `None` uses the document's
+    /// `\cite`/`\bibliography` style.
+    style_override: Option<String>,
+    /// Presentation-only CSL locale. `None` uses `DEFAULT_CITATION_LOCALE`.
+    locale: Option<String>,
 }
 
+#[derive(Clone)]
 struct PopupLevel {
     number: u64,
+    /// The document/body this number resolves within. Kept so a style or
+    /// locale change can re-render an already-open stack.
+    scope: String,
     /// The cited document body is the scope for nested citations.
     child_scope: Option<String>,
     markup: String,
@@ -134,6 +196,28 @@ pub struct PopupRaster {
 impl CitationPopup {
     pub fn is_open(&self) -> bool { !self.stack.is_empty() }
 
+    /// The selected style override, or the CSL default when none is selected.
+    pub fn style(&self) -> &str {
+        self.style_override
+            .as_deref()
+            .unwrap_or(mathed_biblio::DEFAULT_STYLE)
+    }
+
+    /// The selected locale, or the default when none is selected.
+    pub fn locale(&self) -> &str {
+        self.locale.as_deref().unwrap_or(DEFAULT_CITATION_LOCALE)
+    }
+
+    /// The saved style override, if any (`None` means the document's style).
+    pub fn style_override(&self) -> Option<&str> {
+        self.style_override.as_deref()
+    }
+
+    /// The saved locale, if any (`None` means the default locale).
+    pub fn locale_override(&self) -> Option<&str> {
+        self.locale.as_deref()
+    }
+
     pub fn close(&mut self) -> bool {
         if self.stack.pop().is_none() { return false; }
         self.refresh();
@@ -145,6 +229,64 @@ impl CitationPopup {
             self.stack.clear();
             self.refresh();
         }
+    }
+
+    /// Select the next bundled CSL style and re-render the open citation.
+    pub fn cycle_style(&mut self) -> Result<String, String> {
+        let current = self.style();
+        let index = CITATION_STYLES
+            .iter()
+            .position(|style| *style == current)
+            .unwrap_or(0);
+        let next = CITATION_STYLES[(index + 1) % CITATION_STYLES.len()];
+        self.change_format(Some(next.to_string()), self.locale.clone())?;
+        Ok(self.style().to_string())
+    }
+
+    /// Select the next bundled CSL locale and re-render the open citation.
+    pub fn cycle_locale(&mut self) -> Result<String, String> {
+        let current = self.locale();
+        let index = CITATION_LOCALES
+            .iter()
+            .position(|locale| *locale == current)
+            .unwrap_or(0);
+        let next = CITATION_LOCALES[(index + 1) % CITATION_LOCALES.len()];
+        self.change_format(self.style_override.clone(), Some(next.to_string()))?;
+        Ok(self.locale().to_string())
+    }
+
+    /// Drop both presentation overrides, returning to the document's own
+    /// style and the default locale.
+    pub fn reset_format(&mut self) -> Result<bool, String> {
+        if self.style_override.is_none() && self.locale.is_none() {
+            return Ok(false);
+        }
+        self.change_format(None, None)?;
+        Ok(true)
+    }
+
+    /// Restore a saved selection. Invalid saved names are ignored rather than
+    /// making the session unopenable.
+    pub fn set_saved_format(&mut self, style: Option<String>, locale: Option<String>) {
+        self.style_override = style.filter(|style| CITATION_STYLES.contains(&style.as_str()));
+        self.locale = locale.filter(|locale| citation_locale(locale).is_ok());
+    }
+
+    fn change_format(
+        &mut self,
+        style: Option<String>,
+        locale: Option<String>,
+    ) -> Result<(), String> {
+        let previous_style = self.style_override.clone();
+        let previous_locale = self.locale.clone();
+        self.style_override = style;
+        self.locale = locale;
+        if let Err(error) = self.rebuild_stack() {
+            self.style_override = previous_style;
+            self.locale = previous_locale;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Toggle a numbered citation; nested numbers resolve within the open
@@ -160,6 +302,18 @@ impl CitationPopup {
             Some(level) => level.child_scope.as_deref().ok_or("This citation contains no nested document")?,
             None => document,
         };
+        let scope = scope.to_string();
+        let (child_scope, markup) = self.render_level(&scope, number)?;
+        self.stack.push(PopupLevel { number, scope, child_scope, markup });
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn clear_if_stale(&mut self, document_revision: u64) {
+        if self.is_open() && self.document_revision != document_revision { self.clear(); }
+    }
+
+    fn render_level(&self, scope: &str, number: u64) -> Result<(Option<String>, String), String> {
         let scan = mathed_core::markers::scan(scope);
         let normalized = super::model::citation_references(&scan);
         let target = normalized.iter().find(|r| r.numbers.contains(&number))
@@ -169,7 +323,7 @@ impl CitationPopup {
             .and_then(|r| r.numbers.first()).copied().ok_or("Citation no longer exists")?;
         let body = mathed_mini::cite_popup::resolve_popup_body(scope, upstream_number)
             .ok_or("Citation no longer exists")?;
-        let (child_scope, body_markup) = match body {
+        match body {
             mathed_mini::cite_popup::PopupBody::DocumentRef { body_text, body_markup } => {
                 let markup = if body_text.is_empty() { body_markup } else {
                     let scan = mathed_core::markers::scan(&body_text);
@@ -179,29 +333,51 @@ impl CitationPopup {
                     };
                     mathed_core::transform::to_render_text(&body_text, &scan, &segments, &options).text
                 };
-                (Some(body_text), markup)
+                Ok((Some(body_text), markup))
             }
             mathed_mini::cite_popup::PopupBody::Bibliography { .. } => {
-                let detail = bibliography_detail(scope, number)
-                    .map(|(citation, entries)| format!("{}\n\n{}", citation, entries.join("\n\n")))
-                    .unwrap_or_else(|error| error);
+                let detail = bibliography_detail(
+                    scope,
+                    number,
+                    self.style_override.as_deref(),
+                    self.locale(),
+                )
+                .map(|(citation, entries)| format!("{}\n\n{}", citation, entries.join("\n\n")))
+                .unwrap_or_else(|error| error);
                 let quoted = serde_json::to_string(&detail).map_err(|e| e.to_string())?;
-                (None, format!("#text({quoted})"))
+                Ok((None, format!("#text({quoted})")))
             }
-        };
-        self.stack.push(PopupLevel { number, child_scope, markup: body_markup });
+        }
+    }
+
+    fn rebuild_stack(&mut self) -> Result<(), String> {
+        let mut rebuilt = Vec::with_capacity(self.stack.len());
+        for level in &self.stack {
+            let (child_scope, markup) = self.render_level(&level.scope, level.number)?;
+            rebuilt.push(PopupLevel {
+                number: level.number,
+                scope: level.scope.clone(),
+                child_scope,
+                markup,
+            });
+        }
+        self.stack = rebuilt;
         self.refresh();
         Ok(())
     }
 
-    pub fn clear_if_stale(&mut self, document_revision: u64) {
-        if self.is_open() && self.document_revision != document_revision { self.clear(); }
-    }
-
     fn refresh(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        let style = self.style_override.as_deref().unwrap_or("document");
+        let locale = self.locale();
         self.raster = self.stack.last().and_then(|level| {
-            let markup = format!("#set text(fill: white, size: 14pt, font: \"DejaVu Sans Mono\")\n#text(fill: rgb(\"#b7d5ea\"))[Citation [{}] · Esc close]\n\n{}", level.number, level.markup);
+            let markup = format!(
+                "#set text(fill: white, size: 14pt, font: \"DejaVu Sans Mono\")\n\
+                 #text(fill: rgb(\"#b7d5ea\"))[Citation [{}] · Esc close]\n\
+                 #text(fill: rgb(\"#8aa9bd\"), size: 11pt)[style: {} · locale: {}]\n\
+                 #text(fill: rgb(\"#6f8798\"), size: 10pt)[Ctrl+Shift+S style · Ctrl+Shift+L locale · Ctrl+Shift+R reset]\n\n{}",
+                level.number, style, locale, level.markup
+            );
             let image = mathed_mini::render_markup(&markup, 400.0).ok()?;
             Some(PopupRaster { width: image.width, height: image.height, rgba: image.data })
         });
@@ -237,8 +413,41 @@ mod tests {
     #[test]
     fn bibliography_uses_locale_for_year_and_full_entry() {
         let text = "#a source:\n  type: Book\n  title: A Book\n  author: Smith, Jane\n  date: 2020\n#b \\bibliography(#a,#b, refs) \\cite(\"source\", bib: \"refs\")";
-        let (citation, entries) = bibliography_detail(text, 1).unwrap();
+        let (citation, entries) =
+            bibliography_detail(text, 1, None, DEFAULT_CITATION_LOCALE).unwrap();
         assert!(citation.contains("2020"), "{citation}");
         assert!(entries[0].contains("A Book"));
+    }
+
+    #[test]
+    fn a_presentation_style_override_changes_the_rendered_citation() {
+        let text = "#a source:\n  type: Book\n  title: A Book\n  author: Smith, Jane\n  date: 2020\n#b \\bibliography(#a,#b, refs) \\cite(\"source\", bib: \"refs\")";
+        let (apa, _) = bibliography_detail(text, 1, None, DEFAULT_CITATION_LOCALE).unwrap();
+        let (vancouver, _) =
+            bibliography_detail(text, 1, Some("vancouver"), DEFAULT_CITATION_LOCALE).unwrap();
+        assert_ne!(apa, vancouver, "selecting a style must change the rendering");
+    }
+
+    #[test]
+    fn bundled_locales_resolve_and_unknown_names_do_not() {
+        assert!(citation_locale("en-US").is_ok());
+        assert!(citation_locale("de-DE").is_ok());
+        assert!(citation_locale("not-a-locale").is_err());
+    }
+
+    #[test]
+    fn cycling_style_and_locale_updates_the_open_popup() {
+        let text = "#a source:\n  type: Book\n  title: A Book\n  author: Smith, Jane\n  date: 2020\n#b \\bibliography(#a,#b, refs) \\cite(\"source\", bib: \"refs\")";
+        let mut popup = CitationPopup::default();
+        popup.toggle(text, 1, 1).unwrap();
+        assert_eq!(popup.style(), "apa");
+        assert_eq!(popup.cycle_style().unwrap(), "chicago-author-date");
+        assert!(popup.is_open());
+        assert!(popup.raster.is_some());
+        assert_eq!(popup.cycle_locale().unwrap(), "en-GB");
+        assert!(popup.reset_format().unwrap());
+        assert_eq!(popup.style(), "apa");
+        assert_eq!(popup.locale(), DEFAULT_CITATION_LOCALE);
+        assert!(!popup.reset_format().unwrap(), "already at the defaults");
     }
 }

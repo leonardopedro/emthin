@@ -278,6 +278,37 @@ pub fn set_host_clipboard(state: &mut EmthinState, text: &str) {
     }
 }
 
+/// Publish the document's current selection as the host PRIMARY selection.
+///
+/// X11/Wayland primary selection is what middle-click pastes. An empty
+/// selection clears it rather than leaving stale text behind. The direct
+/// `arboard` handle is used for the same reason as the clipboard path: the
+/// proxy cannot answer synchronously inside an input handler.
+pub fn set_host_primary(state: &mut EmthinState, text: &str) {
+    use arboard::{ClearExtLinux, LinuxClipboardKind, SetExtLinux};
+
+    let Some(clipboard) = ensure_doc_clipboard(state) else {
+        return;
+    };
+    let result = if text.is_empty() {
+        clipboard
+            .clear_with()
+            .clipboard(LinuxClipboardKind::Primary)
+    } else {
+        clipboard
+            .set()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text(text.to_owned())
+    };
+    match result {
+        Ok(()) => {
+            state.selection.primary_cache = Some(text.to_owned());
+            tracing::debug!("document primary selection set ({} bytes)", text.len());
+        }
+        Err(e) => tracing::warn!("document primary selection write failed: {e}"),
+    }
+}
+
 /// The document's direct handle on the host clipboard, acquired on first use.
 ///
 /// Constructing an `arboard::Clipboard` takes ownership of the host selection, so

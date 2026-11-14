@@ -54,6 +54,24 @@ pub enum IncomingMessage {
     OpenDoc { path: String },
     /// Snapshot the current document to a path.
     SaveDoc { path: String },
+    /// Write the document's ASCII-only Typst interchange projection.
+    ExportAscii { path: String },
+    /// Replace the document with a file containing the ASCII-only projection.
+    ImportAscii { path: String },
+    /// Set the document's reading size, in points. Values outside the
+    /// supported range are clamped; the resulting size is reported in
+    /// `text_size_changed`.
+    SetTextSize { pt: f32 },
+    /// Feed one synthetic touch contact into the live gesture handlers. This
+    /// is the test seam for two-finger panning: the live harness has no
+    /// touchscreen, and XTEST cannot synthesize multitouch. Coordinates are
+    /// output-local logical pixels, the same space pointer events use.
+    InjectTouch {
+        phase: TouchPhase,
+        slot: i32,
+        x: f64,
+        y: f64,
+    },
     /// Dump the full document + figure state.
     ListState,
     /// Ask the voice harness about a `\voice` dialogue block
@@ -75,6 +93,29 @@ pub enum IncomingMessage {
     DbusRouterRemoveRule { id: String },
     /// List all current DBus routing rules.
     DbusRouterListRules,
+}
+
+/// Contact phase for [`IncomingMessage::InjectTouch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Motion,
+    Up,
+    Cancel,
+}
+
+impl TouchPhase {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "down" => Ok(Self::Down),
+            "motion" => Ok(Self::Motion),
+            "up" => Ok(Self::Up),
+            "cancel" => Ok(Self::Cancel),
+            other => Err(format!(
+                "invalid touch phase '{other}' (expected down, motion, up or cancel)"
+            )),
+        }
+    }
 }
 
 /// emthin → control client.
@@ -116,12 +157,31 @@ pub enum OutgoingMessage {
     State {
         page: usize,
         page_count: usize,
+        /// Reading size in points.
+        text_size: f32,
+        /// Presentation zoom and pan, separate from the reading size.
+        view_zoom: f64,
+        view_pan_x: f64,
+        view_pan_y: f64,
+        citation_style: Option<String>,
+        citation_locale: Option<String>,
         doc: String,
         figures: Vec<StateFigure>,
     },
     /// The document was written to disk.
     DocSaved {
         path: String,
+    },
+    /// The document's ASCII-only projection was written to disk.
+    AsciiExported {
+        path: String,
+    },
+    /// The reading size changed (or was clamped). `page_count` is the
+    /// count after the reflow, so a client can confirm the effect without
+    /// a second `list_state`.
+    TextSizeChanged {
+        pt: f32,
+        page_count: usize,
     },
     /// A voice turn finished and was spliced into its `\voice` block
     /// as a `gemma:` line. `block` is the block's 0-based index at
@@ -180,6 +240,8 @@ pub enum IpcErrorCode {
     VoiceFailed,
     /// A document file could not be read or written.
     IoFailed,
+    /// `import_ascii` received a file containing non-ASCII bytes.
+    NotAscii,
 }
 
 impl IpcErrorCode {
@@ -191,6 +253,7 @@ impl IpcErrorCode {
             Self::UnknownFigure => "unknown_figure",
             Self::VoiceFailed => "voice_failed",
             Self::IoFailed => "io_failed",
+            Self::NotAscii => "not_ascii",
         }
     }
 
@@ -204,6 +267,7 @@ impl IpcErrorCode {
             Self::AppGone => "unavailable",
             Self::VoiceFailed => "execution_failure",
             Self::IoFailed => "io",
+            Self::NotAscii => "malformed_input",
         }
     }
 
@@ -226,16 +290,18 @@ impl IpcErrorCode {
             Self::UnknownFigure => "No figure with that key exists — check `list_state`'s `figures` and the figure keys in the document.",
             Self::VoiceFailed => "The turn could not be queued (no `\\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry.",
             Self::IoFailed => "The document path could not be read/written — check the path exists and is writable by the compositor's user.",
+            Self::NotAscii => "The file is not the ASCII interchange projection. Re-export it with `export_ascii`, or convert its non-ASCII characters, before importing.",
         }
     }
 
     /// Every code, for the doc-sync test.
-    pub const ALL: [IpcErrorCode; 5] = [
+    pub const ALL: [IpcErrorCode; 6] = [
         Self::NotBound,
         Self::AppGone,
         Self::UnknownFigure,
         Self::VoiceFailed,
         Self::IoFailed,
+        Self::NotAscii,
     ];
 }
 
@@ -304,6 +370,21 @@ impl IncomingMessage {
             "save_doc" => Self::SaveDoc {
                 path: params_get_string(params, "path")?,
             },
+            "export_ascii" => Self::ExportAscii {
+                path: params_get_string(params, "path")?,
+            },
+            "import_ascii" => Self::ImportAscii {
+                path: params_get_string(params, "path")?,
+            },
+            "set_text_size" => Self::SetTextSize {
+                pt: params_get_f32(params, "pt")?,
+            },
+            "inject_touch" => Self::InjectTouch {
+                phase: TouchPhase::parse(&params_get_string(params, "phase")?)?,
+                slot: params_get_i32(params, "slot")?,
+                x: params_get_f64(params, "x")?,
+                y: params_get_f64(params, "y")?,
+            },
             "list_state" => Self::ListState,
             // Both fields optional: omitted `text` means "ask the
             // pending you: line, or dictate", omitted `block` means
@@ -344,6 +425,23 @@ fn params_get_i32(params: &serde_json::Value, key: &str) -> Result<i32, String> 
         .as_i64()
         .and_then(|v| i32::try_from(v).ok())
         .ok_or_else(|| format!("missing/invalid field '{key}'"))
+}
+
+fn params_get_f32(params: &serde_json::Value, key: &str) -> Result<f32, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite())
+        .map(|v| v as f32)
+        .ok_or_else(|| format!("missing or invalid field '{key}'"))
+}
+
+fn params_get_f64(params: &serde_json::Value, key: &str) -> Result<f64, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("missing or invalid field '{key}'"))
 }
 
 fn params_get_usize(params: &serde_json::Value, key: &str) -> Result<usize, String> {
@@ -401,6 +499,8 @@ impl OutgoingMessage {
             Self::PageChanged { .. } => "page_changed",
             Self::State { .. } => "state",
             Self::DocSaved { .. } => "doc_saved",
+            Self::AsciiExported { .. } => "ascii_exported",
+            Self::TextSizeChanged { .. } => "text_size_changed",
             Self::VoiceResult { .. } => "voice_result",
             Self::XWaylandReady { .. } => "x_wayland_ready",
             Self::DbusRouterRules { .. } => "dbus_router_rules",
@@ -443,15 +543,31 @@ impl OutgoingMessage {
             Self::State {
                 page,
                 page_count,
+                text_size,
+                view_zoom,
+                view_pan_x,
+                view_pan_y,
+                citation_style,
+                citation_locale,
                 doc,
                 figures,
             } => serde_json::json!({
                 "page": page,
                 "page_count": page_count,
+                "text_size": text_size,
+                "view_zoom": view_zoom,
+                "view_pan_x": view_pan_x,
+                "view_pan_y": view_pan_y,
+                "citation_style": citation_style,
+                "citation_locale": citation_locale,
                 "doc": doc,
                 "figures": figures,
             }),
             Self::DocSaved { path } => serde_json::json!({"path": path}),
+            Self::AsciiExported { path } => serde_json::json!({"path": path}),
+            Self::TextSizeChanged { pt, page_count } => {
+                serde_json::json!({"pt": pt, "page_count": page_count})
+            }
             Self::VoiceResult {
                 block,
                 utterance,
@@ -541,6 +657,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_finite_text_size_and_rejects_missing_or_non_numeric_ones() {
+        let m = IncomingMessage::from_jsonrpc(
+            "set_text_size",
+            &serde_json::json!({"pt": 24.0}),
+        )
+        .expect("set_text_size");
+        assert!(matches!(m, IncomingMessage::SetTextSize { pt } if (pt - 24.0).abs() < f32::EPSILON));
+        assert!(IncomingMessage::from_jsonrpc("set_text_size", &serde_json::json!({})).is_err());
+        assert!(
+            IncomingMessage::from_jsonrpc("set_text_size", &serde_json::json!({"pt": "24"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_ascii_interchange_paths() {
+        let m = IncomingMessage::from_jsonrpc(
+            "export_ascii",
+            &serde_json::json!({"path": "/tmp/out.typ"}),
+        )
+        .expect("export_ascii");
+        assert!(matches!(m, IncomingMessage::ExportAscii { path } if path == "/tmp/out.typ"));
+        let m = IncomingMessage::from_jsonrpc(
+            "import_ascii",
+            &serde_json::json!({"path": "/tmp/in.typ"}),
+        )
+        .expect("import_ascii");
+        assert!(matches!(m, IncomingMessage::ImportAscii { path } if path == "/tmp/in.typ"));
+        assert!(IncomingMessage::from_jsonrpc("export_ascii", &serde_json::json!({})).is_err());
+        assert!(IncomingMessage::from_jsonrpc("import_ascii", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
     fn parses_page_navigation() {
         let m = IncomingMessage::from_jsonrpc("goto_page", &serde_json::json!({"page": 3}))
             .expect("goto_page");
@@ -548,6 +697,34 @@ mod tests {
         assert!(
             IncomingMessage::from_jsonrpc("goto_page", &serde_json::json!({"page": -1})).is_err()
         );
+    }
+
+    #[test]
+    fn parses_touch_injection_and_rejects_bad_phases_or_positions() {
+        let m = IncomingMessage::from_jsonrpc(
+            "inject_touch",
+            &serde_json::json!({"phase":"down","slot":0,"x":10.5,"y":20}),
+        )
+        .expect("inject_touch");
+        assert!(matches!(
+            m,
+            IncomingMessage::InjectTouch {
+                phase: TouchPhase::Down,
+                slot: 0,
+                x,
+                y,
+            } if (x - 10.5).abs() < f64::EPSILON && (y - 20.0).abs() < f64::EPSILON
+        ));
+        assert!(IncomingMessage::from_jsonrpc(
+            "inject_touch",
+            &serde_json::json!({"phase":"sideways","slot":0,"x":1,"y":2})
+        )
+        .is_err());
+        assert!(IncomingMessage::from_jsonrpc(
+            "inject_touch",
+            &serde_json::json!({"phase":"down","slot":0,"x":"1","y":2})
+        )
+        .is_err());
     }
 
     #[test]
@@ -614,6 +791,13 @@ mod tests {
                 title: "t".into(),
             },
             OutgoingMessage::PageChanged { page: 0 },
+            OutgoingMessage::AsciiExported {
+                path: "/tmp/out.typ".into(),
+            },
+            OutgoingMessage::TextSizeChanged {
+                pt: 20.0,
+                page_count: 3,
+            },
             OutgoingMessage::VoiceResult {
                 block: 0,
                 utterance: "u".into(),
