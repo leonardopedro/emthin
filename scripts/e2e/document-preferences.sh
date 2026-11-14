@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Per-document view, reading, and citation preferences over IPC.
+#
+# The session is re-used instead of started here: `prepare_document_preferences`
+# runs before `start_emthin`, and `document_preferences_checks` runs after the
+# session is up. That lets the fixture put the two documents' preferences in
+# `session.json` before the first load, while the switches themselves go through
+# the real `open_doc` IPC method.
+#
+# No input injection is needed: opening each document, then reading the page and
+# reading size back through `list_state`, exercises the restore path; the saved
+# JSON is checked after each switch so a default overwriting a saved preference
+# cannot hide behind an in-memory value.
+#
+# Sourced by run.sh, so it uses the shared `check`/`log` helpers and does not
+# call `finish`.
+
+PREF_DOC_A="$E2E_RUN/preferences-a.doc"
+PREF_DOC_B="$E2E_RUN/preferences-b.doc"
+PREF_SESSION_JSON="$E2E_RUN/session.json"
+
+# Write the two documents and their distinct preferences. Called before emthin
+# starts, so the first `open_doc` already sees both entries.
+prepare_document_preferences() {
+  mkdir -p "$E2E_RUN"
+  python3 - "$PREF_DOC_A" "$PREF_DOC_B" "$PREF_SESSION_JSON" <<'PY'
+import json
+import sys
+
+doc_a, doc_b, session = sys.argv[1:]
+text = ("Per-document preferences must survive switching files. " * 8 + "\n\n") * 10
+for path in (doc_a, doc_b):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+def key(path):
+    import os
+    return os.path.realpath(path)
+
+payload = {
+    "version": 1,
+    "documents": {
+        key(doc_a): {
+            "view_zoom": 2.0,
+            "view_pan_x": 0.0,
+            "view_pan_y": 24.0,
+            "citation_style": "vancouver",
+            "citation_locale": "de-DE",
+            "current_page": 1,
+            "text_size": 20.0,
+        },
+        key(doc_b): {
+            "view_zoom": 0.75,
+            "view_pan_x": 0.0,
+            "view_pan_y": 0.0,
+            "citation_style": "mla",
+            "citation_locale": "fr-FR",
+            "current_page": 2,
+            "text_size": 14.0,
+        },
+    },
+}
+with open(session, "w", encoding="utf-8") as f:
+    json.dump(payload, f)
+PY
+}
+
+# page reading_size page_count, from the live state notification.
+preference_state() {
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | python3 -c '
+import json, sys
+dec = json.JSONDecoder()
+text = sys.stdin.read()
+i = 0
+while i < len(text):
+    while i < len(text) and text[i] != "{":
+        i += 1
+    if i >= len(text):
+        break
+    try:
+        obj, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    if obj.get("method") == "state":
+        p = obj["params"]
+        page, text_value, count = p["page"], p["text_size"], p["page_count"]
+        zoom, pan_x, pan_y = p["view_zoom"], p["view_pan_x"], p["view_pan_y"]
+        style, locale = p["citation_style"], p["citation_locale"]
+        print(
+            f"{page} {text_value:g} {count} {zoom:g} {pan_x:g} {pan_y:g} "
+            f"{style} {locale}"
+        )
+'
+}
+
+# The saved preference fields, one whitespace-delimited line per document, so a
+# failed restore is visible as a changed value rather than a silent overwrite.
+saved_preferences() {
+  python3 - "$PREF_SESSION_JSON" "$PREF_DOC_A" "$PREF_DOC_B" <<'PY'
+import json
+import os
+import sys
+
+path, doc_a, doc_b = sys.argv[1:]
+with open(path, encoding="utf-8") as f:
+    documents = json.load(f)["documents"]
+
+def fields(path):
+    p = documents.get(os.path.realpath(path), {})
+    print(
+        f"{p.get('view_zoom', 1.0):g} {p.get('citation_style')} "
+        f"{p.get('citation_locale')} {p.get('current_page', 0)} "
+        f"{p.get('text_size', 17.0):g}",
+        end=" ",
+    )
+
+fields(doc_a)
+fields(doc_b)
+print()
+PY
+}
+
+document_preferences_checks() {
+  echo >&2
+  log "per-document preferences: two documents over open_doc"
+
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" open_doc \
+    "{\"path\":\"$PREF_DOC_A\"}" >/dev/null 2>&1
+  sleep "${E2E_SETTLE:-1.5}"
+  local state a_page a_text a_count a_zoom a_pan_x a_pan_y a_style a_locale
+  state="$(preference_state)"
+  read -r a_page a_text a_count a_zoom a_pan_x a_pan_y a_style a_locale <<<"$state"
+  check "document A restores its page" "$a_page" "1"
+  check "document A restores its reading size" "$a_text" "20"
+  check "document A restores its view zoom" "$a_zoom" "2"
+  check "document A restores its citation style" "$a_style" "vancouver"
+  check "document A restores its citation locale" "$a_locale" "de-DE"
+  if [ "${a_count:-0}" -le 2 ]; then
+    warn "the fixture laid out only $a_count page(s); page restore is not distinct"
+  fi
+
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" open_doc \
+    "{\"path\":\"$PREF_DOC_B\"}" >/dev/null 2>&1
+  sleep "${E2E_SETTLE:-1.5}"
+  local b_page b_text b_count b_zoom b_pan_x b_pan_y b_style b_locale
+  state="$(preference_state)"
+  read -r b_page b_text b_count b_zoom b_pan_x b_pan_y b_style b_locale <<<"$state"
+  check "document B restores its page" "$b_page" "2"
+  check "document B restores its reading size" "$b_text" "14"
+  check "document B restores its view zoom" "$b_zoom" "0.75"
+  check "document B restores its citation style" "$b_style" "mla"
+  check "document B restores its citation locale" "$b_locale" "fr-FR"
+  if [ "${b_count:-0}" -le 2 ]; then
+    warn "the fixture laid out only $b_count page(s); page restore is not distinct"
+  fi
+
+  # Returning to A saves B first, then restores A. Waiting past the autosave
+  # boundary makes the persisted values the assertion, not just the in-memory
+  # page/reading size read above.
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" open_doc \
+    "{\"path\":\"$PREF_DOC_A\"}" >/dev/null 2>&1
+  sleep 6
+
+  local a_zoom a_style a_locale a_saved_page a_saved_text
+  local b_zoom b_style b_locale b_saved_page b_saved_text
+  read -r a_zoom a_style a_locale a_saved_page a_saved_text \
+    b_zoom b_style b_locale b_saved_page b_saved_text \
+    <<<"$(saved_preferences)"
+  check "document A keeps its view zoom" "$a_zoom" "2"
+  check "document A keeps its citation style" "$a_style" "vancouver"
+  check "document A keeps its citation locale" "$a_locale" "de-DE"
+  check "document A keeps its saved page" "$a_saved_page" "1"
+  check "document A keeps its saved reading size" "$a_saved_text" "20"
+
+  check "document B keeps its view zoom" "$b_zoom" "0.75"
+  check "document B keeps its citation style" "$b_style" "mla"
+  check "document B keeps its citation locale" "$b_locale" "fr-FR"
+  check "document B keeps its saved page" "$b_saved_page" "2"
+  check "document B keeps its saved reading size" "$b_saved_text" "14"
+
+  # A is still open at 2x, so the page overflows the viewport and a two-finger
+  # drag has somewhere to pan. The injector asserts the live pan changed.
+  local touch_out touch_status
+  touch_out="$(python3 "$PWD/scripts/e2e/touch.py" "$E2E_IPC" 0 -80 2>&1)"
+  touch_status=$?
+  check "two-finger touch pans the zoomed page" "$touch_status" "0"
+  [ -n "$touch_out" ] && log "  $touch_out"
+}
