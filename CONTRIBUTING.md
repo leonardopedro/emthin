@@ -28,10 +28,15 @@ want to exercise emthin end-to-end against real X applications.
 ## Local checks
 
 ```
-cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace
+cargo fmt --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+cargo test --locked --workspace
 ```
+
+The same four commands are the CI gates. `cargo fmt` intentionally omits
+`--all` because that walks the path-dependency closure into sibling
+repositories.
 
 ## Commits & PRs
 

@@ -83,6 +83,11 @@ The `docui`, `figure_render`, `keymap`, `session` and figure-binding
 tests are plain unit tests: they are pure logic over the document and
 need no compositor.
 
+CI also gates `cargo fmt --check`, `cargo clippy --locked --workspace
+--all-targets -- -D warnings`, and `RUSTDOCFLAGS="-D warnings" cargo doc
+--locked --workspace --no-deps --document-private-items`. Run those before
+a PR; a warning in a lint gate is a failed build, not a suggestion.
+
 ### Protocol gates
 
 - `bash scripts/verify-invariants` — the repo's invariant gate

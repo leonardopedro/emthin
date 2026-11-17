@@ -7,8 +7,18 @@ source caret while editing. Moving beyond the source closes its columns and
 continues in the rendered document. Tap an empty document to start writing.
 The shortcut guide can also be tapped on a touchscreen. Typing an
 unescaped `#` creates a fresh marker named using mathed's RFC 1751 word table;
-type `\#` for a literal hash. Text and Loro marks are saved together between
-launches. Press **Tab** to show or hide markers in the document and source;
+type `\#` for a literal hash. IME candidates stay in the source field until
+they are committed, and rendered movement, selection and deletion follow
+mathed's grapheme boundaries. Pages are laid out once on a background worker for
+each document/marker/fold state: page placeholders keep the full document, but
+only the visible page and one neighbour keep bitmaps; distant pages are
+rehydrated from the retained layout on demand. Caret and search overlays only
+repaint, and PNG decoding stays off the UI thread. **A−/A+** change the reading
+size (8–32 pt) and **Zoom−/Zoom+** magnify the page from 1× to 4× with
+horizontal panning; both settings persist. The selection's fixed end and the
+reading position are stored as Loro cursor anchors, so they follow edits and
+survive relaunch. Text and Loro marks are
+saved together between launches. Press **Tab** to show or hide markers in the document and source;
 the columns for the text at the caret open and close with them. The **Tab Show
 markers** shortcut provides the same control on touchscreens.
 
@@ -25,11 +35,19 @@ Hayagriva-formatted citation and bibliography entry. **Ctrl+K** lists citations;
 contain further expandable citations. Tap a collapsed translator or template
 title to expand its code; **Ctrl+L** folds or unfolds the block at the caret.
 On the rendered page, **Shift+arrows** selects text and **Ctrl+A/C/X/V**
-selects all, copies, cuts and pastes. Hidden marker names are omitted from a
-copy and retained when visible text is cut.
+selects all, copies, cuts and pastes. Long-press selects a word through
+mathed's word boundaries and dragging extends it; a contextual
+Copy/Cut/Paste/Select-all bar provides the same touch-only path. Hidden marker
+names are omitted from a copy and retained when visible text is cut. Loaded
+pages expose their text as virtual accessibility nodes in reading order, with
+source-backed bounds and actions for citations, folds and source editing;
+unloaded pages request only their own page when accessibility focus reaches
+them.
 **Ctrl+O** opens a Loro `.mathed` snapshot or UTF-8 Typst source. **Ctrl+S**
-saves a Loro snapshot, including modifier marks; an opened plain text file is
-saved as a new `.mathed` file so its marks are preserved.
+saves a Loro snapshot, including modifier marks; **Ctrl+Shift+S** saves a copy
+without changing the active file. An opened plain text file is saved as a new
+`.mathed` file so its marks are preserved. Saving over a file that changed
+externally offers a copy, an intentional replacement, or cancel.
 
 To use marked text as a modifier, tap the corresponding rendered text. The
 panel below the document shows the
@@ -54,3 +72,8 @@ while the source remains editable.
 
 The Android pad does not yet expose every mathed feature; in particular, this
 interface does not implement its kernel execution and notebook workflows.
+
+The [Android development plan](DEVELOPMENT_PLAN.md) records the current review,
+priorities, and scoped implementation tasks. The [feature specification](FEATURE_SPEC.md)
+defines the selected future behavior; the [sibling study](SIBLING_STUDY.md)
+records its source evidence and adaptation decisions.

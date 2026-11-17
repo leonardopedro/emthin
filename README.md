@@ -211,6 +211,8 @@ future external frontend observe and drive the document. See
 ## Design
 
 - `docs/REWRITE_PLAN.md` — the rewrite design and work breakdown.
+- `docs/collaboration.md` — the collaboration layers and why AT Protocol is
+  reserved for session publication, not live delta transport.
 - `docs/AGENT_LOOP.md` — the LLM debug loop: headless geometry JSON
   (`scripts/agent/preview.sh`), live session driving and screenshots
   (`scripts/agent/live.sh`). Semantic tier first, pixels second.

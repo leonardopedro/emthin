@@ -93,6 +93,22 @@ pub enum IncomingMessage {
     DbusRouterRemoveRule { id: String },
     /// List all current DBus routing rules.
     DbusRouterListRules,
+    /// Ask for this document's current version token, hex encoded.
+    CollabVersion,
+    /// Join a collaborating peer at a version token. The answer is a
+    /// `collab_delta` notification carrying everything the peer missed.
+    CollabJoin { peer: String, version: String },
+    /// Apply a delta frame from a peer. `seq` is that peer's reliable-stream
+    /// sequence number; `delta` is hex encoded.
+    CollabDelta {
+        peer: String,
+        seq: u64,
+        delta: String,
+    },
+    /// Acknowledge every frame through `seq` from `peer`.
+    CollabAck { peer: String, seq: u64 },
+    /// Drop a peer and its reliable stream.
+    CollabLeave { peer: String },
 }
 
 /// Contact phase for [`IncomingMessage::InjectTouch`].
@@ -209,6 +225,16 @@ pub enum OutgoingMessage {
     DbusRouterRuleRemoved {
         id: String,
     },
+    /// A collaboration frame for a peer. `delta` is hex encoded.
+    CollabDelta {
+        peer: String,
+        seq: u64,
+        delta: String,
+    },
+    /// The document's current version token, hex encoded.
+    CollabVersion {
+        version: String,
+    },
     /// A command failed. `code` is the machine-readable reason from the
     /// closed [`IpcErrorCode`] set; `message` is the human detail and is
     /// free to change wording at any time — clients must branch on `code`.
@@ -242,6 +268,8 @@ pub enum IpcErrorCode {
     IoFailed,
     /// `import_ascii` received a file containing non-ASCII bytes.
     NotAscii,
+    /// A collaboration frame or version token could not be applied.
+    CollabFailed,
 }
 
 impl IpcErrorCode {
@@ -254,6 +282,7 @@ impl IpcErrorCode {
             Self::VoiceFailed => "voice_failed",
             Self::IoFailed => "io_failed",
             Self::NotAscii => "not_ascii",
+            Self::CollabFailed => "collab_failed",
         }
     }
 
@@ -268,6 +297,7 @@ impl IpcErrorCode {
             Self::VoiceFailed => "execution_failure",
             Self::IoFailed => "io",
             Self::NotAscii => "malformed_input",
+            Self::CollabFailed => "malformed_input",
         }
     }
 
@@ -291,17 +321,19 @@ impl IpcErrorCode {
             Self::VoiceFailed => "The turn could not be queued (no `\\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry.",
             Self::IoFailed => "The document path could not be read/written — check the path exists and is writable by the compositor's user.",
             Self::NotAscii => "The file is not the ASCII interchange projection. Re-export it with `export_ascii`, or convert its non-ASCII characters, before importing.",
+            Self::CollabFailed => "The collaboration frame or version token is malformed or does not belong to this document. Send a frame produced by the same document's `collab_version`/`collab_delta` exchange; do not reuse one peer's frame for another.",
         }
     }
 
     /// Every code, for the doc-sync test.
-    pub const ALL: [IpcErrorCode; 6] = [
+    pub const ALL: [IpcErrorCode; 7] = [
         Self::NotBound,
         Self::AppGone,
         Self::UnknownFigure,
         Self::VoiceFailed,
         Self::IoFailed,
         Self::NotAscii,
+        Self::CollabFailed,
     ];
 }
 
@@ -408,6 +440,23 @@ impl IncomingMessage {
                 id: params_get_string(params, "id")?,
             },
             "dbus_router_list_rules" => Self::DbusRouterListRules,
+            "collab_version" => Self::CollabVersion,
+            "collab_join" => Self::CollabJoin {
+                peer: params_get_string(params, "peer")?,
+                version: params_get_string(params, "version")?,
+            },
+            "collab_delta" => Self::CollabDelta {
+                peer: params_get_string(params, "peer")?,
+                seq: params_get_u64(params, "seq")?,
+                delta: params_get_string(params, "delta")?,
+            },
+            "collab_ack" => Self::CollabAck {
+                peer: params_get_string(params, "peer")?,
+                seq: params_get_u64(params, "seq")?,
+            },
+            "collab_leave" => Self::CollabLeave {
+                peer: params_get_string(params, "peer")?,
+            },
             other => return Err(format!("unknown IPC method: {other}")),
         })
     }
@@ -448,6 +497,12 @@ fn params_get_usize(params: &serde_json::Value, key: &str) -> Result<usize, Stri
     params[key]
         .as_u64()
         .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| format!("missing/invalid field '{key}'"))
+}
+
+fn params_get_u64(params: &serde_json::Value, key: &str) -> Result<u64, String> {
+    params[key]
+        .as_u64()
         .ok_or_else(|| format!("missing/invalid field '{key}'"))
 }
 
@@ -506,6 +561,8 @@ impl OutgoingMessage {
             Self::DbusRouterRules { .. } => "dbus_router_rules",
             Self::DbusRouterRuleAdded { .. } => "dbus_router_rule_added",
             Self::DbusRouterRuleRemoved { .. } => "dbus_router_rule_removed",
+            Self::CollabDelta { .. } => "collab_delta",
+            Self::CollabVersion { .. } => "collab_version",
             Self::Error { .. } => "error",
         }
     }
@@ -586,6 +643,10 @@ impl OutgoingMessage {
                 "rule": serde_json::to_value(rule).unwrap_or_default(),
             }),
             Self::DbusRouterRuleRemoved { id } => serde_json::json!({"id": id}),
+            Self::CollabDelta { peer, seq, delta } => {
+                serde_json::json!({"peer": peer, "seq": seq, "delta": delta})
+            }
+            Self::CollabVersion { version } => serde_json::json!({"version": version}),
             // N2 (2026-10-13, REAdapt R16): the error notification now
             // carries `category`, `retryable` and `remediation` alongside
             // `code`/`message`. Additive — a client that parses only
@@ -733,6 +794,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_collaboration_frames() {
+        let m = IncomingMessage::from_jsonrpc(
+            "collab_join",
+            &serde_json::json!({"peer": "alice", "version": "0a"}),
+        )
+        .expect("join");
+        assert!(matches!(m, IncomingMessage::CollabJoin { ref peer, .. } if peer == "alice"));
+
+        let m = IncomingMessage::from_jsonrpc(
+            "collab_delta",
+            &serde_json::json!({"peer":"alice","seq":3,"delta":"beef"}),
+        )
+        .expect("delta");
+        assert!(matches!(
+            m,
+            IncomingMessage::CollabDelta { seq: 3, ref peer, .. } if peer == "alice"
+        ));
+
+        let m = IncomingMessage::from_jsonrpc(
+            "collab_ack",
+            &serde_json::json!({"peer":"alice","seq":4}),
+        )
+        .expect("ack");
+        assert!(matches!(m, IncomingMessage::CollabAck { seq: 4, .. }));
+
+        let m = IncomingMessage::from_jsonrpc("collab_leave", &serde_json::json!({"peer":"alice"}))
+            .expect("leave");
+        assert!(matches!(m, IncomingMessage::CollabLeave { .. }));
+
+        assert!(matches!(
+            IncomingMessage::from_jsonrpc("collab_version", &serde_json::json!({})).unwrap(),
+            IncomingMessage::CollabVersion
+        ));
+
+        // A missing or negative sequence is not silently defaulted.
+        assert!(IncomingMessage::from_jsonrpc(
+            "collab_ack",
+            &serde_json::json!({"peer":"alice","seq":-1})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collab_notifications_carry_hex_payloads() {
+        let msg = OutgoingMessage::CollabDelta {
+            peer: "alice".into(),
+            seq: 2,
+            delta: "00ff".into(),
+        };
+        assert_eq!(msg.method_name(), "collab_delta");
+        let json = msg.into_params_value();
+        assert_eq!(json["peer"], "alice");
+        assert_eq!(json["seq"], 2);
+        assert_eq!(json["delta"], "00ff");
+
+        let msg = OutgoingMessage::CollabVersion {
+            version: "0a0b".into(),
+        };
+        assert_eq!(msg.method_name(), "collab_version");
+        assert_eq!(msg.into_params_value()["version"], "0a0b");
+    }
+
+    #[test]
     fn parses_voice_with_optional_text_and_block() {
         let m = IncomingMessage::from_jsonrpc("voice", &serde_json::json!({}))
             .expect("a bare voice turn");
@@ -805,6 +929,14 @@ mod tests {
             },
             OutgoingMessage::XWaylandReady { display: 1 },
             OutgoingMessage::DbusRouterRuleRemoved { id: "i".into() },
+            OutgoingMessage::CollabDelta {
+                peer: "a".into(),
+                seq: 1,
+                delta: "00".into(),
+            },
+            OutgoingMessage::CollabVersion {
+                version: "00".into(),
+            },
             OutgoingMessage::Error {
                 code: IpcErrorCode::VoiceFailed,
                 message: "m".into(),

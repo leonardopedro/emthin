@@ -14,7 +14,7 @@
 //! callback invokes `on_socket_connect`, which removes both sources,
 //! spawns the satellite in a dedicated thread, and transitions to
 //! `Running`. The thread waits for the child to exit, then sends
-//! `ToMain::Rearm` through a [`calloop::channel`] — the main loop's
+//! `ToMain::Rearm` through a `calloop::channel` — the main loop's
 //! handler invokes `on_rearm()`, which drains any pending connections
 //! (anti-busyloop) and re-installs the `Generic` sources.
 //!

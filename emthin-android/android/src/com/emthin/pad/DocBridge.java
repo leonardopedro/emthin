@@ -25,14 +25,45 @@ public final class DocBridge {
 
     public static native String snapshot(long handle);
 
+    /** Raw snapshot bytes captured on the UI thread for recovery/rendering. */
+    public static native byte[] snapshotBytes(long handle);
+
+    /** Open a raw Loro snapshot. Returns zero on invalid data. */
+    public static native long openSnapshotBytes(byte[] snapshot);
+
+    /**
+     * SHA-256 of canonical rich-text content, including every attribute
+     * name/value and excluding Loro history. Empty on an invalid snapshot.
+     * Safe to call on a worker with captured bytes.
+     */
+    public static native String logicalFingerprint(byte[] snapshot);
+
     public static native void free(long handle);
 
     public static native String state(long handle);
+
+    /**
+     * Encodes a stable Loro cursor at a UTF-16 offset. The result contains
+     * the base64 cursor, affinity and UTF-16 fallback; callers bind it to the
+     * current document identity.
+     */
+    public static native String createAnchor(long handle, int offsetUtf16, int side);
+
+    /** Resolves a stable cursor to a grapheme-snapped UTF-16 offset. */
+    public static native int resolveAnchor(long handle, String encoded, int side,
+                                           int fallbackUtf16);
 
     /** Mathed's incremental search, returned as UTF-16 ranges. */
     public static native String search(String text, String query);
 
     public static native int wordBoundary(String text, int caret, int direction);
+
+    /**
+     * Grapheme boundary in UTF-16 units using mathed's UAX #29 rules.
+     * Direction -1 is the previous boundary, 0/1 the containing cluster's
+     * start/end, and 2 the next boundary.
+     */
+    public static native int graphemeBoundary(String text, int offset, int direction);
 
     public static native String mathCompletion(String text, int caret);
 
@@ -90,6 +121,26 @@ public final class DocBridge {
 
     public static native String renderPagesWithSnapshot(String docText, String snapshot,
             int start, int maxPages, float scale, int caretUtf16, int showMarkers, String expanded);
+
+    /**
+     * Compile (or reuse) the one retained worker layout for captured snapshot
+     * bytes. Returns page count, caption position and modifier warnings.
+     * Safe on the render worker; no live model handle is passed.
+     */
+    public static native String prepareLayout(byte[] snapshot, String docText,
+            String layoutId, int showMarkers, String expanded, float textSizePt);
+
+    /**
+     * Rasterize one page from a prepared layout and retain glyph metadata only
+     * for the inclusive page window. Safe on the render worker.
+     */
+    public static native String renderLayoutPage(String layoutId, String docText,
+            int pageIndex, float scale, long pixelLimit,
+            int retainFrom, int retainTo);
+
+    /** Locate a UTF-16 range in a prepared layout without rasterizing pages. */
+    public static native String locateLayoutRange(String layoutId, String docText,
+            int startUtf16, int endUtf16);
 
     /**
      * Compiles a CPS constant-return program with the australVM

@@ -138,6 +138,57 @@ a parallel implementation. `x`/`y` are output-local logical pixels.
 {"jsonrpc":"2.0","method":"inject_touch","params":{"phase":"up","slot":0,"x":450,"y":420}}
 ```
 
+### `collab_version`
+
+Ask for the document's current Loro version token. Answers with
+`collab_version`, whose `version` is hex encoded. A remote peer sends that
+token in `collab_join`; it is opaque and must not be parsed by the client.
+
+```json
+{"jsonrpc":"2.0","method":"collab_version","params":{}}
+```
+
+### `collab_join`
+
+Add a collaborating peer and answer with the delta it is missing. `version`
+is the peer's hex-encoded version token, or `""` for a new peer that needs
+the whole document. The answer is `collab_delta`; `seq` is the first frame
+on that peer's reliable stream. Calling it again for a peer that is already
+joined is a reconnect: the peer's stream restarts at sequence 1 and the
+delta is calculated from the supplied token.
+
+```json
+{"jsonrpc":"2.0","method":"collab_join","params":{"peer":"alice","version":""}}
+```
+
+### `collab_delta`
+
+Apply one delta frame from a peer. `delta` is the hex-encoded Loro delta and
+`seq` is that peer's reliable-stream sequence number. Missing sequence numbers
+are buffered; a duplicate is ignored. Applying a delta may answer with
+`collab_delta` notifications for the other peers.
+
+```json
+{"jsonrpc":"2.0","method":"collab_delta","params":{"peer":"alice","seq":1,"delta":"0a0b"}}
+```
+
+### `collab_ack`
+
+Acknowledge every frame through `seq` for a peer. This releases the retained
+frames; an acknowledgement beyond what was sent is clamped.
+
+```json
+{"jsonrpc":"2.0","method":"collab_ack","params":{"peer":"alice","seq":4}}
+```
+
+### `collab_leave`
+
+Drop a peer and its reliable stream. No reply is emitted.
+
+```json
+{"jsonrpc":"2.0","method":"collab_leave","params":{"peer":"alice"}}
+```
+
 ### `list_state`
 
 Dump the whole document and figure list. Answers with `state`.
@@ -208,6 +259,8 @@ protocol).
 | `dbus_router_rule_added` | a DBus routing rule was added | `id`, `rule` |
 | `dbus_router_rule_removed` | a DBus routing rule was removed | `id` |
 | `dbus_router_rules` | the full routing rule list changed | `rules` |
+| `collab_delta` | a peer has a delta frame to apply, or a local edit must be forwarded | `peer`, `seq`, `delta` (hex) |
+| `collab_version` | reply to `collab_version` | `version` (hex) |
 | `error` | a command failed | `code`, `message`, `category`, `retryable`, `remediation` — the tagged error contract, see [error-contract.md](error-contract.md) |
 
 The three `dbus_router_*` notifications are **unsolicited**: they are emitted
@@ -219,12 +272,12 @@ A `rule` is `{id, priority, destination?, interface?, method?, target}`, where
 `destination` is a glob (`None` is the wildcard) and `target` is `"host"`,
 `"isolated"` or `"deny"`.
 
-`state.figures` is a list of:
-
 `state.text_size` is the reading size in points. `state.view_zoom` and
 `state.view_pan_x` / `view_pan_y` are the presentation-only view transform.
 `state.citation_style` / `citation_locale` are the open popup's overrides, or
 `null` when the document's defaults apply.
+
+`state.figures` is a list of:
 
 ```json
 {

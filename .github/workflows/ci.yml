@@ -73,6 +73,18 @@ jobs:
       - name: rustfmt
         run: cargo fmt --check
 
+      # Lint every target, tests included. CONTRIBUTING and AGENTS both tell
+      # contributors to run this; before this step CI never did, so the
+      # documented gate could rot silently.
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # Public rustdoc is part of the contract: `docs/` explains the
+      # architecture, and stale intra-doc links make the API docs lie. The
+      # workspace has no missing-docs lint, so `-D warnings` is enough.
+      - name: rustdoc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+
       # All three workspace crates, not just the compositor: the plan A14
       # acceptance is "`cargo test -p emthin` plus the clipboard/dbus crate
       # tests". `--locked` keeps CI on the committed Cargo.lock.
@@ -112,16 +124,30 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
 
-      # Same path-dep closure as `test`: emthin-pad → velysterm
-      # (mathed_core, mathed_mini) → unfer (decide_core, pulled in by
-      # mathed_core). dynamic-arctic is not needed: mathed_mini's `kernel`
-      # feature is off here, which drops unfer_consensus.
+      # Same path-dep closure as `test`, plus australVM: emthin-pad →
+      # velysterm (mathed_core, mathed_mini) → unfer (decide_core, pulled in
+      # by mathed_core), and emthin-pad → australVM/safestos/cranelift. The
+      # bridge's selected features (`cedar`, `tier1-rs`) do not pull
+      # dynamic-arctic, so it is not needed here. dynamic-arctic is not part
+      # of this path closure: mathed_mini's `kernel` feature is off here,
+      # which drops unfer_consensus.
       - name: checkout sibling repos (path deps)
         run: |
           git clone --depth 1 --branch main \
             https://github.com/leonardopedro/velysterm.git ../velysterm
           git clone --depth 1 --branch main \
             https://github.com/leonardopedro/unfer.git ../unfer
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/australVM.git ../australVM
+
+      # The A1 acceptance asks for the sibling revisions that produced the
+      # verdict, not just "main". Keep them in the job log so a failure can
+      # be reproduced against the same path-dependency set.
+      - name: record sibling revisions
+        run: |
+          for repo in velysterm unfer australVM; do
+            printf '%s %s\n' "$repo" "$(git -C "../$repo" rev-parse HEAD)"
+          done | tee /tmp/emthin_android_siblings.txt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # Swatinem/rust-cache@v2
         with:
@@ -137,6 +163,11 @@ jobs:
             tail -25 /tmp/emthin_pad_tests.log | sed 's/^/::error::android: /'
             exit 1
           }
+
+      # The A2 ownership coordinators, A3 recovery codec and A4 provider
+      # helpers are plain Java, so these host tests need no Android SDK.
+      - name: Java ownership + recovery + provider tests
+        run: bash emthin-android/test-java.sh
 
   # The §6 step-7 E2E — the only gate that exercises the real session:
   # keystrokes through XTEST, the clipboard proxy both ways, list_state on

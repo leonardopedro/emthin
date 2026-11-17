@@ -88,6 +88,26 @@ pub fn event_loop_tick(state: &mut EmthinState) {
     // --- Clean up destroyed floating dialogs ---
     crate::handlers::dialogs::cleanup_dead_dialogs(state);
 
+    // --- Forward local document changes to collaboration peers ---
+    //
+    // The document revision is the trigger, so this covers keyboard edits,
+    // IPC-driven edits, and splices from the voice/formals workers without
+    // every edit site having to remember the session. A remote import sets
+    // `collab_revision` to the post-import revision, so it is not echoed
+    // back as a local edit on the next tick.
+    match state.collab_local_edit() {
+        Ok(outbound) => {
+            for out in outbound {
+                state.ipc.send(crate::ipc::OutgoingMessage::CollabDelta {
+                    peer: out.peer,
+                    seq: out.seq,
+                    delta: crate::ipc::hex::encode(&out.delta),
+                });
+            }
+        }
+        Err(e) => tracing::warn!("collaboration local edit: {e}"),
+    }
+
     // --- Dispatch incoming IPC messages from the control client ---
     if let Some(msgs) = state.ipc.recv_all() {
         for msg in msgs {

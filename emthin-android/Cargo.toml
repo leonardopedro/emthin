@@ -31,6 +31,10 @@ mathed_mini = { path = "../../velysterm/crates/mathed_mini", default-features = 
 # base64 carries a raster across the JNI string boundary in one value,
 # matching mathed_android's screenshot transport.
 base64 = "0.22"
+# Recovery fingerprints read Loro's full richtext attributes (all names and
+# values), not just mathed's `prop:*` segment marks.
+loro = "1.16"
+sha2 = "0.10"
 unicode-segmentation = "1"
 typst = "0.15"
 typst-layout = "0.15"

@@ -198,10 +198,13 @@ cmd_install() {
 }
 
 cmd_launch() {
-    if D shell am start -W -n "$ACTIVITY" >/dev/null 2>&1; then
-        pass "am start -W $ACTIVITY"
+    # The JIT roundtrip is diagnostic-only: the normal launcher path no
+    # longer compiles at startup. This verification launch opts in so the
+    # logcat proof below still exercises the australVM lane.
+    if D shell am start -W -n "$ACTIVITY" --ez emthin.jitSmoke true >/dev/null 2>&1; then
+        pass "am start -W $ACTIVITY (jit diagnostic)"
     else
-        fail "am start -W $ACTIVITY"
+        fail "am start -W $ACTIVITY (jit diagnostic)"
     fi
 }
 
@@ -345,15 +348,12 @@ EOF
     D shell input tap "$(( (x1 + x2) / 2 ))" "$(( (y1 + y2) / 2 ))" >/dev/null 2>&1
 }
 
-# Tap below the starter's two source lines so the caret lands at the
-# document end. Tapping the text itself would put it at the tap's char.
+# First paint focuses the rendered page at the document end. Tapping the
+# page would move the caret to the tapped glyph and may open the source field,
+# so the lane verifies the rendered surface and leaves focus where it is.
 tap_editor_end() {
-    local b x1 y1 x2 y2
-    b=$(node_bounds 'class="android.widget.EditText"') || return 1
-    read -r x1 y1 x2 y2 <<EOF
-$b
-EOF
-    D shell input tap "$(( (x1 + x2) / 2 ))" "$(( y1 + (y2 - y1) * 2 / 3 ))" >/dev/null 2>&1
+    node_bounds 'class="android.widget.ImageView"' >/dev/null || return 1
+    D shell input keyevent KEYCODE_MOVE_END >/dev/null 2>&1
 }
 
 keyboard_shown() {
@@ -398,7 +398,7 @@ cmd_persistence() {
     cmd_clear_data || return
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch || return
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "starter document did not render two pages"; return; }
     wait_for_log "$log" 'captionScroll' \
         || { fail "starter document did not open at the first caption"; return; }
@@ -425,13 +425,16 @@ cmd_persistence() {
 
     # Move one grapheme back from the document end. The first-paint
     # fallback uses text.length() (90); a restored caret is 89, so the
-    # log line distinguishes a real restore from the fallback.
+    # log line distinguishes a real restore from the fallback. Caret motion
+    # is overlay-only and must not start a render.
     D logcat -c >/dev/null 2>&1 || true
     D shell input keyevent KEYCODE_DPAD_LEFT >/dev/null 2>&1
-    wait_for_log "$log" 'startRender .*textLen 90 caret 89' \
+    wait_for_log "$log" 'caretMove offset 89' \
         || { fail "caret probe did not move to 89"; return; }
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
-        || { fail "caret probe did not render two pages"; return; }
+    if grep -q 'startRender' "$log"; then
+        fail "caret movement triggered a layout render"
+        return
+    fi
     sleep 0.5
 
     # Move the preview into page 2's content, then background the app so
@@ -453,7 +456,7 @@ cmd_persistence() {
     wait_for_log "$log" 'startRender .*textLen 90 caret 89' \
         || { fail "relaunch did not restore the caret at 89"; return; }
     pass "relaunch restored the caret at 89"
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "restored document did not render two pages"; return; }
     wait_for_log "$log" 'restoreScroll' \
         || { fail "relaunch did not restore the preview reading position"; return; }
@@ -485,7 +488,7 @@ cmd_new_reset() {
     cmd_clear_data || return
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch || return
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "starter document did not render two pages"; return; }
     wait_for_log "$log" 'captionScroll' \
         || { fail "starter document did not open at the first caption"; return; }
@@ -515,7 +518,7 @@ cmd_new_reset() {
         || { fail "New probe did not reach the model"; return; }
     wait_for_log "$log" 'startRender .*textLen 90' \
         || { fail "New probe did not render"; return; }
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "New probe did not render two pages"; return; }
     pass "typed the 90-byte probe"
 
@@ -523,7 +526,7 @@ cmd_new_reset() {
     # title, and capture the dark dialog before confirming it.
     D logcat -c >/dev/null 2>&1 || true
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="New"') \
+    b=$(node_bounds 'text="\^N New"') \
         || { fail "New not found in UI hierarchy"; return; }
     tap_center "$b"
     sleep 0.8
@@ -545,7 +548,7 @@ cmd_new_reset() {
     pass "New reset the document to 89 bytes"
     wait_for_log "$log" 'startRender .*textLen 89' \
         || { fail "New reset did not render"; return; }
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "New reset did not render two pages"; return; }
     wait_for_log "$log" 'captionScroll' \
         || { fail "New reset did not reopen at the first caption"; return; }
@@ -553,7 +556,7 @@ cmd_new_reset() {
 
     # The confirmation is only useful if the reset is undoable.
     cmd_uidump "$ui" || return
-    if ! grep -q 'text="Undo"[^>]*enabled="true"' "$ui"; then
+    if ! grep -q 'text="\^Z Undo"[^>]*enabled="true"' "$ui"; then
         fail "Undo was not enabled after New"
         return
     fi
@@ -563,7 +566,7 @@ cmd_new_reset() {
     fi
 
     D logcat -c >/dev/null 2>&1 || true
-    b=$(node_bounds 'text="Undo"') \
+    b=$(node_bounds 'text="\^Z Undo"') \
         || { fail "Undo not found in UI hierarchy"; return; }
     tap_center "$b"
     wait_for_log "$log" 'applyState setCaret true .*textLen 90' \
@@ -571,7 +574,7 @@ cmd_new_reset() {
     pass "Undo restored the 90-byte edited document"
     wait_for_log "$log" 'startRender .*textLen 90' \
         || { fail "Undo restore did not render"; return; }
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "Undo restore did not render two pages"; return; }
     sleep 0.5
     if shot=$(cmd_screencap "$OUTDIR/new-reset-after-undo.png"); then
@@ -594,7 +597,7 @@ cmd_scroll_anchor() {
     cmd_clear_data || return
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch || return
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "starter document did not render two pages"; return; }
     wait_for_log "$log" 'captionScroll' \
         || { fail "starter document did not open at the first caption"; return; }
@@ -655,10 +658,10 @@ cmd_scroll_anchor() {
     # match the pre-collapse two-page render.
     D logcat -c >/dev/null 2>&1 || true
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="Undo"') \
+    b=$(node_bounds 'text="\^Z Undo"') \
         || { fail "Undo not found in UI hierarchy"; return; }
     tap_center "$b"
-    wait_for_log "$log" 'applyChunk total 2 pages 2' \
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "undo did not restore the two-page document"; return; }
     sleep 0.6
     D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"

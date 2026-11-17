@@ -1,7 +1,7 @@
 //! The rendered document: emthin's shell UI.
 //!
 //! Wayland apps are **figures in a rendered document**, like images in
-//! a PDF. The document text is a `mathed_core` [`MathDoc`] holding
+//! a PDF. The document text is a `mathed_core` `MathDoc` holding
 //! hidden markers and `\name(...)` property statements; an `\app`
 //! statement reserves a slot of a given size, and the app bound to it is
 //! composited exactly over that slot after the document is laid out and
@@ -502,7 +502,7 @@ impl DocUi {
     /// hidden markers and statements — the projection is the *rendered*
     /// document, not a second editable source.
     pub fn export_ascii(&self) -> String {
-        ascii_interchange::export(&self.model.text())
+        ascii_interchange::export(self.model.text())
     }
 
     /// Replace the document with an ASCII-only interchange projection.
@@ -1393,6 +1393,7 @@ mod ascii_interchange_tests {
     }
 }
 
+#[cfg(test)]
 mod session_tests {
     use super::*;
     use crate::session::SessionFile;

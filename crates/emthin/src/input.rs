@@ -383,7 +383,6 @@ impl EmthinState {
             crate::ipc::TouchPhase::Up => self.handle_touch_up(slot),
             crate::ipc::TouchPhase::Cancel => self.handle_touch_cancel(slot),
         }
-        self.relayout_document();
         self.needs_redraw = true;
     }
 

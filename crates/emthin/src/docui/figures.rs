@@ -5,10 +5,9 @@
 //! comes from its `\app` statement's literal args; its *actual* rect
 //! comes from `mathed_core::figures::figures_in_frame` on the laid-out
 //! page. This module is the seam between those two plus the compositor:
-//! [`FigureManager::sync`] reconciles them after every re-layout, and
-//! [`FigureManager::claim_toplevel`] binds a freshly mapped client to a
-//! figure (appending a new figure to the document when every existing
-//! one is taken).
+//! [`FigureManager::sync`] reconciles them after every re-layout. Binding a
+//! freshly mapped client to a figure (appending a new figure to the document
+//! when every existing one is taken) lives in `handlers::apps::claim_figure`.
 
 use std::ops::Range;
 

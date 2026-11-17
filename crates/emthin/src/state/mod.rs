@@ -332,6 +332,14 @@ pub struct EmthinState {
     /// stays [`dbus::DbusBridge::default`] (inert) if the host has no
     /// session bus.
     pub dbus: dbus::DbusBridge,
+
+    /// Collaboration peers and presence. The document stays in `doc`;
+    /// the session only tracks peer streams and versions.
+    pub collab: emthin_collab::Session,
+    /// Document revision last offered to the collaboration session, so a
+    /// local edit is forwarded once and a remote import is not echoed back
+    /// as a local edit.
+    pub collab_revision: u64,
 }
 
 impl EmthinState {
@@ -440,6 +448,12 @@ impl EmthinState {
             cursor: cursor::CursorState::default(),
             needs_redraw: true,
             dbus: dbus::DbusBridge::default(),
+            collab: emthin_collab::Session::new(
+                format!("emthin-{}", std::process::id()),
+                "emthin",
+                30_000,
+            ),
+            collab_revision: 0,
         })
     }
 
@@ -495,6 +509,32 @@ impl EmthinState {
             .map_err(|e| format!("failed to init display event source: {e}"))?;
 
         Ok(socket_name)
+    }
+
+    /// Forward local document changes to the collaboration peers.
+    ///
+    /// Called once per tick: the document revision is the trigger, so every
+    /// path that edits the document (keyboard, IPC, a formals/voice splice)
+    /// is covered without each one remembering to notify the session.
+    pub fn collab_local_edit(
+        &mut self,
+    ) -> Result<Vec<emthin_collab::Outbound>, emthin_collab::SessionError> {
+        let revision = self.doc.model().revision();
+        if revision == self.collab_revision {
+            return Ok(Vec::new());
+        }
+        let out = self.collab.local_edit(self.doc.model().math_doc())?;
+        self.collab_revision = revision;
+        Ok(out)
+    }
+
+    /// Mark the current revision as already synchronized after a remote
+    /// import, and rebuild the derived document state around it.
+    pub fn collab_after_remote(&mut self) {
+        self.collab_revision = self.doc.model().revision();
+        self.doc.model_mut().rescan();
+        self.relayout_document();
+        self.needs_redraw = true;
     }
 
     /// Fullscreen geometry for the primary output (logical pixels).

@@ -24,15 +24,17 @@
 pub mod model;
 
 pub mod jit;
+pub mod layout;
 pub mod modifiers;
 
 #[path = "../../crates/emthin/src/docui/citations.rs"]
 pub mod citations;
 
-use jni::objects::{JClass, JString};
-use jni::sys::{jfloat, jint, jlong};
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jbyte, jfloat, jint, jlong};
 use jni::{EnvUnowned, errors};
 use serde_json::{Value, json};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::DocModel;
 
@@ -176,6 +178,85 @@ fn utf16_to_byte(text: &str, utf16: usize) -> usize {
     text.len()
 }
 
+/// Start of the grapheme cluster containing or ending at `byte`.
+fn grapheme_start(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    if byte == 0 {
+        return 0;
+    }
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if byte <= start {
+            return start;
+        }
+        if byte < start + grapheme.len() {
+            return start;
+        }
+    }
+    text.len()
+}
+
+/// End of the grapheme cluster containing or starting at `byte`.
+fn grapheme_end(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    if byte == text.len() {
+        return byte;
+    }
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if byte <= start {
+            return start;
+        }
+        let end = start + grapheme.len();
+        if byte < end {
+            return end;
+        }
+    }
+    text.len()
+}
+
+/// Previous grapheme boundary strictly before `byte`.
+fn previous_grapheme_start(text: &str, byte: usize) -> usize {
+    let mut previous = 0;
+    for (start, _) in text.grapheme_indices(true) {
+        if start >= byte {
+            break;
+        }
+        previous = start;
+    }
+    previous
+}
+
+/// Next grapheme boundary strictly after `byte`.
+fn next_grapheme_end(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if start >= byte {
+            return (start + grapheme.len()).min(text.len());
+        }
+    }
+    text.len()
+}
+
+/// Grapheme boundary in UTF-16 units. `direction` is -1 for the previous
+/// boundary, 0/1 for the start/end of the cluster containing `offset`, and
+/// 2 for the next boundary. The same UAX #29 rules used by `DocModel`
+/// backspace/delete and modifier range snapping are used here.
+fn grapheme_boundary_utf16(text: &str, offset: usize, direction: i32) -> usize {
+    let byte = utf16_to_byte(text, offset);
+    let boundary = match direction {
+        d if d < 0 => {
+            let start = grapheme_start(text, byte);
+            if start == byte { previous_grapheme_start(text, byte) } else { start }
+        }
+        0 => grapheme_start(text, byte),
+        1 => grapheme_end(text, byte),
+        _ => {
+            let end = grapheme_end(text, byte);
+            if end == byte { next_grapheme_end(text, byte) } else { end }
+        }
+    };
+    byte_to_utf16(text, boundary)
+}
+
 /// UTF-8 byte offset → UTF-16 code-unit index.
 fn byte_to_utf16(text: &str, byte: usize) -> usize {
     let byte = byte.min(text.len());
@@ -228,12 +309,11 @@ fn sync_text(m: &mut DocModel, new_text: &str, caret_utf16: usize) {
         while prefix < ob.len() && prefix < nb.len() && ob[prefix] == nb[prefix] {
             prefix += 1;
         }
-        // Equal bytes imply equal boundary structure in both strings,
-        // but a divergence *inside* a multi-byte char leaves `prefix`
-        // mid-char — back off to a boundary shared by both.
-        while prefix > 0 && !(old.is_char_boundary(prefix) && new_text.is_char_boundary(prefix)) {
-            prefix -= 1;
-        }
+        // A byte diff can land inside a multi-byte char or a grapheme
+        // cluster (combining marks, ZWJ emoji). Expand both ends to whole
+        // clusters so a keystroke never leaves half a user-perceived
+        // character behind or splits a surrogate/ZWJ sequence.
+        let start = grapheme_start(&old, prefix).min(grapheme_start(new_text, prefix));
 
         let mut suffix = 0;
         while suffix < ob.len() - prefix
@@ -242,19 +322,17 @@ fn sync_text(m: &mut DocModel, new_text: &str, caret_utf16: usize) {
         {
             suffix += 1;
         }
-        while suffix > 0
-            && !(old.is_char_boundary(ob.len() - suffix)
-                && new_text.is_char_boundary(nb.len() - suffix))
-        {
-            suffix -= 1;
-        }
+        let old_end = grapheme_end(&old, ob.len() - suffix).max(start);
+        let new_end = grapheme_end(new_text, nb.len() - suffix).max(start);
 
-        m.replace(
-            prefix..ob.len() - suffix,
-            &new_text[prefix..nb.len() - suffix],
-        );
+        m.replace(start..old_end, &new_text[start..new_end]);
     }
-    m.set_caret(utf16_to_byte(new_text, caret_utf16));
+    m.set_caret(utf16_to_grapheme_byte(new_text, caret_utf16));
+}
+
+/// UTF-16 index to a UTF-8 byte start snapped to a grapheme boundary.
+fn utf16_to_grapheme_byte(text: &str, utf16: usize) -> usize {
+    grapheme_start(text, utf16_to_byte(text, utf16))
 }
 
 // ----- JNI entry points -----------------------------------------------
@@ -305,6 +383,57 @@ fn model_from_snapshot(encoded: &str, expected: &str) -> Option<DocModel> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
     let model = DocModel::from_snapshot(&bytes).ok()?;
     (model.text() == expected).then_some(model)
+}
+
+/// Canonical UTF-8 bytes for all rich-text content in a Loro snapshot.
+///
+/// Adjacent runs with identical attributes are coalesced and attribute names
+/// are sorted. Every attribute (including `prop:*` and marker-link values) is
+/// included. Loro operation history and view state are not.
+fn canonical_content(snapshot: &[u8]) -> Option<Vec<u8>> {
+    use loro::ToJson as _;
+    let doc = loro::LoroDoc::new();
+    doc.import(snapshot).ok()?;
+    let text = doc.get_text("source");
+    let value = text.get_richtext_value().to_json_value();
+    let deltas = value.as_array()?;
+    let mut runs: Vec<(String, serde_json::Map<String, Value>)> = Vec::new();
+    for delta in deltas {
+        let Some(map) = delta.as_object() else { continue };
+        let insert = map.get("insert").and_then(Value::as_str).unwrap_or("");
+        let mut attrs = serde_json::Map::new();
+        if let Some(original) = map.get("attributes").and_then(Value::as_object) {
+            let mut keys: Vec<&String> = original.keys().collect();
+            keys.sort();
+            for key in keys {
+                attrs.insert(key.clone(), original[key].clone());
+            }
+        }
+        if let Some((last_text, last_attrs)) = runs.last_mut() {
+            if *last_attrs == attrs {
+                last_text.push_str(insert);
+                continue;
+            }
+        }
+        runs.push((insert.to_owned(), attrs));
+    }
+    let canonical: Vec<Value> = runs
+        .into_iter()
+        .map(|(insert, attributes)| {
+            json!({
+                "insert": insert,
+                "attributes": Value::Object(attributes),
+            })
+        })
+        .collect();
+    serde_json::to_vec(&canonical).ok()
+}
+
+/// SHA-256 of [`canonical_content`], as lowercase hex.
+fn logical_fingerprint(snapshot: &[u8]) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let canonical = canonical_content(snapshot)?;
+    Some(format!("{:x}", Sha256::digest(canonical)))
 }
 
 fn search_ranges(text: &str, query: &str) -> Value {
@@ -379,7 +508,12 @@ fn citation_detail(text: &str, number: u64, width: f64, scale: f32) -> Value {
     };
     match body {
         PopupBody::Bibliography { keys, .. } => {
-            match citations::bibliography_detail(text, number) {
+            match citations::bibliography_detail(
+                text,
+                number,
+                None,
+                citations::DEFAULT_CITATION_LOCALE,
+            ) {
                 Ok((citation, entries)) => json!({"kind":"bibliography", "text":citation,
                     "entries":entries, "resolved":true}),
                 Err(error) => json!({"kind":"bibliography", "text":format!("[{}]", keys.join(", ")),
@@ -431,6 +565,16 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_mathCompletion<'local>(
 ) -> JString<'local> {
     unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
         JString::from_str(env, math_completion(&text.to_string(), caret.max(0) as usize).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_graphemeBoundary<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, offset: jint, direction: jint,
+) -> jint {
+    unowned_env.with_env(|_env| -> errors::Result<jint> {
+        Ok(grapheme_boundary_utf16(&text.to_string(), offset.max(0) as usize, direction) as jint)
     }).resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
@@ -563,6 +707,112 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_snapshot<'local>(
             // SAFETY: the handle is owned by the UI thread until onDestroy.
             let bytes = unsafe { model_mut(handle).math_doc().snapshot() };
             JString::from_str(env, base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Capture a stable Loro cursor for a UTF-16 offset. The caller stores the
+/// document identity alongside the encoded position and rejects it elsewhere.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_createAnchor<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    offset_utf16: jint,
+    side: jint,
+) -> JString<'local> {
+    use base64::Engine as _;
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let model = unsafe { model_mut(handle) };
+        let byte = utf16_to_byte(model.text(), offset_utf16.max(0) as usize);
+        let value = match model.math_doc().create_anchor(byte, side) {
+            Some(anchor) => json!({
+                "encoded": base64::engine::general_purpose::STANDARD.encode(anchor.encoded),
+                "side": anchor.side,
+                "fallback": byte_to_utf16(model.text(), anchor.fallback),
+            }),
+            None => json!({"error": "Could not create a stable position"}),
+        };
+        JString::from_str(env, value.to_string())
+    })
+    .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Resolve a stable Loro cursor to a grapheme-snapped UTF-16 offset, or -1 for
+/// an anchor that does not belong to this document.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_resolveAnchor<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    encoded: JString<'local>,
+    side: jint,
+    fallback_utf16: jint,
+) -> jint {
+    use base64::Engine as _;
+    unowned_env.with_env(|_env| -> errors::Result<jint> {
+        let model = unsafe { model_mut(handle) };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.to_string()) else {
+            return Ok(-1);
+        };
+        let fallback = utf16_to_byte(model.text(), fallback_utf16.max(0) as usize);
+        let resolved = model.math_doc().resolve_anchor(&bytes, fallback);
+        let boundary = if side > 0 {
+            grapheme_end(model.text(), resolved)
+        } else {
+            grapheme_start(model.text(), resolved)
+        };
+        Ok(byte_to_utf16(model.text(), boundary) as jint)
+    })
+    .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Capture the live document's snapshot as bytes for recovery/render work.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_snapshotBytes<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JByteArray<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JByteArray<'local>> {
+            // SAFETY: the handle is owned by the UI thread until onDestroy.
+            let bytes = unsafe { model_mut(handle).math_doc().snapshot() };
+            let array = JByteArray::new(env, bytes.len())?;
+            array.set_region(env, 0, bytes.iter().map(|b| *b as jbyte).collect::<Vec<_>>().as_slice())?;
+            Ok(array)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Open a Loro snapshot without a separate text assertion. Zero on invalid data.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_openSnapshotBytes<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    unowned_env
+        .with_env(|env| -> errors::Result<jlong> {
+            let bytes = env.convert_byte_array(&snapshot)?;
+            let model = DocModel::from_snapshot(&bytes).ok();
+            Ok(model.map_or(0, |m| Box::into_raw(Box::new(m)) as jlong))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// SHA-256 of canonical rich-text content, safe to call on a worker.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_logicalFingerprint<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: JByteArray<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let bytes = env.convert_byte_array(&snapshot)?;
+            let fingerprint = logical_fingerprint(&bytes).unwrap_or_default();
+            JString::from_str(env, fingerprint)
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
@@ -938,6 +1188,84 @@ fn render_pages_with_options_expanded(
     Ok(json!({ "total": total, "start": start, "pages": chunk, "warnings": warnings }).to_string())
 }
 
+/// Compile or reuse the one worker-retained layout for this capture and
+/// presentation. Safe off the UI thread; it imports captured snapshot bytes
+/// and never accesses the live model handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_prepareLayout<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: JByteArray<'local>,
+    doc_text: JString<'local>,
+    layout_id: JString<'local>,
+    show_markers: jint,
+    expanded: JString<'local>,
+    text_size: jfloat,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let bytes = env.convert_byte_array(&snapshot)?;
+        let text = doc_text.to_string();
+        let expanded: Vec<(String, String)> =
+            serde_json::from_str(&expanded.to_string()).unwrap_or_default();
+        let result = layout::prepare(&bytes, &text, &layout_id.to_string(), show_markers != 0, &expanded, text_size as f32)
+            .unwrap_or_else(|error| json!({"error": error}));
+        JString::from_str(env, result.to_string())
+    })
+    .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Rasterize one page from the retained layout at the requested density.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_renderLayoutPage<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    layout_id: JString<'local>,
+    doc_text: JString<'local>,
+    page: jint,
+    scale: jfloat,
+    pixel_limit: jlong,
+    retain_from: jint,
+    retain_to: jint,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let result = layout::render_page(
+            &layout_id.to_string(),
+            &doc_text.to_string(),
+            page.max(0) as usize,
+            scale as f32,
+            pixel_limit.max(1) as u64,
+            retain_from.max(0) as usize,
+            retain_to.max(0) as usize,
+        )
+        .unwrap_or_else(|error| json!({"error": error}));
+        JString::from_str(env, result.to_string())
+    })
+    .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Locate a UTF-16 source range in the retained layout without rasterizing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_locateLayoutRange<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    layout_id: JString<'local>,
+    doc_text: JString<'local>,
+    start_utf16: jint,
+    end_utf16: jint,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let result = layout::locate_range(
+            &layout_id.to_string(),
+            &doc_text.to_string(),
+            start_utf16.max(0) as usize,
+            end_utf16.max(0) as usize,
+        )
+        .unwrap_or_else(|error| json!({"error": error}));
+        JString::from_str(env, result.to_string())
+    })
+    .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPagesWithSnapshot<'local>(
     mut unowned_env: EnvUnowned<'local>,
@@ -1021,6 +1349,100 @@ mod tests {
         assert_eq!(typed_marker("\\#", 1), None);
         assert!(typed_marker("\\\\#", 2).is_some());
         assert_eq!(typed_marker("hello", 0), None);
+    }
+
+    fn long_fixture() -> String {
+        (0..90)
+            .map(|i| format!("Paragraph {i}: retained layout keeps the source map and glyph bands.\n\n"))
+            .collect()
+    }
+
+    #[test]
+    fn retained_layout_compiles_once_for_initial_and_later_chunks() {
+        let text = long_fixture();
+        let model = DocModel::new(&text);
+        let snapshot = model.math_doc().snapshot();
+        let prepared = layout::prepare(&snapshot, &text, "retained-a", false, &[], 17.0).unwrap();
+        assert!(prepared["total"].as_u64().unwrap() > 1, "fixture must span pages");
+        let compiles = layout::compiles();
+
+        let first = layout::render_page("retained-a", &text, 0, 1.0, 4_000_000, 0, 1).unwrap();
+        let repeated = layout::render_page("retained-a", &text, 0, 1.0, 4_000_000, 0, 1).unwrap();
+        let later = layout::render_page("retained-a", &text, 1, 1.0, 4_000_000, 0, 1).unwrap();
+        assert_eq!(first["png"], repeated["png"], "page rasters are deterministic");
+        assert!(!later["hits"].as_array().unwrap().is_empty());
+        assert_eq!(compiles, layout::compiles(), "later/repeated raster requests must not compile");
+
+        let independent: Value = serde_json::from_str(&render_pages_with_options_expanded(
+            &text, 0, 1, 1.0, 0, Some(&model), false, true, &[]).unwrap()).unwrap();
+        assert_eq!(first["png"], independent["pages"][0]["png"],
+            "cached and independent rasters agree");
+        let cached_hits = first["hits"].as_array().unwrap();
+        let independent_hits = independent["pages"][0]["hits"].as_array().unwrap();
+        assert_eq!(cached_hits.len(), independent_hits.len(),
+            "cached and independent hit counts agree");
+        for (i, (cached, standalone)) in cached_hits.iter().zip(independent_hits).enumerate() {
+            let cached = cached.as_array().unwrap();
+            let standalone = standalone.as_array().unwrap();
+            assert_eq!(cached[4], standalone[4], "cached/independent hit {i} source offset differs");
+            for axis in 0..4 {
+                let a = cached[axis].as_f64().unwrap();
+                let b = standalone[axis].as_f64().unwrap();
+                assert!((a - b).abs() < 0.01,
+                    "cached/independent hit {i} geometry differs on axis {axis}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn presentation_and_mark_changes_replace_the_retained_layout() {
+        let text = "#a bold #b visible text tail";
+        let mut model = DocModel::new(text);
+        let hidden = layout::prepare(&model.math_doc().snapshot(), text, "retained-hidden", false, &[], 17.0).unwrap();
+        assert!(hidden["total"].as_u64().unwrap() >= 1);
+        let hidden_png = layout::render_page("retained-hidden", text, 0, 1.0, 4_000_000, 0, 0).unwrap()["png"].clone();
+
+        let before_markers = layout::compiles();
+        layout::prepare(&model.math_doc().snapshot(), text, "retained-markers", true, &[], 17.0).unwrap();
+        assert!(layout::compiles() > before_markers, "marker visibility is a layout input");
+        let shown_png = layout::render_page("retained-markers", text, 0, 1.0, 4_000_000, 0, 0).unwrap()["png"].clone();
+        assert_ne!(hidden_png, shown_png);
+
+        let visible = text.find("visible").unwrap();
+        assert!(modifiers::set_link(&mut model, "a", "b", visible..visible + "visible".len(), true));
+        let before_mark = layout::compiles();
+        layout::prepare(&model.math_doc().snapshot(), text, "retained-marks", false, &[], 17.0).unwrap();
+        assert!(layout::compiles() > before_mark, "a marks-only capture recompiles");
+        let marked_png = layout::render_page("retained-marks", text, 0, 1.0, 4_000_000, 0, 0).unwrap()["png"].clone();
+        assert_ne!(hidden_png, marked_png, "a modifier-only change changes its output");
+    }
+
+    #[test]
+    fn retained_layout_locates_a_late_range_without_rasterizing() {
+        let text = long_fixture();
+        let model = DocModel::new(&text);
+        layout::prepare(&model.math_doc().snapshot(), &text, "retained-locate", false, &[], 17.0).unwrap();
+        let target = text.rfind("Paragraph 89").unwrap();
+        let start = byte_to_utf16(&text, target);
+        let located = layout::locate_range("retained-locate", &text, start, start + 2).unwrap();
+        assert_eq!(located["found"], true, "late source range must be locatable: {located}");
+        assert!(located["page"].as_u64().unwrap() > 0, "target belongs on a later page");
+        let page = located["page"].as_u64().unwrap() as usize;
+        let raster = layout::render_page("retained-locate", &text, page, 1.0, 4_000_000, page, page).unwrap();
+        assert!(!raster["hits"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stable_anchors_track_utf16_positions_across_edits() {
+        let mut model = DocModel::new("alpha 👋 target");
+        let target = model.text().find("target").unwrap();
+        let target_utf16 = byte_to_utf16(model.text(), target);
+        let anchor = model.math_doc().create_anchor(target, -1).unwrap();
+        model.insert(0, "new 👋 prefix\n");
+        let resolved = model.math_doc().resolve_anchor(&anchor.encoded, anchor.fallback);
+        assert_eq!(byte_to_utf16(model.text(), resolved),
+                target_utf16 + "new 👋 prefix\n".encode_utf16().count());
+        assert!(model.text().is_char_boundary(resolved));
     }
 
     #[test]
@@ -1170,6 +1592,25 @@ mod tests {
     }
 
     #[test]
+    fn logical_fingerprint_tracks_marks_but_not_snapshot_history() {
+        let mut model = DocModel::new("a👋b");
+        let before = logical_fingerprint(&model.math_doc().snapshot()).unwrap();
+        assert_eq!(before.len(), 64, "lowercase SHA-256 hex");
+        let revision = model.math_doc().revision();
+        model.math_doc_mut().mark_segment(1..5, "prop:bold", "example");
+        model.math_doc_mut().commit();
+        let after = logical_fingerprint(&model.math_doc().snapshot()).unwrap();
+        assert_eq!(model.math_doc().revision(), revision,
+            "a mark-only change must not bump the text revision");
+        assert_ne!(before, after, "all mark attributes contribute to the fingerprint");
+
+        let restored = DocModel::from_snapshot(&model.math_doc().snapshot()).unwrap();
+        assert_eq!(logical_fingerprint(&restored.math_doc().snapshot()).unwrap(), after,
+            "the fingerprint survives snapshot round-trip");
+        assert_eq!(canonical_content(b"not a loro snapshot"), None);
+    }
+
+    #[test]
     fn loro_modifier_changes_the_real_page_raster() {
         let mut model = DocModel::new("#a bold #b hello");
         let at = model.text().find("hello").unwrap();
@@ -1273,6 +1714,8 @@ mod tests {
         assert_eq!(utf16_to_byte("👋", 1), 0);
         assert_eq!(utf16_to_byte("👋", 2), 4);
         assert_eq!(byte_to_utf16("👋", 4), 2);
+        assert_eq!(utf16_to_grapheme_byte("e\u{301}", 1), 0);
+        assert_eq!(utf16_to_grapheme_byte("e\u{301}", 2), "e\u{301}".len());
     }
 
     #[test]
@@ -1334,6 +1777,39 @@ mod tests {
         assert_eq!(m.text(), base, "undo must restore the session base");
         assert!(m.redo(), "redo must re-apply the merged group");
         assert!(m.text().starts_with("undoProbe"));
+    }
+
+    #[test]
+    fn grapheme_boundaries_keep_zwj_combining_and_rtl_clusters_whole() {
+        let family = "x👨‍👩‍👧y";
+        let family_start = 1;
+        let family_end = byte_to_utf16(family, family.find('y').unwrap());
+        assert_eq!(grapheme_boundary_utf16(family, family_start + 2, 1), family_end);
+        assert_eq!(grapheme_boundary_utf16(family, family_end, -1), family_start);
+        assert_eq!(grapheme_boundary_utf16(family, family_end, 2), family_end + 1);
+        let accented = "e\u{301}x";
+        assert_eq!(grapheme_boundary_utf16(accented, 1, -1), 0);
+        assert_eq!(grapheme_boundary_utf16(accented, 1, 1), 2);
+        let rtl = "مرحبا\u{64e}x";
+        let after = byte_to_utf16(rtl, rtl.find('x').unwrap());
+        assert_eq!(grapheme_boundary_utf16(rtl, after - 1, 1), after);
+    }
+
+    #[test]
+    fn sync_expands_edits_to_whole_grapheme_clusters() {
+        let family = "👨‍👩‍👧";
+        let mut m = DocModel::new(family);
+        let without_mother = "👨‍👧";
+        sync_text(&mut m, without_mother, without_mother.encode_utf16().count());
+        assert_eq!(m.text(), without_mother);
+        assert!(m.undo());
+        assert_eq!(m.text(), family, "one undo restores the whole old cluster");
+
+        let mut combining = DocModel::new("e\u{301}x");
+        sync_text(&mut combining, "ex", 1);
+        assert_eq!(combining.text(), "ex");
+        assert!(combining.undo());
+        assert_eq!(combining.text(), "e\u{301}x");
     }
 
     #[test]
@@ -1538,7 +2014,7 @@ mod tests {
         // the root's #101418 (a deliberate, different colour) cannot
         // match. Exactly one occurrence: a renamed call must fail here
         // rather than leave the canvas unpinned.
-        let marker = "pageView.setBackgroundColor(Color.parseColor(\"#";
+        let marker = "page.setBackgroundColor(Color.parseColor(\"#";
         let occurrences = java.matches(marker).count();
         assert_eq!(
             occurrences, 1,
@@ -1581,7 +2057,7 @@ mod tests {
         .expect("MainActivity.java must be readable");
 
         assert!(
-            java.contains("previewPages.addView(pageView, new LinearLayout.LayoutParams("),
+            java.contains("previewPages.addView(page, new LinearLayout.LayoutParams("),
             "the page ImageView must be added with an explicit LayoutParams height (EXACTLY spec)"
         );
         assert!(
@@ -1656,7 +2132,7 @@ mod tests {
             "the first render must use the document end as its caret so the startup preview is collapsed"
         );
         assert!(
-            java.contains("requestChunk(text, 0, caret);"),
+            java.contains("requestChunk(text, 0, caret, \"initial\");"),
             "startRender must pass the first render's parked caret into chunk 0"
         );
     }
@@ -1727,6 +2203,88 @@ mod tests {
         );
     }
 
+    /// A6 wiring guard: page work stays on the render worker, decoding and
+    /// pixel sampling do not run on the main looper, old pages remain until a
+    /// replacement is accepted, and caret overlays do not request a relayout.
+    #[test]
+    fn a6_rendering_uses_a_retained_worker_layout() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+        assert!(java.contains("DocBridge.prepareLayout(")
+                && java.contains("DocBridge.renderLayoutPage(")
+                && java.contains("renderAndDecodeChunk("),
+            "the app must prepare one layout and raster pages from it on the worker");
+        assert!(java.contains("BitmapFactory.decodeByteArray(png, 0, png.length);")
+                && java.contains("decodeMs += (System.nanoTime() - decodeStart)"),
+            "PNG decode and pixel sampling must be counted in worker work");
+        assert!(!java.contains("DocBridge.renderPagesWithSnapshot(text, snapshot"),
+            "the app must use captured snapshot bytes, not the superseded string path");
+        assert!(java.contains("renderPresentationKey()")
+                && !java.contains("renderPresentationKey(caret)"),
+            "the layout key must exclude the caret");
+        let caret_start = java.find("private final class CaretEditText").unwrap();
+        let caret_end = java.find("private final class SourceEditText").unwrap();
+        assert!(!java[caret_start..caret_end].contains("scheduleRender()"),
+            "caret movement must repaint overlays without a layout request");
+        assert!(java.contains("pagesStale = true;")
+                && java.contains("if (pagesStale) return true;")
+                && java.contains("pagesStale = false;"),
+            "old pages must remain visible but reject stale hit positions");
+        assert!(java.contains("if (session.isLatest(owner))")
+                && java.contains("applyChunk(chunk);"),
+            "a superseded worker chunk must not erase the newer frame");
+    }
+
+    /// A8 wiring guard: long-press selection shares the rendered selection
+    /// and clipboard path, and every loaded page exposes source-backed
+    /// virtual text blocks through an AccessibilityNodeProvider.
+    #[test]
+    fn a8_touch_selection_and_virtual_accessibility_are_wired() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+        assert!(java.contains("touchLongPress")
+                && java.contains("selectWordAt(")
+                && java.contains("showSelectionBar();")
+                && java.contains("copyRenderedSelection();")
+                && java.contains("deleteRenderedSelection();")
+                && java.contains("pasteRenderedClipboard();"),
+            "touch selection must use the existing rendered selection and clipboard path");
+        assert!(java.contains("getAccessibilityNodeProvider()")
+                && java.contains("accessibleBlocks(")
+                && java.contains("visibleSource(")
+                && java.contains("AccessibilityAction.ACTION_CLICK")
+                && java.contains("requestPage(index, \"accessible\")"),
+            "rendered pages must expose source-backed virtual text and load on accessibility focus");
+    }
+
+    /// A5 wiring guard: candidates stay in the native field until commit,
+    /// and rendered movement/deletion asks the shared Rust rules for
+    /// grapheme boundaries instead of using Java's char/code-point units.
+    #[test]
+    fn editing_defers_composition_and_uses_native_grapheme_boundaries() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+        assert!(java.contains("DocBridge.graphemeBoundary"),
+            "rendered editing must use mathed's native grapheme rules");
+        assert!(java.contains("boolean isComposing()")
+                && java.contains("finishActiveComposition();")
+                && java.contains("isComposing(editor)"),
+            "composition must be observable and flushed before Save/New/Open");
+        assert!(java.contains("replaceRenderedRange"),
+            "selection replacement must combine removal and insertion");
+        assert!(!java.contains("Character.charCount(Character.codePointAt"),
+            "rendered movement must not use a second code-point boundary rule");
+    }
+
     /// A cold launch rebuilds DocModel from its initial text. Without the
     /// autosave the pad always reopened the starter and every edit was lost
     /// when Android killed the process.
@@ -1739,14 +2297,26 @@ mod tests {
         .expect("MainActivity.java must be readable");
 
         assert!(
-            java.contains("getSharedPreferences(PREFS, MODE_PRIVATE)")
-                && java.contains("getString(PREF_DOC, null)"),
-            "onCreate must load the autosaved document before creating the model"
+            java.contains("recoveryStore = new RecoveryStore(getFilesDir())")
+                && java.contains("recoveryStore.load()")
+                && java.contains("recoveryWorker.execute"),
+            "onCreate must inspect recovery slots on the owned background worker"
         );
         assert!(
-            java.contains(".putString(PREF_DOC, editor.getText().toString())")
-                && java.contains("protected void onPause()"),
-            "edits and onPause must save the editor text"
+            java.contains("DocBridge.openSnapshotBytes(load.best.snapshot)")
+                && java.contains("DocBridge.createFromSnapshot(legacy.snapshot, legacy.text)"),
+            "cold launch must prefer a valid recovery slot and migrate a matching legacy snapshot"
+        );
+        assert!(
+            !java.contains(".putString(PREF_SNAPSHOT,")
+                && !java.contains(".putString(PREF_DOC,"),
+            "document-sized state must not be written back to SharedPreferences"
+        );
+        assert!(
+            java.contains("protected void onPause()")
+                && java.contains("captureRecoveryNow()")
+                && java.contains("captureViewNow()"),
+            "pause must capture recovery and view state for the owned worker"
         );
         assert!(
             java.contains(".putInt(PREF_CARET, Math.max(0, editor.getSelectionStart()))")
@@ -1754,10 +2324,9 @@ mod tests {
             "savePosition must persist the caret and preview reading offset"
         );
         assert!(
-            java.contains("DocBridge.sync(handle, initial, savedCaret)")
-                && java.contains("restoreScrollY = savedScroll")
-                && java.contains("bringPointIntoView(caret)"),
-            "a cold launch must restore the caret, scroll it into view, and restore the reading offset"
+            java.contains("restoreScrollY = scroll")
+                && java.contains("editor.setSelection(Math.min(caret, selection),"),
+            "a cold launch must restore the caret, selection and reading offset"
         );
     }
 }

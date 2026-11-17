@@ -348,8 +348,8 @@ fn turn_lines(speaker: &str, text: &str) -> Vec<String> {
 /// Where to find the harness, and the one turn in flight.
 ///
 /// Construction never probes beyond a `$PATH` scan — the first
-/// [`VoiceBridge::submit`] decides whether the binary is usable, the
-/// same deferral [`super::FormalVerifier`] uses.
+/// [`submit`] decides whether the binary is usable, the same deferral
+/// [`super::FormalVerifier`] uses.
 pub struct VoiceBridge {
     binary: Option<PathBuf>,
     tx: Sender<VoiceEvent>,

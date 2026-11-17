@@ -1027,6 +1027,7 @@ dependencies = [
  "arboard",
  "clap",
  "emthin-clipboard",
+ "emthin-collab",
  "emthin-dbus",
  "hayagriva",
  "libc",
@@ -1055,6 +1056,13 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "x11rb",
+]
+
+[[package]]
+name = "emthin-collab"
+version = "0.1.0"
+dependencies = [
+ "mathed_core",
 ]
 
 [[package]]

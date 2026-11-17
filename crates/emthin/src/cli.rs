@@ -37,7 +37,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_spawn: bool,
 
-    /// Explicit IPC socket path (default: $XDG_RUNTIME_DIR/emthin-<pid>.ipc).
+    /// Explicit IPC socket path (default: `$XDG_RUNTIME_DIR/emthin-<pid>.ipc`).
     #[arg(long)]
     pub ipc_path: Option<std::path::PathBuf>,
 

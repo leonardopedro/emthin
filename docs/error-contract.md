@@ -38,6 +38,7 @@ change — enum variant and doc row — and that is the point.
 | `voice_failed` | execution_failure | yes | The turn could not be queued (no `\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry. | `voice` (and async turn failures spliced into the transcript) |
 | `io_failed` | io | no | The document path could not be read/written — check the path exists and is writable by the compositor's user. | `open_doc`, `save_doc`, `export_ascii`, `import_ascii` |
 | `not_ascii` | malformed_input | no | The file is not the ASCII interchange projection. Re-export it with `export_ascii`, or convert its non-ASCII characters, before importing. | `import_ascii` |
+| `collab_failed` | malformed_input | no | The collaboration frame or version token is malformed or does not belong to this document. Send a frame produced by the same document's `collab_version`/`collab_delta` exchange; do not reuse one peer's frame for another. | `collab_join`, `collab_delta`, `collab_ack` |
 
 Categories are a closed set too: `not_found`, `unavailable`,
 `execution_failure`, `io` (plus `malformed_input` for a rejected

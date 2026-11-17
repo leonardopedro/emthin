@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/emthin", "crates/emthin-clipboard", "crates/emthin-dbus"]
+members = [
+    "crates/emthin",
+    "crates/emthin-clipboard",
+    "crates/emthin-collab",
+    "crates/emthin-dbus",
+]
 # Guard against rust-analyzer's scratch target directory (which it may create
 # under crates/target/rust-analyzer/) being picked up as a workspace member.
 exclude = ["crates/target"]

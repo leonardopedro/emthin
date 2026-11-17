@@ -46,6 +46,16 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
                 .dbus
                 .send_rpc(emthin_dbus::router::BridgeCommand::ListRules);
         }
+        IncomingMessage::CollabVersion => ipc_collab_version(state),
+        IncomingMessage::CollabJoin { peer, version } => ipc_collab_join(state, &peer, &version),
+        IncomingMessage::CollabDelta { peer, seq, delta } => {
+            ipc_collab_delta(state, &peer, seq, &delta)
+        }
+        IncomingMessage::CollabAck { peer, seq } => ipc_collab_ack(state, &peer, seq),
+        IncomingMessage::CollabLeave { peer } => {
+            tracing::debug!("IPC collab_leave {peer}");
+            state.collab.leave(&peer);
+        }
     }
 }
 
@@ -56,6 +66,85 @@ fn error(state: &mut EmthinState, code: IpcErrorCode, message: impl Into<String>
     let message = message.into();
     tracing::warn!("IPC error [{code:?}]: {message}");
     state.ipc.send(OutgoingMessage::Error { code, message });
+}
+
+fn ipc_collab_version(state: &mut EmthinState) {
+    let version = crate::ipc::hex::encode(&state.doc.model().math_doc().version_vector());
+    tracing::debug!("IPC collab_version ({} hex chars)", version.len());
+    state.ipc.send(OutgoingMessage::CollabVersion { version });
+}
+
+fn ipc_collab_join(state: &mut EmthinState, peer: &str, version: &str) {
+    let version = match crate::ipc::hex::decode(version) {
+        Ok(v) => v,
+        Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
+    };
+    let result = if state.collab.has_peer(peer) {
+        state
+            .collab
+            .reconnect(state.doc.model().math_doc(), peer, &version)
+    } else {
+        state
+            .collab
+            .join(state.doc.model().math_doc(), peer, &version)
+    };
+    let out = match result {
+        Ok(out) => out,
+        Err(e) => return error(state, IpcErrorCode::CollabFailed, e.to_string()),
+    };
+    tracing::debug!("IPC collab_join {peer}");
+    state.ipc.send(OutgoingMessage::CollabDelta {
+        peer: out.peer,
+        seq: out.seq,
+        delta: crate::ipc::hex::encode(&out.delta),
+    });
+}
+
+fn ipc_collab_delta(state: &mut EmthinState, peer: &str, seq: u64, delta: &str) {
+    let delta = match crate::ipc::hex::decode(delta) {
+        Ok(delta) => delta,
+        Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
+    };
+    let outcome = {
+        let doc = state.doc.model_mut().math_doc_mut();
+        state.collab.receive(doc, peer, seq, &delta)
+    };
+    // `math_doc_mut` dirtied the model; rebuild the scan even when the
+    // import failed after applying some of the buffered commands.
+    state.doc.model_mut().rescan();
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => return error(state, IpcErrorCode::CollabFailed, e.to_string()),
+    };
+    let outbound = match outcome {
+        emthin_collab::ReceiveOutcome::Applied { outbound, .. } => outbound,
+        emthin_collab::ReceiveOutcome::Duplicate => return,
+        emthin_collab::ReceiveOutcome::Gap { expected } => {
+            tracing::warn!(
+                "collab delta from {peer} arrived at seq {seq} with a gap; expected {expected}"
+            );
+            return;
+        }
+    };
+    tracing::debug!(
+        "IPC collab_delta {peer} seq={seq} ({} forwarded)",
+        outbound.len()
+    );
+    state.collab_after_remote();
+    for out in outbound {
+        state.ipc.send(OutgoingMessage::CollabDelta {
+            peer: out.peer,
+            seq: out.seq,
+            delta: crate::ipc::hex::encode(&out.delta),
+        });
+    }
+}
+
+fn ipc_collab_ack(state: &mut EmthinState, peer: &str, seq: u64) {
+    if let Err(e) = state.collab.ack(peer, seq) {
+        return error(state, IpcErrorCode::CollabFailed, e.to_string());
+    }
+    tracing::debug!("IPC collab_ack {peer} through {seq}");
 }
 
 fn ipc_spawn(state: &mut EmthinState, cmd: &str, args: &[String]) {
@@ -166,6 +255,9 @@ fn ipc_open_doc(state: &mut EmthinState, path: &str) {
     let path = std::path::PathBuf::from(path);
     match state.doc.open_document(&path) {
         Ok(()) => {
+            // The session's peer versions belong to the previous document.
+            state.collab.clear_peers();
+            state.collab_revision = state.doc.model().revision();
             state.relayout_document();
             state.needs_redraw = true;
             tracing::info!("opened document {}", path.display());

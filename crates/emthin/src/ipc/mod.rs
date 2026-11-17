@@ -1,5 +1,6 @@
 mod connection;
 pub mod dispatch;
+pub(crate) mod hex;
 pub mod jsonrpc;
 pub mod messages;
 
