@@ -1,0 +1,12 @@
+[package]
+name = "emthin-collab"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lee <loyalpartner@163.com>"]
+license = "GPL-3.0"
+repository = "https://github.com/emthin/emthin"
+description = "Transport-agnostic reliable command stream for emthin collaboration"
+publish = false
+
+[dependencies]
+mathed_core = { path = "../../../velysterm/crates/mathed_core" }

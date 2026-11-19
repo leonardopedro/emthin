@@ -1,0 +1,13 @@
+[package]
+name = "emthin-core-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lee <loyalpartner@163.com>"]
+license = "GPL-3.0"
+repository = "https://github.com/emthin/emthin"
+description = "Transport-free Herdr Core protocol client for emthin terminal figures"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
