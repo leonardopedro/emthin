@@ -49,9 +49,20 @@ pub struct DocModel {
     /// Selection anchor (the fixed end of a selection). `None` = no
     /// selection.
     anchor: Option<usize>,
-    /// Set by any text mutation; cleared by [`DocModel::take_dirty`]
-    /// once the layout has been rebuilt.
+    /// Set by any content or forced-layout change; cleared by
+    /// [`DocModel::take_dirty`] once the layout has processed it.
     dirty: bool,
+    /// Bumped by every content mutation and forced layout invalidation. The
+    /// caret/selection does not bump it.
+    content_generation: u64,
+}
+
+/// The part of caret/selection state that can change rendered source. Empty
+/// caret ranges are deliberately omitted: moving through prose must not force
+/// a recompile just because the document contains a marker elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevealKey {
+    spans: Vec<Range<usize>>,
 }
 
 impl Default for DocModel {
@@ -72,6 +83,7 @@ impl DocModel {
             caret: 0,
             anchor: None,
             dirty: true,
+            content_generation: 1,
         }
     }
 
@@ -87,6 +99,7 @@ impl DocModel {
             caret: 0,
             anchor: None,
             dirty: true,
+            content_generation: 1,
         })
     }
 
@@ -102,6 +115,7 @@ impl DocModel {
 
     pub fn math_doc_mut(&mut self) -> &mut MathDoc {
         self.dirty = true;
+        self.content_generation = self.content_generation.wrapping_add(1);
         &mut self.doc
     }
 
@@ -132,21 +146,11 @@ impl DocModel {
         self.caret
     }
 
-    /// Whether caret/selection placement can affect the rendered source.
-    fn has_revealable_content(&self) -> bool {
-        !self.scan.markers.is_empty()
-            || !self.scan.stmts.is_empty()
-            || self.text().contains("  ")
-            || !mathed_core::transform::math_span_ranges(self.text()).is_empty()
-    }
-
-    /// Move the caret, collapsing any selection.
+    /// Move the caret, collapsing any selection. This does not dirty the
+    /// content; [`DocModel::reveal_key`] tells the layout whether the move
+    /// actually changes revealed source.
     pub fn set_caret(&mut self, pos: usize) {
-        let pos = pos.min(self.doc.len());
-        if (self.caret != pos || self.anchor.is_some()) && self.has_revealable_content() {
-            self.dirty = true;
-        }
-        self.caret = pos;
+        self.caret = pos.min(self.doc.len());
         self.anchor = None;
     }
 
@@ -155,9 +159,6 @@ impl DocModel {
     pub fn extend_selection_to(&mut self, pos: usize) {
         let pos = pos.min(self.doc.len());
         let anchor = self.anchor.unwrap_or(self.caret);
-        if (self.caret != pos || self.anchor != Some(anchor)) && self.has_revealable_content() {
-            self.dirty = true;
-        }
         self.anchor = Some(anchor);
         self.caret = pos;
     }
@@ -167,9 +168,6 @@ impl DocModel {
     /// caret its start — so drag-selection that goes backwards reads
     /// the same as the forward one.
     pub fn set_selection(&mut self, range: Range<usize>) {
-        if self.has_revealable_content() {
-            self.dirty = true;
-        }
         let end = range.end.min(self.len());
         let start = range.start.min(self.len());
         if start <= end {
@@ -182,9 +180,6 @@ impl DocModel {
     }
 
     pub fn clear_selection(&mut self) {
-        if self.anchor.is_some() && self.has_revealable_content() {
-            self.dirty = true;
-        }
         self.anchor = None;
     }
 
@@ -290,6 +285,13 @@ impl DocModel {
         self.rescan();
     }
 
+    /// Apply a pre-checked batch as one undo step, then rescan once for
+    /// the final text. Used by literal Find/Replace plans.
+    pub fn replace_many(&mut self, ops: Vec<mathed_core::doc::ReplaceOp>) {
+        self.doc.replace_many(ops);
+        self.rescan();
+    }
+
     /// Replace `range` with `text` **without** moving the caret — used
     /// by geometry writes (a figure resize rewriting its `\app` args),
     /// where the caret is about something else entirely.
@@ -340,24 +342,57 @@ impl DocModel {
         self.scan = scan(self.doc.text());
         self.segments = resolve_segments(&self.scan);
         self.dirty = true;
+        self.content_generation = self.content_generation.wrapping_add(1);
     }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// Force the next  to do work, without a text change.
+    /// Monotonic content/layout generation. Caret and selection changes do
+    /// not affect it.
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
+    }
+
+    /// Force the next layout to do work without a text change.
     ///
     /// For changes that invalidate the layout but not the text — today, a
-    /// viewport change, which re-letterboxes every placed rect.
+    /// reading-size change, which reflows every page.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.content_generation = self.content_generation.wrapping_add(1);
     }
 
     /// Consume the dirty flag (the layout cache calls this after a
     /// successful re-layout).
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// The non-empty reveal ranges for the current caret/selection. Sorted and
+    /// deduplicated so ordinary caret movement through prose compares equal.
+    pub fn reveal_key(&self) -> RevealKey {
+        let mut spans: Vec<Range<usize>> = self
+            .reveal_spans()
+            .into_iter()
+            .filter(|range| range.start < range.end)
+            .collect();
+        if let Some(span) = mathed_mini::render::reveal_span_in(&self.scan, &self.segments, self.caret)
+        {
+            spans.push(span);
+        }
+        if let Some(marker) = self
+            .scan
+            .markers
+            .iter()
+            .find(|marker| marker.range.start <= self.caret && self.caret <= marker.range.end)
+        {
+            spans.push(marker.range.clone());
+        }
+        spans.sort_by_key(|range| (range.start, range.end));
+        spans.dedup();
+        RevealKey { spans }
     }
 
     /// The reveal ranges the transform needs for the current caret /
@@ -480,17 +515,52 @@ mod tests {
     }
 
     #[test]
-    fn caret_and_selection_changes_invalidate_the_reveal_layout() {
+    fn caret_and_selection_changes_update_the_reveal_key_without_dirting_content() {
         let mut model = DocModel::new("#a hello #b");
         model.take_dirty();
-        model.set_caret(3);
-        assert!(model.take_dirty());
-        model.extend_selection_to(5);
-        assert!(model.take_dirty());
-        model.clear_selection();
-        assert!(model.take_dirty());
+        model.set_caret(4);
+        let prose = model.reveal_key();
         model.set_caret(5);
+        assert_eq!(
+            model.reveal_key(),
+            prose,
+            "moving within prose does not change the reveal key"
+        );
+        model.set_caret(1);
+        assert!(!model.is_dirty(), "caret motion is not a content edit");
+        let in_marker = model.reveal_key();
+        assert_ne!(in_marker, prose, "entering a marker changes the key");
+        model.extend_selection_to(5);
         assert!(!model.is_dirty());
+        assert_ne!(model.reveal_key(), in_marker, "selection reveals source");
+        model.clear_selection();
+        assert!(!model.is_dirty());
+        assert_eq!(
+            model.reveal_key(),
+            prose,
+            "clearing the selection leaves the caret in prose"
+        );
+        model.set_caret(1);
+        assert_eq!(model.reveal_key(), in_marker);
+    }
+
+    #[test]
+    fn a_stable_anchor_tracks_an_edit_above_it() {
+        let mut model = DocModel::new("alpha target");
+        let target = model.text().find("target").expect("target");
+        let anchor = model
+            .math_doc()
+            .create_anchor(target, -1)
+            .expect("anchor");
+        model.insert(0, "prefix ");
+        let resolved = model
+            .math_doc()
+            .resolve_anchor(&anchor.encoded, anchor.fallback);
+        assert_eq!(
+            &model.text()[resolved..resolved + "target".len()],
+            "target",
+            "the logical caret follows the text it was attached to"
+        );
     }
 
     #[test]

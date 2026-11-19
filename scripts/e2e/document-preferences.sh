@@ -24,12 +24,16 @@ PREF_SESSION_JSON="$E2E_RUN/session.json"
 # starts, so the first `open_doc` already sees both entries.
 prepare_document_preferences() {
   mkdir -p "$E2E_RUN"
+  # The snapshot from the previous run restores that run's document at its page
+  # and autosaves it before the fixture is opened, overwriting session.json. The
+  # fixture is the state under test, so start from no snapshot.
+  rm -f "$E2E_DOC" "$E2E_DOC.lock"
   python3 - "$PREF_DOC_A" "$PREF_DOC_B" "$PREF_SESSION_JSON" <<'PY'
 import json
 import sys
 
 doc_a, doc_b, session = sys.argv[1:]
-text = ("Per-document preferences must survive switching files. " * 8 + "\n\n") * 10
+text = ("Per-document preferences must survive switching files. " * 8 + "\n\n") * 20
 for path in (doc_a, doc_b):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)

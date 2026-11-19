@@ -20,6 +20,7 @@ import android.net.Uri;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.Spannable;
+import android.text.SpannableStringBuilder;
 import android.text.TextWatcher;
 import android.text.style.BackgroundColorSpan;
 import android.text.style.ReplacementSpan;
@@ -33,11 +34,14 @@ import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.HorizontalScrollView;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -45,6 +49,7 @@ import org.json.JSONObject;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -98,6 +103,8 @@ public class MainActivity extends Activity {
     private TextView undoButton;
     private TextView redoButton;
     private TextView markersButton;
+    private TextView saveButton;
+    private TextView navBackButton, navForwardButton;
     private EditText targetsField;
     private String appliedTargetList = "";
     private boolean showMarkers;
@@ -105,15 +112,30 @@ public class MainActivity extends Activity {
     private LinearLayout searchBar;
     private EditText searchField;
     private TextView searchCount;
-    private JSONArray searchMatches = new JSONArray();
-    private int searchCurrent = -1;
-    private int searchOrigin;
+    private TextView findScopeButton;
+    private LinearLayout replaceRow;
+    private LinearLayout findResults;
+    private ScrollView findResultsScroll;
+    private EditText replaceField;
+    private TextView replaceStatus;
+    private TextView replaceAllButton;
+    private FindController find;
+    private boolean replaceVisible;
+    private FindController.Page replacePlan;
+    private String replacePlanText = "";
+    private SearchOrigin searchOriginState;
+    private String findResultsSignature = "";
+    private boolean findScrollPending;
+    /** Selection to restore when the next Undo reverses a replace batch. */
+    private int replaceUndoStart = -1;
+    private int replaceUndoEnd = -1;
     private int selectionAnchor = -1;
     private StableAnchor selectionAnchorStable;
     /** Touch selection state; the long-press timeout may be pending. */
     private LinearLayout selectionBar;
     private RenderedPage touchSelectionPage;
     private int touchSelectionAnchor = -1;
+    private int touchSelectionHandle = -1;
     private float touchDownX, touchDownY;
     private boolean touchSelecting;
     /** Source offset of the virtual accessibility text block with focus. */
@@ -144,6 +166,8 @@ public class MainActivity extends Activity {
     private static final int EXPORT_RECOVERY = 43;
     private static final int SAVE_COPY_DOCUMENT = 44;
     private Uri documentUri;
+    /** Human name of the open source file; survives a source-only Open. */
+    private String documentLabel;
     private boolean documentIsSnapshot = true;
     /** Content identity last written by an explicit Save/Open, not recovery. */
     private String savedFingerprint = "";
@@ -164,6 +188,8 @@ public class MainActivity extends Activity {
     private final PadSession session = new PadSession();
     /** Provider work is independent of view/render ownership. */
     private final ExecutorService fileWorker = Executors.newSingleThreadExecutor();
+    /** Find scans are literal and bounded; they never use the render worker. */
+    private final ExecutorService findWorker = Executors.newSingleThreadExecutor();
     /** The sole recovery/view writer; provider waits cannot block it. */
     private final ExecutorService recoveryWorker = Executors.newSingleThreadExecutor();
     private RecoveryStore recoveryStore;
@@ -199,6 +225,11 @@ public class MainActivity extends Activity {
     private TextView previewError;
     private LinearLayout modifierPanel;
     private LinearLayout modifierRows;
+    private LinearLayout modifierSuggestions;
+    private LinearLayout expandedModifierRow;
+    private int modifierRowGeneration;
+    private final InspectorView.ComparisonCache modifierRowCache =
+            new InspectorView.ComparisonCache();
     private EditText sourceField;
     private TextView mathHint;
     private boolean syncingCaret;
@@ -207,7 +238,18 @@ public class MainActivity extends Activity {
     private JSONArray documentModifierLinks = new JSONArray();
     private JSONArray documentCitations = new JSONArray();
     private JSONArray documentSegments = new JSONArray();
+    private final CitationController citationController = new CitationController();
     private final java.util.LinkedHashMap<String, String[]> expandedSegments = new java.util.LinkedHashMap<>();
+    private final NavigationController navigation = new NavigationController();
+    private static final int NAV_SECTIONS = 0, NAV_DEFINITIONS = 1, NAV_REFERENCES = 2;
+    private int lastNavigateTab = NAV_REFERENCES;
+    private JSONObject documentSemantics = new JSONObject();
+    private JSONArray currentDiagnostics = new JSONArray();
+    private String statusText = "";
+    private int diagnosticCount;
+    private String fixtureText, fixtureModifier, fixtureTargets, fixtureModifier2, fixtureTargets2, fixtureMarker;
+    private String fixtureOpenPath;
+    private boolean fixturePending;
     private String modifierStart;
     private String modifierEnd;
     private int modifierBodyStart;
@@ -316,6 +358,9 @@ public class MainActivity extends Activity {
         inspectorOpen = showMarkers;
         String savedUri = prefs.getString(PREF_DOCUMENT_URI, null);
         if (savedUri != null) documentUri = Uri.parse(savedUri);
+        documentLabel = prefs.getString("documentLabel", null);
+        if (documentLabel == null && documentUri != null)
+            documentLabel = documentUri.getLastPathSegment();
         documentIsSnapshot = prefs.getBoolean(PREF_DOCUMENT_SNAPSHOT, true);
         String rememberedHash = prefs.getString(PREF_DOCUMENT_HASH, "");
         if (rememberedHash != null && !rememberedHash.isEmpty()) {
@@ -324,6 +369,44 @@ public class MainActivity extends Activity {
                     prefs.getLong(PREF_DOCUMENT_MODIFIED, 0));
         }
 
+        // Device-lane fixture hook: only an explicit adb intent supplies these.
+        // It makes the modifier-pair inspector repeatable without IME taps.
+        fixtureText = getIntent().getStringExtra("emthin.fixture");
+        String fixtureB64 = getIntent().getStringExtra("emthin.fixtureB64");
+        if (fixtureB64 != null) {
+            try {
+                fixtureText = new String(Base64.decode(fixtureB64, Base64.DEFAULT),
+                        java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                fixtureText = null;
+            }
+        }
+        fixtureModifier = getIntent().getStringExtra("emthin.fixtureModifier");
+        fixtureTargets = getIntent().getStringExtra("emthin.fixtureTargets");
+        String fixtureTargetsB64 = getIntent().getStringExtra("emthin.fixtureTargetsB64");
+        if (fixtureTargetsB64 != null) {
+            try {
+                fixtureTargets = new String(Base64.decode(fixtureTargetsB64, Base64.DEFAULT),
+                        java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                fixtureTargets = null;
+            }
+        }
+        fixtureModifier2 = getIntent().getStringExtra("emthin.fixtureModifier2");
+        fixtureTargets2 = getIntent().getStringExtra("emthin.fixtureTargets2");
+        String fixtureTargets2B64 = getIntent().getStringExtra("emthin.fixtureTargets2B64");
+        if (fixtureTargets2B64 != null) {
+            try {
+                fixtureTargets2 = new String(Base64.decode(fixtureTargets2B64, Base64.DEFAULT),
+                        java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                fixtureTargets2 = null;
+            }
+        }
+        fixtureMarker = getIntent().getStringExtra("emthin.fixtureMarker");
+        fixtureOpenPath = getIntent().getStringExtra("emthin.fixtureOpenPath");
+        fixturePending = fixtureText != null;
+
         buildUi();
         previewBox.post(new Runnable() {
             @Override public void run() { applyViewZoomWidth(); }
@@ -331,7 +414,7 @@ public class MainActivity extends Activity {
         // The editor exists so the view hierarchy is complete, but it must
         // not accept an edit that recovery is still loading.
         editor.setEnabled(false);
-        status.setText("Restoring document…");
+        setStatus("");
         recoveryStore = new RecoveryStore(getFilesDir());
 
         final int bundleCaret = savedInstanceState != null
@@ -613,8 +696,7 @@ public class MainActivity extends Activity {
                 installRecovered(restored, load.best.metadata, view,
                         bundleDocument, bundleCaret, bundleScroll, bundleScrollWidth);
                 if (!load.bad.isEmpty()) {
-                    status.setText("Recovered an earlier checkpoint · recovery evidence retained"
-                            + saveStateLabel());
+                    setStatus("Recovered an earlier checkpoint · recovery evidence retained");
                 }
                 removeLegacy(prefs());
                 return;
@@ -735,16 +817,19 @@ public class MainActivity extends Activity {
                 : new StableAnchor(metadata.documentId, readingEncoded, readingSide, readingFallback);
         scrollToReadingAnchorAfterChunk = readingAnchorStable != null;
         updateMarkerVisibility();
-        if (showMarkers && markersButton != null) markersButton.setText("Tab Hide markers");
+        refreshActionLabels();
         if (inspectorOpen) updateModifierPanel();
         scheduleRender();
         requestViewWrite(true);
         if (legacyPending) captureRecoveryNow();
+        resetNavigation();
     }
 
     private void installFreshStarter() {
         if (handle != 0) DocBridge.free(handle);
-        handle = DocBridge.create(STARTER);
+        boolean fixture = fixturePending;
+        fixturePending = false;
+        handle = DocBridge.create(fixture && fixtureText != null ? fixtureText : STARTER);
         session.beginDocument();
         recoveryGeneration = 0;
         durableFingerprint = "";
@@ -762,8 +847,63 @@ public class MainActivity extends Activity {
         restoringState = true;
         applyState(DocBridge.state(handle), true);
         restoringState = false;
-        status.setText("New document · unsaved");
+        setStatus("New document");
         captureRecoveryNow();
+        resetNavigation();
+        if (fixture) installModifierFixture();
+        if (fixtureOpenPath != null) {
+            String path = fixtureOpenPath;
+            fixtureOpenPath = null;
+            Uri uri = Uri.fromFile(new java.io.File(path));
+            setDocumentLabel(uri.getLastPathSegment());
+            readDocument(uri, session.capture(PadSession.OPEN, "fixtureOpen"));
+        }
+    }
+
+    /** Test-only hook: link a modifier pair to target pairs and open the inspector. */
+    private void installModifierFixture() {
+        if (fixtureModifier == null || fixtureTargets == null) return;
+        String[] ids = fixtureModifier.trim().split("\\s*,\\s*|\\s+");
+        if (ids.length != 2) return;
+        String result = DocBridge.setMarkerTargets(handle, ids[0], ids[1], fixtureTargets);
+        try {
+            JSONObject state = new JSONObject(result);
+            if (state.has("error")) {
+                trace("fixture", "error", state.optString("error"));
+                return;
+            }
+            if (fixtureModifier2 != null && fixtureTargets2 != null) {
+                String[] incoming = fixtureModifier2.trim().split("\\s*,\\s*|\\s+");
+                if (incoming.length == 2) {
+                    result = DocBridge.setMarkerTargets(handle, incoming[0], incoming[1], fixtureTargets2);
+                    state = new JSONObject(result);
+                    if (state.has("error")) {
+                        trace("fixture", "error", state.optString("error"));
+                        return;
+                    }
+                }
+            }
+            applyState(result, false);
+            int caret = 0;
+            String wanted = fixtureMarker == null ? ids[0] : fixtureMarker;
+            for (int i = 0; i < documentMarkers.length(); i++) {
+                JSONObject marker = documentMarkers.optJSONObject(i);
+                if (marker != null && wanted.equals(marker.optString("id"))) {
+                    caret = marker.optInt("end", 0);
+                    break;
+                }
+            }
+            inspectorOpen = true;
+            wholeDocumentEditing = false;
+            editor.setSelection(caret);
+            inspectorSignature = "";
+            updateModifierPanel();
+            focusSourceCaret();
+            trace("fixture", "modifier", fixtureModifier, "targets", fixtureTargets,
+                    "caret", caret);
+        } catch (Exception e) {
+            trace("fixture", "error", e.toString());
+        }
     }
 
     private void offerTextOnlyRecovery(Legacy legacy, java.util.List<RecoveryStore.BadSlot> bad) {
@@ -785,7 +925,7 @@ public class MainActivity extends Activity {
                         long restored = DocBridge.create(legacy.text);
                         installRecovered(restored, legacyMetadata(legacy.text), java.util.Collections.emptyMap(),
                                 null, -1, -1, 0);
-                        status.setText("Recovered text without marks · original snapshot retained · unsaved");
+                        setStatus("Recovered text without marks · original snapshot retained");
                     }
                 })
                 .setNeutralButton("Export snapshot", new DialogInterface.OnClickListener() {
@@ -811,7 +951,7 @@ public class MainActivity extends Activity {
 
     private void showRecoveryChoice(RecoveryStore.Load load, Legacy legacy) {
         editor.setEnabled(false);
-        status.setText("Recovery needs a choice");
+        setStatus("Recovery needs a choice");
         java.io.ByteArrayOutputStream export = new java.io.ByteArrayOutputStream();
         for (RecoveryStore.BadSlot bad : load.bad) {
             if (bad.raw == null) continue;
@@ -958,7 +1098,7 @@ public class MainActivity extends Activity {
         if (!recoveryReady || handle == 0 || recoveryStore == null) return;
         byte[] snapshot = DocBridge.snapshotBytes(handle);
         if (snapshot == null || snapshot.length > RecoveryCodec.MAX_SNAPSHOT) {
-            status.setText("Recovery cannot be updated: document exceeds 32 MiB");
+            setStatus("Recovery cannot be updated: document exceeds 32 MiB");
             failCheckpoint();
             return;
         }
@@ -1007,7 +1147,7 @@ public class MainActivity extends Activity {
                 return;
             }
             if (!gone) {
-                status.setText("Recovery failed: " + failure);
+                setStatus("Recovery failed: " + failure);
                 if (legacyPending) fileMessage("Recovery could not be updated; old data is retained.");
                 failCheckpoint();
             }
@@ -1020,7 +1160,7 @@ public class MainActivity extends Activity {
         removeLegacy(prefs());
         if (gone) return;
         if (checkpointAction == null && recoveryOwed == null)
-            status.setText("Recovered · durable" + saveStateLabel());
+            setStatus("Recovered · durable");
         if (recoveryOwed != null) {
             RecoveryCapture next = recoveryOwed;
             recoveryOwed = null;
@@ -1173,7 +1313,9 @@ public class MainActivity extends Activity {
         // Invalidate first: a result already posted to `main` must not touch
         // this view while the native handle is being freed.
         session.dispose();
+        if (find != null) find.cancel();
         renderWork.close();
+        findWorker.shutdown();
         main.removeCallbacks(renderNow);
         main.removeCallbacks(updateModifierComparisons);
         main.removeCallbacks(recoveryNow);
@@ -1200,56 +1342,22 @@ public class MainActivity extends Activity {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
 
-        TextView newButton = shortcut("^N New", new Runnable() {
-            @Override public void run() { confirmNewDocument(); }
-        });
-        undoButton = shortcut("^Z Undo", new Runnable() {
-            @Override public void run() { applyState(DocBridge.undo(handle), true); }
-        });
-        redoButton = shortcut("^Y Redo", new Runnable() {
-            @Override public void run() { applyState(DocBridge.redo(handle), true); }
-        });
-        markersButton = shortcut(showMarkers ? "Tab Hide markers" : "Tab Show markers", new Runnable() {
-            @Override public void run() { toggleMarkers(); }
-        });
-        TextView close = shortcut("Esc Close", new Runnable() {
-            @Override public void run() { closeInspector(); }
-        });
-        bar.addView(newButton);
-        bar.addView(undoButton);
-        bar.addView(redoButton);
-        bar.addView(shortcut("^O Open", new Runnable() {
-            @Override public void run() { chooseDocument(); }
-        }));
-        bar.addView(shortcut("^S Save", new Runnable() {
-            @Override public void run() { saveToDocument(); }
-        }));
-        bar.addView(shortcut("^⇧S Copy", new Runnable() {
-            @Override public void run() { saveCopyToDocument(); }
-        }));
-        bar.addView(shortcut("^F Find", new Runnable() {
-            @Override public void run() { openSearch(); }
-        }));
-        bar.addView(shortcut("^K Cites", new Runnable() {
-            @Override public void run() { showCitations(0); }
-        }));
-        bar.addView(shortcut("^L Fold", new Runnable() {
-            @Override public void run() { toggleFoldAt(editor.getSelectionStart(), false); }
-        }));
-        bar.addView(markersButton);
-        bar.addView(shortcut("A−", new Runnable() {
-            @Override public void run() { changeReadingSize(-1f); }
-        }));
-        bar.addView(shortcut("A+", new Runnable() {
-            @Override public void run() { changeReadingSize(1f); }
-        }));
-        bar.addView(shortcut("Zoom−", new Runnable() {
-            @Override public void run() { changeViewZoom(-0.5f); }
-        }));
-        bar.addView(shortcut("Zoom+", new Runnable() {
-            @Override public void run() { changeViewZoom(0.5f); }
-        }));
-        bar.addView(close);
+        for (final ActionCatalog.Id action : ActionCatalog.TOOLBAR) {
+            TextView button = shortcut(ActionCatalog.label(action, showMarkers, false),
+                    new Runnable() {
+                        @Override public void run() { runAction(action); }
+                    });
+            switch (action) {
+                case UNDO: undoButton = button; break;
+                case REDO: redoButton = button; break;
+                case SAVE: saveButton = button; break;
+                case MARKERS: markersButton = button; break;
+                case NAV_BACK: navBackButton = button; button.setEnabled(false); break;
+                case NAV_FORWARD: navForwardButton = button; button.setEnabled(false); break;
+                default: break;
+            }
+            bar.addView(button);
+        }
         HorizontalScrollView shortcuts = new HorizontalScrollView(this);
         shortcuts.setHorizontalScrollBarEnabled(false);
         shortcuts.addView(bar);
@@ -1282,13 +1390,15 @@ public class MainActivity extends Activity {
         root.addView(selectionBar, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         searchBar = new LinearLayout(this);
-        searchBar.setOrientation(LinearLayout.HORIZONTAL);
+        searchBar.setOrientation(LinearLayout.VERTICAL);
         searchBar.setVisibility(View.GONE);
+        LinearLayout searchQueryRow = new LinearLayout(this);
+        searchQueryRow.setOrientation(LinearLayout.HORIZONTAL);
         searchField = new EditText(this);
         searchField.setSingleLine(true);
         searchField.setTextColor(Color.parseColor("#E6EDF3"));
         searchField.setHintTextColor(Color.parseColor("#8796A5"));
-        searchField.setHint("Find · Enter accept · ^S next · ^R previous · Esc cancel");
+        searchField.setHint("Find · Enter accept · ^S next here · ^R previous · Esc cancel");
         searchField.setContentDescription("Find in document");
         searchField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         searchField.setImeOptions(EditorInfo.IME_ACTION_DONE);
@@ -1299,22 +1409,80 @@ public class MainActivity extends Activity {
         });
         searchField.setOnEditorActionListener(new TextView.OnEditorActionListener() {
             @Override public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
-                if (actionId == EditorInfo.IME_ACTION_DONE) { closeSearch(false); return true; }
+                if (actionId == EditorInfo.IME_ACTION_DONE) { acceptFind(); return true; }
                 return false;
             }
         });
-        searchBar.addView(searchField, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-        searchBar.addView(shortcut("^R Prev", new Runnable() {
-            @Override public void run() { moveSearch(-1); }
-        }));
-        searchBar.addView(shortcut("^S Next", new Runnable() {
-            @Override public void run() { moveSearch(1); }
-        }));
-        searchBar.addView(shortcut("Enter", new Runnable() {
-            @Override public void run() { closeSearch(false); }
-        }));
+        searchQueryRow.addView(searchField, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        findScopeButton = shortcut("Text", new Runnable() {
+            @Override public void run() { cycleFindScope(); }
+        });
+        findScopeButton.setContentDescription("Search scope: Text");
+        searchQueryRow.addView(findScopeButton);
         searchCount = panelLabel("");
-        searchBar.addView(searchCount);
+        searchQueryRow.addView(searchCount);
+        searchBar.addView(searchQueryRow);
+
+        LinearLayout searchNavRow = new LinearLayout(this);
+        searchNavRow.setOrientation(LinearLayout.HORIZONTAL);
+        searchNavRow.addView(shortcut("^R Prev", new Runnable() {
+            @Override public void run() { moveFind(-1); }
+        }));
+        searchNavRow.addView(shortcut(ActionCatalog.label(ActionCatalog.Id.FIND_NEXT,
+                false, true), new Runnable() {
+            @Override public void run() { runAction(ActionCatalog.Id.FIND_NEXT); }
+        }));
+        searchNavRow.addView(shortcut("Enter Accept", new Runnable() {
+            @Override public void run() { acceptFind(); }
+        }));
+        searchNavRow.addView(shortcut("Esc Cancel", new Runnable() {
+            @Override public void run() { closeSearch(true); }
+        }));
+        searchNavRow.addView(shortcut("Replace…", new Runnable() {
+            @Override public void run() { toggleReplaceRow(); }
+        }));
+        searchBar.addView(searchNavRow);
+
+        replaceRow = new LinearLayout(this);
+        replaceRow.setOrientation(LinearLayout.HORIZONTAL);
+        replaceRow.setVisibility(View.GONE);
+        replaceField = new EditText(this);
+        replaceField.setSingleLine(true);
+        replaceField.setTextColor(Color.parseColor("#E6EDF3"));
+        replaceField.setHintTextColor(Color.parseColor("#8796A5"));
+        replaceField.setHint("Replace with literal text");
+        replaceField.setContentDescription("Replacement text");
+        replaceField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        replaceField.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                if (replacePlan != null) {
+                    clearReplacePlan();
+                    replaceStatus.setText("");
+                }
+            }
+        });
+        replaceRow.addView(replaceField, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        replaceRow.addView(shortcut("Replace", new Runnable() {
+            @Override public void run() { replaceCurrent(); }
+        }));
+        replaceAllButton = shortcut("Replace all…", new Runnable() {
+            @Override public void run() { previewOrApplyReplaceAll(); }
+        });
+        replaceRow.addView(replaceAllButton);
+        replaceStatus = panelLabel("");
+        replaceStatus.setVisibility(View.GONE);
+        searchBar.addView(replaceRow);
+        searchBar.addView(replaceStatus);
+
+        findResultsScroll = new ScrollView(this);
+        findResultsScroll.setVisibility(View.GONE);
+        findResults = new LinearLayout(this);
+        findResults.setOrientation(LinearLayout.VERTICAL);
+        findResultsScroll.addView(findResults);
+        searchBar.addView(findResultsScroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(150)));
         root.addView(searchBar);
         status = new TextView(this);
         status.setTextColor(Color.parseColor("#9BA7B4"));
@@ -1593,10 +1761,12 @@ public class MainActivity extends Activity {
 
     private void rememberDocument(Uri uri, boolean snapshot, ProviderIo.Stamp stamp) {
         documentUri = uri;
+        documentLabel = uri.getLastPathSegment();
         documentIsSnapshot = snapshot;
         fileStamp = stamp;
         SharedPreferences.Editor edit = prefs().edit()
                 .putString(PREF_DOCUMENT_URI, uri.toString())
+                .putString("documentLabel", documentLabel)
                 .putBoolean(PREF_DOCUMENT_SNAPSHOT, snapshot);
         if (stamp != null && stamp.known()) {
             edit.putString(PREF_DOCUMENT_HASH, stamp.sha256)
@@ -1619,6 +1789,18 @@ public class MainActivity extends Activity {
                 .remove(PREF_DOCUMENT_SIZE)
                 .remove(PREF_DOCUMENT_MODIFIED)
                 .apply();
+        // Keep documentLabel: a source-only Open has no save URI until Save,
+        // but the status line should still name the file that was opened.
+    }
+
+    private void clearDocumentLabel() {
+        documentLabel = null;
+        prefs().edit().remove("documentLabel").apply();
+    }
+
+    private void setDocumentLabel(String label) {
+        documentLabel = label;
+        prefs().edit().putString("documentLabel", label).apply();
     }
 
     private void readDocument(final Uri uri, PadSession.Owner pickerOwner) {
@@ -1654,10 +1836,10 @@ public class MainActivity extends Activity {
             if (!op.copy && !activeFile.copy && op.uri.equals(activeFile.uri)
                     && "save".equals(op.kind) && "save".equals(activeFile.kind)) {
                 owedFileSave = op;
-                status.setText("Save queued · the newest capture will be written");
+                setStatus("Save queued · the newest capture will be written");
             } else if (waitingFile == null) {
                 waitingFile = op;
-                status.setText("Waiting for the current file operation…");
+                setStatus("Waiting for the current file operation…");
             } else {
                 fileMessage("Another file operation is already waiting; try again when it finishes.");
             }
@@ -1668,9 +1850,9 @@ public class MainActivity extends Activity {
 
     private void startFileOperation(final FileOperation op) {
         activeFile = op;
-        status.setText("save".equals(op.kind)
-                ? (op.copy ? "Saving copy…" : "Saving document…")
-                : "Opening document…");
+        setStatus("save".equals(op.kind)
+                ? (op.copy ? "Writing copy…" : "Writing snapshot…")
+                : "Opening file…");
         main.removeCallbacks(showFileCancel);
         main.postDelayed(showFileCancel, 1000);
         op.future = fileWorker.submit(new Runnable() {
@@ -1701,8 +1883,10 @@ public class MainActivity extends Activity {
                 finishFileOperation(op, new Runnable() {
                     @Override public void run() {
                         if (error != null) {
-                            if (session.sameDocument(op.owner))
+                            if (session.sameDocument(op.owner)) {
+                                setStatus("Open failed · recovery retained");
                                 fileMessage("Could not open document: " + error);
+                            }
                             return;
                         }
                         openDownloaded(op, data, fingerprint, contentHash, modified);
@@ -1716,6 +1900,7 @@ public class MainActivity extends Activity {
                                 String contentHash, long modified) {
         if (handle == 0 || !session.sameDocument(op.owner)) return;
         if (op.originalSnapshot == null || !op.originalSnapshot.equals(DocBridge.snapshot(handle))) {
+            setStatus("Open cancelled · document changed");
             fileMessage("Document changed while opening; open it again.");
             return;
         }
@@ -1727,6 +1912,7 @@ public class MainActivity extends Activity {
                 || (fileName != null && fileName.toLowerCase(java.util.Locale.ROOT).endsWith(".mathed"));
         if (!snapshot) {
             if (snapshotRequired) {
+                setStatus("Open failed · malformed snapshot");
                 fileMessage("Could not open this document: malformed .mathed snapshot.");
                 return;
             }
@@ -1734,11 +1920,13 @@ public class MainActivity extends Activity {
                 String text = ProviderIo.decodeUtf8(bytes);
                 next = DocBridge.create(text);
             } catch (java.nio.charset.CharacterCodingException e) {
+                setStatus("Open failed · invalid UTF-8");
                 fileMessage("Could not open this document: invalid UTF-8.");
                 return;
             }
         }
         if (next == 0) {
+            setStatus("Open failed · recovery retained");
             fileMessage("Could not open this document.");
             return;
         }
@@ -1753,6 +1941,7 @@ public class MainActivity extends Activity {
                         || op.originalSnapshot == null
                         || !op.originalSnapshot.equals(DocBridge.snapshot(handle))) {
                     DocBridge.free(opened);
+                    setStatus("Open cancelled · document changed");
                     fileMessage("Document changed while opening; open it again.");
                     return;
                 }
@@ -1773,7 +1962,9 @@ public class MainActivity extends Activity {
                     unsaved = false;
                 } else {
                     // A plain source file has no marks. Keep it unsaved and
-                    // require Save to create a .mathed snapshot.
+                    // require Save to create a .mathed snapshot, but preserve
+                    // the opened file's name in the status line.
+                    setDocumentLabel(op.uri.getLastPathSegment());
                     forgetDocument();
                     savedFingerprint = "";
                     unsaved = true;
@@ -1782,6 +1973,7 @@ public class MainActivity extends Activity {
                 restoringState = true;
                 applyState(DocBridge.state(handle), true);
                 restoringState = false;
+                resetNavigation();
                 fileMessage(snapshot ? "Document opened"
                         : "Source imported; Save creates a .mathed document");
             }
@@ -1902,13 +2094,14 @@ public class MainActivity extends Activity {
             startWaitingFileOperation();
             return;
         }
-        status.setText("Starting queued file operation…");
+        setStatus("Starting queued file operation…");
         startFileOperation(next);
     }
 
     private void saveSucceeded(FileOperation op, ProviderIo.Stamp stamp, String fingerprint) {
         if (!session.sameDocument(op.owner)) return;
         if (op.copy) {
+            setStatus("Copy saved · active document unchanged");
             fileMessage("Copy saved · active document unchanged");
             return;
         }
@@ -1921,7 +2114,7 @@ public class MainActivity extends Activity {
         unsaved = !clean;
         captureRecoveryNow();
         if (clean) {
-            status.setText("Document saved · durable");
+            setStatus("Document saved · durable");
             fileMessage("Document saved");
         } else {
             fileMessage("An earlier revision was saved; newer edits remain unsaved.");
@@ -1931,10 +2124,12 @@ public class MainActivity extends Activity {
     private void saveFailed(FileOperation op, String error) {
         if (!session.sameDocument(op.owner)) return;
         if (op.copy) {
+            setStatus("Copy failed · active document unchanged");
             fileMessage("Could not save copy: " + error + ". The active file and recovery are unchanged.");
             return;
         }
         unsaved = true;
+        setStatus("Save failed · recovery retained");
         fileMessage("Could not save document: " + error + ". Recovery is retained.");
         new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
                 .setTitle("Save failed")
@@ -1999,7 +2194,7 @@ public class MainActivity extends Activity {
             activeFile = null;
             main.removeCallbacks(showFileCancel);
             dismissFileCancel();
-            status.setText("save".equals(op.kind)
+            setStatus("save".equals(op.kind)
                     ? "Write cancelled · the destination may have changed · recovery retained"
                     : "Open cancelled · recovery retained");
         }
@@ -2043,6 +2238,7 @@ public class MainActivity extends Activity {
         }
         finishActiveComposition();
         forgetDocument();
+        clearDocumentLabel();
         session.beginDocument();
         renderWork.clearPending();
         expandedSegments.clear();
@@ -2064,6 +2260,7 @@ public class MainActivity extends Activity {
         restoringState = true;
         applyState(DocBridge.sync(handle, STARTER, 0), true);
         restoringState = false;
+        resetNavigation();
         // Run the initial render now, so a quick Undo cannot inherit the
         // first-paint caret/scroll special case meant for this replacement.
         main.removeCallbacks(renderNow);
@@ -2292,6 +2489,55 @@ public class MainActivity extends Activity {
             return (float) (getWidth() / Math.max(1.0, widthPt));
         }
 
+        /** Screen-space point for the start (0) or end (1) selection handle. */
+        private float[] selectionHandlePoint(int which) {
+            if (selectionAnchor < 0 || editor == null
+                    || selectionAnchor == editor.getSelectionStart()) return null;
+            int begin = Math.min(selectionAnchor, editor.getSelectionStart());
+            int end = Math.max(selectionAnchor, editor.getSelectionStart());
+            JSONArray chosen = null;
+            int chosenPos = which == 0 ? Integer.MAX_VALUE : -1;
+            for (int i = 0; i < hits.length(); i++) {
+                JSONArray hit = hits.optJSONArray(i);
+                if (hit == null) continue;
+                int pos = hit.optInt(4, -1);
+                if (pos < begin || pos >= end) continue;
+                if (which == 0 ? pos < chosenPos : pos > chosenPos) {
+                    chosen = hit;
+                    chosenPos = pos;
+                }
+            }
+            if (chosen == null) return null;
+            float factor = pointScale();
+            float x = (float) (which == 0 ? chosen.optDouble(0) : chosen.optDouble(2)) * factor;
+            float bottom = (float) chosen.optDouble(3) * factor;
+            return new float[] {x, bottom};
+        }
+
+        /** Which handle is under a local touch, or -1. */
+        int selectionHandleAt(float x, float y) {
+            float[] start = selectionHandlePoint(0);
+            float[] end = selectionHandlePoint(1);
+            float radius = dp(24);
+            if (start != null && Math.hypot(x - start[0], y - start[1] - dp(8)) <= radius) return 0;
+            if (end != null && Math.hypot(x - end[0], y - end[1] - dp(8)) <= radius) return 1;
+            return -1;
+        }
+
+        private void drawSelectionHandles(Canvas canvas) {
+            Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            paint.setColor(Color.parseColor("#B3CFE4"));
+            paint.setStyle(Paint.Style.FILL);
+            float radius = dp(7);
+            for (int which = 0; which < 2; which++) {
+                float[] point = selectionHandlePoint(which);
+                if (point == null) continue;
+                float y = point[1] + dp(8);
+                canvas.drawRect(point[0] - dp(1), point[1], point[0] + dp(1), y, paint);
+                canvas.drawCircle(point[0], y, radius, paint);
+            }
+        }
+
         private final android.view.accessibility.AccessibilityNodeProvider provider =
                 new android.view.accessibility.AccessibilityNodeProvider() {
             @Override public android.view.accessibility.AccessibilityNodeInfo
@@ -2461,6 +2707,7 @@ public class MainActivity extends Activity {
                                 (float) hit.optDouble(2) * factor,
                                 (float) hit.optDouble(3) * factor, selected);
                 }
+                drawSelectionHandles(canvas);
             }
             if (searchBar != null && searchBar.getVisibility() == View.VISIBLE) {
                 Paint highlight = new Paint();
@@ -2469,16 +2716,20 @@ public class MainActivity extends Activity {
                     JSONArray hit = hits.optJSONArray(i);
                     if (hit == null) continue;
                     int pos = hit.optInt(4, -1);
-                    int lo = 0, hi = searchMatches.length();
+                    if (find == null) continue;
+                    FindController.Match[] matches = find.pageMatches();
+                    int lo = 0, hi = matches.length;
                     while (lo < hi) {
                         int mid = (lo + hi) >>> 1;
-                        if (searchMatches.optJSONArray(mid).optInt(1) <= pos) lo = mid + 1;
+                        if (matches[mid].end <= pos) lo = mid + 1;
                         else hi = mid;
                     }
-                    if (lo < searchMatches.length()) {
-                        JSONArray match = searchMatches.optJSONArray(lo);
-                        if (match != null && pos >= match.optInt(0) && pos < match.optInt(1)) {
-                            highlight.setColor(lo == searchCurrent ? 0x887DBB55 : 0x66898920);
+                    if (lo < matches.length) {
+                        FindController.Match match = matches[lo];
+                        if (pos >= match.start && pos < match.end) {
+                            int global = find.pageStart() + lo;
+                            highlight.setColor(global == find.currentGlobal()
+                                    ? 0x887DBB55 : 0x66898920);
                             canvas.drawRect((float) hit.optDouble(0) * factor,
                                     (float) hit.optDouble(1) * factor,
                                     (float) hit.optDouble(2) * factor,
@@ -2584,20 +2835,136 @@ public class MainActivity extends Activity {
         focusRenderedCaret();
     }
 
+    private boolean findVisible() {
+        return searchBar != null && searchBar.getVisibility() == View.VISIBLE;
+    }
+
+    private boolean searchTextHasFocus() {
+        View focus = getCurrentFocus();
+        if (!(focus instanceof EditText)) return false;
+        for (View view = focus; view != null; ) {
+            if (view == searchBar) return true;
+            android.view.ViewParent parent = view.getParent();
+            view = parent instanceof View ? (View) parent : null;
+        }
+        return false;
+    }
+
+    private boolean imeActive(View view) {
+        if (view == null) return false;
+        android.view.inputmethod.InputMethodManager ime =
+                (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        return ime != null && ime.isActive(view);
+    }
+
+    private void hideIme(View view) {
+        if (view == null) return;
+        android.view.inputmethod.InputMethodManager ime =
+                (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (ime != null) ime.hideSoftInputFromWindow(view.getWindowToken(), 0);
+    }
+
+    private void refreshActionLabels() {
+        if (markersButton != null)
+            markersButton.setText(ActionCatalog.label(ActionCatalog.Id.MARKERS,
+                    showMarkers, findVisible()));
+        if (saveButton != null)
+            saveButton.setText(ActionCatalog.label(ActionCatalog.Id.SAVE,
+                    showMarkers, findVisible()));
+    }
+
+    /** One implementation for every toolbar button and its advertised key. */
+    private boolean runAction(ActionCatalog.Id action) {
+        switch (action) {
+            case NEW: confirmNewDocument(); break;
+            case UNDO: applyUndo(); break;
+            case REDO: applyState(DocBridge.redo(handle), true); break;
+            case OPEN: chooseDocument(); break;
+            case SAVE: saveToDocument(); break;
+            case SAVE_COPY: saveCopyToDocument(); break;
+            case FIND: openSearch(); break;
+            case FIND_REPLACE:
+                openSearch();
+                if (!replaceVisible) toggleReplaceRow();
+                break;
+            case FIND_NEXT: moveFind(1); break;
+            case FIND_PREVIOUS: moveFind(-1); break;
+            case NAVIGATE_LAST: showNavigate(lastNavigateTab); break;
+            case NAVIGATE_REFERENCES: showNavigate(NAV_REFERENCES); break;
+            case NAVIGATE_SECTIONS: showNavigate(NAV_SECTIONS); break;
+            case NAV_BACK: navigateBack(); break;
+            case NAV_FORWARD: navigateForward(); break;
+            case FOLD: toggleFoldAt(editor.getSelectionStart(), false); break;
+            case MARKERS: toggleMarkers(); break;
+            case READING_SMALLER: changeReadingSize(-1f); break;
+            case READING_LARGER: changeReadingSize(1f); break;
+            case ZOOM_OUT: changeViewZoom(-0.5f); break;
+            case ZOOM_IN: changeViewZoom(0.5f); break;
+            case CLOSE_INSPECTOR: closeInspector(); break;
+            default: return false;
+        }
+        return true;
+    }
+
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                && event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+            if (findVisible()) {
+                View focused = getCurrentFocus();
+                if (searchTextHasFocus() && imeActive(focused)) {
+                    // Let the first Back dismiss the IME; the next one cancels Find.
+                    focused.clearFocus();
+                    if (searchField != null) searchField.clearFocus();
+                    if (replaceField != null) replaceField.clearFocus();
+                    // Use the query field's token, the same target that the
+                    // working Close/Escape path uses for this overlay.
+                    hideIme(searchField);
+                } else {
+                    closeSearch(true);
+                }
+                return true;
+            }
+            if (inspectorOpen) {
+                if (sourceField != null && sourceField.hasFocus() && imeActive(sourceField)) {
+                    sourceField.clearFocus();
+                    hideIme(sourceField);
+                    focusRenderedCaret();
+                } else {
+                    closeInspector();
+                }
+                return true;
+            }
+        }
         if (event.getAction() == KeyEvent.ACTION_DOWN && searchBar != null
                 && searchBar.getVisibility() == View.VISIBLE) {
             if (event.getKeyCode() == KeyEvent.KEYCODE_ESCAPE) { closeSearch(true); return true; }
-            if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) { closeSearch(false); return true; }
-            if (event.isCtrlPressed() && event.getKeyCode() == KeyEvent.KEYCODE_S) { moveSearch(1); return true; }
-            if (event.isCtrlPressed() && event.getKeyCode() == KeyEvent.KEYCODE_R) { moveSearch(-1); return true; }
+            if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) { acceptFind(); return true; }
+            if (event.isCtrlPressed() && event.getKeyCode() == KeyEvent.KEYCODE_S)
+                return runAction(ActionCatalog.Id.FIND_NEXT);
+            if (event.isCtrlPressed() && event.getKeyCode() == KeyEvent.KEYCODE_R)
+                return runAction(ActionCatalog.Id.FIND_PREVIOUS);
+        }
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                && event.getKeyCode() == KeyEvent.KEYCODE_F3) {
+            if (findVisible())
+                runAction(event.isShiftPressed()
+                        ? ActionCatalog.Id.FIND_PREVIOUS : ActionCatalog.Id.FIND_NEXT);
+            else openSearch(lastFindQuery(), event.isShiftPressed());
+            return true;
         }
         if (pagesStale && getCurrentFocus() instanceof RenderedPage) {
             // The old frame remains visible, but its hit/source mapping is for
             // a superseded capture. Reject edits until the replacement chunk
             // is accepted instead of mutating through stale positions.
             return true;
+        }
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.isAltPressed()
+                && !(getCurrentFocus() instanceof EditText)) {
+            if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_LEFT)
+                return runAction(ActionCatalog.Id.NAV_BACK);
+            if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_RIGHT)
+                return runAction(ActionCatalog.Id.NAV_FORWARD);
         }
         if (event.getAction() == KeyEvent.ACTION_DOWN && !event.isCtrlPressed() && !event.isAltPressed()) {
             int code = event.getKeyCode();
@@ -2708,89 +3075,213 @@ public class MainActivity extends Activity {
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
             if (event.isCtrlPressed()) {
                 switch (event.getKeyCode()) {
-                    case KeyEvent.KEYCODE_N: confirmNewDocument(); return true;
-                    case KeyEvent.KEYCODE_Z: applyState(DocBridge.undo(handle), true); return true;
-                    case KeyEvent.KEYCODE_Y: applyState(DocBridge.redo(handle), true); return true;
-                    case KeyEvent.KEYCODE_O: chooseDocument(); return true;
+                    case KeyEvent.KEYCODE_N: return runAction(ActionCatalog.Id.NEW);
+                    case KeyEvent.KEYCODE_Z: return runAction(ActionCatalog.Id.UNDO);
+                    case KeyEvent.KEYCODE_Y: return runAction(ActionCatalog.Id.REDO);
+                    case KeyEvent.KEYCODE_O: return runAction(ActionCatalog.Id.OPEN);
                     case KeyEvent.KEYCODE_S:
-                        if (event.isShiftPressed()) saveCopyToDocument();
-                        else saveToDocument();
-                        return true;
-                    case KeyEvent.KEYCODE_F: openSearch(); return true;
-                    case KeyEvent.KEYCODE_R: if (event.isShiftPressed()) { openSearch(); return true; } break;
-                    case KeyEvent.KEYCODE_K: showCitations(0); return true;
-                    case KeyEvent.KEYCODE_L: toggleFoldAt(editor.getSelectionStart(), false); return true;
+                        return runAction(ActionCatalog.ctrlS(findVisible(),
+                                event.isShiftPressed()));
+                    case KeyEvent.KEYCODE_F: return runAction(ActionCatalog.Id.FIND);
+                    case KeyEvent.KEYCODE_H: return runAction(ActionCatalog.Id.FIND_REPLACE);
+                    case KeyEvent.KEYCODE_R:
+                        if (event.isShiftPressed()) return runAction(ActionCatalog.Id.FIND);
+                        break;
+                    case KeyEvent.KEYCODE_K:
+                        return runAction(ActionCatalog.Id.NAVIGATE_REFERENCES);
+                    case KeyEvent.KEYCODE_G:
+                        return runAction(ActionCatalog.Id.NAVIGATE_SECTIONS);
+                    case KeyEvent.KEYCODE_L: return runAction(ActionCatalog.Id.FOLD);
                 }
                 if (event.getKeyCode() >= KeyEvent.KEYCODE_1 && event.getKeyCode() <= KeyEvent.KEYCODE_9) {
                     showCitations(event.getKeyCode() - KeyEvent.KEYCODE_1 + 1);
                     return true;
                 }
             } else if (event.getKeyCode() == KeyEvent.KEYCODE_ESCAPE && inspectorOpen) {
-                closeInspector();
-                return true;
+                return runAction(ActionCatalog.Id.CLOSE_INSPECTOR);
             }
         }
         if (event.getKeyCode() == KeyEvent.KEYCODE_TAB && !event.isCtrlPressed()
                 && !event.isAltPressed()) {
             if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-                toggleMarkers();
+                runAction(ActionCatalog.Id.MARKERS);
             }
             return true;
         }
         return super.dispatchKeyEvent(event);
     }
 
-    private void openSearch() {
+    /** Everything Find must restore when it is cancelled. */
+    private static final class SearchOrigin {
+        final int caretStart, caretEnd, scrollY;
+        final StableAnchor reading;
+        final int readingFallback;
+        final java.util.LinkedHashMap<String, String[]> folds;
+        final boolean inspector;
+
+        SearchOrigin(int caretStart, int caretEnd, int scrollY, StableAnchor reading,
+                     int readingFallback, java.util.LinkedHashMap<String, String[]> folds,
+                     boolean inspector) {
+            this.caretStart = caretStart;
+            this.caretEnd = caretEnd;
+            this.scrollY = scrollY;
+            this.reading = reading;
+            this.readingFallback = readingFallback;
+            this.folds = folds;
+            this.inspector = inspector;
+        }
+    }
+
+    private void ensureFind() {
+        if (find != null) return;
+        find = new FindController(new FindController.SearchFn() {
+            @Override public FindController.Page search(FindController.Request request) throws Exception {
+                String scope = request.scope == FindController.SCOPE_SOURCE ? "source"
+                        : request.scope == FindController.SCOPE_SELECTION ? "selection" : "text";
+                JSONObject o = new JSONObject(DocBridge.searchScoped(request.text, request.query,
+                        scope, request.selectionStart, request.selectionEnd, request.anchor,
+                        request.pageStart, request.pageSize, request.includeAll ? 1 : 0));
+                if (o.has("error")) {
+                    return new FindController.Page(0, 0, 0, 0, 0,
+                            new FindController.Match[0], o.getString("error"));
+                }
+                trace("findScope", "scope", scope, "query", request.query,
+                        "total", o.optInt("total"), "replaceable", o.optInt("replaceable"));
+                JSONArray array = o.optJSONArray("matches");
+                FindController.Match[] matches = new FindController.Match[
+                        array == null ? 0 : array.length()];
+                for (int i = 0; i < matches.length; i++) {
+                    JSONObject match = array.getJSONObject(i);
+                    matches[i] = new FindController.Match(match.getInt("start"),
+                            match.getInt("end"), match.optBoolean("protected"));
+                }
+                return new FindController.Page(o.optInt("total"), o.optInt("replaceable"),
+                        o.optInt("protected"), o.optInt("first"),
+                        o.optInt("pageStart"), matches, null);
+            }
+        }, findWorker, new java.util.concurrent.Executor() {
+            @Override public void execute(Runnable command) { main.post(command); }
+        }, new FindController.Listener() {
+            @Override public void onFindChanged() {
+                renderFindState();
+                if (find != null && !find.isLoading()) showCurrentFindMatch();
+            }
+        });
+    }
+
+    private void openSearch() { openSearch("", false); }
+
+    private void openSearch(String initialQuery, boolean previous) {
         if (handle == 0) return;
+        ensureFind();
         if (searchBar.getVisibility() != View.VISIBLE) {
-            searchOrigin = editor.getSelectionStart();
+            rememberReadingAnchor();
+            searchOriginState = new SearchOrigin(editor.getSelectionStart(), editor.getSelectionEnd(),
+                    previewScroll.getScrollY(), readingAnchorStable, readingAnchorFallback,
+                    new java.util.LinkedHashMap<>(expandedSegments), inspectorOpen);
+            find.open(editor.getText().toString(), editor.getSelectionStart(),
+                    editor.getSelectionStart(), editor.getSelectionEnd());
             if (inspectorOpen) closeInspector();
             searchBar.setVisibility(View.VISIBLE);
+            replaceVisible = false;
+            replaceRow.setVisibility(View.GONE);
+            replaceStatus.setVisibility(View.GONE);
+            replaceStatus.setText("");
+            replaceField.setText("");
+            replacePlan = null;
+            replacePlanText = "";
+            findResultsSignature = "";
             searchField.setText("");
-            searchMatches = new JSONArray();
-            searchCurrent = -1;
             searchCount.setText("");
+            renderFindState();
         }
+        if (!initialQuery.isEmpty()) {
+            searchField.setText(initialQuery);
+            searchField.setSelection(initialQuery.length());
+            if (previous) {
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        if (find != null && !find.isLoading()) find.previous(editor.getText().toString());
+                    }
+                });
+            }
+        }
+        refreshActionLabels();
         searchField.requestFocus();
     }
 
     private void updateSearch() {
-        if (handle == 0 || searchBar.getVisibility() != View.VISIBLE) return;
-        try {
-            searchMatches = new JSONArray(DocBridge.search(editor.getText().toString(), searchField.getText().toString()));
-            searchCurrent = -1;
-            for (int i = 0; i < searchMatches.length(); i++) {
-                if (searchMatches.getJSONArray(i).getInt(0) >= searchOrigin) { searchCurrent = i; break; }
-            }
-            if (searchCurrent < 0 && searchMatches.length() > 0) searchCurrent = 0;
-            showSearchMatch();
-        } catch (Exception e) { searchCount.setText("Search unavailable"); }
-    }
-
-    private void moveSearch(int direction) {
-        int count = searchMatches.length();
-        if (count == 0) return;
-        searchCurrent = (searchCurrent + direction + count) % count;
-        showSearchMatch();
-    }
-
-    private void showSearchMatch() {
-        if (searchCurrent < 0) {
-            searchCount.setText(searchField.length() == 0 ? "" : "No matches");
+        if (handle == 0 || searchBar.getVisibility() != View.VISIBLE || find == null) return;
+        String query = searchField.getText().toString();
+        String text = editor.getText().toString();
+        if (!find.query().equals(query)) {
+            replacePlan = null;
+            replacePlanText = "";
+            findResultsSignature = "";
+            resetReplaceButton();
+            find.queryChanged(text, query);
         } else {
-            JSONArray match = searchMatches.optJSONArray(searchCurrent);
-            if (match != null) setDocumentCaret(match.optInt(0));
-            searchCount.setText((searchCurrent + 1) + " / " + searchMatches.length());
-            scrollSearchMatch();
+            find.documentChanged(text);
         }
-        invalidateRenderedCaret();
     }
 
-    private void scrollSearchMatch() {
-        if (searchCurrent < 0 || searchBar.getVisibility() != View.VISIBLE) return;
-        final int target = searchMatches.optJSONArray(searchCurrent).optInt(0);
+    private void clearReplacePlan() {
+        replacePlan = null;
+        replacePlanText = "";
+        resetReplaceButton();
+    }
+
+    private void resetReplaceButton() {
+        if (replaceAllButton != null) replaceAllButton.setText("Replace all…");
+    }
+
+    private void moveFind(int direction) {
+        if (find == null || find.total() == 0) return;
+        if (direction < 0) find.previous(editor.getText().toString());
+        else find.next(editor.getText().toString());
+    }
+
+    private void cycleFindScope() {
+        if (find == null) return;
+        int next = find.scope() == FindController.SCOPE_TEXT ? FindController.SCOPE_SOURCE
+                : find.scope() == FindController.SCOPE_SOURCE ? FindController.SCOPE_SELECTION
+                : FindController.SCOPE_TEXT;
+        if (next == FindController.SCOPE_SELECTION && !find.selectionAvailable()) {
+            next = FindController.SCOPE_TEXT;
+        }
+        clearReplacePlan();
+        find.setScope(editor.getText().toString(), next);
+        findResultsSignature = "";
+        renderFindState();
+    }
+
+    private void showCurrentFindMatch() {
+        if (find == null || searchBar.getVisibility() != View.VISIBLE) return;
+        FindController.Match match = find.currentMatch();
+        if (match == null) {
+            findScrollPending = false;
+            invalidateRenderedCaret();
+            return;
+        }
+        clearSelectionAnchor();
+        editor.setSelection(match.start, match.end);
+        if (match.start < match.end) setSelectionAnchor(match.start);
+        invalidateRenderedCaret();
+        if (find.scope() == FindController.SCOPE_SOURCE && match.protectedRange) {
+            findScrollPending = false;
+            searchCount.setText(find.status() + " \u00b7 Accept opens source");
+            return;
+        }
+        revealFoldAt(match.start);
+        scrollFindMatch(match);
+    }
+
+    private void scrollFindMatch(FindController.Match match) {
+        if (searchBar.getVisibility() != View.VISIBLE) return;
+        final int target = match.start;
         CaretSpot spot = caretSpot(target);
         if (spot.page != null && spot.distance == 0) {
+            findScrollPending = false;
             final RenderedPage page = spot.page;
             final JSONArray hit = spot.hit;
             page.post(new Runnable() {
@@ -2804,20 +3295,326 @@ public class MainActivity extends Activity {
                 }
             });
         } else {
+            findScrollPending = true;
             locatePage(target, "search");
         }
     }
 
+    /** Reveal the innermost collapsed segments containing an accepted match. */
+    private void revealFoldAt(int offset) {
+        boolean changed = false;
+        for (int i = 0; i < documentSegments.length(); i++) {
+            JSONObject segment = documentSegments.optJSONObject(i);
+            if (segment == null) continue;
+            JSONArray span = segment.optJSONArray("span");
+            if (span == null || span.length() != 2) continue;
+            if (offset < span.optInt(0) || offset > span.optInt(1)) continue;
+            String key = segment.optString("startId") + "\u0000" + segment.optString("endId");
+            if (expandedSegments.containsKey(key)) continue;
+            expandedSegments.put(key, new String[] {segment.optString("startId"),
+                    segment.optString("endId")});
+            changed = true;
+        }
+        if (changed) scheduleRender();
+    }
+
+    private void acceptFind() {
+        if (find == null || find.currentMatch() == null) {
+            closeSearch(false);
+            return;
+        }
+        FindController.Match match = find.currentMatch();
+        boolean source = find.scope() == FindController.SCOPE_SOURCE && match.protectedRange;
+        rememberFindQuery();
+        recordAcceptedFind(match.start, match.end, source);
+        closeSearch(false);
+        if (source) openSourceAt(match.start, match.end);
+    }
+
+    private void rememberFindQuery() {
+        if (find == null || find.query().isEmpty()) return;
+        prefs().edit().putString("findQuery:" + session.documentId(), find.query()).apply();
+    }
+
+    private String lastFindQuery() {
+        return prefs().getString("findQuery:" + session.documentId(), "");
+    }
+
+    private void openSourceAt(int start, int end) {
+        openSourceAt(start, end, true);
+    }
+
+    private void openSourceAt(int start, int end, boolean wholeDocument) {
+        if (inspectorOpen) closeInspector();
+        clearSelectionAnchor();
+        editor.setSelection(Math.max(0, start), Math.max(0, end));
+        inspectorOpen = true;
+        wholeDocumentEditing = wholeDocument;
+        inspectorSignature = "";
+        updateModifierPanel();
+        focusSourceCaret();
+        if (sourceField != null) {
+            int a = Math.max(0, start - modifierBodyStart);
+            int b = Math.max(a, end - modifierBodyStart);
+            sourceField.setSelection(Math.min(a, sourceField.length()),
+                    Math.min(b, sourceField.length()));
+        }
+    }
+
+    private void restoreSearchOrigin() {
+        SearchOrigin origin = searchOriginState;
+        if (origin == null) return;
+        editor.setSelection(origin.caretStart, origin.caretEnd);
+        if (origin.caretStart < origin.caretEnd) setSelectionAnchor(origin.caretStart);
+        else clearSelectionAnchor();
+        boolean foldsChanged = !expandedSegments.equals(origin.folds);
+        expandedSegments.clear();
+        expandedSegments.putAll(origin.folds);
+        readingAnchorStable = origin.reading;
+        readingAnchorFallback = origin.readingFallback;
+        if (foldsChanged) {
+            scrollToReadingAnchorAfterChunk = origin.reading != null;
+            scheduleRender();
+            if (!scrollToReadingAnchor()) previewScroll.scrollTo(0, origin.scrollY);
+        } else {
+            // Search overlays never reflow the page; restore the exact viewport.
+            scrollToReadingAnchorAfterChunk = false;
+            previewScroll.scrollTo(0, origin.scrollY);
+        }
+        if (origin.inspector) {
+            inspectorOpen = true;
+            wholeDocumentEditing = false;
+            inspectorSignature = "";
+            updateModifierPanel();
+            focusSourceCaret();
+        }
+    }
+
     private void closeSearch(boolean cancel) {
-        if (cancel) setDocumentCaret(searchOrigin);
+        if (cancel) restoreSearchOrigin();
         searchBar.setVisibility(View.GONE);
-        searchMatches = new JSONArray();
-        searchCurrent = -1;
+        findResultsScroll.setVisibility(View.GONE);
+        replaceRow.setVisibility(View.GONE);
+        replaceStatus.setVisibility(View.GONE);
+        replaceVisible = false;
+        findScrollPending = false;
+        if (find != null) find.cancel();
+        searchOriginState = null;
         android.view.inputmethod.InputMethodManager ime =
                 (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (ime != null) ime.hideSoftInputFromWindow(searchField.getWindowToken(), 0);
         invalidateRenderedCaret();
-        focusRenderedCaret();
+        refreshActionLabels();
+        if (!cancel && !inspectorOpen) focusRenderedCaret();
+    }
+
+    private void renderFindState() {
+        if (find == null || searchBar == null || searchBar.getVisibility() != View.VISIBLE) return;
+        String scope = find.scope() == FindController.SCOPE_SOURCE ? "Source"
+                : find.scope() == FindController.SCOPE_SELECTION ? "Selection" : "Text";
+        findScopeButton.setText(scope);
+        findScopeButton.setContentDescription("Search scope: " + scope);
+        searchCount.setText(find.status());
+        setStatus(statusText);
+        findResultsScroll.setVisibility(find.pageMatches().length == 0 ? View.GONE : View.VISIBLE);
+        String signature = find.query() + "\u0000" + find.scope() + "\u0000"
+                + find.pageStart() + "\u0000" + find.total() + "\u0000" + find.pageMatches().length;
+        if (signature.equals(findResultsSignature)) return;
+        findResultsSignature = signature;
+        findResults.removeAllViews();
+        for (int i = 0; i < find.pageMatches().length; i++) {
+            final int global = find.pageStart() + i;
+            final FindController.Match match = find.pageMatches()[i];
+            TextView row = panelLabel("");
+            row.setText(findSnippet(match, global));
+            row.setTextColor(match.protectedRange ? Color.parseColor("#D6A86A")
+                    : Color.parseColor("#C8D4DF"));
+            row.setPadding(dp(6), dp(5), dp(6), dp(5));
+            row.setContentDescription("Match " + (global + 1) + " of " + find.total());
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    if (find != null) find.selectGlobal(global, editor.getText().toString());
+                }
+            });
+            findResults.addView(row);
+            if (i + 1 < find.pageMatches().length) {
+                View divider = new View(this);
+                divider.setBackgroundColor(Color.parseColor("#25313C"));
+                findResults.addView(divider, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
+            }
+        }
+    }
+
+    /** One 80-grapheme source snippet with the current match marked. */
+    private CharSequence findSnippet(FindController.Match match, int global) {
+        String text = editor.getText().toString();
+        int start = Math.max(0, Math.min(match.start, text.length()));
+        int end = Math.max(start, Math.min(match.end, text.length()));
+        int before = start, after = end;
+        for (int i = 0; i < 40 && before > 0; i++) {
+            before = DocBridge.graphemeBoundary(text, before, -1);
+        }
+        for (int i = 0; i < 40 && after < text.length(); i++) {
+            after = DocBridge.graphemeBoundary(text, after, 2);
+        }
+        SpannableStringBuilder snippet = new SpannableStringBuilder();
+        if (before > 0) snippet.append("\u2026");
+        int contentStart = snippet.length();
+        snippet.append(text, before, after);
+        if (after < text.length()) snippet.append("\u2026");
+        int markStart = contentStart + (start - before);
+        int markEnd = contentStart + (end - before);
+        if (markEnd > markStart) {
+            snippet.setSpan(new BackgroundColorSpan(0x6689B06A), markStart, markEnd,
+                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        snippet.append("  ");
+        snippet.append(match.protectedRange ? "\u00b7 structural" : "\u00b7 @" + (start + 1));
+        return snippet;
+    }
+
+    private void toggleReplaceRow() {
+        replaceVisible = !replaceVisible;
+        replaceRow.setVisibility(replaceVisible ? View.VISIBLE : View.GONE);
+        replaceStatus.setVisibility(replaceVisible ? View.VISIBLE : View.GONE);
+        if (replaceVisible) {
+            replaceField.requestFocus();
+            replaceField.setSelection(replaceField.length());
+        } else {
+            clearReplacePlan();
+            replaceField.clearFocus();
+            searchField.requestFocus();
+        }
+    }
+
+    private void replaceCurrent() {
+        if (find == null || find.currentMatch() == null || handle == 0) return;
+        FindController.Match match = find.currentMatch();
+        if (match.protectedRange) {
+            replaceStatus.setText("Structural matches are not replaced");
+            return;
+        }
+        String expected = editor.getText().toString();
+        JSONArray ops = new JSONArray();
+        JSONObject op = new JSONObject();
+        try {
+            op.put("start", match.start);
+            op.put("end", match.end);
+            op.put("text", replaceField.getText().toString());
+            ops.put(op);
+            String state = DocBridge.replaceMany(handle, expected, ops.toString());
+            JSONObject result = new JSONObject(state);
+            if (result.has("error")) {
+                replaceStatus.setText(result.getString("error"));
+                clearReplacePlan();
+                return;
+            }
+            replaceUndoStart = editor.getSelectionStart();
+            replaceUndoEnd = editor.getSelectionEnd();
+            applyState(state, true);
+            find.searchFrom(editor.getText().toString(), editor.getSelectionStart());
+            replaceStatus.setText("Replaced 1 occurrence");
+            clearReplacePlan();
+        } catch (Exception e) {
+            replaceStatus.setText("Replacement failed");
+            Log.w("emthin-pad", "literal replacement failed", e);
+        }
+    }
+
+    private void previewOrApplyReplaceAll() {
+        if (find == null || handle == 0) return;
+        String current = editor.getText().toString();
+        if (replacePlan != null && replacePlanText.equals(current)
+                && find.query().equals(searchField.getText().toString())) {
+            applyReplacePlan(replacePlan, current);
+            return;
+        }
+        final String expected = current;
+        replaceStatus.setText("Preparing replacement\u2026");
+        resetReplaceButton();
+        find.requestPlan(expected, new FindController.PlanListener() {
+            @Override public void onPlan(FindController.Page page, String error) {
+                if (searchBar.getVisibility() != View.VISIBLE || find == null) return;
+                if (error != null || page.error != null) {
+                    replaceStatus.setText(error != null ? error : page.error);
+                    return;
+                }
+                if (!expected.equals(editor.getText().toString())) {
+                    replaceStatus.setText("The document changed; refresh the preview");
+                    return;
+                }
+                if (page.replaceable > 10_000) {
+                    replaceStatus.setText("Narrow the selection to replace this many occurrences");
+                    return;
+                }
+                if (page.replaceable == 0) {
+                    replaceStatus.setText(page.protectedCount > 0
+                            ? "Structural matches are not replaced" : "No replaceable matches");
+                    return;
+                }
+                replacePlan = page;
+                replacePlanText = expected;
+                replaceAllButton.setText("Replace " + page.replaceable + " occurrences");
+                String replacement = replaceField.getText().toString();
+                StringBuilder preview = new StringBuilder();
+                preview.append(page.replaceable).append(page.replaceable == 1
+                        ? " replaceable match" : " replaceable matches");
+                if (page.protectedCount > 0) {
+                    preview.append(" \u00b7 ").append(page.protectedCount)
+                            .append(" protected \u00b7 Structural matches are not replaced");
+                }
+                int shown = 0;
+                for (int i = 0; i < page.matches.length && shown < 20; i++) {
+                    FindController.Match match = page.matches[i];
+                    if (match.protectedRange) continue;
+                    String before = editor.getText().subSequence(match.start, match.end).toString();
+                    if (before.length() > 40) before = before.substring(0, 40) + "\u2026";
+                    String after = replacement.length() > 40
+                            ? replacement.substring(0, 40) + "\u2026" : replacement;
+                    preview.append("\n").append(before).append(" \u2192 ")
+                            .append(after.isEmpty() ? "(delete)" : after);
+                    shown++;
+                }
+                replaceStatus.setText(preview.toString());
+            }
+        });
+    }
+
+    private void applyReplacePlan(FindController.Page page, String expected) {
+        JSONArray ops = new JSONArray();
+        String replacement = replaceField.getText().toString();
+        for (FindController.Match match : page.matches) {
+            if (match.protectedRange) continue;
+            JSONObject op = new JSONObject();
+            try {
+                op.put("start", match.start);
+                op.put("end", match.end);
+                op.put("text", replacement);
+                ops.put(op);
+            } catch (Exception e) {
+                replaceStatus.setText("Replacement plan is invalid");
+                return;
+            }
+        }
+        try {
+            String state = DocBridge.replaceMany(handle, expected, ops.toString());
+            JSONObject result = new JSONObject(state);
+            if (result.has("error")) {
+                replaceStatus.setText(result.getString("error"));
+                clearReplacePlan();
+                return;
+            }
+            replaceUndoStart = editor.getSelectionStart();
+            replaceUndoEnd = editor.getSelectionEnd();
+            applyState(state, true);
+            find.searchFrom(editor.getText().toString(), editor.getSelectionStart());
+            replaceStatus.setText("Replaced " + page.replaceable + " occurrences");
+            clearReplacePlan();
+        } catch (Exception e) {
+            replaceStatus.setText("Replacement failed");
+            Log.w("emthin-pad", "replace-all failed", e);
+        }
     }
 
     private void focusSourceCaret() {
@@ -2874,97 +3671,694 @@ public class MainActivity extends Activity {
         return false;
     }
 
-    private void showCitations(int openNumber) {
+    /** Capture the reader's actual place, including stable source anchors. */
+    private NavigationController.Entry currentLocation(String kind, String label) {
+        rememberReadingAnchor();
+        int a = editor == null ? 0 : editor.getSelectionStart();
+        int b = editor == null ? 0 : editor.getSelectionEnd();
+        int start = Math.min(a, b), end = Math.max(a, b);
+        StableAnchor selection = selectionAnchor >= 0 ? captureStableAnchor(selectionAnchor, -1) : null;
+        return new NavigationController.Entry(kind, label, start, end,
+                selection == null ? "" : selection.encoded,
+                selection == null ? -1 : selection.side,
+                selection == null ? start : selection.fallback,
+                readingAnchorStable == null ? "" : readingAnchorStable.encoded,
+                readingAnchorStable == null ? -1 : readingAnchorStable.side,
+                readingAnchorFallback, expandedSegments, inspectorOpen, wholeDocumentEditing);
+    }
+
+    private NavigationController.Entry destination(String kind, String label,
+                                                  int start, int end, boolean inspector) {
+        int a = Math.max(0, Math.min(editor.length(), start));
+        int b = Math.max(0, Math.min(editor.length(), end));
+        StableAnchor anchor = captureStableAnchor(a, -1);
+        return new NavigationController.Entry(kind, label, Math.min(a, b), Math.max(a, b),
+                anchor == null ? "" : anchor.encoded, anchor == null ? -1 : anchor.side,
+                anchor == null ? a : anchor.fallback,
+                anchor == null ? "" : anchor.encoded, anchor == null ? -1 : anchor.side,
+                anchor == null ? a : anchor.fallback, expandedSegments, inspector, inspector);
+    }
+
+    private void resetNavigation() {
+        navigation.reset(currentLocation("current", "Current"));
+        refreshNavigationButtons();
+    }
+
+    private void refreshNavigationButtons() {
+        if (navBackButton != null) navBackButton.setEnabled(navigation.canBack());
+        if (navForwardButton != null) navForwardButton.setEnabled(navigation.canForward());
+    }
+
+    /** Explicit destinations only: accepted search, sections, definitions/uses,
+     * references and diagnostics. Ordinary caret/scroll/fold changes never
+     * enter here. */
+    private void navigateTo(String kind, String label, int start, int end, boolean inspector) {
+        if (handle == 0) return;
+        if (navigation.current() == null) resetNavigation();
+        else navigation.replaceCurrent(currentLocation("current", "Current"));
+        NavigationController.Entry destination = destination(kind, label, start, end, inspector);
+        if (!navigation.push(destination)) {
+            refreshNavigationButtons();
+            return;
+        }
+        NavigationController.Entry origin = navigation.entries().get(navigation.index() - 1);
+        trace("navigate", "kind", kind, "start", start, "history", navigation.size(),
+                "index", navigation.index(), "inspector", inspector,
+                "originInspector", origin.inspector,
+                "originWholeDocument", origin.wholeDocument);
+        restoreLocation(destination);
+        refreshNavigationButtons();
+    }
+
+    private void recordAcceptedFind(int start, int end, boolean source) {
+        if (handle == 0) return;
+        NavigationController.Entry origin = null;
+        SearchOrigin saved = searchOriginState;
+        if (saved != null) {
+            origin = new NavigationController.Entry("current", "Current",
+                    Math.min(saved.caretStart, saved.caretEnd),
+                    Math.max(saved.caretStart, saved.caretEnd), "", -1, saved.caretStart,
+                    saved.reading == null ? "" : saved.reading.encoded,
+                    saved.reading == null ? -1 : saved.reading.side, saved.readingFallback,
+                    saved.folds, saved.inspector, false);
+        }
+        if (navigation.current() == null) {
+            navigation.reset(origin == null ? currentLocation("current", "Current") : origin);
+        } else {
+            navigation.replaceCurrent(origin == null ? currentLocation("current", "Current") : origin);
+        }
+        NavigationController.Entry entry = destination("search", "Accepted find", start, end, source);
+        navigation.push(entry);
+        trace("navigate", "kind", "search", "start", start, "history", navigation.size(),
+                "index", navigation.index());
+        refreshNavigationButtons();
+    }
+
+    private void navigateBack() {
+        NavigationController.Entry entry = navigation.back();
+        if (entry != null) {
+            trace("navigate", "kind", entry.kind, "start", entry.start,
+                    "history", navigation.size(), "index", navigation.index());
+            restoreLocation(entry);
+        }
+        refreshNavigationButtons();
+    }
+
+    private void navigateForward() {
+        NavigationController.Entry entry = navigation.forward();
+        if (entry != null) {
+            trace("navigate", "kind", entry.kind, "start", entry.start,
+                    "history", navigation.size(), "index", navigation.index());
+            restoreLocation(entry);
+        }
+        refreshNavigationButtons();
+    }
+
+    /** Restore source selection, folds and reading position. A destination whose
+     * rendered body is unavailable falls back to the source inspector. */
+    private void restoreLocation(NavigationController.Entry entry) {
+        if (handle == 0 || entry == null) return;
+        if (searchBar != null && searchBar.getVisibility() == View.VISIBLE) closeSearch(false);
+        boolean foldsChanged = !expandedSegments.equals(entry.folds);
+        expandedSegments.clear();
+        expandedSegments.putAll(entry.folds);
+        int start = Math.max(0, Math.min(editor.length(), entry.start));
+        int end = Math.max(0, Math.min(editor.length(), entry.end));
+        if (entry.inspector) {
+            openSourceAt(start, Math.max(start, end), entry.wholeDocument);
+            if (foldsChanged) scheduleRender();
+            return;
+        }
+        if (inspectorOpen) closeInspector();
+        clearSelectionAnchor();
+        editor.setSelection(start, end);
+        if (start < end) {
+            if (!entry.selectionAnchor.isEmpty()) {
+                selectionAnchor = start;
+                selectionAnchorStable = new StableAnchor(session.documentId(),
+                        entry.selectionAnchor, entry.selectionSide, entry.selectionFallback);
+                showSelectionBar();
+            } else {
+                setSelectionAnchor(start);
+            }
+        }
+        readingAnchorStable = entry.readingAnchor.isEmpty() ? null
+                : new StableAnchor(session.documentId(), entry.readingAnchor,
+                        entry.readingSide, entry.readingFallback);
+        readingAnchorFallback = entry.readingFallback;
+        if (foldsChanged) scheduleRender();
+        if (!scrollToReadingAnchor() && !foldsChanged) {
+            if (pagesStale || renderedPages.isEmpty()) {
+                openSourceAt(start, Math.max(start, end));
+                return;
+            }
+            locatePage(start, "navigation");
+        }
+        invalidateRenderedCaret();
+    }
+
+    private void refreshSemantics(String text) {
+        try {
+            documentSemantics = new JSONObject(DocBridge.semanticIndex(text));
+            JSONArray defs = documentSemantics.optJSONArray("defs");
+            JSONArray sections = documentSemantics.optJSONArray("sections");
+            trace("semantics", "defs", defs == null ? 0 : defs.length(),
+                    "sections", sections == null ? 0 : sections.length(), "textLen", text.length());
+        } catch (Exception e) {
+            documentSemantics = new JSONObject();
+            Log.w("emthin-pad", "could not read semantic index", e);
+        }
+    }
+
+    private JSONObject definitionAt(int caret) {
+        JSONArray defs = documentSemantics.optJSONArray("defs");
+        if (defs == null) return null;
+        for (int i = 0; i < defs.length(); i++) {
+            JSONObject def = defs.optJSONObject(i);
+            JSONArray span = def == null ? null : def.optJSONArray("span");
+            if (span != null && caret >= span.optInt(0) && caret <= span.optInt(1)) return def;
+            JSONArray uses = def == null ? null : def.optJSONArray("uses");
+            if (uses == null) continue;
+            for (int j = 0; j < uses.length(); j++) {
+                JSONObject use = uses.optJSONObject(j);
+                if (use != null && caret >= use.optInt("start") && caret <= use.optInt("end")) return def;
+            }
+        }
+        return null;
+    }
+
+    private void showNavigate(int tab) {
         if (editor == null || handle == 0) return;
-        final PadSession.Owner dialogOwner =
-                session.capture(PadSession.CITATION, "citations");
-        final String text = editor.getText().toString();
+        lastNavigateTab = tab;
+        refreshSemantics(editor.getText().toString());
+        final int shownTab = tab;
         ScrollView scroll = new ScrollView(this);
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(12), dp(8), dp(12), dp(12));
         scroll.addView(rows);
+
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        String[] labels = {"Sections", "Definitions", "References"};
+        for (int i = 0; i < labels.length; i++) {
+            final int which = i;
+            TextView button = shortcut((i == shownTab ? "• " : "") + labels[i], new Runnable() {
+                @Override public void run() { showNavigate(which); }
+            });
+            button.setEnabled(i != shownTab);
+            tabs.addView(button);
+        }
+        rows.addView(tabs);
+        if (shownTab == NAV_REFERENCES) {
+            final String text = editor.getText().toString();
+            JSONArray references;
+            try {
+                references = new JSONArray(DocBridge.citationIndex(text, true));
+            } catch (Exception e) {
+                references = documentCitations;
+            }
+            final JSONArray citations = references;
+            final EditText filter = new EditText(this);
+            filter.setHint("Filter citations");
+            filter.setSingleLine(true);
+            rows.addView(filter);
+            final LinearLayout referenceRows = new LinearLayout(this);
+            referenceRows.setOrientation(LinearLayout.VERTICAL);
+            rows.addView(referenceRows);
+            final Runnable refresh = new Runnable() {
+                @Override public void run() {
+                    appendReferenceRows(referenceRows, citations, filter.getText().toString());
+                }
+            };
+            filter.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+                @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+                @Override public void afterTextChanged(Editable s) { refresh.run(); }
+            });
+            refresh.run();
+        } else {
+            appendNavigationRows(rows, shownTab);
+        }
+
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Navigate").setView(scroll).setNegativeButton("Close", null).show();
+    }
+
+    private void appendReferenceRows(LinearLayout rows, JSONArray citations, String filter) {
+        rows.removeAllViews();
+        if (citations == null || citations.length() == 0) {
+            rows.addView(panelLabel("No references"));
+            return;
+        }
+        boolean any = false;
+        for (int i = 0; i < citations.length(); i++) {
+            JSONObject reference = citations.optJSONObject(i);
+            if (reference == null) continue;
+            JSONArray numbers = reference.optJSONArray("numbers");
+            if (numbers == null || numbers.length() == 0) continue;
+            int number = numbers.optInt(0);
+            String label = reference.optString("label", "Reference");
+            String snippet = reference.optString("source");
+            String keys = citationKeyText(reference.optJSONArray("keys"));
+            boolean resolved = reference.optBoolean("resolved", true);
+            if (!CitationController.matchesFilter(filter, Integer.toString(number),
+                    label, snippet, keys, resolved)) continue;
+            any = true;
+            TextView button = shortcut(citationHeading(number, label) + " · "
+                    + (resolved ? "resolved" : "unresolved")
+                    + (snippet.isEmpty() ? "" : "\n" + snippet), new Runnable() {
+                @Override public void run() { showCitations(number); }
+            });
+            button.setContentDescription((resolved ? "Resolved" : "Unresolved")
+                    + " citation [" + number + "] " + label);
+            rows.addView(button);
+        }
+        if (!any) rows.addView(panelLabel("No matching references"));
+    }
+
+    private void appendNavigationRows(LinearLayout rows, int tab) {
+        if (tab == NAV_SECTIONS) {
+            JSONArray sections = documentSemantics.optJSONArray("sections");
+            if (sections == null || sections.length() == 0) {
+                rows.addView(panelLabel("No sections"));
+                return;
+            }
+            for (int i = 0; i < sections.length(); i++) {
+                final JSONObject section = sections.optJSONObject(i);
+                if (section == null) continue;
+                int start = section.optInt("start"), end = section.optInt("end");
+                String label = section.optString("heading", "Section")
+                        + " · " + section.optInt("statementCount") + " statements";
+                rows.addView(navigationButton(label, "section",
+                        section.optString("heading", "Section"), start, end, false));
+            }
+            return;
+        }
+        if (tab == NAV_DEFINITIONS) {
+            JSONArray defs = documentSemantics.optJSONArray("defs");
+            if (defs == null || defs.length() == 0) {
+                rows.addView(panelLabel("No definitions"));
+                return;
+            }
+            for (int i = 0; i < defs.length(); i++) {
+                final JSONObject def = defs.optJSONObject(i);
+                if (def == null) continue;
+                JSONArray span = def.optJSONArray("span");
+                int start = span == null ? 0 : span.optInt(0);
+                int end = span == null ? start : span.optInt(1);
+                String name = def.optString("name", "definition");
+                rows.addView(navigationButton(name + " · " + def.optInt("useCount") + " uses",
+                        "definition", name, start, end, true));
+                if (def.optInt("useCount") > 0) {
+                    rows.addView(shortcut("Uses of " + name, new Runnable() {
+                        @Override public void run() { showUses(def); }
+                    }));
+                }
+            }
+            return;
+        }
+        if (documentCitations.length() == 0) {
+            rows.addView(panelLabel("No references"));
+            return;
+        }
+        for (int i = 0; i < documentCitations.length(); i++) {
+            JSONObject reference = documentCitations.optJSONObject(i);
+            if (reference == null) continue;
+            int start = reference.optInt("start"), end = reference.optInt("end");
+            rows.addView(navigationButton(reference.optString("label", "Reference")
+                    + " · " + reference.optString("label"), "reference",
+                    reference.optString("label", "Reference"), start, end, true));
+        }
+    }
+
+    private TextView navigationButton(String label, final String kind, final String name,
+                                      final int start, final int end, final boolean source) {
+        TextView button = shortcut(label, new Runnable() {
+            @Override public void run() { navigateTo(kind, name, start, end, source); }
+        });
+        button.setContentDescription(label + ". Open " + kind);
+        return button;
+    }
+
+    private void showUses(JSONObject def) {
+        final JSONArray uses = def.optJSONArray("uses");
+        if (uses == null || uses.length() == 0) return;
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(rows);
+        final String text = editor.getText().toString();
+        for (int i = 0; i < uses.length(); i++) {
+            final JSONObject use = uses.optJSONObject(i);
+            if (use == null) continue;
+            final int start = use.optInt("start"), end = use.optInt("end");
+            String snippet = text.substring(Math.max(0, Math.min(start, text.length())),
+                    Math.max(0, Math.min(end, text.length()))).trim();
+            if (snippet.isEmpty()) snippet = "use " + (i + 1);
+            rows.addView(shortcut(snippet + " · offset " + start, new Runnable() {
+                @Override public void run() {
+                    navigateTo("definition", "Definition use", start, end, true);
+                }
+            }));
+        }
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Uses of " + def.optString("name", "definition"))
+                .setView(scroll).setNegativeButton("Close", null).show();
+    }
+
+    private void showCitations(int openNumber) {
+        if (editor == null || handle == 0) return;
+        final PadSession.Owner dialogOwner =
+                session.capture(PadSession.CITATION, "citations");
+        final String text = editor.getText().toString();
+        final int originCaret = editor.getSelectionStart();
+        final int originScroll = previewScroll == null ? 0 : previewScroll.getScrollY();
+        final boolean[] navigated = {false};
+        final int[] currentOpen = {openNumber};
+        try {
+            JSONObject choices = new JSONObject(DocBridge.citationChoices());
+            JSONArray styleArray = choices.optJSONArray("styles");
+            JSONArray localeArray = choices.optJSONArray("locales");
+            String[] styles = new String[styleArray == null ? 0 : styleArray.length()];
+            String[] locales = new String[localeArray == null ? 0 : localeArray.length()];
+            for (int i = 0; i < styles.length; i++) styles[i] = styleArray.optString(i);
+            for (int i = 0; i < locales.length; i++) locales[i] = localeArray.optString(i);
+            citationController.setChoices(styles, locales,
+                    choices.optString("defaultStyle"), choices.optString("defaultLocale"));
+            SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+            citationController.setSavedFormat(
+                    prefs.getString(citationFormatKey("Style"), null),
+                    prefs.getString(citationFormatKey("Locale"), null));
+        } catch (Exception e) {
+            citationController.setChoices(new String[0], new String[0], "apa", "en-US");
+            citationController.setSavedFormat(null, null);
+        }
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(12), dp(8), dp(12), dp(12));
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        final TextView styleLabel = panelLabel("Style");
+        controls.addView(styleLabel);
+        final Spinner styleSpinner = new Spinner(this);
+        final Spinner localeSpinner = new Spinner(this);
+        List<String> styleNames = new ArrayList<>();
+        styleNames.add("Document default");
+        Collections.addAll(styleNames, citationController.styles());
+        ArrayAdapter<String> styleAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, styleNames);
+        styleAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        styleSpinner.setAdapter(styleAdapter);
+        List<String> localeNames = new ArrayList<>();
+        localeNames.add("Default (" + citationController.defaultLocale() + ")");
+        Collections.addAll(localeNames, citationController.locales());
+        ArrayAdapter<String> localeAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, localeNames);
+        localeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        localeSpinner.setAdapter(localeAdapter);
+        controls.addView(styleSpinner, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        controls.addView(localeSpinner, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        content.addView(controls);
+
+        final EditText filter = new EditText(this);
+        filter.setHint("Filter citations");
+        filter.setSingleLine(true);
+        content.addView(filter);
+        final LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        content.addView(rows);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content);
         final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("Citations").setView(scroll).create();
-        appendCitationRows(rows, text, dialog, dialogOwner, 0, openNumber);
+                .setTitle("Citations").setView(scroll)
+                .setNegativeButton("Close", null).create();
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                rows.removeAllViews();
+                appendCitationRows(rows, text, dialog, dialogOwner, 0,
+                        currentOpen[0], Collections.<CitationController.Path>emptyList(), true,
+                        navigated);
+            }
+        };
+        filter.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable s) {
+                citationController.setFilter(s.toString());
+                refresh.run();
+            }
+        });
+        styleSpinner.setSelection(citationIndex(citationController.styles(), citationController.style()) + 1);
+        localeSpinner.setSelection(citationIndex(citationController.locales(), citationController.locale()) + 1);
+        styleSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                citationController.setStyle(position == 0 ? null : citationController.styles()[position - 1]);
+                saveCitationFormat();
+                refresh.run();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        localeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                citationController.setLocale(position == 0 ? null : citationController.locales()[position - 1]);
+                saveCitationFormat();
+                refresh.run();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        TextView reset = shortcut("Reset style and locale", new Runnable() {
+            @Override public void run() {
+                citationController.resetFormat();
+                saveCitationFormat();
+                styleSpinner.setSelection(0);
+                localeSpinner.setSelection(0);
+                refresh.run();
+            }
+        });
+        content.addView(reset);
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface ignored) {
+                if (navigated[0]) return;
+                if (editor != null && originCaret >= 0 && originCaret <= editor.length()) {
+                    clearSelectionAnchor();
+                    editor.setSelection(originCaret);
+                }
+                if (previewScroll != null) {
+                    previewScroll.scrollTo(0, originScroll);
+                    previewScroll.requestFocus();
+                }
+            }
+        });
+        refresh.run();
         dialog.show();
     }
 
-    private void appendCitationRows(LinearLayout rows, final String text, final AlertDialog dialog,
+    private String citationFormatKey(String suffix) {
+        return "citation" + suffix + ":" + session.documentId();
+    }
+
+    private void saveCitationFormat() {
+        SharedPreferences.Editor edit = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
+        if (citationController.style() == null) edit.remove(citationFormatKey("Style"));
+        else edit.putString(citationFormatKey("Style"), citationController.style());
+        if (citationController.locale() == null) edit.remove(citationFormatKey("Locale"));
+        else edit.putString(citationFormatKey("Locale"), citationController.locale());
+        edit.apply();
+    }
+
+    private static int citationIndex(String[] values, String selected) {
+        if (selected == null) return -1;
+        for (int i = 0; i < values.length; i++) if (values[i].equals(selected)) return i;
+        return -1;
+    }
+
+    private static String citationHeading(int number, String label) {
+        String value = label == null ? "" : label.trim();
+        if (value.matches("^\\[\\d+\\].*")) return value;
+        return "[" + number + "]" + (value.isEmpty() ? "" : " " + value);
+    }
+
+    private static String citationKeyText(JSONArray keys) {
+        if (keys == null) return "";
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < keys.length(); i++) {
+            if (text.length() > 0) text.append(", ");
+            text.append(keys.optString(i));
+        }
+        return text.toString();
+    }
+
+    private void appendCitationRows(LinearLayout rows, final String scope, final AlertDialog dialog,
                                     final PadSession.Owner dialogOwner,
-                                    final int depth, int openNumber) {
+                                    final int depth, int openNumber,
+                                    final List<CitationController.Path> parentPath,
+                                    boolean resolveStatus, final boolean[] navigated) {
         try {
-            JSONArray citations = new JSONArray(DocBridge.citationIndex(text));
+            JSONArray citations = new JSONArray(DocBridge.citationIndex(scope, resolveStatus));
             if (citations.length() == 0 && depth == 0) rows.addView(panelLabel("No citations"));
             for (int i = 0; i < citations.length(); i++) {
                 JSONObject cite = citations.getJSONObject(i);
                 JSONArray numbers = cite.getJSONArray("numbers");
+                String label = cite.optString("label");
+                String snippet = cite.optString("source");
+                String keys = citationKeyText(cite.optJSONArray("keys"));
+                boolean resolved = cite.optBoolean("resolved", true);
                 for (int j = 0; j < numbers.length(); j++) {
                     final int number = numbers.getInt(j);
-                    final TextView heading = panelLabel("▸ [" + number + "]");
+                    final int start = cite.optInt("start");
+                    final int end = cite.optInt("end");
+                    final boolean visible = citationController.matches(
+                            Integer.toString(number), label, snippet, keys, resolved);
+                    final List<CitationController.Path> path = citationController.append(
+                            parentPath, scope, number, start, end, label);
+                    final boolean repeated = path == null
+                            && CitationController.isCycle(parentPath, scope, number, start, end);
+                    final boolean tooDeep = path == null && !repeated;
+                    final LinearLayout item = new LinearLayout(this);
+                    item.setOrientation(LinearLayout.VERTICAL);
+                    item.setVisibility(visible ? View.VISIBLE : View.GONE);
+                    final TextView heading = panelLabel("");
+                    String title = (path == null ? (repeated ? "↻ " : "… ") : "▸ ")
+                            + citationHeading(number, label);
+                    String status = resolved ? "resolved" : "unresolved";
+                    heading.setText(title + "\n" + (snippet.isEmpty() ? status : snippet + " · " + status));
                     heading.setTextColor(Color.parseColor("#B7D5EA"));
                     heading.setPadding(dp(8 + depth * 12), dp(8), dp(8), dp(8));
                     final LinearLayout details = new LinearLayout(this);
                     details.setOrientation(LinearLayout.VERTICAL);
                     details.setPadding(dp(16 + depth * 12), 0, dp(8), dp(8));
                     details.setVisibility(View.GONE);
+                    final boolean[] loaded = {false};
                     heading.setOnClickListener(new View.OnClickListener() {
                         @Override public void onClick(View v) {
+                            if (repeated) {
+                                goToCitationSource(dialog, navigated, label, parentPath);
+                                return;
+                            }
+                            if (tooDeep) {
+                                goToCitationSource(dialog, navigated, label, parentPath);
+                                return;
+                            }
                             boolean open = details.getVisibility() != View.VISIBLE;
                             details.setVisibility(open ? View.VISIBLE : View.GONE);
-                            heading.setText((open ? "▾ [" : "▸ [") + number + "]");
-                            if (open && details.getChildCount() == 0) {
-                                details.addView(panelLabel("Loading…"));
-                                final float scale = Math.max(1f, Math.min(3f, getResources().getDisplayMetrics().density));
-                                final float width = Math.max(60f, (getResources().getDisplayMetrics().widthPixels - dp(100)) / scale);
-                                renderWork.submit("citation", RenderController.EXPLICIT, new RenderController.Job() {
-                                    @Override public void run() {
-                                        final String result = DocBridge.citationDetail(text, number, width, scale);
-                                        main.post(new Runnable() {
-                                            @Override public void run() {
-                                                if (!dialog.isShowing()
-                                                        || !session.sameDocument(dialogOwner)) return;
-                                                details.removeAllViews();
-                                                try {
-                                                    JSONObject detail = new JSONObject(result);
-                                                    if (detail.has("error")) {
-                                                        details.addView(panelLabel(detail.getString("error")));
-                                                    } else if ("bibliography".equals(detail.optString("kind"))) {
-                                                        details.addView(panelLabel(detail.optString("text")));
-                                                        JSONArray entries = detail.optJSONArray("entries");
-                                                        if (entries != null) {
-                                                            for (int k = 0; k < entries.length(); k++)
-                                                                details.addView(panelLabel(entries.optString(k)));
-                                                        }
-                                                        if (!detail.optBoolean("resolved"))
-                                                            details.addView(panelLabel(detail.optString("errorDetail", "Citation could not be resolved")));
-                                                    } else {
-                                                        byte[] png = Base64.decode(detail.getString("png"), Base64.DEFAULT);
-                                                        Bitmap bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
-                                                        if (bitmap == null) throw new IllegalStateException("invalid citation image");
-                                                        bitmap.setDensity(Bitmap.DENSITY_NONE);
-                                                        ImageView image = new ImageView(MainActivity.this);
-                                                        image.setImageBitmap(bitmap);
-                                                        image.setScaleType(ImageView.ScaleType.FIT_START);
-                                                        image.setContentDescription("Referenced document text");
-                                                        details.addView(image, new LinearLayout.LayoutParams(
-                                                                LinearLayout.LayoutParams.MATCH_PARENT, bitmap.getHeight()));
-                                                        if (depth < 7) appendCitationRows(details, detail.optString("text"), dialog, dialogOwner, depth + 1, 0);
-                                                    }
-                                                } catch (Exception e) { details.addView(panelLabel("Could not display citation")); }
-                                            }
-                                        });
-                                    }
-                                });
+                            heading.setText((open ? "▾" : "▸") + heading.getText().toString().substring(1));
+                            if (open && !loaded[0]) {
+                                loaded[0] = true;
+                                loadCitationDetail(details, heading, scope, number, dialog,
+                                        dialogOwner, depth, path, label, navigated);
                             }
                         }
                     });
-                    rows.addView(heading);
-                    rows.addView(details);
-                    if (number == openNumber) heading.performClick();
+                    item.addView(heading);
+                    item.addView(details);
+                    rows.addView(item);
+                    if (number == openNumber && visible) heading.performClick();
                 }
             }
         } catch (Exception e) { rows.addView(panelLabel("Could not list citations")); }
+    }
+
+    private void goToCitationSource(AlertDialog dialog, boolean[] navigated,
+                                    String label, List<CitationController.Path> path) {
+        int[] source = CitationController.rootSource(path);
+        if (source == null || editor == null) return;
+        navigated[0] = true;
+        dialog.dismiss();
+        navigateTo("citation", label == null || label.isEmpty() ? "Citation" : label,
+                source[0], source[1], true);
+    }
+
+    private void loadCitationDetail(final LinearLayout details, final TextView heading,
+                                    final String scope, final int number,
+                                    final AlertDialog dialog, final PadSession.Owner dialogOwner,
+                                    final int depth, final List<CitationController.Path> path,
+                                    final String label, final boolean[] navigated) {
+        details.addView(panelLabel("Loading…"));
+        final float scale = Math.max(1f, Math.min(3f, getResources().getDisplayMetrics().density));
+        final float width = Math.max(60f, (getResources().getDisplayMetrics().widthPixels - dp(100)) / scale);
+        final int version = citationController.version();
+        final String style = citationController.style() == null ? "" : citationController.style();
+        final String locale = citationController.locale() == null ? "" : citationController.locale();
+        renderWork.submit("citation", RenderController.EXPLICIT, new RenderController.Job() {
+            @Override public void run() {
+                final String result = DocBridge.citationDetail(scope, number, width, scale, style, locale);
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        if (!dialog.isShowing() || !session.sameDocument(dialogOwner)
+                                || version != citationController.version()
+                                || details.getParent() == null) return;
+                        details.removeAllViews();
+                        try {
+                            JSONObject detail = new JSONObject(result);
+                            TextView breadcrumb = panelLabel(CitationController.breadcrumb(path));
+                            breadcrumb.setTextColor(Color.parseColor("#D8E8F4"));
+                            details.addView(breadcrumb);
+                            if (depth > 0) {
+                                details.addView(shortcut("Back to previous citation", new Runnable() {
+                                    @Override public void run() {
+                                        details.setVisibility(View.GONE);
+                                        String text = heading.getText().toString();
+                                        if (text.startsWith("▾")) heading.setText("▸" + text.substring(1));
+                                    }
+                                }));
+                            }
+                            if (detail.has("error")) {
+                                details.addView(panelLabel(detail.getString("error")));
+                                JSONObject meta = detail.optJSONObject("metadata");
+                                if (meta != null) details.addView(panelLabel("Source: " + meta.optString("source")));
+                            } else if ("bibliography".equals(detail.optString("kind"))) {
+                                details.addView(panelLabel(detail.optString("text")));
+                                JSONArray entries = detail.optJSONArray("entries");
+                                if (entries != null) {
+                                    for (int k = 0; k < entries.length(); k++)
+                                        details.addView(panelLabel(entries.optString(k)));
+                                }
+                                if (!detail.optBoolean("resolved"))
+                                    details.addView(panelLabel(detail.optString("errorDetail", "Citation could not be resolved")));
+                                JSONObject meta = detail.optJSONObject("metadata");
+                                if (meta != null && !meta.optString("source").isEmpty()) {
+                                    details.addView(panelLabel("Source: " + meta.optString("source")));
+                                    details.addView(shortcut("Edit source", new Runnable() {
+                                        @Override public void run() {
+                                            goToCitationSource(dialog, navigated, label, path);
+                                        }
+                                    }));
+                                }
+                            } else {
+                                byte[] png = Base64.decode(detail.getString("png"), Base64.DEFAULT);
+                                Bitmap bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
+                                if (bitmap == null) throw new IllegalStateException("invalid citation image");
+                                bitmap.setDensity(Bitmap.DENSITY_NONE);
+                                ImageView image = new ImageView(MainActivity.this);
+                                image.setImageBitmap(bitmap);
+                                image.setScaleType(ImageView.ScaleType.FIT_START);
+                                image.setContentDescription("Referenced document text");
+                                details.addView(image, new LinearLayout.LayoutParams(
+                                        LinearLayout.LayoutParams.MATCH_PARENT, bitmap.getHeight()));
+                                if (path.size() < CitationController.MAX_DEPTH) {
+                                    appendCitationRows(details, detail.optString("text"), dialog,
+                                            dialogOwner, depth + 1, 0, path, false, navigated);
+                                } else {
+                                    details.addView(panelLabel("Depth limit — use the original citation source"));
+                                }
+                            }
+                            int[] root = CitationController.rootSource(path);
+                            if (root != null && !detail.has("error")) {
+                                details.addView(shortcut("Go to source", new Runnable() {
+                                    @Override public void run() {
+                                        goToCitationSource(dialog, navigated, label, path);
+                                    }
+                                }));
+                            }
+                        } catch (Exception e) { details.addView(panelLabel("Could not display citation")); }
+                    }
+                });
+            }
+        });
     }
 
     private boolean hasRenderedSelection() {
@@ -3213,6 +4607,103 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * Suggest marker names only for the pair being edited. The scan is
+     * already available; this never enumerates all possible pairs.
+     */
+    private void updateTargetSuggestions(final EditText field) {
+        if (field != targetsField || modifierSuggestions == null) return;
+        modifierSuggestions.removeAllViews();
+        if (!field.hasFocus()) return;
+        String value = field.getText().toString();
+        int caret = Math.max(0, Math.min(field.getSelectionStart(), value.length()));
+        int segmentStart = value.lastIndexOf(',', Math.max(0, caret - 1)) + 1;
+        int segmentEnd = value.indexOf(',', caret);
+        if (segmentEnd < 0) segmentEnd = value.length();
+        String segment = value.substring(segmentStart, segmentEnd);
+        int leading = 0;
+        while (leading < segment.length() && Character.isWhitespace(segment.charAt(leading))) leading++;
+        int space = -1;
+        for (int i = leading; i < segment.length(); i++) {
+            if (Character.isWhitespace(segment.charAt(i))) { space = i; break; }
+        }
+        final boolean endToken = space >= 0;
+        String first = (endToken ? segment.substring(leading, space) : segment.substring(leading)).trim();
+        if (first.startsWith("#")) first = first.substring(1);
+        String query = first;
+        int startIndex = -1;
+        if (endToken) {
+            String rest = segment.substring(space).trim();
+            if (rest.startsWith("#")) rest = rest.substring(1);
+            query = rest;
+            for (int i = 0; i < documentMarkers.length(); i++) {
+                if (first.equals(documentMarkers.optJSONObject(i).optString("id"))) { startIndex = i; break; }
+            }
+            if (startIndex < 0) return;
+        }
+        int shown = 0;
+        for (int i = endToken ? startIndex + 1 : 0;
+                i < documentMarkers.length() && shown < 6; i++) {
+            JSONObject marker = documentMarkers.optJSONObject(i);
+            if (marker == null) continue;
+            String id = marker.optString("id");
+            if (!id.startsWith(query)) continue;
+            final String chosen = id;
+            String snippet = markerSnippet(marker);
+            TextView suggestion = shortcut(id + (snippet.isEmpty() ? "" : " · " + snippet),
+                    new Runnable() {
+                @Override public void run() {
+                    applyTargetSuggestion(field, chosen, endToken);
+                }
+            });
+            suggestion.setContentDescription("Suggest marker " + id + (snippet.isEmpty() ? "" : ", " + snippet));
+            modifierSuggestions.addView(suggestion);
+            shown++;
+        }
+    }
+
+    private String markerSnippet(JSONObject marker) {
+        if (editor == null) return "";
+        String text = editor.getText().toString();
+        int end = marker.optInt("end", 0);
+        int next = text.length();
+        for (int i = 0; i < documentMarkers.length(); i++) {
+            JSONObject other = documentMarkers.optJSONObject(i);
+            if (other == null) continue;
+            int start = other.optInt("start", 0);
+            if (start >= end && start < next) next = start;
+        }
+        String snippet = text.substring(Math.max(0, Math.min(end, text.length())),
+                Math.max(0, Math.min(next, text.length()))).trim().replace('\n', ' ');
+        if (snippet.length() > 32) snippet = snippet.substring(0, 32) + "…";
+        return snippet;
+    }
+
+    private void applyTargetSuggestion(EditText field, String id, boolean endToken) {
+        if (field != targetsField) return;
+        String value = field.getText().toString();
+        int caret = Math.max(0, Math.min(field.getSelectionStart(), value.length()));
+        int segmentStart = value.lastIndexOf(',', Math.max(0, caret - 1)) + 1;
+        int segmentEnd = value.indexOf(',', caret);
+        if (segmentEnd < 0) segmentEnd = value.length();
+        String segment = value.substring(segmentStart, segmentEnd);
+        int leading = 0;
+        while (leading < segment.length() && Character.isWhitespace(segment.charAt(leading))) leading++;
+        int space = -1;
+        for (int i = leading; i < segment.length(); i++) {
+            if (Character.isWhitespace(segment.charAt(i))) { space = i; break; }
+        }
+        String replacement;
+        if (!endToken) {
+            String rest = space < 0 ? "" : segment.substring(space);
+            replacement = segment.substring(0, leading) + id + " " + rest.trim();
+        } else {
+            replacement = segment.substring(0, space + 1) + id;
+        }
+        field.getText().replace(segmentStart, segmentEnd, replacement);
+        field.setSelection(Math.min(field.length(), segmentStart + replacement.length()));
+    }
+
     /** Apply complete pairs outside the pair currently being edited. */
     private void commitTargetPairs(EditText field, boolean preserveActive) {
         if (field != targetsField || modifierStart == null || editingModifier) return;
@@ -3227,7 +4718,7 @@ public class MainActivity extends Activity {
                 if (value.charAt(i) == ',') active++;
             }
         }
-        java.util.ArrayList<String> complete = new java.util.ArrayList<>();
+        java.util.LinkedHashSet<String> complete = new java.util.LinkedHashSet<>();
         for (int i = 0; i < pairs.length; i++) {
             String pair = i == active ? (i < previous.length ? previous[i] : "") : pairs[i];
             if (!pair.trim().isEmpty()) complete.add(pair.trim());
@@ -3254,9 +4745,7 @@ public class MainActivity extends Activity {
     private void toggleMarkers() {
         showMarkers = !showMarkers;
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_SHOW_MARKERS, showMarkers).apply();
-        if (markersButton != null) {
-            markersButton.setText(showMarkers ? "Tab Hide markers" : "Tab Show markers");
-        }
+        refreshActionLabels();
         trace("markerVisibility", "shown", showMarkers);
         updateMarkerVisibility();
         updateSourceMarkerVisibility();
@@ -3385,13 +4874,39 @@ public class MainActivity extends Activity {
         inspectorSignature = signature;
         modifierPanel.removeAllViews();
         modifierPanel.setVisibility(View.VISIBLE);
+        modifierPanel.addView(shortcut("Show document", new Runnable() {
+            @Override public void run() { closeInspector(); }
+        }));
 
+        final boolean wideInspector = wideInspector();
         LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.HORIZONTAL);
+        controls.setOrientation(wideInspector ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
         modifierPanel.addView(controls);
         mathHint = panelLabel("");
         mathHint.setVisibility(View.GONE);
         modifierPanel.addView(mathHint);
+
+        final JSONObject definition = definitionAt(editor.getSelectionStart());
+        if (definition != null) {
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            final JSONArray defSpan = definition.optJSONArray("span");
+            final int defStart = defSpan == null ? 0 : defSpan.optInt(0);
+            final int defEnd = defSpan == null ? defStart : defSpan.optInt(1);
+            actions.addView(shortcut("Go to definition", new Runnable() {
+                @Override public void run() {
+                    navigateTo("definition", definition.optString("name", "Definition"),
+                            defStart, defEnd, true);
+                }
+            }));
+            actions.addView(shortcut("Find uses", new Runnable() {
+                @Override public void run() { showUses(definition); }
+            }));
+            actions.addView(shortcut("Rename definition…", new Runnable() {
+                @Override public void run() { showRenameDialog(definition); }
+            }));
+            modifierPanel.addView(actions);
+        }
 
         final EditText source = new SourceEditText(this);
         sourceField = source;
@@ -3422,12 +4937,14 @@ public class MainActivity extends Activity {
             }
         });
         controls.addView(source, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+                wideInspector ? 0 : LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, wideInspector ? 1f : 0f));
         updateSourceMarkerVisibility();
 
         if (!markedPart) {
             targetsField = null;
             modifierRows = null;
+            modifierSuggestions = null;
             session.invalidate(PadSession.INSPECTOR);
             return;
         }
@@ -3454,12 +4971,20 @@ public class MainActivity extends Activity {
             }
         }
         controls.addView(targets, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+                wideInspector ? 0 : LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, wideInspector ? 1f : 0f));
 
+        modifierSuggestions = new LinearLayout(this);
+        modifierSuggestions.setOrientation(LinearLayout.VERTICAL);
+        modifierPanel.addView(modifierSuggestions);
+        updateTargetSuggestions(targets);
         targets.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
-            @Override public void afterTextChanged(Editable s) { scheduleTargetCommit(targets); }
+            @Override public void afterTextChanged(Editable s) {
+                updateTargetSuggestions(targets);
+                scheduleTargetCommit(targets);
+            }
         });
         targets.setOnFocusChangeListener(new View.OnFocusChangeListener() {
             @Override public void onFocusChange(View v, boolean focused) {
@@ -3564,6 +5089,85 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Preview a checked semantic rename, then apply it as one grouped edit. */
+    private void showRenameDialog(final JSONObject definition) {
+        if (handle == 0) return;
+        final int defIndex = definition.optInt("index", -1);
+        final String oldName = definition.optString("name", "");
+        if (defIndex < 0 || oldName.isEmpty()) return;
+        final EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(oldName);
+        input.setSelection(0, input.length());
+        input.setHint("One math identifier");
+        input.setContentDescription("New definition name");
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        final AlertDialog[] holder = new AlertDialog[1];
+        holder[0] = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Rename definition")
+                .setMessage("Preview the definition and every resolved use before applying.")
+                .setView(input)
+                .setPositiveButton("Preview", null)
+                .setNegativeButton("Cancel", null)
+                .create();
+        holder[0].setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface dialog) {
+                holder[0].getButton(AlertDialog.BUTTON_POSITIVE)
+                        .setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        String name = input.getText().toString().trim();
+                        String preview = DocBridge.renamePreview(
+                                editor.getText().toString(), defIndex, name);
+                        try {
+                            JSONObject result = new JSONObject(preview);
+                            if (result.has("error")) {
+                                input.setError(result.getString("error"));
+                                return;
+                            }
+                            holder[0].dismiss();
+                            confirmRename(defIndex, result.optString("name", name),
+                                    result.optInt("uses"));
+                        } catch (Exception e) {
+                            input.setError("Could not preview this rename");
+                        }
+                    }
+                });
+            }
+        });
+        holder[0].show();
+    }
+
+    private void confirmRename(final int defIndex, final String newName, int uses) {
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Rename to " + newName + "?")
+                .setMessage("Renames the definition and " + uses
+                        + " resolved use" + (uses == 1 ? "" : "s") + ".")
+                .setPositiveButton("Rename", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        String expected = editor.getText().toString();
+                        String state = DocBridge.renameDefinition(handle, expected, defIndex, newName);
+                        try {
+                            JSONObject result = new JSONObject(state);
+                            if (result.has("error")) {
+                                fileMessage("Rename refused: " + result.getString("error"));
+                                return;
+                            }
+                            applyState(state, true);
+                            setStatus("Renamed definition to " + newName);
+                            if (inspectorOpen) {
+                                inspectorSignature = "";
+                                updateModifierPanel();
+                                focusSourceCaret();
+                            }
+                        } catch (Exception e) {
+                            fileMessage("Rename failed: " + e.getMessage());
+                        }
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
     private void closeInspector() {
         finishActiveComposition();
         if (targetsField != null) commitTargetPairs(targetsField, false);
@@ -3573,6 +5177,9 @@ public class MainActivity extends Activity {
         modifierStart = modifierEnd = null;
         sourceField = null;
         mathHint = null;
+        modifierSuggestions = null;
+        expandedModifierRow = null;
+        modifierRowGeneration++;
         inspectorSignature = "";
         session.invalidate(PadSession.INSPECTOR);
         main.removeCallbacks(updateModifierComparisons);
@@ -3616,11 +5223,9 @@ public class MainActivity extends Activity {
         final String text = editor.getText().toString();
         final String snapshot = DocBridge.snapshot(handle);
         final String start = modifierStart, end = modifierEnd;
-        final float scale = Math.max(1f, Math.min(3f, getResources().getDisplayMetrics().density));
-        final float width = Math.max(60f, modifierRows.getWidth() / (2f * scale));
         renderWork.submit("inspector", RenderController.EXPLICIT, new RenderController.Job() {
             @Override public void run() {
-                final String result = DocBridge.modifierComparisons(text, snapshot, start, end, width, scale);
+                final String result = DocBridge.modifierRelationships(text, snapshot, start, end);
                 main.post(new Runnable() {
                     @Override public void run() {
                         if (session.isLatest(owner) && modifierRows != null) {
@@ -3660,50 +5265,211 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean wideInspector() {
+        int width = modifierPanel == null ? 0 : modifierPanel.getWidth();
+        float density = getResources().getDisplayMetrics().density;
+        if (width <= 0) width = getResources().getDisplayMetrics().widthPixels;
+        return InspectorView.columns(width, density);
+    }
+
     private void comparisonRow(View left, View right) {
         LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.addView(left, new LinearLayout.LayoutParams(0,
-                left instanceof ImageView ? (Integer) left.getTag() : LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-        row.addView(right, new LinearLayout.LayoutParams(0,
-                right instanceof ImageView ? (Integer) right.getTag() : LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        row.setOrientation(wideInspector() ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        boolean wide = wideInspector();
+        row.addView(left, new LinearLayout.LayoutParams(wide ? 0 : LinearLayout.LayoutParams.MATCH_PARENT,
+                left instanceof ImageView ? (Integer) left.getTag() : LinearLayout.LayoutParams.WRAP_CONTENT, wide ? 1f : 0f));
+        row.addView(right, new LinearLayout.LayoutParams(wide ? 0 : LinearLayout.LayoutParams.MATCH_PARENT,
+                right instanceof ImageView ? (Integer) right.getTag() : LinearLayout.LayoutParams.WRAP_CONTENT, wide ? 1f : 0f));
         modifierRows.addView(row);
     }
 
     private void showModifierComparisons(String json) {
         modifierRows.removeAllViews();
+        expandedModifierRow = null;
         try {
             JSONObject result = new JSONObject(json);
             if (result.has("error")) { modifierRows.addView(panelLabel(result.getString("error"))); return; }
             JSONArray incoming = result.getJSONArray("incoming");
-            comparisonRow(panelLabel("Modifiers"), panelLabel("Without modifier"));
-            if (incoming.length() == 0) comparisonRow(panelLabel("None"), panelLabel(""));
+            modifierRows.addView(panelLabel("Incoming modifiers"));
+            if (incoming.length() == 0) modifierRows.addView(panelLabel("None"));
             for (int i = 0; i < incoming.length(); i++) {
-                JSONObject row = incoming.getJSONObject(i);
-                comparisonRow(panelLabel(row.getString("label")), comparisonImage(row.optJSONObject("without")));
+                addModifierRelationship(incoming.getJSONObject(i), false);
             }
             JSONArray outgoing = result.getJSONArray("outgoing");
-            comparisonRow(panelLabel("Modified text"), panelLabel("Without this modifier"));
-            if (outgoing.length() == 0) comparisonRow(panelLabel("No applications yet"), panelLabel(""));
+            modifierRows.addView(panelLabel("Outgoing targets"));
+            if (outgoing.length() == 0) modifierRows.addView(panelLabel("No applications yet"));
             for (int i = 0; i < outgoing.length(); i++) {
-                JSONObject row = outgoing.getJSONObject(i);
-                comparisonRow(comparisonImage(row.optJSONObject("with")), comparisonImage(row.optJSONObject("without")));
-                if (!row.optBoolean("legacy", false)) continue;
-                final int start = row.getInt("start"), end = row.getInt("end");
-                TextView remove = shortcut("Remove this application", new Runnable() {
-                    @Override public void run() {
-                        String state = DocBridge.setModifier(handle, modifierStart, modifierEnd, start, end, 0);
-                        if (!state.contains("\"error\"")) {
-                            applyState(state, false);
-                            scheduleModifierComparisons();
-                        }
-                    }
-                });
-                modifierRows.addView(remove);
+                addModifierRelationship(outgoing.getJSONObject(i), true);
             }
         } catch (Exception e) {
             modifierRows.addView(panelLabel("Could not display comparisons"));
         }
+    }
+
+    private void addModifierRelationship(final JSONObject row, final boolean outgoing) {
+        String snippet = row.optString("snippet");
+        String label = outgoing ? snippet : row.optString("label");
+        String ids = citationKeyText(row.optJSONArray("targetIds"));
+        boolean resolved = row.optBoolean("resolved", true);
+        String title = (outgoing ? "→ " : "← ") + (label.isEmpty() ? "(empty)" : label)
+                + (ids.isEmpty() ? "" : "  #" + ids.replace(", ", " #"))
+                + " · " + (resolved ? "resolved" : "unresolved");
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        final TextView heading = panelLabel(title + (snippet.isEmpty() || outgoing ? "" : "\n" + snippet));
+        heading.setTextColor(Color.parseColor("#B7D5EA"));
+        final LinearLayout details = new LinearLayout(this);
+        details.setOrientation(LinearLayout.VERTICAL);
+        details.setVisibility(View.GONE);
+        heading.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (expandedModifierRow != null && expandedModifierRow != details) {
+                    expandedModifierRow.setVisibility(View.GONE);
+                }
+                boolean open = details.getVisibility() != View.VISIBLE;
+                details.setVisibility(open ? View.VISIBLE : View.GONE);
+                expandedModifierRow = open ? details : null;
+                if (open && details.getChildCount() == 0) {
+                    details.addView(panelLabel("Loading comparison…"));
+                    requestModifierRow(details, row, outgoing);
+                }
+            }
+        });
+        card.addView(heading);
+        card.addView(details);
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        TextView modifier = shortcut("Go to modifier", new Runnable() {
+            @Override public void run() {
+                goToModifier(row, outgoing);
+            }
+        });
+        boolean hasSource = row.has("sourceStart") && !row.isNull("sourceStart");
+        modifier.setEnabled(outgoing || hasSource);
+        actions.addView(modifier);
+        actions.addView(shortcut("Go to target", new Runnable() {
+            @Override public void run() {
+                goToModifierTarget(row, outgoing);
+            }
+        }));
+        actions.addView(shortcut("Remove link", new Runnable() {
+            @Override public void run() { removeModifierRelationship(row, outgoing); }
+        }));
+        card.addView(actions);
+        if (!resolved) card.addView(panelLabel(row.optString("error", "Unresolved relationship")));
+        modifierRows.addView(card);
+    }
+
+    private void goToModifier(JSONObject row, boolean outgoing) {
+        boolean hasSource = row.has("sourceStart") && !row.isNull("sourceStart");
+        int start = outgoing ? modifierBodyStart : (hasSource ? row.optInt("sourceStart", -1) : -1);
+        int end = outgoing ? modifierBodyEnd : (hasSource ? row.optInt("sourceEnd", -1) : -1);
+        if (start < 0 || end < start) return;
+        navigateTo("modifier", outgoing ? "Modifier" : row.optString("label", "Modifier"),
+                start, end, true);
+    }
+
+    private void goToModifierTarget(JSONObject row, boolean outgoing) {
+        int start = outgoing ? row.optInt("start", -1) : modifierBodyStart;
+        int end = outgoing ? row.optInt("end", -1) : modifierBodyEnd;
+        if (start < 0 || end < start) return;
+        navigateTo("modifier-target", "Modified text", start, end, true);
+    }
+
+    private void removeModifierRelationship(JSONObject row, boolean outgoing) {
+        String state;
+        String rowStart = row.optString("startId");
+        String rowEnd = row.optString("endId");
+        JSONArray targetIds = row.optJSONArray("targetIds");
+        if (outgoing) {
+            if (targetIds != null && targetIds.length() >= 2) {
+                String next = removePair(markerPairsFor(modifierStart, modifierEnd),
+                        targetIds.optString(0), targetIds.optString(1));
+                state = DocBridge.setMarkerTargets(handle, modifierStart, modifierEnd, next);
+            } else {
+                state = DocBridge.setModifier(handle, modifierStart, modifierEnd,
+                        row.optInt("start"), row.optInt("end"), 0);
+            }
+        } else if (targetIds != null && targetIds.length() >= 2 && !rowStart.isEmpty()) {
+            String next = removePair(markerPairsFor(rowStart, rowEnd), modifierStart, modifierEnd);
+            state = DocBridge.setMarkerTargets(handle, rowStart, rowEnd, next);
+        } else if (!rowStart.isEmpty()) {
+            state = DocBridge.setModifier(handle, rowStart, rowEnd,
+                    row.optInt("start"), row.optInt("end"), 0);
+        } else {
+            return;
+        }
+        try {
+            JSONObject parsed = new JSONObject(state);
+            if (parsed.has("error")) {
+                setStatus("Remove refused: " + parsed.getString("error"));
+                return;
+            }
+            applyState(state, false);
+            inspectorSignature = "";
+            updateModifierPanel();
+        } catch (Exception e) {
+            setStatus("Could not remove modifier link");
+        }
+    }
+
+    private static String removePair(String list, String start, String end) {
+        java.util.ArrayList<String> kept = new java.util.ArrayList<>();
+        String wanted = start + " " + end;
+        for (String item : list.split(",")) {
+            String value = item.trim().replaceFirst("^#", "").replace(" #", " ");
+            if (!value.isEmpty() && !value.equals(wanted)) kept.add(value);
+        }
+        return android.text.TextUtils.join(", ", kept);
+    }
+
+    private void requestModifierRow(final LinearLayout details, final JSONObject row, final boolean outgoing) {
+        int start = outgoing ? row.optInt("start") : modifierBodyStart;
+        int end = outgoing ? row.optInt("end") : modifierBodyEnd;
+        String excludeStart = outgoing ? modifierStart : row.optString("startId");
+        String excludeEnd = outgoing ? modifierEnd : row.optString("endId");
+        final float scale = Math.max(1f, Math.min(3f, getResources().getDisplayMetrics().density));
+        final float width = Math.max(60f, modifierRows.getWidth() / (wideInspector() ? 2f * scale : scale));
+        final String key = InspectorView.ComparisonCache.key(modifierStart, modifierEnd,
+                start, end, excludeStart, excludeEnd, (int) width, scale,
+                editor.getText().toString().hashCode());
+        Object cached = modifierRowCache.get(key);
+        if (cached instanceof JSONObject) {
+            renderModifierRow(details, (JSONObject) cached);
+            return;
+        }
+        final String text = editor.getText().toString();
+        final String snapshot = DocBridge.snapshot(handle);
+        final int generation = ++modifierRowGeneration;
+        renderWork.submit("modifier-row", RenderController.EXPLICIT, new RenderController.Job() {
+            @Override public void run() {
+                final String result = DocBridge.modifierComparisonRow(text, snapshot, start, end,
+                        excludeStart, excludeEnd, width, scale);
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        if (generation != modifierRowGeneration || details.getParent() == null) return;
+                        try {
+                            JSONObject parsed = new JSONObject(result);
+                            if (!parsed.has("error")) modifierRowCache.put(key, parsed);
+                            renderModifierRow(details, parsed);
+                        } catch (Exception e) {
+                            details.removeAllViews();
+                            details.addView(panelLabel("Could not display comparison"));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private void renderModifierRow(LinearLayout details, JSONObject result) {
+        details.removeAllViews();
+        if (result.has("error")) {
+            details.addView(panelLabel(result.optString("error", "Comparison unavailable")));
+            return;
+        }
+        comparisonRow(panelLabel("With modifier"), comparisonImage(result.optJSONObject("with")));
+        comparisonRow(panelLabel("Without modifier"), comparisonImage(result.optJSONObject("without")));
     }
 
     // ----- mathed rendering --------------------------------------------
@@ -3760,6 +5526,7 @@ public class MainActivity extends Activity {
         visibleScrollY = -1;
         long captureStart = System.nanoTime();
         renderSnapshot = DocBridge.snapshotBytes(handle);
+        clearDiagnostics();
         trace("renderCost", "captureMs", (System.nanoTime() - captureStart) / 1_000_000.0);
         if (restoreScrollY >= 0 && restoreScrollWidth > 0 && previewPages.getWidth() > 0) {
             restoreScrollY = Math.round((float) restoreScrollY * previewPages.getWidth()
@@ -3836,11 +5603,11 @@ public class MainActivity extends Activity {
         final String layoutId, error, intent;
         final int total, start, captionStart;
         final List<DecodedPage> pages;
-        final JSONArray pageSizes, warnings;
+        final JSONArray pageSizes, warnings, diagnostics;
 
         DecodedChunk(String layoutId, String error, int total, int start, int captionStart,
                      List<DecodedPage> pages, JSONArray pageSizes, JSONArray warnings,
-                     String intent) {
+                     JSONArray diagnostics, String intent) {
             this.layoutId = layoutId;
             this.error = error;
             this.total = total;
@@ -3849,6 +5616,7 @@ public class MainActivity extends Activity {
             this.pages = pages;
             this.pageSizes = pageSizes;
             this.warnings = warnings;
+            this.diagnostics = diagnostics == null ? new JSONArray() : diagnostics;
             this.intent = intent;
         }
     }
@@ -3913,10 +5681,13 @@ public class MainActivity extends Activity {
         long layoutMs = (System.nanoTime() - layoutStart) / 1_000_000;
         try {
             JSONObject prepared = new JSONObject(preparedJson);
+            JSONArray diagnostics = prepared.optJSONArray("diagnostics");
+            if (diagnostics == null) diagnostics = new JSONArray();
             String error = prepared.optString("error", "");
             if (!error.isEmpty()) {
                 return new DecodedChunk(layoutId, error, 0, start, -1,
-                        new ArrayList<DecodedPage>(), new JSONArray(), new JSONArray(), intent);
+                        new ArrayList<DecodedPage>(), new JSONArray(), new JSONArray(),
+                        diagnostics, intent);
             }
             int total = prepared.getInt("total");
             int caption = prepared.optInt("captionStart", -1);
@@ -3926,7 +5697,8 @@ public class MainActivity extends Activity {
             if (warnings == null) warnings = new JSONArray();
             if (start >= total) {
                 return new DecodedChunk(layoutId, "Page is outside the layout", total, start,
-                        caption, new ArrayList<DecodedPage>(), pageSizes, warnings, intent);
+                        caption, new ArrayList<DecodedPage>(), pageSizes, warnings,
+                        diagnostics, intent);
             }
             int page = start;
             JSONObject pageSize = pageSizes.optJSONObject(page);
@@ -3944,7 +5716,8 @@ public class MainActivity extends Activity {
             String pageError = p.optString("error", "");
             if (!pageError.isEmpty()) {
                 return new DecodedChunk(layoutId, pageError, total, page, caption,
-                        new ArrayList<DecodedPage>(), pageSizes, warnings, intent);
+                        new ArrayList<DecodedPage>(), pageSizes, warnings,
+                        diagnostics, intent);
             }
             int w = p.getInt("width");
             int h = p.getInt("height");
@@ -3970,10 +5743,11 @@ public class MainActivity extends Activity {
             trace("renderCost", "layoutMs", layoutMs, "rasterMs", rasterMs,
                     "decodeMs", decodeMs, "pages", pages.size(), "layoutId", layoutId);
             return new DecodedChunk(layoutId, "", total, page, caption,
-                    pages, pageSizes, warnings, intent);
+                    pages, pageSizes, warnings, diagnostics, intent);
         } catch (Exception e) {
             return new DecodedChunk(layoutId, "render: " + e.getMessage(), 0, start, -1,
-                    new ArrayList<DecodedPage>(), new JSONArray(), new JSONArray(), intent);
+                    new ArrayList<DecodedPage>(), new JSONArray(), new JSONArray(),
+                    new JSONArray(), intent);
         }
     }
 
@@ -3981,10 +5755,118 @@ public class MainActivity extends Activity {
      * Shows a render diagnostic and stops the page stream until the next
      * edit (a half-typed expression must not retry per scroll tick).
      */
-    private void showPreviewError(String message) {
+    private void showPreviewError(String message, JSONArray diagnostics) {
+        if (diagnostics != null && diagnostics.length() > 0) setDiagnostics(diagnostics, renderLayoutId);
+        else setDiagnostics(syntheticDiagnostic("render", message, "error"), renderLayoutId);
         previewError.setText(message);
         previewError.setVisibility(View.VISIBLE);
         totalPages = pagesLoaded;
+    }
+
+    private JSONArray syntheticDiagnostic(String code, String message, String severity) {
+        JSONArray result = new JSONArray();
+        try {
+            JSONObject diagnostic = new JSONObject();
+            diagnostic.put("id", renderLayoutId + ":" + code + ":runtime");
+            diagnostic.put("severity", severity);
+            diagnostic.put("code", code);
+            diagnostic.put("message", message == null ? "Preview unavailable" : message);
+            diagnostic.put("captureId", renderLayoutId);
+            diagnostic.put("start", JSONObject.NULL);
+            diagnostic.put("end", JSONObject.NULL);
+            diagnostic.put("markerPair", JSONObject.NULL);
+            diagnostic.put("provenance", "document");
+            result.put(diagnostic);
+        } catch (Exception ignored) { }
+        return result;
+    }
+
+    /** Replace the visible diagnostic set for one accepted layout capture. */
+    private void setDiagnostics(JSONArray diagnostics, String capture) {
+        currentDiagnostics = diagnostics == null ? new JSONArray() : diagnostics;
+        int errors = 0, warnings = 0;
+        for (int i = 0; i < currentDiagnostics.length(); i++) {
+            JSONObject diagnostic = currentDiagnostics.optJSONObject(i);
+            if (diagnostic == null) continue;
+            if ("error".equals(diagnostic.optString("severity"))) errors++;
+            else if ("warning".equals(diagnostic.optString("severity"))) warnings++;
+        }
+        diagnosticCount = currentDiagnostics.length();
+        setStatus(statusText);
+        previewError.setOnClickListener(null);
+        previewError.setClickable(false);
+        if (diagnosticCount == 0) {
+            previewError.setVisibility(View.GONE);
+            return;
+        }
+        StringBuilder summary = new StringBuilder();
+        summary.append(diagnosticCount).append(diagnosticCount == 1 ? " diagnostic" : " diagnostics");
+        if (errors > 0) summary.append(" · ").append(errors).append(errors == 1 ? " error" : " errors");
+        if (warnings > 0) summary.append(" · ").append(warnings).append(warnings == 1 ? " warning" : " warnings");
+        summary.append(" · tap for details");
+        previewError.setText(summary.toString());
+        previewError.setVisibility(View.VISIBLE);
+        previewError.setClickable(true);
+        previewError.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showDiagnostics(); }
+        });
+        trace("diagnostics", "capture", capture, "count", diagnosticCount,
+                "errors", errors, "warnings", warnings);
+    }
+
+    private void clearDiagnostics() {
+        currentDiagnostics = new JSONArray();
+        diagnosticCount = 0;
+        setStatus(statusText);
+        previewError.setOnClickListener(null);
+        previewError.setClickable(false);
+        if (renderedPages.isEmpty()) {
+            previewError.setVisibility(View.GONE);
+        } else {
+            previewError.setText("Preview out of date");
+            previewError.setVisibility(View.VISIBLE);
+        }
+    }
+
+    /** Status error/warning count opens this source-linked list. */
+    private void showDiagnostics() {
+        if (diagnosticCount == 0) return;
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setPadding(dp(12), dp(6), dp(12), dp(10));
+        scroll.addView(rows);
+        final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Diagnostics")
+                .setView(scroll)
+                .setNegativeButton("Close", null)
+                .create();
+        for (int i = 0; i < currentDiagnostics.length(); i++) {
+            final JSONObject diagnostic = currentDiagnostics.optJSONObject(i);
+            if (diagnostic == null) continue;
+            String severity = diagnostic.optString("severity", "warning");
+            String code = diagnostic.optString("code", "diagnostic");
+            String provenance = diagnostic.optString("provenance", "document");
+            String markerPair = citationKeyText(diagnostic.optJSONArray("markerPair"));
+            String label = severity.toUpperCase(java.util.Locale.ROOT) + " · " + code
+                    + " · " + provenance + (markerPair.isEmpty() ? "" : " · #" + markerPair.replace(", ", " #"));
+            final int start = diagnostic.isNull("start") ? -1 : diagnostic.optInt("start", -1);
+            final int end = diagnostic.isNull("end") ? start : diagnostic.optInt("end", start);
+            TextView row = panelLabel(label + "\n" + diagnostic.optString("message", ""));
+            row.setTextColor(Color.parseColor("error".equals(severity) ? "#F2A7A7" : "#D9C98A"));
+            if (start >= 0) {
+                row.setClickable(true);
+                row.setContentDescription("Open diagnostic source: " + code);
+                row.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        dialog.dismiss();
+                        navigateTo("diagnostic", "Diagnostic", start, Math.max(start, end), true);
+                    }
+                });
+            }
+            rows.addView(row);
+        }
+        dialog.show();
     }
 
     /** Applies one worker-decoded chunk to the page stack. */
@@ -3992,7 +5874,7 @@ public class MainActivity extends Activity {
         long applyStart = System.nanoTime();
         try {
             if (!chunk.error.isEmpty()) {
-                showPreviewError(chunk.error);
+                showPreviewError(chunk.error, chunk.diagnostics);
                 return;
             }
             totalPages = chunk.total;
@@ -4016,21 +5898,27 @@ public class MainActivity extends Activity {
             trimPageBitmaps();
             ensureVisiblePages();
             restorePreviewScroll();
-            if (searchBar.getVisibility() == View.VISIBLE && searchCurrent >= 0) scrollSearchMatch();
-            JSONArray warnings = chunk.warnings;
-            if (warnings != null && warnings.length() > 0) {
+            if (searchBar.getVisibility() == View.VISIBLE && findScrollPending) {
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        if (searchBar.getVisibility() == View.VISIBLE && findScrollPending) {
+                            showCurrentFindMatch();
+                        }
+                    }
+                });
+            }
+            setDiagnostics(chunk.diagnostics, chunk.layoutId);
+            if (chunk.diagnostics.length() == 0 && chunk.warnings.length() > 0) {
                 StringBuilder message = new StringBuilder();
-                for (int i = 0; i < warnings.length(); i++) {
+                for (int i = 0; i < chunk.warnings.length(); i++) {
                     if (i > 0) message.append('\n');
-                    message.append(warnings.getString(i));
+                    message.append(chunk.warnings.getString(i));
                 }
                 previewError.setText(message.toString());
                 previewError.setVisibility(View.VISIBLE);
-            } else {
-                previewError.setVisibility(View.GONE);
             }
         } catch (Exception e) {
-            showPreviewError("render: " + e.getMessage());
+            showPreviewError("render: " + e.getMessage(), null);
         } finally {
             trace("renderCost", "uiApplyMs", (System.nanoTime() - applyStart) / 1_000_000.0,
                     "start", chunk.start, "pages", chunk.pages.size());
@@ -4092,7 +5980,20 @@ public class MainActivity extends Activity {
                         touchDownY = event.getY();
                         moved = false;
                         touchSelecting = false;
+                        touchSelectionHandle = -1;
                         main.removeCallbacks(touchLongPress);
+                        if (page.loaded) {
+                            int handle = page.selectionHandleAt(event.getX(), event.getY());
+                            if (handle >= 0) {
+                                int begin = Math.min(selectionAnchor, editor.getSelectionStart());
+                                int end = Math.max(selectionAnchor, editor.getSelectionStart());
+                                setSelectionAnchor(handle == 0 ? end : begin);
+                                touchSelectionHandle = handle;
+                                touchSelecting = true;
+                                showSelectionBar();
+                                return true;
+                            }
+                        }
                         if (!pagesStale && page.loaded) {
                             main.postDelayed(touchLongPress,
                                     android.view.ViewConfiguration.getLongPressTimeout());
@@ -4124,6 +6025,7 @@ public class MainActivity extends Activity {
                             selectPageGlyph(page, event.getX(), event.getY());
                         }
                         touchSelecting = false;
+                        touchSelectionHandle = -1;
                         touchSelectionPage = null;
                         return true;
                     case MotionEvent.ACTION_CANCEL:
@@ -4132,6 +6034,7 @@ public class MainActivity extends Activity {
                             touchSelectionPage = null;
                         }
                         touchSelecting = false;
+                        touchSelectionHandle = -1;
                         return true;
                     default:
                         return true;
@@ -4341,6 +6244,14 @@ public class MainActivity extends Activity {
                     "px", offset, "scrollY", y);
         } else if ("caret".equals(intent) || "search".equals(intent)) {
             focusRenderedCaret();
+        } else if ("navigation".equals(intent)) {
+            CaretSpot spot = caretSpot(editor.getSelectionStart());
+            if (spot.page != null && spot.distance <= 1) {
+                focusRenderedCaret();
+            } else {
+                // A figure-only or hidden destination keeps a source fallback.
+                openSourceAt(editor.getSelectionStart(), editor.getSelectionEnd());
+            }
         }
         ensureVisiblePages();
     }
@@ -4498,6 +6409,19 @@ public class MainActivity extends Activity {
      *                 plain typing the editor already owns the caret and
      *                 the state caret just echoes it back.
      */
+    private void applyUndo() {
+        int start = replaceUndoStart, end = replaceUndoEnd;
+        replaceUndoStart = replaceUndoEnd = -1;
+        applyState(DocBridge.undo(handle), true);
+        if (start >= 0 && editor != null) {
+            int a = Math.min(start, editor.length());
+            int b = Math.min(end, editor.length());
+            editor.setSelection(a, b);
+            if (a < b) setSelectionAnchor(a); else clearSelectionAnchor();
+            invalidateRenderedCaret();
+        }
+    }
+
     private void applyState(String json, boolean setCaret) {
         try {
             JSONObject o = new JSONObject(json);
@@ -4508,6 +6432,7 @@ public class MainActivity extends Activity {
             refreshSelectionAnchor();
             refreshReadingAnchor();
             if (!restoringState) unsaved = true;
+            if (!setCaret) replaceUndoStart = replaceUndoEnd = -1;
 
             String text = o.getString("text");
             modelText = text;
@@ -4530,7 +6455,8 @@ public class MainActivity extends Activity {
             if (documentMarkers == null) documentMarkers = new JSONArray();
             documentModifierLinks = o.optJSONArray("modifierLinks");
             if (documentModifierLinks == null) documentModifierLinks = new JSONArray();
-            documentCitations = new JSONArray(DocBridge.citationIndex(text));
+            documentCitations = new JSONArray(DocBridge.citationIndex(text, false));
+            refreshSemantics(text);
             documentSegments = o.optJSONArray("segments");
             if (documentSegments == null) documentSegments = new JSONArray();
             refreshSegments(o);
@@ -4544,7 +6470,7 @@ public class MainActivity extends Activity {
             scheduleRender();
             if (searchBar != null && searchBar.getVisibility() == View.VISIBLE) updateSearch();
         } catch (Exception e) {
-            status.setText("state error: " + e.getMessage());
+            setStatus("state error: " + e.getMessage());
         }
     }
 
@@ -4579,13 +6505,29 @@ public class MainActivity extends Activity {
         }
 
         String extra = segs.length() > shown ? ", +more" : "";
-        status.setText("rev " + o.getLong("revision") + " · " + segs.length()
-                + " segs · " + props + extra + saveStateLabel());
+        trace("status", "revision", o.getLong("revision"), "segments", segs.length(),
+                "props", props.toString(), "more", segs.length() > shown);
+        setStatus("Ready");
     }
 
-    private String saveStateLabel() {
-        if (!recoveryReady) return "";
-        return unsaved ? " · unsaved" : " · saved";
+    /** Keeps the status line's diagnostic count clickable across status updates. */
+    private void setStatus(String text) {
+        statusText = text == null ? "" : text;
+        if (status == null) return;
+        String name = StatusModel.documentName(documentLabel != null ? documentLabel
+                : documentUri == null ? null : documentUri.getLastPathSegment());
+        String state = StatusModel.saveState(recoveryReady, unsaved,
+                activeFile == null ? null : activeFile.kind,
+                activeFile != null && activeFile.copy);
+        String detail = statusText;
+        if (findVisible() && find != null && !find.status().isEmpty()) {
+            detail = detail.isEmpty() ? find.status() : detail + " · " + find.status();
+        }
+        status.setText(StatusModel.compose(name, state, detail, diagnosticCount));
+        status.setClickable(diagnosticCount > 0);
+        status.setOnClickListener(diagnosticCount > 0 ? new View.OnClickListener() {
+            @Override public void onClick(View v) { showDiagnostics(); }
+        } : null);
     }
 
     /**

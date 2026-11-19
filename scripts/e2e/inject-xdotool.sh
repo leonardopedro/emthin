@@ -50,8 +50,10 @@ inject_focus() {
 }
 
 inject_key() {
-  xdotool key --clearmodifiers --delay 20 -- "$1" >/dev/null 2>&1 \
-    || { warn "xdotool could not deliver: $1"; return 1; }
+  case "$1" in
+    space) xdotool key --clearmodifiers --delay 20 -- space >/dev/null 2>&1 ;;
+    *)     xdotool key --clearmodifiers --delay 20 -- "$1" >/dev/null 2>&1 ;;
+  esac || { warn "xdotool could not deliver: $1"; return 1; }
   sleep "${INJECT_SETTLE:-0.2}"
 }
 

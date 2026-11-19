@@ -94,6 +94,107 @@ while i < len(text):
 '
 }
 
+# `page page_count` from the live state notification.
+page_from_state() {
+  python3 -c '
+import sys, json
+dec = json.JSONDecoder()
+text = sys.stdin.read()
+i = 0
+while i < len(text):
+    while i < len(text) and text[i] != "{":
+        i += 1
+    if i >= len(text):
+        break
+    try:
+        obj, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    if obj.get("method") == "state":
+        p = obj["params"]
+        print(p["page"], p["page_count"])
+        break
+'
+}
+
+current_page_state() {
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | page_from_state
+}
+
+# The compact status line, or an empty string in quiet state.
+status_from_state() {
+  python3 -c '
+import sys, json
+dec = json.JSONDecoder()
+text = sys.stdin.read()
+i = 0
+while i < len(text):
+    while i < len(text) and text[i] != "{":
+        i += 1
+    if i >= len(text):
+        break
+    try:
+        obj, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    if obj.get("method") == "state":
+        print(obj["params"].get("status") or "")
+        break
+'
+}
+
+current_status() {
+  python3 "$PWD/scripts/e2e/ipc.py" "$E2E_IPC" list_state | status_from_state
+}
+
+await_status_contains() {
+  local needle=$1 status="" deadline=$((SECONDS + ${2:-10}))
+  while :; do
+    status="$(current_status 2>/dev/null || true)"
+    case "$status" in
+      *"$needle"*) printf '%s\n' "$status"; return 0 ;;
+    esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      printf '%s\n' "$status"
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+await_status_lacks() {
+  local needle=$1 status="" deadline=$((SECONDS + ${2:-10}))
+  while :; do
+    status="$(current_status 2>/dev/null || true)"
+    case "$status" in
+      *"$needle"*) ;;
+      *) printf '%s\n' "$status"; return 0 ;;
+    esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      printf '%s\n' "$status"
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+# Poll until the visible page is `$1`, returning the final `page page_count`.
+await_page() {
+  local want=$1 state="" page count deadline=$((SECONDS + 10))
+  while :; do
+    state="$(current_page_state 2>/dev/null || true)"
+    if [ -n "$state" ]; then
+      read -r page count <<<"$state"
+      [ "$page" = "$want" ] && { printf '%s\n' "$state"; return 0; }
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      printf '%s\n' "$state"
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 wayland_only_check() {
   echo >&2
   log "transport check: does emthin hold any X11 connection?"
@@ -291,19 +392,216 @@ keyboard_checks() {
     FAILED=$(( FAILED + 1 ))
   fi
 
-  # IME commit into the document caret: with fcitx5 running under the nested
-  # session, a commit arrives as a text-input-v3 commit and must land in the
-  # document. Reported rather than asserted, because whether an IME is actually
-  # engaged depends on the host's fcitx configuration and is not something this
-  # script can force.
-  if command -v fcitx5 >/dev/null 2>&1; then
-    log "fcitx5 present; an IME commit needs the host's fcitx to be engaged"
-  else
-    warn "fcitx5 not on PATH; the IME commit cannot be exercised at all"
+  multipage_checks
+}
+
+# Page navigation through the same injected keyboard path. A fresh document is
+# used so the check does not depend on the preference fixture's page count.
+multipage_checks() {
+  echo >&2
+  log "multi-page navigation: PgDn/PgUp via the keyboard path"
+
+  local doc="$E2E_RUN/multipage.typ"
+  python3 - "$doc" <<'PY'
+import sys
+text = ("A page-navigation fixture line with enough text to paginate. " * 8 + "\n\n") * 40
+text += "findcancelprobe\n"
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    f.write(text)
+PY
+  ipc open_doc "{\"path\":\"$doc\"}" >/dev/null 2>&1 || true
+
+  local state="" page count deadline=$((SECONDS + 10))
+  while :; do
+    state="$(current_page_state 2>/dev/null || true)"
+    if [ -n "$state" ]; then
+      read -r page count <<<"$state"
+      [ "$count" -ge 3 ] && break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      skip "multi-page navigation" "fixture laid out ${count:-0} page(s); need >= 3"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  # Start from a known page, then move only with keys.
+  ipc goto_page '{"page":0}' >/dev/null 2>&1 || true
+  await_page 0 >/dev/null || true
+
+  local advanced=0 returned=0
+  inject_key Page_Down || warn "Page_Down was not delivered"
+  if await_page 1 >/dev/null; then advanced=1; fi
+  check "PgDn advances to the next page" "$advanced" "1"
+
+  inject_key Page_Up || warn "Page_Up was not delivered"
+  if await_page 0 >/dev/null; then returned=1; fi
+  check "PgUp returns to the previous page" "$returned" "1"
+
+  find_cancel_checks
+}
+
+# Open Find, jump to a unique probe on a later page, then cancel with Escape.
+# The check deliberately asserts both the close and the restored origin, since
+# a bar that closes but leaves the reader at the match has not cancelled.
+find_cancel_checks() {
+  # wtype's synthetic Ctrl modifier is not delivered with the following key:
+  # emthin sees `KEY_f` with no ctrl and types a literal `f` into the document.
+  # Find is therefore XTEST-only, the same boundary as the IME check, until the
+  # wtype path can carry a chord.
+  [ "${CONFIG:-}" = xdotool ] || return 0
+
+  echo >&2
+  log "find: Escape cancels and restores the pre-search page"
+
+  if ! inject_available; then
+    skip "Find cancel" "no injection available"
+    return 0
   fi
+
+  local doc="$E2E_RUN/multipage.typ"
+  ipc open_doc "{\"path\":\"$doc\"}" >/dev/null 2>&1 || true
+  if ! await_page 0 >/dev/null; then
+    skip "Find cancel" "fixture did not return to page 0"
+    return 0
+  fi
+  local before
+  before="$(current_document)"
+
+  inject_key ctrl+f || warn "Ctrl+F was not delivered"
+  local opened=0
+  if await_status_contains "Find" 5 >/dev/null; then opened=1; fi
+  check "Ctrl+F opens the Find bar" "$opened" "1"
+
+  inject_type "findcancelprobe" || true
+  local matched=0
+  if await_status_contains "Find 1/1" 10 >/dev/null; then matched=1; fi
+  check "Find reports the unique probe as 1/1" "$matched" "1"
+
+  # F3 is a global binding and remains available while the bar is open. It
+  # selects the match and reveals its page, which gives Escape something to
+  # restore.
+  inject_key F3 || warn "F3 was not delivered"
+  local moved=0 state="" page count deadline=$((SECONDS + 10))
+  while :; do
+    state="$(current_page_state 2>/dev/null || true)"
+    if [ -n "$state" ]; then
+      read -r page count <<<"$state"
+      [ "$page" -gt 0 ] && { moved=1; break; }
+    fi
+    [ "$SECONDS" -ge "$deadline" ] && break
+    sleep 0.1
+  done
+  check "F3 reveals the matching page" "$moved" "1"
+
+  inject_key Escape || warn "Escape was not delivered"
+  local closed=0 restored=0 after=""
+  if await_status_lacks "Find" 5 >/dev/null; then closed=1; fi
+  if await_page 0 >/dev/null; then restored=1; fi
+  after="$(current_document)"
+  check "Escape cancels Find" "$closed" "1"
+  check "cancelling Find restores the pre-search page" "$restored" "1"
+  check "cancelling Find leaves the document unchanged" "$after" "$before"
+}
+
+# fcitx5 commits into the focused text-input-v3 client. wtype delivers keys after
+# wlroots' input-method grab, so this is an XTEST-lane check by construction; the
+# other lanes neither claim nor count it.
+ime_checks() {
+  [ "${CONFIG:-}" = xdotool ] || return 0
+
+  if [ "${IME_READY:-0}" != 1 ]; then
+    skip "fcitx5 IME commit" "fcitx5/rime did not start; see $E2E_ROOT/fcitx5.log"
+    return 0
+  fi
+  if ! command -v kgx >/dev/null 2>&1; then
+    skip "fcitx5 IME commit" "kgx is not available as the text-input client"
+    return 0
+  fi
+
+  echo >&2
+  log "IME: fcitx5/rime -> emthin text-input-v3 -> kgx"
+
+  local probe="$E2E_RUN/ime-probe.typ"
+  printf '#1 IME probe #2 \\app(#1, #2, 600, 300, "kgx")\n' > "$probe"
+  ipc open_doc "{\"path\":\"$probe\"}" >/dev/null 2>&1 || true
+  sleep 1
+  ipc spawn '{"cmd":"kgx"}' >/dev/null 2>&1 || true
+
+  local st="" bound=0
+  for _ in $(seq 1 80); do
+    st="$(state 2>/dev/null || true)"
+    case "$st" in
+      *f0*) case "$st" in *"window=None"*) ;; *) bound=1; break ;; esac ;;
+    esac
+    sleep 0.25
+  done
+  if [ "$bound" != 1 ]; then
+    skip "fcitx5 IME commit" "kgx did not bind to a figure; state: ${st:-empty}"
+    return 0
+  fi
+
+  ipc focus '{"figure":"f0"}' >/dev/null 2>&1 || true
+  sleep 1
+  # GTK/VTE requests text-input-v3 lazily, only after the first key. That key is
+  # deliberately harmless: it only exists to make the client enable the IME.
+  inject_type "x" || true
+  local enabled=0
+  for _ in $(seq 1 120); do
+    if grep -aq 'winit.set_ime_allowed(true)' "$E2E_ROOT/emthin.log" 2>/dev/null; then
+      enabled=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$enabled" != 1 ]; then
+    skip "fcitx5 IME commit" "no text-input-v3 client enabled the host IME"
+    return 0
+  fi
+  sleep 1
+
+  # "nihao" is Rime's pinyin for 你好; space selects the first candidate, which
+  # fcitx emits as a commit to emthin's host, then to the focused text-input
+  # client. The log line is the assertion because kgx's pty may render the text
+  # without exposing a stable file to read.
+  inject_type "nihao" || true
+  local preedit_line=""
+  for _ in $(seq 1 40); do
+    preedit_line="$(grep -anF 'winit Ime event: Preedit("ni hao"' \
+      "$E2E_ROOT/emthin.log" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    [ -n "$preedit_line" ] && break
+    sleep 0.25
+  done
+  inject_key space || true
+
+  local committed=0 commit_line=""
+  for _ in $(seq 1 40); do
+    commit_line="$(grep -anF 'winit Ime event: Commit("你好")' \
+      "$E2E_ROOT/emthin.log" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    if [ -n "$commit_line" ]; then
+      committed=1
+      break
+    fi
+    sleep 0.25
+  done
+  check "fcitx5 commits 你好 through emthin's IME host" "$committed" "1"
+
+  # The preedit is the half-typed pinyin, not the final glyph. Assert both that
+  # it appeared and that it was logged before the commit, so a client that
+  # jumps straight to Commit cannot pass by matching the final line alone.
+  local ordered=0
+  if [ -n "$preedit_line" ] && [ -n "$commit_line" ] &&
+    [ "$preedit_line" -lt "$commit_line" ]; then
+    ordered=1
+  fi
+  check "fcitx5 logs the preedit before the commit" "$ordered" "1"
+
+  ipc close '{"figure":"f0"}' >/dev/null 2>&1 || true
+  ipc focus '{"figure":null}' >/dev/null 2>&1 || true
 }
 
 wayland_only_check
 clipboard_checks
 keyboard_checks
+ime_checks
 finish

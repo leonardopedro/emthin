@@ -38,10 +38,27 @@
 #                (used by e2e)
 #   scroll-anchor  cold-launch starter -> page-2 -> one-page collapse ->
 #                undo reading-position proof (used by e2e)
+#   search-replace  Find -> Accept -> Back/Forward -> Replace current -> Undo
+#                (used by e2e)
+#   accessibility  TalkBack enabled + bound -> page spoken and pad registered
+#                as a client. Installs TALKBACK_APK when available, otherwise
+#                uses an existing install, otherwise skips explicitly
+#                (used by e2e)
+#   diagnostics   exact + owner banner -> diagnostics list -> source -> Back
+#                (used by e2e)
+#   named-document  open a real named source file -> status shows its name
+#                (used by e2e)
+#   focus-stack  Find/replace IME + dialog Back + inspector Escape
+#                (used by e2e)
+#   composing-ime  test-only IME -> composing CJK -> commit -> emoji commit
+#                (used by e2e; requires the disposable test APK)
+#   modifier-inspector  deterministic modifier/target fixture -> incoming and
+#                outgoing rows -> expand one comparison (used by e2e)
 #   e2e          authorize, connect, build, install, launch, screencap,
 #                swipe, screencap, logcat, persistence, new-reset,
-#                scroll-anchor, pull + byte-identity (the repeatable
-#                device proof)
+#                scroll-anchor, search-replace, focus-stack, composing-ime,
+#                accessibility, diagnostics, named-document, modifier-inspector,
+#                pull + byte-identity (the repeatable device proof)
 #
 # Env overrides:
 #   DEVICE       adb serial (default: waydroid status IP + :5555; an explicit
@@ -50,6 +67,14 @@
 #   APK          built apk path (default: <script dir>/build/emthin-pad.apk)
 #   OUTDIR       screenshot/logcat output dir (default: /tmp/emthin-device-lane)
 #   SKIP_BUILD   1 = e2e uses the existing APK instead of rebuilding it
+#   EMTHIN_LANE_PACKAGE  application id to install/drive (default:
+#                com.emthin.pad.test). The test package is disposable; a normal
+#                package additionally requires EMTHIN_LANE_DISPOSABLE=1.
+#   EMTHIN_LANE_DISPOSABLE  1 = allow `pm clear` on a non-test package. Only
+#                set it for an install with no working document.
+#   TALKBACK_APK path to a TalkBack APK. When TalkBack is absent and this is
+#                readable, the accessibility step installs it for the check and
+#                uninstalls it afterwards. Without it an absent TalkBack skips.
 #   SWIPE_X / SWIPE_FROM_Y / SWIPE_TO_Y / SWIPE_MS   drag (default: from wm size)
 #
 # Exit status: 0 = every step passed, 1 = a step failed, 2 = bad usage,
@@ -59,10 +84,15 @@ set -u
 PATH=/run/current-system/sw/bin:$PATH
 export PATH
 
-PKG=com.emthin.pad
-ACTIVITY=com.emthin.pad/.MainActivity
+TEST_PACKAGE=com.emthin.pad.test
+PKG="${EMTHIN_LANE_PACKAGE:-$TEST_PACKAGE}"
+ACTIVITY="$PKG/com.emthin.pad.MainActivity"
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-APK="${APK:-$SCRIPT_DIR/build/emthin-pad.apk}"
+if [ "$PKG" = "$TEST_PACKAGE" ]; then
+    APK="${APK:-$SCRIPT_DIR/build/test/emthin-pad-test.apk}"
+else
+    APK="${APK:-$SCRIPT_DIR/build/emthin-pad.apk}"
+fi
 OUTDIR="${OUTDIR:-/tmp/emthin-device-lane}"
 XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONTAINER_ADB_KEYS="$XDG_DATA/waydroid/data/misc/adb/adb_keys"
@@ -81,6 +111,7 @@ FAILURES=0
 DEVICE="${DEVICE:-}"
 ADB="${ADB:-adb}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+EMTHIN_LANE_DISPOSABLE="${EMTHIN_LANE_DISPOSABLE:-0}"
 
 say()  { printf '%s\n' "$*"; }
 pass() { printf 'ok   %s\n' "$1"; }
@@ -165,7 +196,12 @@ cmd_connect() {
 }
 
 cmd_build() {
-    local default_apk="$SCRIPT_DIR/build/emthin-pad.apk"
+    local default_apk
+    if [ "$PKG" = "$TEST_PACKAGE" ]; then
+        default_apk="$SCRIPT_DIR/build/test/emthin-pad-test.apk"
+    else
+        default_apk="$SCRIPT_DIR/build/emthin-pad.apk"
+    fi
     if [ "$APK" != "$default_apk" ]; then
         say "info build: custom APK path $APK; not rebuilding"
         return 0
@@ -174,9 +210,13 @@ cmd_build() {
         fail "build-apk.sh is not executable"
         return 1
     fi
+    local test_env=()
+    if [ "$PKG" = "$TEST_PACKAGE" ]; then
+        test_env=(EMTHIN_TEST_PACKAGE="$TEST_PACKAGE")
+    fi
     # build-apk.sh asks adb for the device ABI when ANDROID_ABI is unset;
     # pass both the serial and the adb executable it should use.
-    if DEVICE="$DEVICE" ADB="$ADB" "$SCRIPT_DIR/build-apk.sh"; then
+    if env DEVICE="$DEVICE" ADB="$ADB" "${test_env[@]}" "$SCRIPT_DIR/build-apk.sh"; then
         pass "build-apk.sh (device ABI)"
     else
         fail "build-apk.sh"
@@ -208,9 +248,14 @@ cmd_launch() {
     fi
 }
 
-# The pad now autosaves. Device checks that assert the starter document
-# must clear that saved text first or they inherit the previous run.
+# The pad autosaves. Device checks that assert the starter document must
+# clear that saved text first or they inherit the previous run. Refuse by
+# default: this wipes the only copy of an unsaved working document.
 cmd_clear_data() {
+    if [ "$PKG" != "$TEST_PACKAGE" ] && [ "$EMTHIN_LANE_DISPOSABLE" != 1 ]; then
+        fail "refusing pm clear $PKG: use $TEST_PACKAGE or set EMTHIN_LANE_DISPOSABLE=1 for a disposable install"
+        return 1
+    fi
     if D shell pm clear "$PKG" >/dev/null 2>&1; then
         pass "cleared pad app data"
     else
@@ -374,6 +419,19 @@ wait_for_log() {
     return 1
 }
 
+# Last textLen reported by any trace line. Device checks derive edit
+# expectations from the actual starter instead of hard-coding its length.
+last_text_len() {
+    awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "textLen") { n = $(i + 1) + 0; found = 1; }
+            }
+        }
+        END { if (found) print n }
+    ' "$1"
+}
+
 # Last restoreScroll's "y actual" pair.
 last_restore() {
     awk '
@@ -403,6 +461,12 @@ cmd_persistence() {
     wait_for_log "$log" 'captionScroll' \
         || { fail "starter document did not open at the first caption"; return; }
     pass "cold-launched the starter"
+    local base_len
+    base_len=$(last_text_len "$log")
+    if [ -z "$base_len" ] || [ "$base_len" -le 0 ]; then
+        fail "cold launch did not report the starter text length"
+        return
+    fi
 
     cmd_uidump "$ui" || return
     tap_editor_end || { fail "editor not found in UI hierarchy"; return; }
@@ -420,7 +484,7 @@ cmd_persistence() {
 
     D logcat -c >/dev/null 2>&1 || true
     D shell input text X >/dev/null 2>&1
-    wait_for_log "$log" 'applyState setCaret false .*textLen 90' \
+    wait_for_log "$log" "applyState setCaret false .*textLen $((base_len + 1))" \
         || { fail "typed probe did not reach the model"; return; }
 
     # Move one grapheme back from the document end. The first-paint
@@ -429,8 +493,8 @@ cmd_persistence() {
     # is overlay-only and must not start a render.
     D logcat -c >/dev/null 2>&1 || true
     D shell input keyevent KEYCODE_DPAD_LEFT >/dev/null 2>&1
-    wait_for_log "$log" 'caretMove offset 89' \
-        || { fail "caret probe did not move to 89"; return; }
+    wait_for_log "$log" "caretMove offset $base_len" \
+        || { fail "caret probe did not move to $base_len"; return; }
     if grep -q 'startRender' "$log"; then
         fail "caret movement triggered a layout render"
         return
@@ -450,12 +514,12 @@ cmd_persistence() {
     sleep 0.3
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch || return
-    wait_for_log "$log" 'applyState setCaret true .*textLen 90' \
-        || { fail "relaunch lost the saved 90-byte document"; return; }
-    pass "relaunch restored the edited document (textLen 90)"
-    wait_for_log "$log" 'startRender .*textLen 90 caret 89' \
-        || { fail "relaunch did not restore the caret at 89"; return; }
-    pass "relaunch restored the caret at 89"
+    wait_for_log "$log" "applyState setCaret true .*textLen $((base_len + 1))" \
+        || { fail "relaunch lost the saved edited document"; return; }
+    pass "relaunch restored the edited document (textLen $((base_len + 1)))"
+    wait_for_log "$log" "startRender .*textLen $((base_len + 1)) caret $base_len" \
+        || { fail "relaunch did not restore the caret at $base_len"; return; }
+    pass "relaunch restored the caret at $base_len"
     wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "restored document did not render two pages"; return; }
     wait_for_log "$log" 'restoreScroll' \
@@ -481,7 +545,7 @@ cmd_persistence() {
 cmd_new_reset() {
     local log="$OUTDIR/new-reset-logcat.txt"
     local ui="$OUTDIR/new-reset-ui.xml"
-    local b focus shot
+    local b focus shot base_len
 
     say "==> new document: reset -> undo"
     mkdir -p "$OUTDIR"
@@ -493,6 +557,11 @@ cmd_new_reset() {
     wait_for_log "$log" 'captionScroll' \
         || { fail "starter document did not open at the first caption"; return; }
     pass "cold-launched the starter for New"
+    base_len=$(last_text_len "$log")
+    if [ -z "$base_len" ] || [ "$base_len" -le 0 ]; then
+        fail "cold launch did not report the starter text length"
+        return
+    fi
 
     cmd_uidump "$ui" || return
     tap_editor_end || { fail "editor not found in UI hierarchy"; return; }
@@ -511,16 +580,16 @@ cmd_new_reset() {
     esac
 
     # Change the document so New has something real to discard and Undo
-    # has a step to restore. The starter is 89 bytes; X makes it 90.
+    # has a step to restore. X adds one byte to the observed starter.
     D logcat -c >/dev/null 2>&1 || true
     D shell input text X >/dev/null 2>&1
-    wait_for_log "$log" 'applyState setCaret false .*textLen 90' \
+    wait_for_log "$log" "applyState setCaret false .*textLen $((base_len + 1))" \
         || { fail "New probe did not reach the model"; return; }
-    wait_for_log "$log" 'startRender .*textLen 90' \
+    wait_for_log "$log" "startRender .*textLen $((base_len + 1))" \
         || { fail "New probe did not render"; return; }
     wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "New probe did not render two pages"; return; }
-    pass "typed the 90-byte probe"
+    pass "typed the $((base_len + 1))-byte probe"
 
     # Open the confirmation through the actual toolbar button, assert its
     # title, and capture the dark dialog before confirming it.
@@ -543,10 +612,10 @@ cmd_new_reset() {
     b=$(node_bounds 'resource-id="android:id/button1"') \
         || { fail "New confirmation has no positive button"; return; }
     tap_center "$b"
-    wait_for_log "$log" 'applyState setCaret true .*textLen 89 canUndo true' \
-        || { fail "New did not reset the document to 89 bytes"; return; }
-    pass "New reset the document to 89 bytes"
-    wait_for_log "$log" 'startRender .*textLen 89' \
+    wait_for_log "$log" "applyState setCaret true .*textLen $base_len canUndo true" \
+        || { fail "New did not reset the document to $base_len bytes"; return; }
+    pass "New reset the document to $base_len bytes"
+    wait_for_log "$log" "startRender .*textLen $base_len" \
         || { fail "New reset did not render"; return; }
     wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "New reset did not render two pages"; return; }
@@ -569,10 +638,10 @@ cmd_new_reset() {
     b=$(node_bounds 'text="\^Z Undo"') \
         || { fail "Undo not found in UI hierarchy"; return; }
     tap_center "$b"
-    wait_for_log "$log" 'applyState setCaret true .*textLen 90' \
-        || { fail "Undo did not restore the 90-byte document"; return; }
-    pass "Undo restored the 90-byte edited document"
-    wait_for_log "$log" 'startRender .*textLen 90' \
+    wait_for_log "$log" "applyState setCaret true .*textLen $((base_len + 1))" \
+        || { fail "Undo did not restore the edited document"; return; }
+    pass "Undo restored the $((base_len + 1))-byte edited document"
+    wait_for_log "$log" "startRender .*textLen $((base_len + 1))" \
         || { fail "Undo restore did not render"; return; }
     wait_for_log "$log" 'applyChunk total 2 pages [12]' \
         || { fail "Undo restore did not render two pages"; return; }
@@ -585,7 +654,7 @@ cmd_new_reset() {
 cmd_scroll_anchor() {
     local log="$OUTDIR/scroll-anchor-logcat.txt"
     local ui="$OUTDIR/scroll-anchor-ui.xml"
-    local target collapse_actual undo_y undo_actual
+    local target collapse_actual undo_y undo_actual base_len
     local b focus i shot
 
     say "==> scroll anchor: page 2 -> one-page collapse -> undo"
@@ -593,7 +662,7 @@ cmd_scroll_anchor() {
 
     # Self-contained start: a previous run or the persistence check may
     # have left text behind, so clear app data and cold-launch the
-    # 89-byte starter instead of inheriting whatever state the app is in.
+    # starter instead of inheriting whatever state the app is in.
     cmd_clear_data || return
     D logcat -c >/dev/null 2>&1 || true
     cmd_launch || return
@@ -602,6 +671,12 @@ cmd_scroll_anchor() {
     wait_for_log "$log" 'captionScroll' \
         || { fail "starter document did not open at the first caption"; return; }
     pass "cold-launched two-page starter at the first caption"
+
+    base_len=$(last_text_len "$log")
+    if [ -z "$base_len" ] || [ "$base_len" -le 0 ]; then
+        fail "cold launch did not report the starter text length"
+        return
+    fi
 
     # Put the caret at the document end and close the IME *before*
     # scrolling. The space then inserts at the end without a keyboard
@@ -647,7 +722,7 @@ cmd_scroll_anchor() {
         fail "collapse did not clamp (actual=$collapse_actual target=$target)"
         return
     fi
-    if ! grep -q 'startRender .*caret 90' "$log"; then
+    if ! grep -q "startRender .*caret $((base_len + 1))" "$log"; then
         fail "space was not inserted at the document end"
         return
     fi
@@ -673,6 +748,977 @@ cmd_scroll_anchor() {
     pass "undo restored y $target"
 
     if shot=$(cmd_screencap "$OUTDIR/scroll-anchor-after.png"); then
+        say "    captured $shot"
+    fi
+}
+
+cmd_search_replace() {
+    local log="$OUTDIR/search-replace-logcat.txt"
+    local ui="$OUTDIR/search-replace-ui.xml"
+    local b shot base_len query=terminal replacement=cursor
+
+    say "==> search/replace: accept -> history -> replace current -> undo"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
+        || { fail "starter document did not render two pages"; return; }
+    sleep 0.6
+    base_len=$(last_text_len "$log")
+    if [ -z "$base_len" ] || [ "$base_len" -le 0 ]; then
+        fail "cold launch did not report the starter text length"
+        return
+    fi
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="\^F Find"') \
+        || { fail "Find not found in UI hierarchy"; return; }
+    tap_center "$b"
+    sleep 0.5
+    cmd_uidump "$ui" || return
+    if ! grep -q 'content-desc="Find in document"' "$ui"; then
+        fail "Find bar did not open"
+        return
+    fi
+    b=$(node_bounds 'content-desc="Find in document"') \
+        || { fail "Find query field not found"; return; }
+    tap_center "$b"
+    sleep 0.3
+    D shell input text "$query" >/dev/null 2>&1
+    wait_for_log "$log" "findScope scope text query $query total 1" \
+        || { fail "scoped search did not report the starter's terminal match"; return; }
+    pass "Find reported one literal Text match"
+
+    cmd_uidump "$ui" || return
+    grep -Eq 'text="[^"]* · 1 / 1"' "$ui" \
+        || { fail "main status did not carry the Find match count"; return; }
+    pass "main status carried the Find match count"
+
+    b=$(node_bounds 'text="Enter Accept"') \
+        || { fail "Accept not found in UI hierarchy"; return; }
+    D logcat -c >/dev/null 2>&1 || true
+    tap_center "$b"
+    wait_for_log "$log" 'navigate kind search' \
+        || { fail "Accept did not record a search destination"; return; }
+    pass "Accept pushed the search destination"
+    if grep -q 'startRender' "$log"; then
+        fail "Accept triggered a full render instead of a direct destination"
+        return
+    fi
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="Alt← Back"') \
+        || { fail "Back action not found in UI hierarchy"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'navigate kind current' \
+        || { fail "Back did not restore the pre-search location"; return; }
+    pass "Back restored the pre-search destination"
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="Alt→ Forward"') \
+        || { fail "Forward action not found in UI hierarchy"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'navigate kind search' \
+        || { fail "Forward did not return to the accepted search"; return; }
+    pass "Forward returned to the accepted search"
+
+    # Replace the current literal match, then one Undo restores the starter.
+    # Find is reopened through the visible toolbar action.
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="\^F Find"') \
+        || { fail "Find not found for replacement"; return; }
+    tap_center "$b"
+    sleep 0.4
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'content-desc="Find in document"') \
+        || { fail "Find query field not found for replacement"; return; }
+    tap_center "$b"
+    sleep 0.2
+    D shell input text "$query" >/dev/null 2>&1
+    sleep 0.7
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="Replace…"') \
+        || { fail "Replace row action not found"; return; }
+    tap_center "$b"
+    sleep 0.4
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'content-desc="Replacement text"') \
+        || { fail "Replacement field not found"; return; }
+    tap_center "$b"
+    D shell input text "$replacement" >/dev/null 2>&1
+    sleep 0.3
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="Replace"') \
+        || { fail "Replace current action not found"; return; }
+    tap_center "$b"
+    local replaced_len=$((base_len - ${#query} + ${#replacement}))
+    wait_for_log "$log" "applyState setCaret true .*textLen $replaced_len" \
+        || { fail "Replace current did not update the document to $replaced_len bytes"; return; }
+    pass "Replace current replaced the literal match"
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="\^Z Undo"') \
+        || { fail "Undo not found after replacement"; return; }
+    tap_center "$b"
+    wait_for_log "$log" "applyState setCaret true .*textLen $base_len" \
+        || { fail "Undo did not restore the $base_len-byte original"; return; }
+    pass "one Undo restored the original after Replace current"
+
+    if shot=$(cmd_screencap "$OUTDIR/search-replace-after.png"); then
+        say "    captured $shot"
+    fi
+}
+
+# A15: the banner and status count open the same list; selecting an exact
+# row opens whole-document source, selecting an owner row opens source at
+# the producing modifier, and Back restores the earlier inspector scope.
+cmd_diagnostics() {
+    local a11y_was rc
+    a11y_was=$(D shell settings get secure accessibility_enabled 2>/dev/null | tr -d '\r')
+    if [ "$a11y_was" = "1" ]; then
+        D shell settings put secure accessibility_enabled 0 >/dev/null 2>&1
+        D shell am force-stop com.android.talkback >/dev/null 2>&1
+        say "    paused TalkBack for deterministic diagnostic taps (restored afterwards)"
+        sleep 1
+    fi
+    _diagnostics
+    rc=$?
+    if [ "$a11y_was" = "1" ]; then
+        D shell settings put secure enabled_accessibility_services \
+            com.android.talkback/com.google.android.marvin.talkback.TalkBackService >/dev/null 2>&1
+        D shell settings put secure accessibility_enabled 1 >/dev/null 2>&1
+    fi
+    return "$rc"
+}
+
+_diagnostics() {
+    local log="$OUTDIR/diagnostics-logcat.txt"
+    local ui="$OUTDIR/diagnostics-ui.xml"
+    local exact owner b
+    exact=$(printf '%s\n' '#1 text #2 \app(#1, #2, 10, 10)' \
+        '#3 thing #4 \prob(#3, #4)' '' 'Unresolved $z$.')
+    owner=$(printf '%s\n' '#1 target #2' '#3 nope #4')
+
+    say "==> diagnostics: banner -> list -> exact/owner source -> Back"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixtureB64 "$(printf '%s' "$exact" | base64 -w0)" >/dev/null 2>&1; then
+        pass "launched the exact-diagnostic fixture"
+    else
+        fail "launch the exact-diagnostic fixture"
+        return
+    fi
+    wait_for_log "$log" 'diagnostics .*count 2 errors 0 warnings 2' \
+        || { fail "exact fixture did not publish two warnings"; return; }
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    grep -q 'text="2 diagnostics · 2 warnings · tap for details"' "$ui" \
+        || { fail "diagnostic banner is missing"; return; }
+    grep -q 'text="Untitled · unsaved · Recovered · durable · 2 diagnostics"' "$ui" \
+        || { fail "status line does not carry the name, state and diagnostic count"; return; }
+    pass "banner and status line report two diagnostics"
+
+    b=$(node_bounds 'text="2 diagnostics · 2 warnings · tap for details"') \
+        || { fail "diagnostic banner is not tappable"; return; }
+    tap_center "$b"
+    sleep 0.6
+    cmd_uidump "$ui" || return
+    grep -q 'Open diagnostic source: execution-unavailable' "$ui" \
+        || { fail "execution diagnostic is missing from the list"; return; }
+    grep -q 'Open diagnostic source: unresolved-name' "$ui" \
+        || { fail "unresolved-name diagnostic is missing from the list"; return; }
+    grep -q 'WARNING · unresolved-name · exact' "$ui" \
+        || { fail "unresolved-name diagnostic is not marked exact"; return; }
+    pass "list shows exact execution and unresolved-name rows"
+
+    b=$(node_bounds 'Open diagnostic source: unresolved-name') \
+        || { fail "unresolved-name row is not clickable"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'navigate kind diagnostic start 71' \
+        || { fail "unresolved name did not navigate to source offset 71"; return; }
+    sleep 0.4
+    cmd_uidump "$ui" || return
+    grep -q 'text="Show document"' "$ui" \
+        || { fail "diagnostic navigation did not open the source inspector"; return; }
+    pass "exact diagnostic opened source at the unresolved name"
+
+    b=$(node_bounds 'text="Alt← Back"') \
+        || { fail "Back action is missing after diagnostic navigation"; return; }
+    tap_center "$b"
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    grep -q 'content-desc="Page 1 of 1"' "$ui" \
+        || { fail "Back did not restore the rendered document"; return; }
+    if grep -q 'text="Show document"' "$ui"; then
+        fail "Back left the source inspector open"
+        return
+    fi
+    pass "Back restored the document and closed the exact source panel"
+
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixtureB64 "$(printf '%s' "$owner" | base64 -w0)" \
+            --es emthin.fixtureModifier '3,4' \
+            --es emthin.fixtureTargetsB64 "$(printf '%s' '1 2' | base64 -w0)" \
+            --es emthin.fixtureMarker '3' >/dev/null 2>&1; then
+        pass "launched the modifier-owner fixture"
+    else
+        fail "launch the modifier-owner fixture"
+        return
+    fi
+    wait_for_log "$log" 'fixture modifier 3,4 targets 1 2' \
+        || { fail "owner fixture link was not applied"; return; }
+    wait_for_log "$log" 'diagnostics .*count 2 errors 2 warnings 0' \
+        || { fail "owner fixture did not publish two errors"; return; }
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="2 diagnostics') \
+        || { fail "diagnostic count entry point is missing"; return; }
+    tap_center "$b"
+    sleep 0.6
+    cmd_uidump "$ui" || return
+    grep -q 'ERROR · typst · owner · #3 #4' "$ui" \
+        || { fail "owner-attributed Typst row is missing"; return; }
+    grep -q 'ERROR · modifier-application · owner · #3 #4' "$ui" \
+        || { fail "modifier-application owner row is missing"; return; }
+    pass "list marks both failures with the #3 #4 modifier owner"
+
+    b=$(node_bounds 'Open diagnostic source: modifier-application') \
+        || { fail "modifier-application row is not clickable"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'navigate kind diagnostic start 15' \
+        || { fail "owner diagnostic did not navigate to source offset 15"; return; }
+    sleep 0.4
+    cmd_uidump "$ui" || return
+    grep -q 'text="Show document"' "$ui" \
+        || { fail "owner diagnostic did not open the source inspector"; return; }
+    pass "owner diagnostic opened source at the modifier pair"
+
+    b=$(node_bounds 'text="Alt← Back"') \
+        || { fail "Back action is missing after owner navigation"; return; }
+    tap_center "$b"
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    grep -q 'content-desc="Target marker pairs"' "$ui" \
+        || { fail "Back did not restore the modifier-at-caret inspector"; return; }
+    grep -q 'text="1 2"' "$ui" \
+        || { fail "Back lost the modifier's target list"; return; }
+    pass "Back restored the modifier inspector and its target list"
+}
+
+# A9: open a real named source file through the fixture hook and prove both
+# the bytes and the visible document name reach the status line.
+cmd_named_document() {
+    local log="$OUTDIR/named-document-logcat.txt"
+    local ui="$OUTDIR/named-document-ui.xml"
+    local file="$OUTDIR/named-source.txt"
+    local remote=/data/local/tmp/named-source.txt
+    local expected
+
+    say "==> named document: open source -> status shows the file name"
+    mkdir -p "$OUTDIR"
+    printf 'Named source fixture\n' >"$file"
+    expected=$(wc -c <"$file" | tr -d ' ')
+    if D push "$file" "$remote" >/dev/null 2>&1; then
+        D shell chmod 644 "$remote" >/dev/null 2>&1
+        pass "pushed the named source fixture"
+    else
+        fail "push the named source fixture"
+        return
+    fi
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" --es emthin.fixtureOpenPath "$remote" >/dev/null 2>&1; then
+        pass "opened the named source fixture"
+    else
+        fail "open the named source fixture"
+        return
+    fi
+    wait_for_log "$log" "applyState .*textLen $expected" \
+        || { fail "named source bytes did not reach the model"; return; }
+    sleep 0.6
+    cmd_uidump "$ui" || return
+    grep -Fq 'text="named-source.txt · unsaved ·' "$ui" \
+        || { fail "status line does not name named-source.txt"; return; }
+    pass "status names the opened document (named-source.txt)"
+}
+
+# A9: Back first dismisses an overlay IME, then closes the overlay; Escape
+# closes the source inspector; dialog Back cancels without leaving the pad.
+cmd_focus_stack() {
+    local log="$OUTDIR/focus-stack-logcat.txt"
+    local ui="$OUTDIR/focus-stack-ui.xml"
+    local exact b
+
+    say "==> focus stack: Find IME -> Back, dialog -> Back, inspector -> Esc"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
+        || { fail "starter did not render for the focus test"; return; }
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="\^F Find"') \
+        || { fail "Find is missing from the toolbar"; return; }
+    tap_center "$b"
+    sleep 0.5
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="Replace…"') \
+        || { fail "Replace row action is missing"; return; }
+    tap_center "$b"
+    sleep 0.4
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'content-desc="Replacement text"') \
+        || { fail "replacement field is missing"; return; }
+    tap_center "$b"
+    sleep 0.3
+    D shell input text x >/dev/null 2>&1
+    sleep 0.6
+    if keyboard_shown; then
+        pass "replacement field opened the IME"
+    else
+        fail "replacement field did not open the IME"
+        return
+    fi
+
+    # Waydroid's IME consumes Back before the activity while the soft
+    # keyboard owns focus, so prove the overlay Escape path here. Dialog
+    # Back (no IME) and source-inspector Escape are checked below.
+    # The first synthetic Escape can be consumed by the IME window; retry a
+    # bounded number of times so the app-level handler is what closes Find.
+    for i in 1 2 3; do
+        D shell input keyevent KEYCODE_ESCAPE >/dev/null 2>&1
+        sleep 0.9
+        cmd_uidump "$ui" || return
+        grep -q 'content-desc="Find in document"' "$ui" || break
+    done
+    if grep -q 'content-desc="Find in document"' "$ui"; then
+        fail "Escape did not cancel Find while the IME was open"
+        return
+    fi
+    if keyboard_shown; then
+        fail "closing Find left the IME visible"
+        return
+    fi
+    pass "Escape cancelled Find and dismissed the IME"
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="\^N New"') \
+        || { fail "New is missing from the toolbar"; return; }
+    tap_center "$b"
+    sleep 0.5
+    cmd_uidump "$ui" || return
+    grep -q 'text="New document"' "$ui" \
+        || { fail "New confirmation did not open"; return; }
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1
+    sleep 0.5
+    cmd_uidump "$ui" || return
+    if grep -q 'text="New document"' "$ui"; then
+        fail "Back did not cancel the New confirmation"
+        return
+    fi
+    pass "Back cancelled the dialog and returned to the pad"
+
+    exact=$(printf '%s\n' '#1 text #2 \app(#1, #2, 10, 10)' \
+        '#3 thing #4 \prob(#3, #4)' '' 'Unresolved $z$.')
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    D shell am start -W -n "$ACTIVITY" \
+        --es emthin.fixtureB64 "$(printf '%s' "$exact" | base64 -w0)" >/dev/null 2>&1
+    wait_for_log "$log" 'diagnostics .*count 2 errors 0 warnings 2' \
+        || { fail "focus fixture did not publish diagnostics"; return; }
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="2 diagnostics') \
+        || { fail "diagnostic banner is missing"; return; }
+    tap_center "$b"
+    sleep 0.6
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'Open diagnostic source: unresolved-name') \
+        || { fail "unresolved-name row is missing"; return; }
+    tap_center "$b"
+    wait_for_log "$log" 'navigate kind diagnostic start 71' \
+        || { fail "diagnostic source did not open"; return; }
+    sleep 0.4
+    cmd_uidump "$ui" || return
+    grep -q 'text="Show document"' "$ui" \
+        || { fail "source inspector did not open for Escape"; return; }
+    D shell input keyevent KEYCODE_ESCAPE >/dev/null 2>&1
+    sleep 0.5
+    cmd_uidump "$ui" || return
+    if grep -q 'text="Show document"' "$ui"; then
+        fail "Escape did not close the source inspector"
+        return
+    fi
+    grep -q 'content-desc="Page 1 of 1"' "$ui" \
+        || { fail "Escape did not return focus to the rendered document"; return; }
+    pass "Escape closed the source inspector and restored the document"
+}
+
+# A14/A16: drive the app's real InputConnection path with a test-only IME in
+# the disposable APK. CJK and emoji go through setComposingText/commitText
+# instead of pasting text or synthesizing key events.
+cmd_composing_ime() {
+    local test_ime="$PKG/com.emthin.pad.TestComposingIme"
+    local enabled_was default_was rc
+
+    if ! D shell ime list -a -s 2>/dev/null | grep -qF "$test_ime"; then
+        fail "$PKG does not expose TestComposingIme; rebuild the test APK"
+        return 1
+    fi
+    enabled_was=$(D shell settings get secure enabled_input_methods 2>/dev/null | tr -d '\r')
+    default_was=$(D shell settings get secure default_input_method 2>/dev/null | tr -d '\r')
+    say "    selected the test composing IME (restored afterwards)"
+
+    _composing_ime_check
+    rc=$?
+
+    D shell ime disable "$test_ime" >/dev/null 2>&1
+    _restore_secure_setting enabled_input_methods "$enabled_was"
+    if [ -n "$default_was" ] && [ "$default_was" != null ]; then
+        D shell ime set "$default_was" >/dev/null 2>&1 || true
+    else
+        _restore_secure_setting default_input_method "$default_was"
+    fi
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    return "$rc"
+}
+
+_ime_action() {
+    local action="$1" text="${2:-}"
+    if [ -n "$text" ]; then
+        D shell content call --uri content://com.emthin.pad.ime \
+            --method "$action" --arg "$text" >/dev/null 2>&1
+    else
+        D shell content call --uri content://com.emthin.pad.ime \
+            --method "$action" >/dev/null 2>&1
+    fi
+}
+
+_wait_ime_log() {
+    local out="$1" pattern="$2" tries=0
+    while [ "$tries" -lt 20 ]; do
+        D logcat -d -s emthin-test-ime:I 2>/dev/null | tr -d '\r' >"$out"
+        grep -qF "$pattern" "$out" && return 0
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+_ime_field_node() {
+    grep -o '<node[^>]*content-desc="Editable text without modifiers"[^>]*>' \
+        "$1" | head -1
+}
+
+_composing_ime_check() {
+    local log="$OUTDIR/composing-ime-logcat.txt"
+    local ime_log="$OUTDIR/composing-ime-service-logcat.txt"
+    local ui="$OUTDIR/composing-ime-ui.xml"
+    local test_ime="$PKG/com.emthin.pad.TestComposingIme"
+    local b field i
+
+    say "==> composing IME: CJK composition -> commit -> emoji commit"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'applyChunk total 2 pages [12]' \
+        || { fail "starter did not render for the composing IME check"; return; }
+
+    # Selecting the IME before pm clear is not stable: clearing the app can
+    # make the system fall back to the previous keyboard. Select it after the
+    # cold launch, before the source field asks for an input connection.
+    D shell ime enable "$test_ime" >/dev/null 2>&1
+    D shell ime set "$test_ime" >/dev/null 2>&1
+    for i in $(seq 1 10); do
+        D shell dumpsys input_method 2>/dev/null | tr -d '\r' \
+            | grep -qF "mCurMethodId=$test_ime" && break
+        sleep 0.2
+    done
+    if ! D shell dumpsys input_method 2>/dev/null | tr -d '\r' \
+            | grep -qF "mCurMethodId=$test_ime"; then
+        fail "test composing IME did not become the active input method"
+        return
+    fi
+
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'text="terminal"') \
+        || { fail "starter text is missing from the page"; return; }
+    tap_center "$b"
+    sleep 0.5
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'content-desc="Editable text without modifiers"') \
+        || { fail "source field did not open"; return; }
+    tap_center "$b"
+    sleep 0.5
+    D shell input keyevent KEYCODE_MOVE_END >/dev/null 2>&1
+    if ! D shell dumpsys input_method 2>/dev/null | tr -d '\r' \
+            | grep -qF "mCurMethodId=$PKG/com.emthin.pad.TestComposingIme"; then
+        fail "test composing IME is not the active input method"
+        return
+    fi
+    pass "source field is focused through the test composing IME"
+
+    D logcat -c >/dev/null 2>&1 || true
+    _ime_action compose 你好
+    _wait_ime_log "$ime_log" 'compose 你好' \
+        || { fail "test IME did not call setComposingText"; return; }
+    sleep 0.3
+    cmd_uidump "$ui" || return
+    field=$(_ime_field_node "$ui")
+    printf '%s' "$field" | grep -qF '你好' \
+        || { fail "CJK composing text did not reach the source field"; return; }
+    pass "CJK composing text reached the source field"
+
+    D logcat -c >/dev/null 2>&1 || true
+    _ime_action finish
+    _wait_ime_log "$ime_log" 'finish ' \
+        || { fail "test IME did not finish CJK composition"; return; }
+    wait_for_log "$log" 'applyState .*textLen' \
+        || { fail "finished CJK composition did not reach the model"; return; }
+    pass "finished CJK composition committed to the model"
+
+    # The render after a commit rebuilds the inspector; focus the field again
+    # before the next input connection action.
+    cmd_uidump "$ui" || return
+    b=$(node_bounds 'content-desc="Editable text without modifiers"') \
+        || { fail "source field disappeared after CJK commit"; return; }
+    tap_center "$b"
+    sleep 0.3
+    D shell input keyevent KEYCODE_MOVE_END >/dev/null 2>&1
+
+    D logcat -c >/dev/null 2>&1 || true
+    _ime_action commit 😀
+    _wait_ime_log "$ime_log" 'commit 😀' \
+        || { fail "test IME did not commit emoji text"; return; }
+    wait_for_log "$log" 'applyState .*textLen' \
+        || { fail "emoji commit did not reach the model"; return; }
+    sleep 0.3
+    cmd_uidump "$ui" || return
+    field=$(_ime_field_node "$ui")
+    printf '%s' "$field" | grep -qF '&#128512;' \
+        || { fail "emoji did not reach the source field"; return; }
+    pass "emoji commit reached the source field and model"
+}
+
+# Restore a global/secure setting exactly, including the null default.
+_restore_global_setting() {
+    local key="$1" value="$2"
+    if [ -z "$value" ] || [ "$value" = null ]; then
+        D shell settings delete global "$key" >/dev/null 2>&1 || true
+    else
+        D shell settings put global "$key" "$value" >/dev/null 2>&1 || true
+    fi
+}
+
+_restore_secure_setting() {
+    local key="$1" value="$2"
+    if [ -z "$value" ] || [ "$value" = null ]; then
+        D shell settings delete secure "$key" >/dev/null 2>&1 || true
+    else
+        D shell settings put secure "$key" "$value" >/dev/null 2>&1 || true
+    fi
+}
+
+# Play Protect can block an adb-side-load indefinitely when the image has no
+# working verification backend. Pause the two verifier settings only for the
+# install and restore them exactly afterwards.
+_install_talkback() {
+    local apk="$1" pv vv rc
+    if [ ! -r "$apk" ]; then
+        fail "TALKBACK_APK is not readable: $apk"
+        return 1
+    fi
+    mkdir -p "$OUTDIR"
+    pv=$(D shell settings get global package_verifier_enable 2>/dev/null | tr -d '\r')
+    vv=$(D shell settings get global verifier_verify_adb_installs 2>/dev/null | tr -d '\r')
+    D shell settings put global package_verifier_enable 0 >/dev/null 2>&1 || true
+    D shell settings put global verifier_verify_adb_installs 0 >/dev/null 2>&1 || true
+    say "    installing TalkBack from $apk (package verification paused for install)"
+    if timeout 180 "$ADB" -s "$DEVICE" install --no-streaming -r "$apk" \
+            >"$OUTDIR/talkback-install.txt" 2>&1; then
+        rc=0
+        pass "installed TalkBack for the accessibility check"
+    else
+        rc=1
+        say "    $(tail -2 "$OUTDIR/talkback-install.txt" | tr '\n' ' ')"
+        fail "install TalkBack from $apk"
+    fi
+    _restore_global_setting package_verifier_enable "$pv"
+    _restore_global_setting verifier_verify_adb_installs "$vv"
+    return "$rc"
+}
+
+# When a TalkBack build is installed, require a real bound service, prove the
+# pad is a client, and capture the page utterance. If TalkBack is absent, use
+# TALKBACK_APK when supplied; otherwise skip explicitly rather than claim
+# coverage or fail an otherwise unrelated e2e run. Enable it only for this
+# check and restore the prior package/settings state afterwards so synthetic-
+# tap steps still run with it paused.
+cmd_accessibility() {
+    local tb='com.android.talkback/com.google.android.marvin.talkback.TalkBackService'
+    local apk="${TALKBACK_APK:-}"
+    local a11y_was services_was touch_was services_new rc
+    local installed_here=0 bound=0 i
+
+    if ! D shell pm path com.android.talkback 2>/dev/null | grep -q '^package:'; then
+        if [ -z "$apk" ]; then
+            say "info accessibility: TalkBack is not installed; set TALKBACK_APK to install it, check skipped"
+            return 0
+        fi
+        if [ ! -r "$apk" ]; then
+            fail "TALKBACK_APK is not readable: $apk"
+            return 1
+        fi
+        _install_talkback "$apk" || return 1
+        installed_here=1
+    fi
+
+    a11y_was=$(D shell settings get secure accessibility_enabled 2>/dev/null | tr -d '\r')
+    services_was=$(D shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r')
+    touch_was=$(D shell settings get secure touch_exploration_enabled 2>/dev/null | tr -d '\r')
+    [ "$services_was" = "null" ] && services_was=""
+    [ "$touch_was" = "null" ] && touch_was=""
+
+    # Track the TTS engine separately: leave the first-run tutorial with TTS
+    # working, then pause it only for the utterance-log capture.
+    TTS_INSTALLED=0
+    TTS_WAS_DISABLED=0
+    TTS_DISABLED_HERE=0
+    if D shell pm path com.google.android.tts 2>/dev/null | grep -q '^package:'; then
+        TTS_INSTALLED=1
+        D shell pm list packages -d 2>/dev/null | tr -d '\r' \
+            | grep -qx 'package:com.google.android.tts' && TTS_WAS_DISABLED=1
+    fi
+
+    D shell settings put secure accessibility_enabled 0 >/dev/null 2>&1
+    D shell am force-stop com.android.talkback >/dev/null 2>&1
+    case ",$services_was," in
+        *",$tb,"*) services_new="$services_was" ;;
+        *) services_new="${services_was:+$services_was,}$tb" ;;
+    esac
+    D shell settings put secure enabled_accessibility_services "$services_new" >/dev/null 2>&1
+    D shell settings put secure accessibility_enabled 1 >/dev/null 2>&1
+    say "    enabled TalkBack for the accessibility check (restored afterwards)"
+
+    # Bind before launching the fixture: if the app starts while TalkBack is
+    # still coming up, the initial page announcement can be missed entirely.
+    for i in $(seq 1 20); do
+        D shell dumpsys accessibility 2>/dev/null | tr -d '\r' \
+            | grep -qF 'Bound services:{Service[label=TalkBack' && bound=1 && break
+        sleep 0.3
+    done
+
+    if [ "$bound" != 1 ]; then
+        fail "TalkBack did not bind before the accessibility fixture launch"
+        _restore_secure_setting enabled_accessibility_services "$services_was"
+        _restore_secure_setting touch_exploration_enabled "$touch_was"
+        _restore_secure_setting accessibility_enabled "$a11y_was"
+        if [ "$TTS_DISABLED_HERE" = 1 ]; then
+            D shell pm enable --user 0 com.google.android.tts >/dev/null 2>&1 || true
+        fi
+        if [ "$installed_here" = 1 ]; then
+            D shell pm uninstall com.android.talkback >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
+
+    _accessibility_check "$services_new"
+    rc=$?
+
+    D shell settings put secure accessibility_enabled 0 >/dev/null 2>&1
+    D shell am force-stop com.android.talkback >/dev/null 2>&1
+    _restore_secure_setting enabled_accessibility_services "$services_was"
+    _restore_secure_setting touch_exploration_enabled "$touch_was"
+    _restore_secure_setting accessibility_enabled "$a11y_was"
+    if [ "$TTS_DISABLED_HERE" = 1 ]; then
+        D shell pm enable --user 0 com.google.android.tts >/dev/null 2>&1 || true
+    fi
+    if [ "$installed_here" = 1 ]; then
+        if D shell pm uninstall com.android.talkback >/dev/null 2>&1; then
+            pass "removed the TalkBack install used for the check"
+        else
+            fail "uninstall TalkBack after the accessibility check"
+            rc=1
+        fi
+    fi
+    return "$rc"
+}
+
+# Fresh TalkBack installs open a six-page tutorial that overlays the pad.
+# Dismiss it before launching the fixture; otherwise the page node and its
+# initial announcement are hidden behind the tutorial window.
+_dismiss_talkback_tutorial() {
+    local ui="$OUTDIR/talkback-tutorial-ui.xml" b i
+    for i in $(seq 1 20); do
+        D shell uiautomator dump "$UI_DUMP_REMOTE" >/dev/null 2>&1 || { sleep 0.4; continue; }
+        D exec-out cat "$UI_DUMP_REMOTE" >"$ui" 2>/dev/null || { sleep 0.4; continue; }
+        tr -d '\r' <"$ui" >"$ui.tmp" && mv "$ui.tmp" "$ui"
+        UI_XML="$ui"
+        if grep -qF 'text="TalkBack is off"' "$ui"; then
+            # TrainingActivity can open before TalkBack has finished enabling.
+            # Continue into the tutorial; the next screen offers Finish.
+            b=$(node_bounds 'text="Continue anyways"') || { sleep 0.4; continue; }
+            tap_center "$b"
+            sleep 0.8
+            continue
+        fi
+        if grep -qF 'text="Welcome to TalkBack"' "$ui"; then
+            # TalkBack consumes synthetic taps; keyboard focus + Enter reliably
+            # activates the tutorial's Finish button.
+            D shell input keyevent KEYCODE_TAB >/dev/null 2>&1
+            sleep 0.15
+            D shell input keyevent KEYCODE_TAB >/dev/null 2>&1
+            sleep 0.15
+            D shell input keyevent KEYCODE_ENTER >/dev/null 2>&1
+            sleep 0.8
+            say "    dismissed the TalkBack first-run tutorial"
+            return 0
+        fi
+        sleep 0.4
+    done
+    return 1
+}
+
+_accessibility_check() {
+    local desired_services="$1"
+    local log="$OUTDIR/accessibility-logcat.txt"
+    local speech="$OUTDIR/accessibility-speech-logcat.txt"
+    local dump="$OUTDIR/accessibility-dumpsys.txt"
+    local ui="$OUTDIR/accessibility-ui.xml"
+    local tb='com.android.talkback/com.google.android.marvin.talkback.TalkBackService'
+    local fixture_b64 a11y services i bound=0 client=0 spoken=0
+
+    say "==> accessibility: TalkBack bound, page spoken, pad registered as a client"
+    mkdir -p "$OUTDIR"
+    fixture_b64=$(printf '%s' '#1 Spoken reading #2' | base64 -w0)
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixtureB64 "$fixture_b64" >/dev/null 2>&1; then
+        pass "launched the pad for the accessibility check"
+    else
+        fail "launch the pad for the accessibility check"
+        return
+    fi
+    wait_for_log "$log" 'applyChunk' \
+        || { fail "pad did not render before the accessibility check"; return; }
+
+    # The first-run tutorial can open after the activity starts. If it did,
+    # relaunch the fixture after dismissing it so TalkBack gets a fresh
+    # window/page announcement to speak.
+    if _dismiss_talkback_tutorial; then
+        # The tutorial's window must be gone before the service will rebind.
+        for i in $(seq 1 15); do
+            D shell dumpsys window 2>/dev/null | tr -d '\r' \
+                | grep -q 'mCurrentFocus=.*TrainingActivity' || break
+            sleep 0.3
+        done
+        # Force-stopping the app also tears down the tutorial task; a service
+        # that is merely toggled while TrainingActivity lives will not rebind.
+        D shell am force-stop com.android.talkback >/dev/null 2>&1
+        sleep 0.5
+        # Now that the tutorial is past, a missing TTS engine makes TalkBack
+        # log the utterance instead of waiting on audio.
+        if [ "$TTS_INSTALLED" = 1 ] && [ "$TTS_WAS_DISABLED" = 0 ]; then
+            if D shell pm disable-user --user 0 com.google.android.tts >/dev/null 2>&1; then
+                TTS_DISABLED_HERE=1
+                say "    paused TTS for the utterance log (restored afterwards)"
+            fi
+        fi
+        D shell settings put secure enabled_accessibility_services "$desired_services" >/dev/null 2>&1
+        D shell settings put secure accessibility_enabled 0 >/dev/null 2>&1
+        sleep 1
+        D shell settings put secure accessibility_enabled 1 >/dev/null 2>&1
+        bound=0
+        for i in $(seq 1 30); do
+            D shell dumpsys accessibility 2>/dev/null | tr -d '\r' \
+                | grep -qF 'Bound services:{Service[label=TalkBack' && bound=1 && break
+            sleep 0.3
+        done
+        # Let the restarted service finish initializing before the relaunch,
+        # then clear the log so the assertion only sees the page utterance.
+        sleep 2
+        D logcat -c >/dev/null 2>&1 || true
+        D shell am force-stop "$PKG" >/dev/null 2>&1
+        D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixtureB64 "$fixture_b64" >/dev/null 2>&1 \
+            || { fail "relaunch the pad after the TalkBack tutorial"; return; }
+        wait_for_log "$log" 'applyChunk' \
+            || { fail "pad did not render after the TalkBack tutorial"; return; }
+    fi
+
+    a11y=$(D shell settings get secure accessibility_enabled 2>/dev/null | tr -d '\r')
+    services=$(D shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r')
+    if [ "$a11y" != "1" ]; then
+        fail "accessibility_enabled is '$a11y', expected 1"
+        return
+    fi
+    if ! printf '%s' "$services" | grep -qF "$tb"; then
+        fail "TalkBack is not in enabled_accessibility_services"
+        return
+    fi
+    pass "TalkBack is enabled in secure settings"
+
+    # Binding and client registration happen after the activity starts.
+    for i in $(seq 1 12); do
+        D shell dumpsys accessibility >"$dump" 2>/dev/null || true
+        grep -qF 'Bound services:{Service[label=TalkBack' "$dump" && bound=1
+        grep -qF "[$PKG]" "$dump" && client=1
+        [ "$bound" = 1 ] && [ "$client" = 1 ] && break
+        sleep 0.5
+    done
+    if [ "$bound" != 1 ]; then
+        say "    $(grep -F 'Bound services:' "$dump" | head -1)"
+        fail "TalkBack is not bound"
+        return
+    fi
+    pass "TalkBack is bound"
+    if [ "$client" != 1 ]; then
+        fail "$PKG is not in the accessibility client list"
+        return
+    fi
+    pass "$PKG is registered as an accessibility client"
+
+    cmd_uidump "$ui" || return
+    grep -qF 'content-desc="Page 1 of 1"' "$ui" \
+        || { fail "rendered page is not exposed as an accessibility node"; return; }
+    grep -qF 'text="Spoken reading"' "$ui" \
+        || { fail "rendered page text is not exposed as an accessibility node"; return; }
+    pass "rendered page and text are exposed to TalkBack"
+
+    # TTS is paused for this check, so TalkBack logs the utterance it would
+    # speak. Wait for the page caption it announces on app launch.
+    for i in $(seq 1 25); do
+        D logcat -d -v brief >"$speech" 2>/dev/null || true
+        if grep -qF 'fragments:[{text:Page 1 of 1' "$speech"; then
+            spoken=1
+            break
+        fi
+        sleep 0.3
+    done
+    if [ "$spoken" != 1 ]; then
+        say "    spoken: $(grep -o 'fragments:.*' "$speech" 2>/dev/null | tail -2 | tr '\n' ' ')"
+        fail "TalkBack did not attempt to speak the rendered page"
+        return
+    fi
+    pass "TalkBack spoke the rendered page caption (Page 1 of 1)"
+}
+
+# Deterministic A14/A15 inspector fixture. The intent extras are the only
+# supported way to supply it: no IME typing or shifting coordinates.
+cmd_modifier_inspector() {
+    local a11y_was rc
+    # TalkBack consumes synthetic taps for focus, so pause it for this
+    # deterministic interaction lane and restore the user's setting afterwards.
+    a11y_was=$(D shell settings get secure accessibility_enabled 2>/dev/null | tr -d '\r')
+    if [ "$a11y_was" = "1" ]; then
+        D shell settings put secure accessibility_enabled 0 >/dev/null 2>&1
+        D shell am force-stop com.android.talkback >/dev/null 2>&1
+        say "    paused TalkBack for deterministic taps (restored afterwards)"
+        sleep 1
+    fi
+    _modifier_inspector
+    rc=$?
+    if [ "$a11y_was" = "1" ]; then
+        D shell settings put secure enabled_accessibility_services \
+            com.android.talkback/com.google.android.marvin.talkback.TalkBackService >/dev/null 2>&1
+        D shell settings put secure accessibility_enabled 1 >/dev/null 2>&1
+    fi
+    return "$rc"
+}
+
+_modifier_inspector() {
+    local log="$OUTDIR/modifier-inspector-logcat.txt"
+    local ui="$OUTDIR/modifier-inspector-ui.xml"
+    local shot b expanded=0 i
+    local fixture='#1 terminal #2 #3 editor #4 #5 bold #6 #7 italic #8'
+    local fixture_b64 targets_b64 targets2_b64
+    fixture_b64=$(printf '%s' "$fixture" | base64 -w0)
+    targets_b64=$(printf '%s' '1 2, 3 4' | base64 -w0)
+    targets2_b64=$(printf '%s' '5 6' | base64 -w0)
+
+    say "==> modifier inspector: fixture -> rows -> expanded comparison"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixtureB64 "$fixture_b64" \
+            --es emthin.fixtureModifier '5,6' \
+            --es emthin.fixtureTargetsB64 "$targets_b64" \
+            --es emthin.fixtureModifier2 '7,8' \
+            --es emthin.fixtureTargets2B64 "$targets2_b64" \
+            --es emthin.fixtureMarker '5' >/dev/null 2>&1; then
+        pass "launched the modifier-pair fixture"
+    else
+        fail "launch the modifier-pair fixture"
+        return
+    fi
+    wait_for_log "$log" 'fixture modifier 5,6 targets 1 2, 3 4' \
+        || { fail "fixture link was not applied"; return; }
+    wait_for_log "$log" 'applyChunk' \
+        || { fail "fixture document did not render"; return; }
+    sleep 1.0
+
+    cmd_uidump "$ui" || return
+    grep -q 'content-desc="Target marker pairs"' "$ui" \
+        || { fail "modifier inspector did not open on the fixture"; return; }
+    grep -q 'text="1 2, 3 4"' "$ui" \
+        || { fail "fixture target list is not shown verbatim"; return; }
+    grep -q '#5 #6' "$ui" \
+        || { fail "incoming relationship for #5/#6 is missing"; return; }
+
+    # The inspector sheet is shorter than its content; scroll it to the
+    # outgoing rows before asserting on them.
+    D shell input swipe 1400 850 1400 720 300 >/dev/null 2>&1
+    sleep 0.5
+    D shell input swipe 1400 850 1400 720 300 >/dev/null 2>&1
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    grep -q '#1 #2' "$ui" \
+        || { fail "outgoing target relationship for #1/#2 is missing"; return; }
+    grep -q '#3 #4' "$ui" \
+        || { fail "outgoing target relationship for #3/#4 is missing"; return; }
+    pass "fixture shows an incoming modifier and both outgoing targets"
+
+    D shell input swipe 1400 730 1400 900 300 >/dev/null 2>&1
+    sleep 0.8
+    cmd_uidump "$ui" || return
+    b=$(node_bounds '#5 #6') \
+        || { fail "incoming relationship heading not tappable"; return; }
+    tap_center "$b"
+    sleep 1.2
+    # The preview renders below the sheet's fold. The exact number of swipes
+    # depends on system-bar and sheet height, so scroll until both labels and
+    # the rendered comparison are in the accessibility window.
+    for i in $(seq 1 5); do
+        cmd_uidump "$ui" || return
+        if grep -q 'text="With modifier"' "$ui" \
+                && grep -q 'text="Without modifier"' "$ui" \
+                && grep -q 'content-desc="Rendered comparison"' "$ui"; then
+            expanded=1
+            break
+        fi
+        # Stay inside the sheet: a swipe starting near the page/sheet boundary
+        # scrolls the page instead. x=1400,y=1200 is over the relationship rows.
+        D shell input swipe 1400 1200 1400 800 300 >/dev/null 2>&1
+        sleep 0.6
+    done
+    if [ "$expanded" != 1 ]; then
+        grep -q 'text="With modifier"' "$ui" \
+            || { fail "expanded row is missing the With modifier preview"; return; }
+        fail "expanded row is missing the Without modifier preview"
+        return
+    fi
+    pass "one comparison row expanded with both rendered sides"
+
+    if shot=$(cmd_screencap "$OUTDIR/modifier-inspector-after.png"); then
         say "    captured $shot"
     fi
 }
@@ -762,10 +1808,17 @@ cmd_e2e() {
     fi
 
     # Autosave, New/Undo, then the reading-position proof. Each check
-    # clears app data itself, so it still cold-launches the 89-byte starter.
+    # clears app data itself, so it still cold-launches the starter.
     cmd_persistence
     cmd_new_reset
     cmd_scroll_anchor
+    cmd_search_replace
+    cmd_accessibility
+    cmd_diagnostics
+    cmd_named_document
+    cmd_focus_stack
+    cmd_composing_ime
+    cmd_modifier_inspector
 
     # Byte-identity of the installed APK, the launch proof's companion.
     cmd_pull
@@ -795,6 +1848,13 @@ case "$cmd" in
     persistence) cmd_persistence ;;
     new-reset) cmd_new_reset ;;
     scroll-anchor) cmd_scroll_anchor ;;
+    search-replace) cmd_search_replace ;;
+    accessibility) cmd_accessibility ;;
+    diagnostics) cmd_diagnostics ;;
+    named-document) cmd_named_document ;;
+    focus-stack) cmd_focus_stack ;;
+    composing-ime) cmd_composing_ime ;;
+    modifier-inspector) cmd_modifier_inspector ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;
 esac

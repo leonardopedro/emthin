@@ -10,14 +10,14 @@ is that the next seam regression can be placed without re-deriving it.
 
 | surface | measures | cannot see | seam guarded |
 |---|---|---|---|
-| `cargo test --workspace` (347) | doc-model invariants, keymap tables, session serde, figure binding, IPC protocol units, xwayland-supervisor timing | anything needing a live compositor: a real input path, a real clipboard, a real shutdown signal | `mathed_core` ↔ `emthin` model contract |
-| `scripts/e2e/run.sh` (5 checks) | one real nested session end to end: XTEST keystrokes reaching the document, clipboard both directions across the proxy, the `list_state` document read, SIGTERM shutdown | rendering quality, IME commit (needs the host's fcitx engaged), multi-page flows, performance | input path · clipboard proxy · control socket · shutdown — the seams *between* crates and processes |
+| `cargo test --workspace` (511 passed, 2 ignored on 2026-11-18; the 2026-10 suite was 347) | doc-model invariants, keymap tables, session serde, figure binding, IPC protocol units, xwayland-supervisor timing | anything needing a live compositor: a real input path, a real clipboard, a real shutdown signal | `mathed_core` ↔ `emthin` model contract |
+| `scripts/e2e/run.sh` (28 checks; 36 with XTEST) | one real nested session end to end: synthetic keystrokes reaching the document, PgDn/PgUp multi-page navigation, clipboard both directions across the proxy, per-document preferences, touch panning, Find cancel and fcitx5/rime preedit/commit in the XTEST lane, the `list_state` document read, SIGTERM shutdown | rendering quality, performance | input path · IME host · clipboard proxy · control socket · shutdown — the seams *between* crates and processes |
 | what a user sees | all of it, eventually | — (they file the bug) | — |
 
 Neither gate is a subset of the other, and neither can absorb the other: the
-cargo suite's 347 stayed green through the entire E2E regression below, and
-the E2E's five checks say nothing about the model invariants a document edit
-can silently break.
+then-347-test cargo suite stayed green through the entire E2E regression below,
+and the E2E's behavioral checks say nothing about the model invariants a
+document edit can silently break.
 
 ## Classifying a regression — the 2026-10-15 example
 

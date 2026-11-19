@@ -1150,7 +1150,7 @@ cargo test --workspace                                               ✓ 198 tes
 | W8 | done | `state/page.rs` replaces `state/workspace.rs`; ext-workspace-v1 re-pointed at pages (ids are page index + 1). |
 | W9 | done | Document snapshot + `session.json` (current page) save on graceful exit and autosave, and restore on start; a dormant figure is framed, labelled with the app name and both relaunch gestures, and `Return` or a click over it runs its `\app`'s `launch:` command. That is §5.10's stand-in and this row's whole ask. The check (kill and relaunch → doc returns, figures dormant, `Return` launches into the same figure) runs headlessly except for the client appearing. The `spawn` **prompt** is *not* required here: §9 lists the spawn-launcher UX as a deliberate placeholder and nothing in §5.10 asks for one. |
 | W10 | done | `AGENTS.md` rewritten, `README.md` + `README_cn.md`, `docs/ipc.md`, `docs/build-notes.md`, CHANGELOG entry, stale migration-policy docs deleted. |
-| W11 | done | Gate above, plus the §6 manual E2E: run under headless Mutter on `Xvfb`, driven over the IPC control socket. All seven steps verified (steps 1-6 under Mutter; step 7 closed 2026-10-15 by the `run.sh` nested-sway harness — 5/5 ×5, CI-wired; IME-commit leg a named skip for host fcitx). See §6. |
+| W11 | done | Gate above, plus the §6 manual E2E: run under headless Mutter on `Xvfb`, driven over the IPC control socket. All seven steps verified (steps 1-6 under Mutter; step 7 closed 2026-10-15 by the `run.sh` nested-sway harness — 5/5 ×5, CI-wired; the IME-commit leg closed 2026-11-18 in the xdotool lane with private fcitx5/rime, including a preedit-before-commit assertion). See §6. |
 
 ## Deviations from this plan, and why
 
@@ -1249,9 +1249,13 @@ literal*; `mathed_core`/`mathed_mini` green and Bevy `mathed` builds.
   --wayland` on `Xvfb :99`), driven over the IPC control socket; step 7
   (IME commit, clipboard host<->client, doc-copy) needed synthetic input
   and the machine had no `xdotool`/`wtype`/`ydotool`/`dotool`, nor a real
-  fcitx.* **Remaining named skip:** the IME-commit leg still needs the
-  host's fcitx engaged — the run says so plainly instead of passing
-  silently (unavailable authority, named per the rea discipline).
+  fcitx.*
+- **IME-commit leg — RESOLVED 2026-11-18.** The `xdotool` lane starts its
+  own fcitx5 with Rime on a private D-Bus session, focuses a `kgx` figure, and
+  asserts the preedit appears before the exact `Ime::Commit("你好")` in
+  `emthin.log`. It is XTEST-only because `wtype`'s virtual-keyboard events
+  arrive after wlroots' input-method grab. The `wtype` lane runs 28 checks;
+  `xdotool` runs 36, including a Find-cancel check.
 - **Dormant-figure affordance** is complete: `Return` over the figure
   relaunches it, a left click on it relaunches it, the launcher prefers the
   pointed-at figure, and a dormant figure is framed and labelled with the app
@@ -1345,8 +1349,7 @@ the document instead of degrading to a generic failure.
   exercised), so this is no longer "no environment": what is missing is a
   check that renders a `\formal` statement in that session and asserts the
   badge. Closing it needs the logos roundtrip (`formals.rs` asks `logos
-  unf`) inside the harness — a task, not a limitation. The IME-commit leg
-  (host fcitx engaged) is the other named skip, recorded under Known gaps.
+  unf`) inside the harness — a task, not a limitation.
 - **Dormant-figure affordance** (W9 partial, above) also bounds P7d: the DAG
   figure reserves its slot, and both `Return` and a click over it relaunch the
   viewer.

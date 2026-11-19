@@ -5,6 +5,10 @@
 #   2. javac + d8 produce classes.dex
 #   3. aapt2 links the manifest, jar drops in dex + .so
 #   4. zipalign + apksigner produce a debug-signed APK
+#
+# Set EMTHIN_TEST_PACKAGE=com.emthin.pad.test to build a separate test APK
+# (build/test/emthin-pad-test.apk) with a distinct application id, so
+# device-lane `pm clear` never touches the normal install.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -164,12 +168,28 @@ env \
     "AR_${TARGET//-/_}=$AR" \
     cargo build --release --target "$TARGET"
 
-BUILD=build
-rm -rf "$BUILD"
+TEST_PACKAGE=${EMTHIN_TEST_PACKAGE:-}
+if [[ -n "$TEST_PACKAGE" ]]; then
+    BUILD=build/test
+    ARTIFACT=emthin-pad-test
+    rm -rf "$BUILD"
+else
+    BUILD=build
+    ARTIFACT=emthin-pad
+    # Keep build/test (the disposable-lane artifact) when rebuilding normally.
+    rm -rf "$BUILD/classes" "$BUILD/dex" "$BUILD/stage" \
+        "$BUILD"/emthin-pad-*.apk "$BUILD/sources.txt"
+fi
 mkdir -p "$BUILD/classes" "$BUILD/dex" "$BUILD/stage/lib/$ABI"
 
 echo "==> [2/6] javac"
-find android/src -name '*.java' > "$BUILD/sources.txt"
+SOURCE_DIRS=(android/src)
+MANIFEST=android/AndroidManifest.xml
+if [[ -n "$TEST_PACKAGE" ]]; then
+    SOURCE_DIRS+=(android/test-src)
+    MANIFEST=android/test-manifest.xml
+fi
+find "${SOURCE_DIRS[@]}" -name '*.java' > "$BUILD/sources.txt"
 javac --release 8 -classpath "$ANDROID_JAR" -d "$BUILD/classes" @"$BUILD/sources.txt"
 
 echo "==> [3/6] d8"
@@ -177,20 +197,25 @@ d8 --min-api "$API" --output "$BUILD/dex" \
     $(find "$BUILD/classes" -name '*.class')
 
 echo "==> [4/6] aapt2 link"
-aapt2 link \
+AAPT_LINK=(aapt2 link \
     -I "$ANDROID_JAR" \
-    --manifest android/AndroidManifest.xml \
+    --manifest "$MANIFEST" \
     --min-sdk-version "$API" \
     --target-sdk-version "$API" \
-    -o "$BUILD/emthin-pad-unsigned.apk"
+    -o "$BUILD/$ARTIFACT-unsigned.apk")
+if [[ -n "$TEST_PACKAGE" ]]; then
+    aapt2 compile --dir android/test-res -o "$BUILD/res.zip"
+    AAPT_LINK+=(-R "$BUILD/res.zip" --rename-manifest-package "$TEST_PACKAGE")
+fi
+"${AAPT_LINK[@]}"
 
 echo "==> [5/6] add dex + native lib"
 cp "target/$TARGET/release/libemthin_pad.so" "$BUILD/stage/lib/$ABI/"
-jar --update --file "$BUILD/emthin-pad-unsigned.apk" \
+jar --update --file "$BUILD/$ARTIFACT-unsigned.apk" \
     -C "$BUILD/dex" classes.dex
-jar --update --file "$BUILD/emthin-pad-unsigned.apk" \
+jar --update --file "$BUILD/$ARTIFACT-unsigned.apk" \
     -C "$BUILD/stage" "lib/$ABI/libemthin_pad.so"
-zipalign -f 4 "$BUILD/emthin-pad-unsigned.apk" "$BUILD/emthin-pad-aligned.apk"
+zipalign -f 4 "$BUILD/$ARTIFACT-unsigned.apk" "$BUILD/$ARTIFACT-aligned.apk"
 
 echo "==> [6/6] sign (debug keystore)"
 if [[ ! -f debug.keystore ]]; then
@@ -205,10 +230,10 @@ apksigner sign \
     --ks-key-alias androiddebugkey \
     --ks-pass pass:android \
     --key-pass pass:android \
-    --out "$BUILD/emthin-pad.apk" \
-    "$BUILD/emthin-pad-aligned.apk"
-apksigner verify "$BUILD/emthin-pad.apk"
+    --out "$BUILD/$ARTIFACT.apk" \
+    "$BUILD/$ARTIFACT-aligned.apk"
+apksigner verify "$BUILD/$ARTIFACT.apk"
 
 echo
-echo "OK: $BUILD/emthin-pad.apk"
-ls -la "$BUILD/emthin-pad.apk"
+echo "OK: $BUILD/$ARTIFACT.apk"
+ls -la "$BUILD/$ARTIFACT.apk"

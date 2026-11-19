@@ -10,7 +10,11 @@ app figure and into the document caret, and clipboard host↔client and doc-copy
 
 No wrapper needed — the scripts re-enter the flake themselves. (`nix develop`
 starts an *interactive* shell, so a pasted block beginning with it hands the rest
-of the block to the nested shell as input.)
+of the block to the nested shell as input.) The flake supplies Mesa and exports
+`GBM_BACKENDS_PATH` / `LIBGL_DRIVERS_PATH` from it; without those, headless
+sway searches `/run/opengl-driver` and exits at `gbm_create_device failed`.
+`lib.sh` checks both paths and the `dri_gbm.so` backend before starting sway, so
+that environment gap fails with its cause rather than a compositor log line.
 
 ## The four configurations
 
@@ -262,8 +266,8 @@ INFO backend: Clipboard backend: wl_data_device active
   arboard takes its own X11 fallback.
 
 On **sway** (wlroots, the nested rig) `zwlr_data_control_v1` *is* present, so both
-paths are Wayland and focus-free — which is why the `E2E_NO_X=1` run passes all
-five checks with no X server reachable.
+paths are Wayland and focus-free — which is why the `E2E_NO_X=1` run passes the
+whole suite with no X server reachable.
 
 The honest one-line version: **the proxy is Wayland on both hosts; the document's
 clipboard is Wayland only where data-control exists, and X11 to Xwayland on
@@ -318,26 +322,33 @@ two more runs stayed green.
 
 The fixes live in `lib.sh` and `run.sh`: `reap_previous_run` now stops Xvfb
 alongside sway and emthin and removes the stale IPC socket before starting;
-`cleanup` takes Xvfb down on the way out. A run now starts from state it
-created, or from nothing. Since 2026-10-15 the harness also runs in CI (the
+`cleanup` takes Xvfb down on the way out. The preference fixture also removes
+the previous run's `emthin.doc` snapshot; otherwise that document restores at its
+old page and autosaves over the fixture's `session.json` before the first
+`open_doc`. A run now starts from state it created, or from nothing. Since 2026-10-15 the harness also runs in CI (the
 `e2e` job in `.github/workflows/ci.yml`), so a regression of this class cannot
 go unnoticed for two days again.
 
 ## What passes today
 
-Run on this machine, `--config xdotool`, sway on Xvfb, emthin inside it —
-three consecutive runs, 2026-10-15:
+Two configurations ran the full suite on 2026-11-18:
 
 ```
- ok  emthin opens no X11 connection
- ok  the host's clipboard reaches a client inside emthin
- ok  a client inside emthin reaches the host's clipboard
- ok  typed text reaches the document
- ok  doc-copy pastes (the marker appears 3 times)
-
-5 ran, 0 skipped
- ok  all 5 executed check(s) passed (0 skipped)
+--config wtype    (headless sway)   28 ran, 0 skipped, all passed
+--config xdotool  (sway on Xvfb)   36 ran, 0 skipped, all passed
 ```
+
+Those runs covered per-document preferences, two-finger panning, multi-page
+PgDn/PgUp navigation, the no-X11 transport check, both clipboard directions,
+typed text, doc-copy, and graceful SIGTERM shutdown. The `xdotool` lane
+therefore exercises the X11 window path: XTEST events go to the nested sway's X
+window on `:99`, and `emthin` itself is still checked to hold no X11 connection.
+It also runs Find cancel (Ctrl+F, a unique query, F3 to reveal a later page, then
+Escape must close Find and restore the original page and document) and
+fcitx5/rime: `nihao` produces a `Preedit("ni hao")` line, then space produces the
+host `Ime::Commit("你好")`; the check asserts the preedit line comes first. The earlier
+`xdotool`/Xvfb campaign on 2026-10-15 passed the same five checks that existed
+then, three consecutive runs.
 
 So §6 step 7's keyboard half is **verified**: keys reach the document, and
 Ctrl+A / Ctrl+C / Ctrl+V round-trips through `arboard` — which is the
@@ -346,8 +357,15 @@ Ctrl+A / Ctrl+C / Ctrl+V round-trips through `arboard` — which is the
 The clipboard half is **verified in both directions** — the earlier "verified
 as broken" verdict was retracted in [The clipboard checks](#the-clipboard-checks):
 there was never a proxy bug, only the IPC-connectivity gate the harness now
-holds open. The IME commit is still not exercised: it needs the host's fcitx
-engaged, which `fcitx5` being installed does not arrange.
+holds open.
+
+The IME half is **verified in the XTEST lane**. `wtype`'s virtual-keyboard events
+are delivered after wlroots' input-method grab, so fcitx never sees them; the
+XTEST lane enters through sway's normal keyboard path. The harness re-enters
+under a private `dbus-run-session`, starts `fcitx5` with Rime on that bus, focuses
+a `kgx` figure, waits for `winit.set_ime_allowed(true)`, then asserts the
+`Preedit("ni hao")` line is logged before the exact `Commit("你好")` line in
+`emthin.log`. It does not use the host desktop's fcitx or D-Bus.
 
 ## Known unresolved
 

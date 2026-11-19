@@ -18,6 +18,7 @@ pub mod protocols;
 pub mod session;
 pub mod shutdown;
 pub mod state;
+pub mod status_bar;
 pub mod tick;
 pub mod util;
 pub mod winit;

@@ -33,7 +33,7 @@ Emacs 界面已被替换（设计与工作分解见 `docs/REWRITE_PLAN.md`）。
 
 **尚未实现**（已在计划中，见重写计划）：
 
-- 交互式应用启动器（`Ctrl+Shift+Return` 目前只是重启第一个休眠插图保存的命令）；
+- 交互式应用启动器（`Ctrl+Shift+Return` 重启指针所指或第一个休眠插图保存的命令，没有提示框）；
 - 休眠插图的"点击启动"交互（Enter 重启绑定在启动器按键上，而非逐图提示）；
 - 插图的自由二维放置 —— 按设计，插图位于文档流中。
 
@@ -71,7 +71,7 @@ emthin --session-file /tmp/emthin-demo.loro
 
 | 按键 | 动作 |
 |---|---|
-| `Ctrl+Shift+Return` | 重启第一个休眠插图保存的命令 |
+| `Ctrl+Shift+Return` | 重启指针所指（或第一个）休眠插图保存的命令 |
 | `PgUp` / `PgDn` | 上一页 / 下一页 |
 | `Home` / `End` | 文档开头 / 结尾 |
 | `Ctrl+Home` / `Ctrl+End` | 行首 / 行尾 |

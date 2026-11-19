@@ -8,6 +8,7 @@ use crate::state::EmthinState;
 /// lifecycle, IPC dispatch, clipboard events, and pending geometry
 /// timeouts.
 pub fn event_loop_tick(state: &mut EmthinState) {
+    let started = std::time::Instant::now();
     // --- Host keymap: apply a layout switch the listener snooped ---
     //
     // One try-recv when nothing arrived. The input path calls this too
@@ -58,6 +59,7 @@ pub fn event_loop_tick(state: &mut EmthinState) {
     // a burst can stay one typeset behind until the next unrelated input.
     let dirty = state.doc.model().is_dirty();
     state.relayout_document();
+    state.poll_document_layout();
     if dirty {
         state.needs_redraw = true;
     }
@@ -107,6 +109,14 @@ pub fn event_loop_tick(state: &mut EmthinState) {
         }
         Err(e) => tracing::warn!("collaboration local edit: {e}"),
     }
+
+    // --- Presence heartbeat and expiry ---
+    //
+    // Presence publishes on a one-second heartbeat, on a caret/focus change,
+    // and immediately after join. It is advisory state: this never edits the
+    // document, and expired peers are pruned here.
+    state.collab_prune_presence();
+    state.collab_publish_presence(false);
 
     // --- Dispatch incoming IPC messages from the control client ---
     if let Some(msgs) = state.ipc.recv_all() {
@@ -173,6 +183,23 @@ pub fn event_loop_tick(state: &mut EmthinState) {
 
     // --- Forward DBus router notifications to the control client ---
     forward_router_notifications(state);
+
+    let elapsed = started.elapsed();
+    let elapsed_us = elapsed.as_micros() as u64;
+    tracing::trace!(
+        target: "emthin::timing",
+        stage = "event_loop_tick",
+        elapsed_us,
+        "event-loop tick"
+    );
+    if elapsed >= std::time::Duration::from_millis(1) {
+        tracing::debug!(
+            target: "emthin::timing",
+            stage = "event_loop_tick",
+            elapsed_us,
+            "slow event-loop tick"
+        );
+    }
 }
 
 /// Forward non-fcitx router notifications (rule add/remove/list) to the

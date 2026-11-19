@@ -86,12 +86,22 @@ Show a document page. 0-based. Out-of-range pages are rejected with an
 
 ### `open_doc` / `save_doc`
 
-Replace the document from a file, or snapshot the current one to a
-file. `save_doc` answers with `doc_saved`.
+Replace the document from a file, or write the current one to a file.
+`open_doc` detects a raw Loro snapshot by content first, then UTF-8 source.
+Opening a snapshot restores text, marks and statement structure; opening source
+creates a fresh document. `save_doc` answers with `doc_saved` containing the
+path, the actual `format` (`source` or `snapshot`) and the SHA-256 `digest` of
+the bytes written.
+
+`format` is optional; absent, `.loro` and `.mathed` paths save a snapshot and
+all other paths save source. `force` is optional and defaults to `false`.
+Without it, a target that changed since it was opened or last saved is refused
+with `doc_conflict`; `force: true` replaces it. The file is replaced atomically.
 
 ```json
 {"jsonrpc":"2.0","method":"open_doc","params":{"path":"/tmp/notes.typ"}}
 {"jsonrpc":"2.0","method":"save_doc","params":{"path":"/tmp/notes.typ"}}
+{"jsonrpc":"2.0","method":"save_doc","params":{"path":"/tmp/notes.mathed","format":"snapshot","force":true}}
 ```
 
 ### `export_ascii` / `import_ascii`
@@ -189,9 +199,30 @@ Drop a peer and its reliable stream. No reply is emitted.
 {"jsonrpc":"2.0","method":"collab_leave","params":{"peer":"alice"}}
 ```
 
+### `collab_presence`
+
+Apply one peer's presence payload. `peer` is the transmitting peer and `blob`
+is the hex-encoded payload produced by another instance's `collab_presence`
+notification. Presence is advisory: it never edits the document, revision or
+undo history. An expired or malformed payload is rejected as `collab_failed`.
+
+```json
+{"jsonrpc":"2.0","method":"collab_presence","params":{"peer":"alice","blob":"0a0b"}}
+```
+
+### `collab_name`
+
+Set this process's collaboration display name and publish it immediately. The
+name defaults to a short stable peer id; there is no account system.
+
+```json
+{"jsonrpc":"2.0","method":"collab_name","params":{"name":"Ada"}}
+```
+
 ### `list_state`
 
-Dump the whole document and figure list. Answers with `state`.
+Dump the whole document, figure list and live peer snapshot. Answers with
+`state`.
 
 ```json
 {"jsonrpc":"2.0","method":"list_state","params":{}}
@@ -250,7 +281,7 @@ protocol).
 | `figure_unbound` | an app left a figure (closed or exited) | `figure`, `window_id` |
 | `app_title_changed` | a bound app's title changed | `window_id`, `title` |
 | `page_changed` | the visible page changed | `page` |
-| `state` | reply to `list_state` | `page`, `page_count`, `text_size`, `view_zoom`, `view_pan_x`, `view_pan_y`, `citation_style`, `citation_locale`, `doc`, `figures` |
+| `state` | reply to `list_state` | `page`, `page_count`, `text_size`, `view_zoom`, `view_pan_x`, `view_pan_y`, `citation_style`, `citation_locale`, `doc`, `figures`, `peers`, `collab_local_peer`, `collab_local_name`, `status`, `layout_error`, `save_error`, `save_warning` |
 | `doc_saved` | reply to `save_doc` | `path` |
 | `ascii_exported` | reply to `export_ascii` | `path` |
 | `text_size_changed` | reply to `set_text_size` | `pt`, `page_count` |
@@ -261,6 +292,7 @@ protocol).
 | `dbus_router_rules` | the full routing rule list changed | `rules` |
 | `collab_delta` | a peer has a delta frame to apply, or a local edit must be forwarded | `peer`, `seq`, `delta` (hex) |
 | `collab_version` | reply to `collab_version` | `version` (hex) |
+| `collab_presence` | the local heartbeat/join published a presence blob, or a remote peer snapshot changed | `local_peer`, `local_name`, `peers`, `blob` (hex or `null`) |
 | `error` | a command failed | `code`, `message`, `category`, `retryable`, `remediation` — the tagged error contract, see [error-contract.md](error-contract.md) |
 
 The three `dbus_router_*` notifications are **unsolicited**: they are emitted
@@ -293,6 +325,31 @@ A `rule` is `{id, priority, destination?, interface?, method?, target}`, where
 
 `window_id` and `title` are `null` for a dormant figure. `rect` is
 zero-sized for a figure that isn't on the visible page.
+
+`state.peers` is the live collaborator snapshot, self excluded, and is empty
+when nobody is present:
+
+```json
+{
+  "peer": "emthin-123-2",
+  "name": "Ada",
+  "cursor": 42,
+  "connected": true,
+  "last_seen_age_ms": 120
+}
+```
+
+`cursor` is a byte offset clamped to this document's text. `connected` says
+whether the reliable delta stream is joined. Presence expires after the
+heartbeat timeout and is pruned; it is never persisted or written to Loro
+history. The `collab_presence` notification carries the same `peers` list so
+a transport can relay the optional `blob` field to the other peer.
+
+`state.status` is the same compact line the bottom overlay draws, or `null`
+when the document is quiet. `state.layout_error` and `state.save_error` carry
+the full failure text for a client that needs more than the line; they remain
+until a successful layout or save clears them. `state.save_warning` reports a
+non-fatal recovery such as loading the verified backup pair.
 
 ## Figure keys
 

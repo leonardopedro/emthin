@@ -11,7 +11,7 @@ pub mod xwayland;
 // that used `crate::KeyboardFocusTarget` before state/ existed).
 pub use focus::KeyboardFocusTarget;
 
-use std::{ffi::OsString, sync::Arc};
+use std::{ffi::OsString, sync::Arc, time::Instant};
 
 use smithay::{
     backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
@@ -294,6 +294,8 @@ pub struct EmthinState {
     /// dormant labels this is compositor presentation state, not document
     /// state: the search itself lives in `docui::search`.
     pub find_bar: crate::find_bar::FindBarCache,
+    /// Bottom status-line raster, cached by the projected line.
+    pub status_bar: crate::status_bar::StatusBarCache,
 
     /// Rasterized math-completion preview, keyed by the glyph. The pending
     /// replacement is document UI state in `DocUi`; only the pixels live here.
@@ -340,6 +342,15 @@ pub struct EmthinState {
     /// local edit is forwarded once and a remote import is not echoed back
     /// as a local edit.
     pub collab_revision: u64,
+    /// This process's display name, also published in presence blobs.
+    pub collab_local_name: String,
+    /// The caret last published, including `None` when the document had no
+    /// keyboard focus. `None` here means "never published".
+    collab_presence_cursor: Option<Option<usize>>,
+    /// When the local heartbeat was last published.
+    collab_presence_last: Option<Instant>,
+    /// When expired presence entries were last pruned.
+    collab_presence_pruned: Option<Instant>,
 }
 
 impl EmthinState {
@@ -392,6 +403,22 @@ impl EmthinState {
 
         let loop_signal = event_loop.get_signal();
 
+        // A process can host more than one state in tests; the id is still
+        // stable for the lifetime of this state/session.
+        let collab_peer = {
+            static NEXT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            format!(
+                "emthin-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        };
+        let collab_timeout = std::env::var("EMTHIN_COLLAB_PRESENCE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000);
+
         Ok(Self {
             start_time,
             display_handle: dh,
@@ -439,6 +466,7 @@ impl EmthinState {
             citation_page: crate::doc_render::DocPageTexture::new(),
             dormant_labels: crate::dormant_label::LabelCache::default(),
             find_bar: crate::find_bar::FindBarCache::default(),
+            status_bar: crate::status_bar::StatusBarCache::default(),
             completion_hint: crate::completion_hint::CompletionHintCache::default(),
             host_keymap: None,
             applied_host_keymap: None,
@@ -449,11 +477,15 @@ impl EmthinState {
             needs_redraw: true,
             dbus: dbus::DbusBridge::default(),
             collab: emthin_collab::Session::new(
-                format!("emthin-{}", std::process::id()),
-                "emthin",
-                30_000,
+                &collab_peer,
+                &collab_peer,
+                collab_timeout,
             ),
             collab_revision: 0,
+            collab_local_name: collab_peer,
+            collab_presence_cursor: None,
+            collab_presence_last: None,
+            collab_presence_pruned: None,
         })
     }
 
@@ -528,6 +560,88 @@ impl EmthinState {
         Ok(out)
     }
 
+    /// Publish the local caret when it changed, when the document gained or
+    /// lost focus, or on the one-second heartbeat. Presence is ephemeral and
+    /// never touches the document.
+    pub fn collab_publish_presence(&mut self, force: bool) {
+        let focused = self
+            .seat
+            .get_keyboard()
+            .is_some_and(|k| k.current_focus().is_none());
+        let len = self.doc.model().len();
+        let cursor = focused.then(|| self.doc.model().caret().min(len));
+        let changed = self.collab_presence_cursor != Some(cursor);
+        let due = self
+            .collab_presence_last
+            .is_none_or(|last| last.elapsed().as_millis() >= 1_000);
+        if !force && !changed && !due {
+            return;
+        }
+        self.collab.set_cursor(cursor);
+        self.collab_presence_cursor = Some(cursor);
+        self.collab_presence_last = Some(Instant::now());
+        let blob = self.collab.presence_blob();
+        self.send_collab_presence(Some(blob));
+    }
+
+    /// Prune expired presence once per heartbeat window. The published view
+    /// already filters expired peers; this frees their entries.
+    pub fn collab_prune_presence(&mut self) {
+        let due = self
+            .collab_presence_pruned
+            .is_none_or(|last| last.elapsed().as_millis() >= 1_000);
+        if !due {
+            return;
+        }
+        self.collab.remove_outdated_presence();
+        self.collab_presence_pruned = Some(Instant::now());
+    }
+
+    /// Merge an inbound presence blob and publish the resulting peer snapshot.
+    pub fn collab_apply_presence(&mut self, blob: &[u8]) -> Result<(), String> {
+        self.collab
+            .apply_presence(blob)
+            .map_err(|e| e.to_string())?;
+        self.send_collab_presence(None);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Set the local display name and republish presence immediately.
+    pub fn collab_set_name(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        self.collab.set_name(name.clone());
+        self.collab_local_name = name;
+        self.collab_publish_presence(true);
+    }
+
+    /// The current peer snapshot, clamped to this document's text length.
+    pub fn collab_peers(&self) -> Vec<crate::ipc::StatePeer> {
+        let now = collab_now_ms();
+        let len = self.doc.model().len();
+        self.collab
+            .present()
+            .into_iter()
+            .map(|peer| crate::ipc::StatePeer {
+                connected: self.collab.has_peer(&peer.peer),
+                cursor: peer.cursor.map(|cursor| cursor.min(len)),
+                last_seen_age_ms: now.saturating_sub(peer.last_seen_ms).max(0),
+                peer: peer.peer,
+                name: peer.name,
+            })
+            .collect()
+    }
+
+    fn send_collab_presence(&mut self, blob: Option<Vec<u8>>) {
+        let peers = self.collab_peers();
+        self.ipc.send(crate::ipc::OutgoingMessage::CollabPresence {
+            local_peer: self.collab.local_peer().to_string(),
+            local_name: self.collab_local_name.clone(),
+            peers,
+            blob: blob.map(|blob| crate::ipc::hex::encode(&blob)),
+        });
+    }
+
     /// Mark the current revision as already synchronized after a remote
     /// import, and rebuild the derived document state around it.
     pub fn collab_after_remote(&mut self) {
@@ -537,7 +651,7 @@ impl EmthinState {
         self.needs_redraw = true;
     }
 
-    /// Fullscreen geometry for the primary output (logical pixels).
+/// Fullscreen geometry for the primary output (logical pixels).
     pub fn output_fullscreen_geo(&self) -> Option<Rectangle<i32, Logical>> {
         let output = self.page.active_space.outputs().next()?;
         let mode = output.current_mode()?;
@@ -574,6 +688,14 @@ impl EmthinState {
     pub fn relayout_document(&mut self) {
         let released = self.doc.relayout();
         self.close_apps_whose_figure_is_gone(&released);
+    }
+
+    /// Apply a completed background layout, if one is ready.
+    pub fn poll_document_layout(&mut self) {
+        if let Some(released) = self.doc.poll_layout() {
+            self.close_apps_whose_figure_is_gone(&released);
+            self.needs_redraw = true;
+        }
     }
 
     fn close_apps_whose_figure_is_gone(&mut self, released: &[u64]) {
@@ -698,6 +820,31 @@ impl EmthinState {
     /// dismissed — an orphaned popup surface keeps its client committing
     /// forever.
     pub fn goto_page(&mut self, page: usize) -> bool {
+        self.goto_page_inner(page, true)
+    }
+
+    /// Return to the previous view in the document history. The page switch is
+    /// the same as `goto_page`, but it must not append a new history entry.
+    pub fn history_back(&mut self) -> bool {
+        let Some(page) = self.doc.history_back() else {
+            return false;
+        };
+        let moved = self.goto_page_inner(page, false);
+        self.doc.restore_history();
+        moved
+    }
+
+    /// Return to the next view in the document history.
+    pub fn history_forward(&mut self) -> bool {
+        let Some(page) = self.doc.history_forward() else {
+            return false;
+        };
+        let moved = self.goto_page_inner(page, false);
+        self.doc.restore_history();
+        moved
+    }
+
+    fn goto_page_inner(&mut self, page: usize, record_history: bool) -> bool {
         if page == self.page.current_page {
             return false;
         }
@@ -713,6 +860,9 @@ impl EmthinState {
             dismiss_popups_for_window(window);
         }
 
+        if record_history {
+            self.doc.record_jump();
+        }
         self.page.current_page = page;
         self.focus.reset_on_page_switch();
         self.ime.reset_on_page_switch();
@@ -743,6 +893,9 @@ impl EmthinState {
         // `on_page_changed` marked the document dirty so the figure rects get
         // re-placed against the new page; this is what does the work.
         self.relayout_document();
+        if record_history {
+            self.doc.remember_current();
+        }
 
         tracing::info!("switched to page {page}");
         self.needs_redraw = true;
@@ -795,6 +948,14 @@ impl EmthinState {
         };
         Some((wl, local))
     }
+}
+
+/// Milliseconds since the Unix epoch, on the same clock presence publishes.
+fn collab_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl crate::xwayland_satellite::HasXwls for EmthinState {

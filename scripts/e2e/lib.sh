@@ -71,6 +71,18 @@ in_shell() {
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 not on PATH (run under: nix develop)"; }
 
+# Fail before sway if Mesa cannot find the GBM backend it dlopens. A missing
+# path here used to surface only as `gbm_create_device failed` in sway.log,
+# which reads like a compositor/renderer bug rather than an environment gap.
+check_mesa_loader_paths() {
+  local gbm="${GBM_BACKENDS_PATH:-/run/opengl-driver/lib/gbm}"
+  local dri="${LIBGL_DRIVERS_PATH:-/run/opengl-driver/lib/dri}"
+  [ -d "$gbm" ] || die "GBM_BACKENDS_PATH is not a directory: $gbm (enter the flake; its Mesa exports this path)"
+  [ -f "$gbm/dri_gbm.so" ] || die "Mesa's GBM backend is missing: $gbm/dri_gbm.so (headless sway cannot create its allocator)"
+  [ -d "$dri" ] || die "LIBGL_DRIVERS_PATH is not a directory: $dri (enter the flake; its Mesa exports this path)"
+  log "Mesa loader paths: $gbm, $dri"
+}
+
 # ── compositor ──────────────────────────────────────────────────────────────
 #
 # `start_compositor <mode>` where mode is:
@@ -106,6 +118,7 @@ start_compositor() {
     #                 all. This is the lane that runs on a Wayland machine
     #                 with nothing but the devshell.
     local backend=x11
+    check_mesa_loader_paths
     if [ "$mode" = sway-headless ]; then
       backend=headless
     else
@@ -232,6 +245,81 @@ supervise_compositor() {
       done' _ "$E2E_XDG" "$E2E_DISPLAY" </dev/null >/dev/null 2>&1 & )
 }
 
+# ── IME ─────────────────────────────────────────────────────────────────────
+#
+# fcitx5 is an input-method client of the compositor. It can only see keys that
+# enter the seat through the normal keyboard path; wtype's virtual keyboard is
+# delivered after that point, so the IME lane is tied to XTEST. Returns non-zero
+# when the caller should skip the IME check.
+start_ime() {
+  command -v fcitx5 >/dev/null 2>&1 || {
+    warn "fcitx5 is not on PATH; the IME commit cannot be exercised"
+    return 1
+  }
+  # E2E_DISPLAY is the compositor this run started. The caller's
+  # WAYLAND_DISPLAY still names the host session, and fcitx must not attach
+  # there (it would be a real IME on the user's desktop).
+  local wayland="${E2E_DISPLAY:-${WAYLAND_DISPLAY:-}}"
+  [ -n "$wayland" ] || {
+    warn "no Wayland socket; fcitx5 has no compositor to attach to"
+    return 1
+  }
+  command -v kgx >/dev/null 2>&1 || {
+    warn "kgx is not on PATH; no text-input client for the IME check"
+    return 1
+  }
+
+  local home="$E2E_ROOT/ime"
+  mkdir -p "$home/config/fcitx5" "$home/data" "$home/cache"
+  cat > "$home/config/fcitx5/profile" <<'EOF'
+[Groups/0]
+Name=Default
+Default Layout=us
+DefaultIM=rime
+
+[Groups/0/Items/0]
+Name=rime
+Layout=
+
+[GroupOrder]
+0=Default
+EOF
+
+  [ -f "$E2E_ROOT/fcitx5.log" ] && mv "$E2E_ROOT/fcitx5.log" "$E2E_ROOT/fcitx5.log.prev"
+  log "starting fcitx5 (rime, private D-Bus session, $wayland)"
+  ( setsid env \
+      XDG_CONFIG_HOME="$home/config" \
+      XDG_DATA_HOME="$home/data" \
+      XDG_CACHE_HOME="$home/cache" \
+      WAYLAND_DISPLAY="$wayland" \
+      fcitx5 -D --disable=notifications,notificationitem,classicui,kimpanel,virtualkeyboard \
+      </dev/null >>"$E2E_ROOT/fcitx5.log" 2>&1 & )
+
+  # `fcitx5-remote` is not used here: before the daemon owns its bus name it
+  # can service-activate a second instance, which then wins the name and makes
+  # the original fail with "another fcitx already running". Wait for the log
+  # line the daemon writes once it has acquired the name.
+  local deadline=$(( SECONDS + 10 ))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if grep -aq 'Loaded addon rime' "$E2E_ROOT/fcitx5.log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  warn "fcitx5 did not load rime within 10s; see $E2E_ROOT/fcitx5.log"
+  return 1
+}
+
+stop_ime() {
+  local pid
+  for pid in $(pgrep -x fcitx5 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -x kgx 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+
 # ── emthin ──────────────────────────────────────────────────────────────────
 #
 # `start_emthin [extra args...]`. `--doc` is not passed by default: the point of
@@ -342,6 +430,9 @@ stop_emthin() {
 # the way out, take down what this run started.
 reap_previous_run() {
   local pid
+  # The IME lane starts both; a failed run can leave them attached to the old
+  # compositor and bus.
+  stop_ime
   for pid in $(emthin_pid); do
     warn "a previous run's emthin is still alive (pid $pid); stopping it"
     kill -TERM "$pid" 2>/dev/null || true

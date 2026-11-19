@@ -717,6 +717,16 @@ impl EmthinState {
     /// Apply a global document binding.
     fn run_doc_action(&mut self, action: crate::docui::keymap::Action) {
         use crate::docui::keymap::Action;
+        let context = keymap::ActionContext {
+            has_query: !self.doc.find().query().is_empty(),
+            can_history_back: self.doc.can_history_back(),
+            can_history_forward: self.doc.can_history_forward(),
+            citation_open: self.doc.citation_popup().is_open(),
+        };
+        if !keymap::available(action, context) {
+            tracing::debug!("action {action:?} does not apply in this context");
+            return;
+        }
         match action {
             Action::NextPage => {
                 let next = self.doc.current_page() + 1;
@@ -761,14 +771,19 @@ impl EmthinState {
                 self.doc.reset_view();
                 tracing::info!("view reset to fit ({}x)", self.doc.view_zoom());
             }
-            Action::ViewPanLeft
-            | Action::ViewPanRight
-            | Action::ViewPanUp
-            | Action::ViewPanDown => {
+            Action::HistoryBack => {
+                if self.history_back() {
+                    tracing::debug!("history: back");
+                }
+            }
+            Action::HistoryForward => {
+                if self.history_forward() {
+                    tracing::debug!("history: forward");
+                }
+            }
+            Action::ViewPanUp | Action::ViewPanDown => {
                 const PAN_STEP: f64 = 48.0;
                 let (dx, dy) = match action {
-                    Action::ViewPanLeft => (-PAN_STEP, 0.0),
-                    Action::ViewPanRight => (PAN_STEP, 0.0),
                     Action::ViewPanUp => (0.0, -PAN_STEP),
                     _ => (0.0, PAN_STEP),
                 };
@@ -855,8 +870,8 @@ impl EmthinState {
         }
     }
 
-    /// `Ctrl+Shift+Return`: spawn the app bound to the focused figure's
-    /// saved command, or the dormant figure the pointer is over.
+    /// `Ctrl+Shift+Return`: relaunch the dormant figure under the pointer,
+    /// or the first dormant figure when the pointer is over none.
     ///
     /// There is no interactive prompt in v1 — a launcher needs a text
     /// input surface of its own, and building one is a bigger decision
@@ -1112,9 +1127,12 @@ impl EmthinState {
                 self.doc.find_backspace();
             }
             keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
-                if self.doc.find_step(true).is_some() {
-                    self.needs_redraw = true;
+                // Enter accepts the current match and closes the bar. With no
+                // match yet (the query is still being typed) it steps instead.
+                if !self.doc.accept_find() && self.doc.find_step(true).is_none() {
+                    tracing::debug!("find: no match for {:?}", self.doc.find().query());
                 }
+                self.needs_redraw = true;
             }
             _ => {
                 let Some(text) = Self::char_for_keysym(keysym) else {

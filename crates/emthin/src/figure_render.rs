@@ -235,6 +235,25 @@ fn namespace(key: &str) -> usize {
 // Document overlays
 // ---------------------------------------------------------------------------
 
+/// Stable namespace for one peer's overlay elements.
+fn peer_key(peer: &str) -> usize {
+    peer.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as usize)
+    })
+}
+
+/// A readable caret colour for a peer id, from a small fixed palette.
+fn peer_color(peer: &str) -> [f32; 4] {
+    const PALETTE: [[f32; 4]; 5] = [
+        [0.95, 0.45, 0.35, 0.95],
+        [0.35, 0.85, 0.55, 0.95],
+        [0.95, 0.75, 0.30, 0.95],
+        [0.65, 0.55, 0.95, 0.95],
+        [0.35, 0.75, 0.95, 0.95],
+    ];
+    PALETTE[peer_key(peer) % PALETTE.len()]
+}
+
 /// The compositor's own marks on the page: the caret, the selection,
 /// and the focused figure's border.
 ///
@@ -282,6 +301,26 @@ pub fn build_overlay_elements(
                 ));
             }
         }
+    }
+
+    // Remote collaborators: a thin caret on the visible page. `caret_rect`
+    // returns `None` for a byte on another page, so a remote caret is hidden
+    // rather than guessed into view. Presence never changes the document.
+    let text_len = state.doc.model().len();
+    for peer in state.collab.present() {
+        let Some(cursor) = peer.cursor else {
+            continue;
+        };
+        let Some(caret) = state.doc.layout().caret_rect(cursor.min(text_len)) else {
+            continue;
+        };
+        let rect = Rectangle::new(caret.loc, (2, caret.size.h).into());
+        out.push(solid(
+            &format!("emthin-peer-{}", peer_key(&peer.peer)),
+            rect,
+            scale,
+            peer_color(&peer.peer),
+        ));
     }
 
     // Focused figure border: a visible tint so the user always knows
@@ -427,6 +466,33 @@ pub fn build_overlay_elements(
                 [0.06, 0.09, 0.12, 0.94],
             ));
             if let Some(element) = crate::find_bar::draw(renderer, image, x, y, scale) {
+                out.push(element);
+            }
+        }
+    }
+
+    // Status line: one compact bottom overlay, and nothing at all when the
+    // projection is quiet.
+    let peer_count = state.collab.present().len();
+    if let Some(line) = state.doc.status(peer_count).line() {
+        if let Some(image) = state.status_bar.get(&line) {
+            let viewport = state.doc.layout().viewport();
+            let x = 12;
+            let y = (viewport.h - image.height as i32 - 12).max(12);
+            let w = image.width as i32;
+            let h = image.height as i32;
+            let pad_x = 8;
+            let pad_y = 5;
+            out.push(solid(
+                "emthin-status-bg",
+                Rectangle::new(
+                    (x - pad_x, y - pad_y).into(),
+                    (w + pad_x * 2, h + pad_y * 2).into(),
+                ),
+                scale,
+                [0.06, 0.09, 0.12, 0.90],
+            ));
+            if let Some(element) = crate::status_bar::draw(renderer, image, x, y, scale) {
                 out.push(element);
             }
         }

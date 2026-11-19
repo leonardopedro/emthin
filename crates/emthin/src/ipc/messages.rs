@@ -17,6 +17,8 @@
 //! is the one place that decides the wire spelling of each event, and a
 //! derive would let a Rust rename silently break every client.
 
+use crate::docui::file::SaveFormat;
+
 /// A rectangle in **output-local logical pixels**, not fractions.
 ///
 /// The old protocol spoke `f64` fractions of the Emacs frame because
@@ -52,8 +54,14 @@ pub enum IncomingMessage {
     GotoPage { page: usize },
     /// Open a document from disk (replacing the current one).
     OpenDoc { path: String },
-    /// Snapshot the current document to a path.
-    SaveDoc { path: String },
+    /// Write the current document to a path. `format` defaults to the path
+    /// extension (`.loro`/`.mathed` = snapshot, otherwise source). `force`
+    /// replaces a file that changed since it was opened or last saved.
+    SaveDoc {
+        path: String,
+        format: Option<SaveFormat>,
+        force: bool,
+    },
     /// Write the document's ASCII-only Typst interchange projection.
     ExportAscii { path: String },
     /// Replace the document with a file containing the ASCII-only projection.
@@ -109,6 +117,12 @@ pub enum IncomingMessage {
     CollabAck { peer: String, seq: u64 },
     /// Drop a peer and its reliable stream.
     CollabLeave { peer: String },
+    /// Apply one remote presence payload. `peer` is the transmitting peer and
+    /// `blob` is hex encoded. Presence is advisory: it never edits the
+    /// document.
+    CollabPresence { peer: String, blob: String },
+    /// Set this process's collaboration display name.
+    CollabName { name: String },
 }
 
 /// Contact phase for [`IncomingMessage::InjectTouch`].
@@ -183,10 +197,26 @@ pub enum OutgoingMessage {
         citation_locale: Option<String>,
         doc: String,
         figures: Vec<StateFigure>,
+        /// Live peers, self excluded. Empty when no peer is connected.
+        peers: Vec<StatePeer>,
+        /// This process's stable presence id and display name.
+        collab_local_peer: String,
+        collab_local_name: String,
+        /// The compact status line, or `null` in quiet state.
+        status: Option<String>,
+        /// The full last layout failure, for a client that needs the detail.
+        layout_error: Option<String>,
+        /// The full last save/persistence failure, or `null`.
+        save_error: Option<String>,
+        /// A non-fatal persistence recovery note, or `null`.
+        save_warning: Option<String>,
     },
-    /// The document was written to disk.
+    /// The document was written to disk. `format` is `source` or `snapshot`;
+    /// `digest` is the SHA-256 of the bytes actually written.
     DocSaved {
         path: String,
+        format: String,
+        digest: String,
     },
     /// The document's ASCII-only projection was written to disk.
     AsciiExported {
@@ -235,6 +265,15 @@ pub enum OutgoingMessage {
     CollabVersion {
         version: String,
     },
+    /// The live peer snapshot and, when this tick published one, the local
+    /// presence blob to relay. `blob` is hex encoded and may be forwarded as a
+    /// `collab_presence` request; `peers` is derived, never durable.
+    CollabPresence {
+        local_peer: String,
+        local_name: String,
+        peers: Vec<StatePeer>,
+        blob: Option<String>,
+    },
     /// A command failed. `code` is the machine-readable reason from the
     /// closed [`IpcErrorCode`] set; `message` is the human detail and is
     /// free to change wording at any time — clients must branch on `code`.
@@ -270,6 +309,9 @@ pub enum IpcErrorCode {
     NotAscii,
     /// A collaboration frame or version token could not be applied.
     CollabFailed,
+    /// A document save would replace a file that changed since it was opened
+    /// or last saved, and the request did not set `force`.
+    DocConflict,
 }
 
 impl IpcErrorCode {
@@ -283,6 +325,7 @@ impl IpcErrorCode {
             Self::IoFailed => "io_failed",
             Self::NotAscii => "not_ascii",
             Self::CollabFailed => "collab_failed",
+            Self::DocConflict => "doc_conflict",
         }
     }
 
@@ -298,6 +341,7 @@ impl IpcErrorCode {
             Self::IoFailed => "io",
             Self::NotAscii => "malformed_input",
             Self::CollabFailed => "malformed_input",
+            Self::DocConflict => "io",
         }
     }
 
@@ -322,11 +366,12 @@ impl IpcErrorCode {
             Self::IoFailed => "The document path could not be read/written — check the path exists and is writable by the compositor's user.",
             Self::NotAscii => "The file is not the ASCII interchange projection. Re-export it with `export_ascii`, or convert its non-ASCII characters, before importing.",
             Self::CollabFailed => "The collaboration frame or version token is malformed or does not belong to this document. Send a frame produced by the same document's `collab_version`/`collab_delta` exchange; do not reuse one peer's frame for another.",
+            Self::DocConflict => "The file changed on disk since it was opened or last saved. Re-open it or save to a new path; repeat with `force: true` only to discard the outside change intentionally.",
         }
     }
 
     /// Every code, for the doc-sync test.
-    pub const ALL: [IpcErrorCode; 7] = [
+    pub const ALL: [IpcErrorCode; 8] = [
         Self::NotBound,
         Self::AppGone,
         Self::UnknownFigure,
@@ -334,7 +379,23 @@ impl IpcErrorCode {
         Self::IoFailed,
         Self::NotAscii,
         Self::CollabFailed,
+        Self::DocConflict,
     ];
+}
+
+/// One live collaborator as reported by `list_state` and `collab_presence`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StatePeer {
+    /// Stable peer id published by that peer.
+    pub peer: String,
+    /// Display name published by that peer.
+    pub name: String,
+    /// Caret byte offset, already clamped to the local text length.
+    pub cursor: Option<usize>,
+    /// Whether the reliable delta stream is currently joined for this peer.
+    pub connected: bool,
+    /// Age of the last presence heartbeat in milliseconds.
+    pub last_seen_age_ms: i64,
 }
 
 /// One figure as reported by `list_state`.
@@ -399,9 +460,18 @@ impl IncomingMessage {
             "open_doc" => Self::OpenDoc {
                 path: params_get_string(params, "path")?,
             },
-            "save_doc" => Self::SaveDoc {
-                path: params_get_string(params, "path")?,
-            },
+            "save_doc" => {
+                let format = match params.get("format") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(value)) => Some(SaveFormat::parse(value)?),
+                    Some(_) => return Err("save_doc: format must be a string".into()),
+                };
+                Self::SaveDoc {
+                    path: params_get_string(params, "path")?,
+                    format,
+                    force: params_get_optional_bool(params, "force")?.unwrap_or(false),
+                }
+            }
             "export_ascii" => Self::ExportAscii {
                 path: params_get_string(params, "path")?,
             },
@@ -457,6 +527,13 @@ impl IncomingMessage {
             "collab_leave" => Self::CollabLeave {
                 peer: params_get_string(params, "peer")?,
             },
+            "collab_presence" => Self::CollabPresence {
+                peer: params_get_string(params, "peer")?,
+                blob: params_get_string(params, "blob")?,
+            },
+            "collab_name" => Self::CollabName {
+                name: params_get_string(params, "name")?,
+            },
             other => return Err(format!("unknown IPC method: {other}")),
         })
     }
@@ -504,6 +581,18 @@ fn params_get_u64(params: &serde_json::Value, key: &str) -> Result<u64, String> 
     params[key]
         .as_u64()
         .ok_or_else(|| format!("missing/invalid field '{key}'"))
+}
+
+/// An optional boolean param: absent or `null` is `None`.
+fn params_get_optional_bool(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} must be a boolean")),
+    }
 }
 
 /// An optional string param: absent or `null` is `None`, anything
@@ -563,6 +652,7 @@ impl OutgoingMessage {
             Self::DbusRouterRuleRemoved { .. } => "dbus_router_rule_removed",
             Self::CollabDelta { .. } => "collab_delta",
             Self::CollabVersion { .. } => "collab_version",
+            Self::CollabPresence { .. } => "collab_presence",
             Self::Error { .. } => "error",
         }
     }
@@ -608,6 +698,13 @@ impl OutgoingMessage {
                 citation_locale,
                 doc,
                 figures,
+                peers,
+                collab_local_peer,
+                collab_local_name,
+                status,
+                layout_error,
+                save_error,
+                save_warning,
             } => serde_json::json!({
                 "page": page,
                 "page_count": page_count,
@@ -619,8 +716,19 @@ impl OutgoingMessage {
                 "citation_locale": citation_locale,
                 "doc": doc,
                 "figures": figures,
+                "peers": peers,
+                "collab_local_peer": collab_local_peer,
+                "collab_local_name": collab_local_name,
+                "status": status,
+                "layout_error": layout_error,
+                "save_error": save_error,
+                "save_warning": save_warning,
             }),
-            Self::DocSaved { path } => serde_json::json!({"path": path}),
+            Self::DocSaved {
+                path,
+                format,
+                digest,
+            } => serde_json::json!({"path": path, "format": format, "digest": digest}),
             Self::AsciiExported { path } => serde_json::json!({"path": path}),
             Self::TextSizeChanged { pt, page_count } => {
                 serde_json::json!({"pt": pt, "page_count": page_count})
@@ -647,6 +755,17 @@ impl OutgoingMessage {
                 serde_json::json!({"peer": peer, "seq": seq, "delta": delta})
             }
             Self::CollabVersion { version } => serde_json::json!({"version": version}),
+            Self::CollabPresence {
+                local_peer,
+                local_name,
+                peers,
+                blob,
+            } => serde_json::json!({
+                "local_peer": local_peer,
+                "local_name": local_name,
+                "peers": peers,
+                "blob": blob,
+            }),
             // N2 (2026-10-13, REAdapt R16): the error notification now
             // carries `category`, `retryable` and `remediation` alongside
             // `code`/`message`. Additive — a client that parses only
@@ -751,6 +870,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_save_doc_format_and_force_and_rejects_bad_fields() {
+        let m = IncomingMessage::from_jsonrpc(
+            "save_doc",
+            &serde_json::json!({"path":"/tmp/notes.mathed","format":"snapshot","force":true}),
+        )
+        .unwrap();
+        assert!(matches!(
+            m,
+            IncomingMessage::SaveDoc {
+                format: Some(SaveFormat::Snapshot),
+                force: true,
+                ..
+            }
+        ));
+
+        let m = IncomingMessage::from_jsonrpc(
+            "save_doc",
+            &serde_json::json!({"path":"/tmp/notes.typ"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            m,
+            IncomingMessage::SaveDoc {
+                format: None,
+                force: false,
+                ..
+            }
+        ));
+
+        assert!(IncomingMessage::from_jsonrpc(
+            "save_doc",
+            &serde_json::json!({"path":"/tmp/notes.typ","format":"loro"})
+        )
+        .is_err());
+        assert!(IncomingMessage::from_jsonrpc(
+            "save_doc",
+            &serde_json::json!({"path":"/tmp/notes.typ","force":"yes"})
+        )
+        .is_err());
+        assert!(IncomingMessage::from_jsonrpc("save_doc", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
     fn parses_page_navigation() {
         let m = IncomingMessage::from_jsonrpc("goto_page", &serde_json::json!({"page": 3}))
             .expect("goto_page");
@@ -823,6 +985,21 @@ mod tests {
             .expect("leave");
         assert!(matches!(m, IncomingMessage::CollabLeave { .. }));
 
+        let m = IncomingMessage::from_jsonrpc(
+            "collab_presence",
+            &serde_json::json!({"peer":"alice","blob":"beef"}),
+        )
+        .expect("presence");
+        assert!(matches!(
+            m,
+            IncomingMessage::CollabPresence { ref peer, ref blob }
+                if peer == "alice" && blob == "beef"
+        ));
+
+        let m = IncomingMessage::from_jsonrpc("collab_name", &serde_json::json!({"name":"Ada"}))
+            .expect("name");
+        assert!(matches!(m, IncomingMessage::CollabName { ref name } if name == "Ada"));
+
         assert!(matches!(
             IncomingMessage::from_jsonrpc("collab_version", &serde_json::json!({})).unwrap(),
             IncomingMessage::CollabVersion
@@ -854,6 +1031,25 @@ mod tests {
         };
         assert_eq!(msg.method_name(), "collab_version");
         assert_eq!(msg.into_params_value()["version"], "0a0b");
+
+        let msg = OutgoingMessage::CollabPresence {
+            local_peer: "a".into(),
+            local_name: "Ada".into(),
+            peers: vec![StatePeer {
+                peer: "b".into(),
+                name: "Bob".into(),
+                cursor: Some(2),
+                connected: true,
+                last_seen_age_ms: 12,
+            }],
+            blob: Some("beef".into()),
+        };
+        assert_eq!(msg.method_name(), "collab_presence");
+        let json = msg.into_params_value();
+        assert_eq!(json["peers"][0]["name"], "Bob");
+        assert_eq!(json["peers"][0]["cursor"], 2);
+        assert_eq!(json["peers"][0]["connected"], true);
+        assert_eq!(json["blob"], "beef");
     }
 
     #[test]
@@ -936,6 +1132,12 @@ mod tests {
             },
             OutgoingMessage::CollabVersion {
                 version: "00".into(),
+            },
+            OutgoingMessage::CollabPresence {
+                local_peer: "a".into(),
+                local_name: "Ada".into(),
+                peers: Vec::new(),
+                blob: None,
             },
             OutgoingMessage::Error {
                 code: IpcErrorCode::VoiceFailed,

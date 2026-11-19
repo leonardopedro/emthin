@@ -186,6 +186,22 @@
             export LD_LIBRARY_PATH="${pkgs.wayland}/lib:${pkgs.libglvnd}/lib:${pkgs.mesa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
 
+            # wlroots (sway's headless backend) and the EGL/DRI stack dlopen the
+            # GBM backend and DRI drivers by *directory*, not through
+            # LD_LIBRARY_PATH. Mesa's NixOS build defaults those searches to
+            # /run/opengl-driver, which does not exist when the flake's Mesa is
+            # what is running; without these, headless sway dies at
+            # `gbm_create_device failed` / `Failed to create allocator`.
+            export GBM_BACKENDS_PATH="${pkgs.mesa}/lib/gbm"
+            export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
+
+            # fcitx5 finds the rime addon's config through XDG_DATA_DIRS, but
+            # dlopens librime.so from its addon directory. That directory is
+            # not in fcitx5's own RUNPATH, so name it explicitly; without this
+            # the E2E gets "Could not locate library librime.so for addon rime"
+            # and no input method is available.
+            export FCITX_ADDON_DIRS="${pkgs.fcitx5-rime}/lib/fcitx5:${pkgs.fcitx5}/lib/fcitx5''${FCITX_ADDON_DIRS:+:$FCITX_ADDON_DIRS}"
+
             # So scripts/e2e/* can tell whether they are already inside the
             # flake and re-enter it if not, rather than the caller having to
             # remember to wrap every invocation. `nix develop` is interactive,

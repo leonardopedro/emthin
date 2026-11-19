@@ -23,15 +23,17 @@
 #[path = "../../crates/emthin/src/docui/model.rs"]
 pub mod model;
 
+pub mod diagnostics;
 pub mod jit;
 pub mod layout;
 pub mod modifiers;
+pub mod semantics;
 
 #[path = "../../crates/emthin/src/docui/citations.rs"]
 pub mod citations;
 
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jbyte, jfloat, jint, jlong};
+use jni::sys::{jboolean, jbyte, jfloat, jint, jlong};
 use jni::{EnvUnowned, errors};
 use serde_json::{Value, json};
 use unicode_segmentation::UnicodeSegmentation;
@@ -442,6 +444,148 @@ fn search_ranges(text: &str, query: &str) -> Value {
         .collect::<Vec<_>>())
 }
 
+fn protected_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let scan = mathed_core::markers::scan(text);
+    let mut ranges: Vec<_> = scan.markers.iter().map(|marker| marker.range.clone()).collect();
+    ranges.extend(scan.stmts.iter().map(|stmt| stmt.range.clone()));
+    ranges
+}
+
+fn intersects(ranges: &[std::ops::Range<usize>], range: &std::ops::Range<usize>) -> bool {
+    ranges.iter().any(|protected| protected.start < range.end && range.start < protected.end)
+}
+
+/// A bounded search page. Text scope omits structure; Source and Selection
+/// return every match and mark which ones replacement must protect.
+fn search_scoped(
+    text: &str,
+    query: &str,
+    scope: &str,
+    selection_start: usize,
+    selection_end: usize,
+    anchor: usize,
+    page_start: i32,
+    page_size: usize,
+    include_all: bool,
+) -> Value {
+    let protected = protected_ranges(text);
+    let search_range = if scope == "selection" {
+        let start = utf16_to_byte(text, selection_start.min(selection_end));
+        let end = utf16_to_byte(text, selection_start.max(selection_end));
+        start..end
+    } else {
+        0..text.len()
+    };
+    let selection_scope = scope == "selection";
+    let text_scope = scope != "source" && !selection_scope;
+    let all: Vec<_> = mathed_core::search::find_matches_in(text, query, search_range)
+        .into_iter()
+        .filter(|range| !text_scope || !intersects(&protected, range))
+        .collect();
+    let anchor_byte = utf16_to_byte(text, anchor);
+    let first = all.iter().position(|range| range.start >= anchor_byte).unwrap_or(0);
+    let page_size = page_size.max(1).min(10_000);
+    let page_start = if include_all {
+        0
+    } else if page_start >= 0 {
+        (page_start as usize).min(all.len())
+    } else {
+        (first / page_size) * page_size
+    };
+    let end = if include_all { all.len().min(10_000) } else { (page_start + page_size).min(all.len()) };
+    let matches: Vec<Value> = all[page_start..end].iter().map(|range| json!({
+        "start": byte_to_utf16(text, range.start),
+        "end": byte_to_utf16(text, range.end),
+        "protected": intersects(&protected, range),
+    })).collect();
+    json!({
+        "total": all.len(),
+        "replaceable": all.iter().filter(|range| !intersects(&protected, range)).count(),
+        "protected": all.iter().filter(|range| intersects(&protected, range)).count(),
+        "first": first,
+        "pageStart": page_start,
+        "matches": matches,
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_searchScoped<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, query: JString<'local>, scope: JString<'local>,
+    selection_start: jint, selection_end: jint, anchor: jint,
+    page_start: jint, page_size: jint, include_all: jint,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let result = search_scoped(&text.to_string(), &query.to_string(), &scope.to_string(),
+            selection_start.max(0) as usize, selection_end.max(0) as usize,
+            anchor.max(0) as usize, page_start, page_size.max(1) as usize, include_all != 0);
+        JString::from_str(env, result.to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Apply a checked batch of literal replacements. `expected` must still be
+/// the document's exact text; every range is validated again against marker
+/// and property ranges. `replace_many` makes the whole batch one Undo step.
+fn replace_many_json(model: &mut DocModel, expected: &str, ops: &Value) -> Result<String, String> {
+    if model.text() != expected {
+        return Err("The document changed; refresh the replacement preview".into());
+    }
+    let entries = ops.as_array().ok_or_else(|| "replacement plan is not an array".to_string())?;
+    if entries.len() > 10_000 {
+        return Err("replacement plan exceeds 10,000 operations".into());
+    }
+    let protected = protected_ranges(expected);
+    let mut replacements = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let start = entry.get("start").and_then(Value::as_u64).ok_or("missing start")? as usize;
+        let end = entry.get("end").and_then(Value::as_u64).ok_or("missing end")? as usize;
+        let with = entry.get("text").and_then(Value::as_str).ok_or("missing text")?;
+        let range = utf16_to_byte(expected, start)..utf16_to_byte(expected, end);
+        if range.start >= range.end || range.end > expected.len()
+            || !expected.is_char_boundary(range.start) || !expected.is_char_boundary(range.end) {
+            return Err("replacement range is invalid".into());
+        }
+        if intersects(&protected, &range) {
+            return Err("Structural matches are not replaced".into());
+        }
+        replacements.push((range, with.to_string()));
+    }
+    replacements.sort_by_key(|(range, _)| range.start);
+    for pair in replacements.windows(2) {
+        if pair[1].0.start < pair[0].0.end {
+            return Err("replacement ranges overlap".into());
+        }
+    }
+    let first = replacements.first().map(|(range, with)| (range.start, with.len())).unwrap_or((0, 0));
+    let ops: Vec<mathed_core::doc::ReplaceOp> = replacements.into_iter()
+        .map(|(range, with)| mathed_core::doc::ReplaceOp { range, with }).collect();
+    model.replace_many(ops);
+    let caret = byte_to_utf16(model.text(), first.0.saturating_add(first.1));
+    model.set_caret(utf16_to_grapheme_byte(model.text(), caret));
+    Ok(state_json(model))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_replaceMany<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, handle: jlong,
+    expected: JString<'local>, ops: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let expected = expected.to_string();
+        let parsed: Value = match serde_json::from_str(&ops.to_string()) {
+            Ok(value) => value,
+            Err(error) => return Ok(JString::from_str(env, json!({"error": format!("invalid replacement plan: {error}")}).to_string())?),
+        };
+        // SAFETY: the handle is confined to the UI thread.
+        let model = unsafe { model_mut(handle) };
+        let result = match replace_many_json(model, &expected, &parsed) {
+            Ok(state) => state,
+            Err(message) => json!({"error": message}).to_string(),
+        };
+        JString::from_str(env, result)
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_search<'local>(
     mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
@@ -474,25 +618,104 @@ fn math_completion(text: &str, caret: usize) -> Value {
     }
 }
 
-fn citation_index(text: &str) -> Value {
+fn citation_source(text: &str, scan: &mathed_core::markers::MarkerScan, stmt_idx: usize) -> (String, usize, usize) {
+    let span = &scan.stmts[stmt_idx].range;
+    let mut snippet = text.get(span.clone()).unwrap_or("")
+        .split_whitespace().collect::<Vec<_>>().join(" ");
+    if snippet.chars().count() > 180 {
+        snippet = snippet.chars().take(180).collect::<String>() + "…";
+    }
+    (snippet, byte_to_utf16(text, span.start), byte_to_utf16(text, span.end))
+}
+
+fn citation_keys(reference: &mathed_core::markers::ReferenceEntry) -> Vec<String> {
+    use mathed_core::markers::ReferenceKind;
+    match &reference.kind {
+        ReferenceKind::Bibliography { keys } => keys.iter()
+            .map(|key| key.trim().trim_matches('"').to_string()).collect(),
+        ReferenceKind::DocumentRef { .. } => Vec::new(),
+    }
+}
+
+fn citation_index(text: &str, resolve_status: bool) -> Value {
+    use mathed_core::markers::ReferenceKind;
     let scan = mathed_core::markers::scan(text);
-    json!(model::citation_references(&scan).iter().map(|reference| {
-        let span = &scan.stmts[reference.stmt_idx].range;
-        json!({"start": byte_to_utf16(text, span.start), "end": byte_to_utf16(text, span.end),
-            "numbers": reference.numbers, "label": mathed_core::markers::cite_label_text(reference)})
-    }).collect::<Vec<_>>())
+    let upstream = mathed_core::markers::scan_references(&scan);
+    let entries = model::citation_references(&scan);
+    let mut result = Vec::new();
+    for reference in &entries {
+        let (source, start, end) = citation_source(text, &scan, reference.stmt_idx);
+        let keys = citation_keys(reference);
+        let kind = match reference.kind {
+            ReferenceKind::Bibliography { .. } => "bibliography",
+            ReferenceKind::DocumentRef { .. } => "document",
+        };
+        let mut resolved = true;
+        let mut status_error = String::new();
+        if resolve_status {
+            match &reference.kind {
+                ReferenceKind::Bibliography { .. } => {
+                    if let Some(number) = reference.numbers.first() {
+                        if let Err(error) = citations::bibliography_detail(
+                            text, *number, None, citations::DEFAULT_CITATION_LOCALE,
+                        ) {
+                            resolved = false;
+                            status_error = error;
+                        }
+                    }
+                }
+                ReferenceKind::DocumentRef { body, .. } => {
+                    let has_body = body.is_some();
+                    let popup = upstream.iter().find(|r| r.stmt_idx == reference.stmt_idx)
+                        .and_then(|r| r.numbers.first()).copied()
+                        .and_then(|number| mathed_mini::cite_popup::resolve_popup_body(text, number));
+                    if !has_body || popup.is_none() {
+                        resolved = false;
+                        status_error = "Citation has no referenced text".to_string();
+                    }
+                }
+            }
+        }
+        result.push(json!({"start": start, "end": end,
+            "numbers": reference.numbers, "label": mathed_core::markers::cite_label_text(reference),
+            "kind": kind, "keys": keys, "source": source, "resolved": resolved,
+            "statusError": status_error}));
+    }
+    json!(result)
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_citationIndex<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, resolve_status: jboolean,
 ) -> JString<'local> {
     unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        JString::from_str(env, citation_index(&text.to_string()).to_string())
+        JString::from_str(env, citation_index(&text.to_string(), resolve_status).to_string())
     }).resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
-fn citation_detail(text: &str, number: u64, width: f64, scale: f32) -> Value {
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_citationChoices<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        JString::from_str(env, json!({
+            "styles": citations::CITATION_STYLES,
+            "locales": citations::CITATION_LOCALES,
+            "defaultStyle": mathed_biblio::DEFAULT_STYLE,
+            "defaultLocale": citations::DEFAULT_CITATION_LOCALE,
+        }).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+fn citation_detail(
+    text: &str,
+    number: u64,
+    width: f64,
+    scale: f32,
+    style: Option<&str>,
+    locale: &str,
+) -> Value {
     use base64::Engine as _;
     use mathed_mini::cite_popup::{resolve_popup_body, PopupBody};
     let scan = mathed_core::markers::scan(text);
@@ -500,26 +723,31 @@ fn citation_detail(text: &str, number: u64, width: f64, scale: f32) -> Value {
     let Some(reference) = references.iter().find(|r| r.numbers.contains(&number)) else {
         return json!({"error": "Citation no longer exists"});
     };
+    let (source, source_start, source_end) = citation_source(text, &scan, reference.stmt_idx);
+    let label = mathed_core::markers::cite_label_text(reference);
+    let keys = citation_keys(reference);
+    let metadata = json!({"number": number, "label": label, "keys": keys,
+        "source": source, "sourceStart": source_start, "sourceEnd": source_end});
     let upstream = mathed_core::markers::scan_references(&scan);
     let upstream_number = upstream.iter().find(|r| r.stmt_idx == reference.stmt_idx)
         .and_then(|r| r.numbers.first()).copied().unwrap_or(number);
     let Some(body) = resolve_popup_body(text, upstream_number) else {
-        return json!({"error": "Citation no longer exists"});
+        return json!({"error": "Citation no longer exists", "source": source,
+            "sourceStart": source_start, "sourceEnd": source_end});
     };
+    let locale = if locale.trim().is_empty() { citations::DEFAULT_CITATION_LOCALE } else { locale };
+    let style = style.map(str::trim).filter(|name| !name.is_empty());
     match body {
         PopupBody::Bibliography { keys, .. } => {
-            match citations::bibliography_detail(
-                text,
-                number,
-                None,
-                citations::DEFAULT_CITATION_LOCALE,
-            ) {
+            match citations::bibliography_detail(text, number, style, locale) {
                 Ok((citation, entries)) => json!({"kind":"bibliography", "text":citation,
-                    "entries":entries, "resolved":true}),
+                    "entries":entries, "resolved":true, "style": style.unwrap_or(mathed_biblio::DEFAULT_STYLE),
+                    "locale": locale, "metadata": metadata}),
                 Err(error) => json!({"kind":"bibliography", "text":format!("[{}]", keys.join(", ")),
-                    "resolved":false, "errorDetail":error}),
+                    "resolved":false, "errorDetail":error, "style": style.unwrap_or(mathed_biblio::DEFAULT_STYLE),
+                    "locale": locale, "metadata": metadata}),
             }
-        },
+        }
         PopupBody::DocumentRef { body_text, body_markup } => {
             let body_markup = if body_text.is_empty() { body_markup } else {
                 let scan = mathed_core::markers::scan(&body_text);
@@ -536,11 +764,14 @@ fn citation_detail(text: &str, number: u64, width: f64, scale: f32) -> Value {
             }).and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
             match image {
                 Some(image) => match png_page(image.width, image.height, &image.data) {
-                    Ok(png) => json!({"kind":"document", "text":body_text, "width":image.width,
-                        "height":image.height, "png":base64::engine::general_purpose::STANDARD.encode(png)}),
-                    Err(error) => json!({"error":error}),
+                    Ok(png) => json!({"kind":"document", "text":body_text, "scope":body_text,
+                        "body":body_text, "width":image.width, "height":image.height,
+                        "png":base64::engine::general_purpose::STANDARD.encode(png),
+                        "resolved":true, "locale": locale, "metadata": metadata}),
+                    Err(error) => json!({"error":error, "metadata": metadata}),
                 },
-                None => json!({"error":"Could not render cited text", "text":body_text}),
+                None => json!({"error":"Could not render cited text", "text":body_text,
+                    "metadata": metadata}),
             }
         }
     }
@@ -549,12 +780,54 @@ fn citation_detail(text: &str, number: u64, width: f64, scale: f32) -> Value {
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_citationDetail<'local>(
     mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
-    number: jint, width: jfloat, scale: jfloat,
+    number: jint, width: jfloat, scale: jfloat, style: JString<'local>,
+    locale: JString<'local>,
 ) -> JString<'local> {
     unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
         let width = if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 };
         let scale = if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 };
-        JString::from_str(env, citation_detail(&text.to_string(), number.max(0) as u64, width, scale).to_string())
+        let style = style.to_string();
+        let locale = locale.to_string();
+        JString::from_str(env, citation_detail(&text.to_string(), number.max(0) as u64,
+            width, scale, (!style.is_empty()).then_some(style.as_str()), &locale).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_semanticIndex<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        JString::from_str(env, semantics::semantic_json(&text.to_string()).to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_renamePreview<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, def_index: jint, new_name: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let result = semantics::rename_preview_json(&text.to_string(),
+            def_index.max(0) as usize, &new_name.to_string());
+        JString::from_str(env, result.to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_renameDefinition<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, handle: jlong,
+    expected: JString<'local>, def_index: jint, new_name: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        // SAFETY: the handle is confined to the UI thread.
+        let model = unsafe { model_mut(handle) };
+        let result = match semantics::rename_definition_json(model, &expected.to_string(),
+            def_index.max(0) as usize, &new_name.to_string()) {
+            Ok(state) => state,
+            Err(message) => json!({"error": message}).to_string(),
+        };
+        JString::from_str(env, result)
     }).resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
@@ -630,24 +903,151 @@ fn modifier_comparisons(model: &DocModel, start_id: &str, end_id: &str, width: f
     let mut outgoing = Vec::new();
     for link in modifiers::links(model) {
         if !link.resolved { continue; }
+        let source_start = modifiers::source_range(model, &link.start_id, &link.end_id);
         if link.target.start < source.end && source.start < link.target.end {
-            let label = modifiers::source_range(model, &link.start_id, &link.end_id)
-                .map(|r| model.text()[r].trim().to_owned())
+            let label = source_start.as_ref()
+                .map(|r| model.text()[r.clone()].trim().to_owned())
                 .unwrap_or_else(|| "Missing modifier".to_string());
             incoming.push(json!({"label": label,
+                "startId": link.start_id, "endId": link.end_id,
+                "targetIds": link.target_ids,
+                "start": byte_to_utf16(model.text(), link.target.start),
+                "end": byte_to_utf16(model.text(), link.target.end),
+                "sourceStart": source_start.as_ref().map(|r| byte_to_utf16(model.text(), r.start)),
+                "sourceEnd": source_start.as_ref().map(|r| byte_to_utf16(model.text(), r.end)),
+                "snippet": snippet_utf16(model.text(), link.target.clone()),
+                "legacy": link.target_ids.is_none(),
+                "resolved": link.resolved,
                 "without": modifier_fragment(model, source.clone(), Some((&link.start_id, &link.end_id)), width, scale)}));
         }
         if link.start_id == start_id && link.end_id == end_id {
             outgoing.push(json!({
                 "start": byte_to_utf16(model.text(), link.target.start),
                 "end": byte_to_utf16(model.text(), link.target.end),
+                "targetIds": link.target_ids,
+                "snippet": snippet_utf16(model.text(), link.target.clone()),
                 "legacy": link.target_ids.is_none(),
+                "resolved": link.resolved,
                 "with": modifier_fragment(model, link.target.clone(), None, width, scale),
                 "without": modifier_fragment(model, link.target, Some((start_id, end_id)), width, scale),
             }));
         }
     }
     json!({"incoming": incoming, "outgoing": outgoing})
+}
+
+fn modifier_relationships(model: &DocModel, start_id: &str, end_id: &str) -> Value {
+    let Some(source) = modifiers::source_range(model, start_id, end_id) else {
+        return json!({"error": "Modifier markers no longer exist"});
+    };
+    let mut incoming = Vec::new();
+    let mut outgoing = Vec::new();
+    for link in modifiers::links(model) {
+        let source_start = modifiers::source_range(model, &link.start_id, &link.end_id);
+        if link.target.start < source.end && source.start < link.target.end {
+            let label = source_start.as_ref()
+                .map(|r| model.text()[r.clone()].trim().to_owned())
+                .unwrap_or_else(|| "Missing modifier".to_string());
+            incoming.push(json!({"label": label,
+                "startId": link.start_id, "endId": link.end_id,
+                "targetIds": link.target_ids,
+                "start": byte_to_utf16(model.text(), link.target.start),
+                "end": byte_to_utf16(model.text(), link.target.end),
+                "sourceStart": source_start.as_ref().map(|r| byte_to_utf16(model.text(), r.start)),
+                "sourceEnd": source_start.as_ref().map(|r| byte_to_utf16(model.text(), r.end)),
+                "snippet": snippet_utf16(model.text(), link.target.clone()),
+                "legacy": link.target_ids.is_none(),
+                "resolved": link.resolved,
+                "error": if link.resolved { "" } else { "Modifier source markers no longer resolve" }}));
+        }
+        if link.start_id == start_id && link.end_id == end_id {
+            outgoing.push(json!({
+                "start": byte_to_utf16(model.text(), link.target.start),
+                "end": byte_to_utf16(model.text(), link.target.end),
+                "targetIds": link.target_ids,
+                "snippet": snippet_utf16(model.text(), link.target.clone()),
+                "legacy": link.target_ids.is_none(),
+                "resolved": link.resolved,
+                "error": if link.resolved { "" } else { "Target markers no longer resolve" },
+                "sourceStart": byte_to_utf16(model.text(), source.start),
+                "sourceEnd": byte_to_utf16(model.text(), source.end),
+                "label": model.text()[source.clone()].trim().to_owned(),
+            }));
+        }
+    }
+    json!({"incoming": incoming, "outgoing": outgoing})
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_modifierRelationships<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, snapshot: JString<'local>,
+    start_id: JString<'local>, end_id: JString<'local>,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let text = text.to_string();
+        let value = match model_from_snapshot(&snapshot.to_string(), &text) {
+            Some(model) => modifier_relationships(&model, &start_id.to_string(), &end_id.to_string()),
+            None => json!({"error": "Could not restore document"}),
+        };
+        JString::from_str(env, value.to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+fn snippet_utf16(text: &str, range: std::ops::Range<usize>) -> String {
+    let mut value = text.get(range).unwrap_or("")
+        .split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() > 80 {
+        value = value.chars().take(80).collect::<String>() + "…";
+    }
+    value
+}
+
+/// One expanded relationship row. Rendering is requested only for the row
+/// the user opened, never for every incoming/outgoing relationship.
+fn modifier_comparison_row(
+    model: &DocModel,
+    target_start: i32,
+    target_end: i32,
+    exclude_start: &str,
+    exclude_end: &str,
+    width: f64,
+    scale: f32,
+) -> Value {
+    let text = model.text();
+    let start = utf16_to_byte(text, target_start.max(0) as usize);
+    let end = utf16_to_byte(text, target_end.max(0) as usize);
+    if start >= end || end > text.len()
+        || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return json!({"error": "This relationship has no visible text"});
+    }
+    let excluded = (!exclude_start.is_empty() && !exclude_end.is_empty())
+        .then_some((exclude_start, exclude_end));
+    json!({
+        "with": modifier_fragment(model, start..end, None, width, scale),
+        "without": modifier_fragment(model, start..end, excluded, width, scale),
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_modifierComparisonRow<'local>(
+    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    text: JString<'local>, snapshot: JString<'local>,
+    target_start: jint, target_end: jint,
+    exclude_start: JString<'local>, exclude_end: JString<'local>,
+    width: jfloat, scale: jfloat,
+) -> JString<'local> {
+    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
+        let text = text.to_string();
+        let value = match model_from_snapshot(&snapshot.to_string(), &text) {
+            Some(model) => modifier_comparison_row(&model, target_start, target_end,
+                &exclude_start.to_string(), &exclude_end.to_string(),
+                if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 },
+                if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 }),
+            None => json!({"error": "Could not restore document"}),
+        };
+        JString::from_str(env, value.to_string())
+    }).resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -1208,7 +1608,7 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_prepareLayout<'local>(
         let expanded: Vec<(String, String)> =
             serde_json::from_str(&expanded.to_string()).unwrap_or_default();
         let result = layout::prepare(&bytes, &text, &layout_id.to_string(), show_markers != 0, &expanded, text_size as f32)
-            .unwrap_or_else(|error| json!({"error": error}));
+            .unwrap_or_else(|error| error);
         JString::from_str(env, result.to_string())
     })
     .resolve::<errors::ThrowRuntimeExAndDefault>()
@@ -1463,6 +1863,62 @@ mod tests {
     }
 
     #[test]
+    fn scoped_search_protects_structure_and_honours_selection_pages() {
+        let text = "#a bold #b visible alpha";
+        let protected = search_scoped(text, "#a", "text", 0, 0, 0, -1, 200, false);
+        assert_eq!(protected["total"], 0, "Text scope omits marker tokens: {protected}");
+        let source = search_scoped(text, "#a", "source", 0, 0, 0, -1, 200, false);
+        assert_eq!(source["total"], 1);
+        assert_eq!(source["matches"][0]["protected"], true);
+        let statement = "#a body #b \\cite(#a, #b)";
+        let statement_text = search_scoped(statement, "cite", "text", 0, 0, 0, -1, 200, false);
+        assert_eq!(statement_text["total"], 0, "Text scope omits property statements");
+        let statement_source = search_scoped(statement, "cite", "source", 0, 0, 0, -1, 200, false);
+        assert_eq!(statement_source["total"], 1);
+        assert_eq!(statement_source["matches"][0]["protected"], true);
+
+        let visible = text.find("visible").unwrap();
+        let start = byte_to_utf16(text, visible);
+        let frozen = search_scoped(text, "visible", "selection", start, start + 7, 0, -1, 200, false);
+        assert_eq!(frozen["total"], 1);
+        let outside = search_scoped(text, "alpha", "selection", start, start + 7, 0, -1, 200, false);
+        assert_eq!(outside["total"], 0, "Selection scope never crosses its frozen endpoints");
+
+        let starter = "#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n"
+            .to_string() + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
+        let prose = search_scoped(&starter, "editor", "text", 0, 0, 0, -1, 200, false);
+        assert_eq!(prose["total"], 1, "marker bodies remain searchable text: {prose}");
+
+        let many = "x ".repeat(250);
+        let first = search_scoped(&many, "x", "text", 0, 0, 0, -1, 200, false);
+        assert_eq!(first["total"], 250);
+        assert_eq!(first["matches"].as_array().unwrap().len(), 200);
+        let last = search_scoped(&many, "x", "text", 0, 0, 0, 200, 200, false);
+        assert_eq!(last["matches"].as_array().unwrap().len(), 50);
+    }
+
+    #[test]
+    fn literal_replace_batch_is_protected_and_one_undo_step() {
+        let text = "#a bold #b one two one";
+        let mut model = DocModel::new(text);
+        let first = text.find("one").unwrap();
+        let second = text.rfind("one").unwrap();
+        let ops = json!([
+            {"start": byte_to_utf16(text, first), "end": byte_to_utf16(text, first + 3), "text": "1"},
+            {"start": byte_to_utf16(text, second), "end": byte_to_utf16(text, second + 3), "text": "1"},
+        ]);
+        replace_many_json(&mut model, text, &ops).unwrap();
+        assert_eq!(model.text(), "#a bold #b 1 two 1");
+        model.undo();
+        assert_eq!(model.text(), text, "one Undo restores the whole replacement batch");
+
+        assert!(replace_many_json(&mut model, "stale", &ops).is_err());
+        let bad = json!([{"start": 0, "end": 3, "text": "x"}]);
+        assert!(replace_many_json(&mut model, text, &bad).is_err(),
+            "markers/property statements cannot be replaced");
+    }
+
+    #[test]
     fn word_navigation_uses_mathed_boundaries_with_utf16_positions() {
         let text = "👋 alpha beta";
         assert_eq!(word_boundary_utf16(text, 3, 1), 8);
@@ -1482,34 +1938,48 @@ mod tests {
     #[test]
     fn citation_details_resolve_hayagriva_and_document_references() {
         let doc = "#1 crazy-rich:\n    type: Book\n    title: Crazy Rich Asians\n    author: Kwan, Kevin\n    date: 2014\n    publisher: Anchor Books\n#2 \\bibliography(#1,#2, refs)\n#3 x #4 \\cite(#3,#4, \"crazy-rich\", bib: \"refs\")";
-        let detail = citation_detail(doc, 1, 300.0, 1.0);
+        let detail = citation_detail(doc, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE);
         assert_eq!(detail["kind"], "bibliography");
         assert_eq!(detail["resolved"], true);
         assert!(detail["text"].as_str().unwrap().contains("Kwan"));
         assert!(detail["text"].as_str().unwrap().contains("2014"), "citation year missing: {detail}");
         assert!(detail["entries"][0].as_str().unwrap().contains("Crazy Rich Asians"));
         let bare = "#1 crazy-rich:\n    type: Book\n    title: Crazy Rich Asians\n    author: Kwan, Kevin\n    date: 2014\n#2 \\bibliography(#1,#2, refs)\n\\cite(\"crazy-rich\", bib: \"refs\") \\cite(#1,#2)";
-        let index = citation_index(bare);
+        let index = citation_index(bare, true);
         assert_eq!(index[0]["numbers"], json!([1]));
         assert_eq!(index[1]["numbers"], json!([2]));
-        assert_eq!(citation_detail(bare, 1, 300.0, 1.0)["resolved"], true);
+        assert_eq!(index[0]["keys"], json!(["crazy-rich"]));
+        assert!(index[0]["source"].as_str().unwrap().contains("\\cite("));
+        assert_eq!(index[0]["resolved"], true);
+        assert_eq!(citation_detail(bare, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE)["resolved"], true);
+        let vancouver = citation_detail(bare, 1, 300.0, 1.0, Some("vancouver"), "de-DE");
+        assert_eq!(vancouver["resolved"], true);
+        assert_eq!(vancouver["style"], "vancouver");
+        assert_eq!(vancouver["locale"], "de-DE");
+        assert_eq!(vancouver["metadata"]["number"], 1);
+        assert!(vancouver["metadata"]["sourceStart"].as_u64().is_some());
+        assert_eq!(citations::CITATION_STYLES[0], "apa");
+        assert!(citations::CITATION_LOCALES.contains(&citations::DEFAULT_CITATION_LOCALE));
         let misspelled = bare.replace("\"crazy-rich\", bib", "\"Kwn14\", bib");
-        let detail = citation_detail(&misspelled, 1, 300.0, 1.0);
+        let detail = citation_detail(&misspelled, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE);
         assert_eq!(detail["resolved"], false);
         assert!(detail["errorDetail"].as_str().unwrap().contains("crazy-rich"));
+        let unresolved_index = citation_index(&misspelled, true);
+        assert_eq!(unresolved_index[0]["resolved"], false);
+        assert!(unresolved_index[0]["statusError"].as_str().unwrap().contains("crazy-rich"));
         let bibtex = "#a @book{kwan:2014, title={Crazy Rich Asians}, author={Kwan, Kevin}, year={2014}} #b \\bibliography(#a,#b, refs, format: \"bibtex\") \\cite(\"kwan:2014\", bib: \"refs\")";
-        let bibtex_detail = citation_detail(bibtex, 1, 300.0, 1.0);
+        let bibtex_detail = citation_detail(bibtex, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE);
         assert_eq!(bibtex_detail["resolved"], true, "{bibtex_detail}");
         assert!(bibtex_detail["text"].as_str().unwrap().contains("2014"));
         let reference = "#a Hello $x^2$ #b \\cite(#a,#b)";
-        let index = citation_index(reference);
+        let index = citation_index(reference, true);
         assert_eq!(index[0]["numbers"], json!([1]));
         let page: Value = serde_json::from_str(&render_pages_with_options(
             reference, 0, 1, 1.0, 0, None, false, true).unwrap()).unwrap();
         let cite_start = index[0]["start"].as_u64().unwrap();
         assert!(page["pages"][0]["hits"].as_array().unwrap().iter()
             .any(|hit| hit[4].as_u64() == Some(cite_start)), "citation label must be tappable");
-        let detail = citation_detail(reference, 1, 300.0, 2.0);
+        let detail = citation_detail(reference, 1, 300.0, 2.0, None, citations::DEFAULT_CITATION_LOCALE);
         assert_eq!(detail["kind"], "document");
         assert!(detail["png"].is_string());
     }
@@ -1643,6 +2113,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["label"], "bold");
         assert!(rows[0]["without"]["rgba"].is_string());
+        let relationships = modifier_relationships(&model, "c", "d");
+        let incoming = &relationships["incoming"][0];
+        assert_eq!(incoming["startId"], "a");
+        assert_eq!(incoming["endId"], "b");
+        assert!(incoming["snippet"].as_str().unwrap().contains("hello"));
+        assert_eq!(incoming["resolved"], true);
+        let row = modifier_comparison_row(&model, incoming["start"].as_i64().unwrap() as i32,
+            incoming["end"].as_i64().unwrap() as i32, "a", "b", 250.0, 2.0);
+        assert!(row["with"]["rgba"].is_string());
+        assert!(row["without"]["rgba"].is_string());
+        assert_ne!(row["with"]["rgba"], row["without"]["rgba"]);
     }
 
     #[test]
@@ -1683,6 +2164,51 @@ mod tests {
         assert_eq!(actual["pages"][0]["rgba"], expected["pages"][0]["rgba"]);
         assert!(actual["warnings"][0].as_str().unwrap().contains("fgh"));
         assert_eq!(modifiers::links(&model).len(), 2, "rendering must not remove links");
+    }
+
+    #[test]
+    fn diagnostics_report_marker_pairs_and_unimplemented_execution() {
+        let text = "#1 text #2 \\app(#1, #9, 10, 10)\n#3 thing #4 \\prob(#3, #4)";
+        let model = DocModel::new(text);
+        let diagnostics = diagnostics::source_diagnostics(&model, "capture-a");
+        let missing = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "marker-pair")
+            .expect("dangling marker pair is reported");
+        assert_eq!(missing["severity"], "error");
+        assert_eq!(missing["provenance"], "exact");
+        assert_eq!(missing["markerPair"], json!(["1", "9"]));
+        assert!(missing["start"].as_u64().is_some(), "statement range is exact source");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic["code"] == "execution-unavailable"
+                && diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Execution is unavailable")
+        }));
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["captureId"] == "capture-a"));
+    }
+
+    #[test]
+    fn diagnostic_attributes_a_generated_typst_error_to_its_modifier_owner() {
+        let text = "#1 target #2\n#3 nope #4\n";
+        let mut model = DocModel::new(text);
+        assert!(modifiers::set_marker_targets(&mut model, "3", "4", "1 2").is_ok());
+        let prepared = layout::prepare(
+            &model.math_doc().snapshot(), text, "diag-owner", false, &[], 17.0,
+        )
+        .expect("the invalid modifier is isolated and the document still renders");
+        let diagnostics = prepared["diagnostics"].as_array().unwrap();
+        let owner = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "modifier-application")
+            .expect("the failing modifier is a diagnostic, not a discarded Eval");
+        assert_eq!(owner["provenance"], "owner");
+        assert_eq!(owner["markerPair"], json!(["3", "4"]));
+        assert_eq!(owner["start"], json!(byte_to_utf16(text, text.find("nope").unwrap() - 1)));
+        assert!(owner["end"].as_u64().unwrap() > owner["start"].as_u64().unwrap());
     }
 
     #[test]
@@ -2261,6 +2787,36 @@ mod tests {
                 && java.contains("AccessibilityAction.ACTION_CLICK")
                 && java.contains("requestPage(index, \"accessible\")"),
             "rendered pages must expose source-backed virtual text and load on accessibility focus");
+    }
+
+    /// A11 wiring guard: Find has scoped bounded pages, a separable
+    /// controller, and literal replacement goes through one native batch.
+    #[test]
+    fn a11_scoped_find_and_grouped_replace_are_wired() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+        let find = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/FindController.java"
+        ))
+        .expect("FindController.java must be readable");
+        assert!(java.contains("new FindController(")
+                && java.contains("DocBridge.searchScoped(")
+                && java.contains("DocBridge.replaceMany(")
+                && java.contains("occurrences")
+                && java.contains("Structural matches are not replaced"),
+            "the UI must use the scoped search and checked replacement boundary");
+        assert!(find.contains("public static final int PAGE_SIZE = 200;")
+                && find.contains("if (token != requestToken) return;")
+                && find.contains("public void searchFrom("),
+            "Find must retain one bounded page and reject stale scans");
+        assert!(java.contains("closeSearch(true)")
+                && java.contains("restoreSearchOrigin()")
+                && java.contains("expandedSegments.putAll(origin.folds)"),
+            "Cancel must restore the captured viewport/folds/selection");
     }
 
     /// A5 wiring guard: candidates stay in the native field until commit,

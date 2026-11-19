@@ -76,12 +76,15 @@ inject_key() {
     Escape)    wtype_lead -k Escape              >/dev/null 2>&1 ;;
     BackSpace) wtype_lead -k BackSpace           >/dev/null 2>&1 ;;
     Page_Down) wtype_lead -k Page_Down           >/dev/null 2>&1 ;;
+    Page_Up)   wtype_lead -k Page_Up             >/dev/null 2>&1 ;;
     End)       wtype_lead -k End                 >/dev/null 2>&1 ;;
     ctrl+c)    wtype_lead -M ctrl -k c -m ctrl   >/dev/null 2>&1 ;;
     ctrl+v)    wtype_lead -M ctrl -k v -m ctrl   >/dev/null 2>&1 ;;
     ctrl+x)    wtype_lead -M ctrl -k x -m ctrl   >/dev/null 2>&1 ;;
     ctrl+a)    wtype_lead -M ctrl -k a -m ctrl   >/dev/null 2>&1 ;;
+    ctrl+f)    wtype_lead -M ctrl -k f -m ctrl   >/dev/null 2>&1 ;;
     ctrl+z)    wtype_lead -M ctrl -k z -m ctrl   >/dev/null 2>&1 ;;
+    F3)        wtype_lead -k F3                  >/dev/null 2>&1 ;;
     *) warn "wtype has no mapping for '$1'"; return 1 ;;
   esac || { warn "wtype could not deliver: $1"; return 1; }
   sleep "${INJECT_SETTLE:-0.2}"

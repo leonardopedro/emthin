@@ -14,6 +14,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -115,9 +116,8 @@ jobs:
   # it — without this job its tests ran nowhere at all, which round 4 found
   # and round 5 closed. Host-only by design: the engine half is
   # target-independent, so these run with no NDK, no emulator and no
-  # waydroid (AGENTS.md "#emthin-android"). Building the *APK* stays an
-  # owner-run lane: `build-apk.sh` hard-pins four Nix store paths that a
-  # flake update moves.
+  # waydroid (AGENTS.md "#emthin-android"). APK builds live in `android-apk`
+  # below, which supplies a runner SDK/NDK instead of the local Nix pins.
   android:
     name: emthin-pad host tests
     runs-on: ubuntu-latest
@@ -166,6 +166,171 @@ jobs:
 
       # The A2 ownership coordinators, A3 recovery codec and A4 provider
       # helpers are plain Java, so these host tests need no Android SDK.
+      - name: Java ownership + recovery + provider tests
+        run: bash emthin-android/test-java.sh
+
+  # The APK lane is expensive and the plan says not to force it on every
+  # host-only change. Gate it on Android sources or this workflow changing;
+  # the `android` job above still runs the Java suite for every push/PR.
+  android-apk-changes:
+    name: Android APK scope
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.scope.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || \
+             [ -z "$BASE_SHA" ] || \
+             [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            build=true
+          elif git diff --quiet "$BASE_SHA" HEAD -- emthin-android .github/workflows/ci.yml; then
+            build=false
+          else
+            build=true
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  # Build both emthin-pad artifacts and run the plain-Java host suite. The
+  # build script's Nix store pins are a fallback for the owner's aarch64
+  # machine; here ANDROID_SDK_ROOT/ANDROID_CLANG/ANDROID_AR point it at a
+  # standard x86_64 SDK and NDK so the same script runs unmodified.
+  android-apk:
+    name: emthin-pad APK builds + host Java
+    needs: android-apk-changes
+    if: needs.android-apk-changes.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7.0.1
+
+      # Same path-dependency closure as the host-test job: the bridge needs
+      # velysterm and unfer, and emthin-pad links australVM's cranelift.
+      - name: checkout sibling repos (path deps)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/velysterm.git ../velysterm
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/unfer.git ../unfer
+          git clone --depth 1 --branch main \
+            https://github.com/leonardopedro/australVM.git ../australVM
+
+      # JDK 21 is what build-apk.sh and test-java.sh were verified with. The
+      # runner's default Java may be older, so pin the downloaded JDK path in
+      # the environment rather than relying on update-alternatives.
+      - name: Java 21
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            openjdk-21-jdk-headless unzip
+          echo "JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "/usr/lib/jvm/java-21-openjdk-amd64/bin" >> "$GITHUB_PATH"
+
+      # The SDK/NDK is ~2 GB and its package set changes only when this key
+      # does. Keep it outside the workspace so it can be restored before the
+      # install step decides whether anything is missing.
+      - name: cache Android SDK + NDK
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # actions/cache@v4.3.0
+        with:
+          path: ${{ runner.temp }}/android-sdk
+          key: android-sdk-${{ runner.os }}-${{ runner.arch }}-api33-bt35-ndk27-v1
+
+      # Use the public command-line tools rather than the runner's mutable
+      # preinstalled SDK. build-apk.sh picks the highest installed platform
+      # and defaults to API 33; build-tools 35 and NDK r27 both support it.
+      # A restored cache skips both the download and the package install.
+      - name: Android SDK + NDK
+        run: |
+          sdk_root="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$sdk_root/cmdline-tools"
+          if [ ! -x "$sdk_root/cmdline-tools/latest/bin/sdkmanager" ]; then
+            curl -fsSLo /tmp/android-cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/android-cmdline-tools.zip -d "$sdk_root/cmdline-tools"
+            mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+          fi
+          chmod +x "$sdk_root/cmdline-tools/latest/bin/sdkmanager" 2>/dev/null || true
+          echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          export ANDROID_HOME="$sdk_root" ANDROID_SDK_ROOT="$sdk_root"
+          export PATH="$sdk_root/cmdline-tools/latest/bin:$JAVA_HOME/bin:$PATH"
+          if [ ! -f "$sdk_root/platforms/android-33/android.jar" ] || \
+             [ ! -x "$sdk_root/build-tools/35.0.0/aapt2" ] || \
+             [ ! -x "$sdk_root/build-tools/35.0.0/zipalign" ] || \
+             [ ! -x "$sdk_root/build-tools/35.0.0/d8" ] || \
+             [ ! -x "$sdk_root/build-tools/35.0.0/apksigner" ] || \
+             [ ! -x "$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" ] || \
+             [ ! -x "$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" ]; then
+            yes | sdkmanager --licenses >/dev/null || true
+            sdkmanager --install \
+              "platforms;android-33" \
+              "build-tools;35.0.0" \
+              "ndk;27.2.12479018"
+          fi
+          # Cache restore preserves modes on GitHub-hosted runners; these are
+          # cheap no-ops that keep a mode-stripping cache from breaking tools.
+          chmod +x \
+            "$sdk_root/build-tools/35.0.0/aapt2" \
+            "$sdk_root/build-tools/35.0.0/zipalign" \
+            "$sdk_root/build-tools/35.0.0/d8" \
+            "$sdk_root/build-tools/35.0.0/apksigner" \
+            "$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" \
+            "$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+            2>/dev/null || true
+
+      # rustup reads emthin-android/rust-toolchain.toml from this directory.
+      - name: add Android Rust target
+        working-directory: emthin-android
+        run: rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # Swatinem/rust-cache@v2
+        with:
+          workspaces: emthin-android
+          key: android-apk
+
+      - name: build normal + test APKs
+        env:
+          ANDROID_ABI: arm64-v8a
+          ANDROID_API: "33"
+          ANDROID_BUILD_TOOLS: "35.0.0"
+        run: |
+          set -o pipefail
+          ndk="$ANDROID_SDK_ROOT/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64"
+          export ANDROID_CLANG="$ndk/bin/aarch64-linux-android33-clang"
+          export ANDROID_AR="$ndk/bin/llvm-ar"
+          cd emthin-android
+
+          ./build-apk.sh 2>&1 | tee /tmp/emthin_pad_apk.log || {
+            tail -30 /tmp/emthin_pad_apk.log | sed 's/^/::error::apk: /'
+            exit 1
+          }
+          EMTHIN_TEST_PACKAGE=com.emthin.pad.test ./build-apk.sh \
+            2>&1 | tee /tmp/emthin_pad_test_apk.log || {
+            tail -30 /tmp/emthin_pad_test_apk.log | sed 's/^/::error::test-apk: /'
+            exit 1
+          }
+          md5sum build/emthin-pad.apk build/test/emthin-pad-test.apk
+
+      # Keep the artifacts available even when the Java suite fails after a
+      # successful build. Nothing to upload means the build never got this far.
+      - name: upload APKs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # actions/upload-artifact@v7.0.1
+        with:
+          name: emthin-pad-apks
+          path: |
+            emthin-android/build/emthin-pad.apk
+            emthin-android/build/test/emthin-pad-test.apk
+          if-no-files-found: ignore
+
       - name: Java ownership + recovery + provider tests
         run: bash emthin-android/test-java.sh
 

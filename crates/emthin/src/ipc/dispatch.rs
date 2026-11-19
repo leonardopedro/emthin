@@ -21,7 +21,11 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
             state.goto_page(page);
         }
         IncomingMessage::OpenDoc { path } => ipc_open_doc(state, &path),
-        IncomingMessage::SaveDoc { path } => ipc_save_doc(state, &path),
+        IncomingMessage::SaveDoc {
+            path,
+            format,
+            force,
+        } => ipc_save_doc(state, &path, format, force),
         IncomingMessage::ExportAscii { path } => ipc_export_ascii(state, &path),
         IncomingMessage::ImportAscii { path } => ipc_import_ascii(state, &path),
         IncomingMessage::SetTextSize { pt } => ipc_set_text_size(state, pt),
@@ -55,6 +59,15 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
         IncomingMessage::CollabLeave { peer } => {
             tracing::debug!("IPC collab_leave {peer}");
             state.collab.leave(&peer);
+            state.needs_redraw = true;
+        }
+        IncomingMessage::CollabPresence { peer, blob } => {
+            ipc_collab_presence(state, &peer, &blob)
+        }
+        IncomingMessage::CollabName { name } => {
+            tracing::debug!("IPC collab_name {name}");
+            state.collab_set_name(name);
+            state.needs_redraw = true;
         }
     }
 }
@@ -98,6 +111,22 @@ fn ipc_collab_join(state: &mut EmthinState, peer: &str, version: &str) {
         seq: out.seq,
         delta: crate::ipc::hex::encode(&out.delta),
     });
+    state.collab_publish_presence(true);
+}
+
+fn ipc_collab_presence(state: &mut EmthinState, peer: &str, blob: &str) {
+    let blob = match crate::ipc::hex::decode(blob) {
+        Ok(blob) => blob,
+        Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
+    };
+    if let Err(e) = state.collab_apply_presence(&blob) {
+        return error(
+            state,
+            IpcErrorCode::CollabFailed,
+            format!("presence from {peer}: {e}"),
+        );
+    }
+    tracing::debug!("IPC collab_presence {peer} ({} bytes)", blob.len());
 }
 
 fn ipc_collab_delta(state: &mut EmthinState, peer: &str, seq: u64, delta: &str) {
@@ -262,24 +291,40 @@ fn ipc_open_doc(state: &mut EmthinState, path: &str) {
             state.needs_redraw = true;
             tracing::info!("opened document {}", path.display());
         }
-        Err(reason) => error(state, IpcErrorCode::IoFailed, reason),
+        Err(reason) => error(state, IpcErrorCode::IoFailed, reason.to_string()),
     }
 }
 
-fn ipc_save_doc(state: &mut EmthinState, path: &str) {
+fn ipc_save_doc(
+    state: &mut EmthinState,
+    path: &str,
+    format: Option<crate::docui::file::SaveFormat>,
+    force: bool,
+) {
     let path = std::path::PathBuf::from(path);
-    match std::fs::write(&path, state.doc.model().text()) {
-        Ok(()) => {
-            tracing::info!("saved document {}", path.display());
+    match state.doc.save_document(&path, format, force) {
+        Ok(saved) => {
+            tracing::info!(
+                "saved document {} as {} ({})",
+                saved.path.display(),
+                saved.kind.as_str(),
+                saved.digest
+            );
             state.ipc.send(OutgoingMessage::DocSaved {
-                path: path.display().to_string(),
+                path: saved.path.display().to_string(),
+                format: saved.kind.as_str().to_string(),
+                digest: saved.digest,
             });
         }
-        Err(e) => error(
+        Err(crate::docui::file::FileError::Conflict(target)) => error(
             state,
-            IpcErrorCode::IoFailed,
-            format!("could not write {}: {e}", path.display()),
+            IpcErrorCode::DocConflict,
+            format!(
+                "{} changed on disk since it was opened; repeat with force:true to replace it",
+                target.display()
+            ),
         ),
+        Err(reason) => error(state, IpcErrorCode::IoFailed, reason.to_string()),
     }
 }
 
@@ -342,6 +387,14 @@ fn ipc_set_text_size(state: &mut EmthinState, pt: f32) {
 }
 
 fn ipc_list_state(state: &mut EmthinState) {
+    state.collab_prune_presence();
+    let peers = state.collab_peers();
+    let collab_local_peer = state.collab.local_peer().to_string();
+    let collab_local_name = state.collab_local_name.clone();
+    let status = state.doc.status(peers.len()).line();
+    let layout_error = state.doc.last_error().map(str::to_string);
+    let save_error = state.doc.persistence_error().map(str::to_string);
+    let save_warning = state.doc.persistence_warning().map(str::to_string);
     let doc = state.doc.model().text().to_string();
     let page = state.doc.current_page();
     let page_count = state.doc.page_count();
@@ -403,5 +456,12 @@ fn ipc_list_state(state: &mut EmthinState) {
         citation_locale,
         doc,
         figures,
+        peers,
+        collab_local_peer,
+        collab_local_name,
+        status,
+        layout_error,
+        save_error,
+        save_warning,
     });
 }

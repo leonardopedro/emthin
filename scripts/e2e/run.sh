@@ -117,6 +117,20 @@ else
   load_inject "$CONFIG"
 fi
 
+# fcitx5 needs a session bus that emthin's bridge and the input method can
+# share, without touching the host desktop's bus. Re-exec once under a private
+# bus for the one lane where XTEST keys can reach the input-method grab.
+if [ "$CONFIG" = xdotool ] && [ "${E2E_DBUS_SESSION:-0}" != 1 ] &&
+  command -v dbus-run-session >/dev/null 2>&1 && command -v fcitx5 >/dev/null 2>&1; then
+  dbus_conf="$(dirname "$(command -v dbus-daemon)")/../share/dbus-1/session.conf"
+  if [ -f "$dbus_conf" ]; then
+    log "re-entering under a private D-Bus session"
+    exec dbus-run-session --config-file="$dbus_conf" -- \
+      env E2E_DBUS_SESSION=1 "$0" --config "$CONFIG"
+  fi
+  warn "dbus session config not found; the IME check will be skipped"
+fi
+
 # ── bring the session up ────────────────────────────────────────────────────
 echo >&2
 log "configuration: $CONFIG (compositor: $COMPOSITOR_MODE)"
@@ -135,6 +149,7 @@ start_emthin
 cleanup() {
   echo >&2
   stop_emthin
+  stop_ime
   # The compositor is this run's, so take it down too: leaving sway holding
   # :99 is what made the *next* run start against a workspace it did not create.
   # Xvfb counts for the same reason — a leaked server on the private display
@@ -153,6 +168,14 @@ trap cleanup EXIT
 sleep 1
 
 document_preferences_checks
+
+# Starting fcitx before emthin lets the startup document autosave over the
+# preference fixture. Start it after those checks; the IME probe has its own
+# document and needs only the compositor's Wayland socket.
+IME_READY=0
+if [ "$CONFIG" = xdotool ]; then
+  start_ime && IME_READY=1
+fi
 
 # shellcheck disable=SC1090
 . "$HERE/step7.sh"

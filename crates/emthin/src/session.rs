@@ -20,9 +20,34 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod store;
+
 /// Version of the on-disk format. Bump on any breaking change; the
 /// loader drops anything it doesn't recognise rather than guessing.
 pub const SESSION_VERSION: u32 = 1;
+
+/// A document-bound Loro cursor plus its capture-time fallback. The encoded
+/// position is opaque and belongs only to the snapshot it was created from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CursorAnchor {
+    pub encoded: String,
+    pub side: i32,
+    pub fallback: usize,
+}
+
+impl CursorAnchor {
+    pub fn new(encoded: Vec<u8>, side: i32, fallback: usize) -> Self {
+        Self {
+            encoded: crate::ipc::hex::encode(&encoded),
+            side,
+            fallback,
+        }
+    }
+
+    pub fn encoded_bytes(&self) -> Option<Vec<u8>> {
+        crate::ipc::hex::decode(&self.encoded).ok()
+    }
+}
 
 /// Reading preferences that belong to one document, not to the process that
 /// happens to have it open.
@@ -50,6 +75,18 @@ pub struct DocumentPreferences {
     /// pagination, unlike the presentation-only view zoom.
     #[serde(default = "default_text_size")]
     pub text_size: f32,
+    /// Logical caret position, document-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caret_anchor: Option<CursorAnchor>,
+    /// Fixed end of a non-empty selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_anchor: Option<CursorAnchor>,
+    /// Caret end of a non-empty selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_caret: Option<CursorAnchor>,
+    /// Top-visible source position for the reading page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_anchor: Option<CursorAnchor>,
 }
 
 impl Default for DocumentPreferences {
@@ -62,6 +99,10 @@ impl Default for DocumentPreferences {
             citation_locale: None,
             current_page: 0,
             text_size: default_text_size(),
+            caret_anchor: None,
+            selection_anchor: None,
+            selection_caret: None,
+            reading_anchor: None,
         }
     }
 }
@@ -77,6 +118,10 @@ impl DocumentPreferences {
             && self.citation_locale.is_none()
             && self.current_page == 0
             && (self.text_size - default_text_size()).abs() < 0.01
+            && self.caret_anchor.is_none()
+            && self.selection_anchor.is_none()
+            && self.selection_caret.is_none()
+            && self.reading_anchor.is_none()
     }
 }
 
@@ -115,6 +160,20 @@ pub struct SessionFile {
     /// XWayland display number, for diagnostics.
     #[serde(default)]
     pub xwayland_display: Option<u32>,
+    /// SHA-256 of the snapshot this metadata was written with. Absent in
+    /// sessions written before the integrity check existed; such a pair is
+    /// accepted as legacy and migrated on the next successful load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_digest: Option<String>,
+}
+
+/// Why a metadata file could not be trusted.
+#[derive(Debug)]
+pub enum MetadataError {
+    /// The file is not valid JSON or is missing required fields.
+    Parse(String),
+    /// The file was written by a different session format version.
+    Version(u32),
 }
 
 fn is_default_view_zoom(zoom: &f64) -> bool {
@@ -154,6 +213,7 @@ impl Default for SessionFile {
             view_pan_x: 0.0,
             view_pan_y: 0.0,
             xwayland_display: None,
+            snapshot_digest: None,
         }
     }
 }
@@ -178,6 +238,7 @@ impl SessionFile {
             citation_locale: self.citation_locale.clone(),
             current_page: self.current_page,
             text_size: self.text_size,
+            ..Default::default()
         }
     }
 
@@ -194,24 +255,38 @@ impl SessionFile {
         self.text_size = default_text_size();
     }
 
-    /// Read a session file. A missing or unparseable file yields the
-    /// default — losing the session's bookkeeping is always better than
-    /// refusing to start.
+    /// Parse metadata bytes strictly enough for the store to distinguish a
+    /// corrupt file from one written by a newer format.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MetadataError> {
+        let session: Self = serde_json::from_slice(bytes)
+            .map_err(|error| MetadataError::Parse(error.to_string()))?;
+        if session.version != SESSION_VERSION {
+            return Err(MetadataError::Version(session.version));
+        }
+        Ok(session)
+    }
+
+    /// Read a session file for callers that only need best-effort
+    /// bookkeeping. A missing or unparseable file yields the default;
+    /// the store uses [`Self::from_bytes`] when it must report the reason.
     pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str::<Self>(&text) {
-                Ok(session) if session.version == SESSION_VERSION => session,
-                Ok(session) => {
+        match std::fs::read(path) {
+            Ok(bytes) => match Self::from_bytes(&bytes) {
+                Ok(session) => session,
+                Err(MetadataError::Version(version)) => {
                     tracing::warn!(
                         "session {} has version {}, expected {}; ignoring",
                         path.display(),
-                        session.version,
+                        version,
                         SESSION_VERSION
                     );
                     Self::default()
                 }
-                Err(e) => {
-                    tracing::warn!("session {} is unreadable ({e}); ignoring", path.display());
+                Err(MetadataError::Parse(error)) => {
+                    tracing::warn!(
+                        "session {} is unreadable ({error}); ignoring",
+                        path.display()
+                    );
                     Self::default()
                 }
             },
@@ -219,15 +294,13 @@ impl SessionFile {
         }
     }
 
-    /// Write the session file. Logs on failure; a session that can't be
-    /// saved must not take the compositor down with it.
+    /// Write the metadata file atomically. The session store writes the
+    /// snapshot and metadata as one verified pair; this is for the metadata-
+    /// only path used by tests and legacy migration.
     pub fn save(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         match serde_json::to_vec_pretty(self) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, bytes) {
+                if let Err(e) = store::write_atomic(path, &bytes) {
                     tracing::warn!("session save failed {}: {e}", path.display());
                 }
             }
@@ -243,16 +316,35 @@ pub struct SessionPaths {
     pub snapshot: PathBuf,
     /// JSON bookkeeping.
     pub metadata: PathBuf,
+    /// Previous snapshot, retained until the next successful save.
+    pub snapshot_backup: PathBuf,
+    /// Metadata matching `snapshot_backup`.
+    pub metadata_backup: PathBuf,
 }
 
 impl SessionPaths {
-    /// Derive both paths from the session file's stem: `foo.loro` →
-    /// `foo.json`.
+    /// Derive the sidecar paths from the session snapshot. The metadata is
+    /// always `session.json` in the snapshot's directory, matching the
+    /// long-standing `--session-file` contract.
     pub fn from_file(file: &Path) -> Self {
         let snapshot = file.to_path_buf();
-        let metadata = file.with_extension("json");
-        Self { snapshot, metadata }
+        let metadata = file
+            .parent()
+            .map(|dir| dir.join("session.json"))
+            .unwrap_or_else(|| PathBuf::from("session.json"));
+        Self {
+            snapshot_backup: with_suffix(file, ".bak"),
+            metadata_backup: with_suffix(&metadata, ".bak"),
+            snapshot,
+            metadata,
+        }
     }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 #[cfg(test)]
@@ -406,5 +498,19 @@ mod tests {
             paths.metadata,
             PathBuf::from("/run/user/1000/emthin/session.json")
         );
+        assert_eq!(
+            paths.snapshot_backup,
+            PathBuf::from("/run/user/1000/emthin/session.loro.bak")
+        );
+        assert_eq!(
+            paths.metadata_backup,
+            PathBuf::from("/run/user/1000/emthin/session.json.bak")
+        );
+    }
+
+    #[test]
+    fn metadata_is_session_json_even_for_a_differently_named_snapshot() {
+        let paths = SessionPaths::from_file(Path::new("/tmp/doc.loro"));
+        assert_eq!(paths.metadata, PathBuf::from("/tmp/session.json"));
     }
 }

@@ -38,8 +38,8 @@ layer-shell, pointer constraints, ext-workspace-v1 — is unchanged.
 
 **Not yet implemented** (planned, see the rewrite plan):
 
-- an interactive app launcher (`Ctrl+Shift+Return` currently relaunches
-  the first dormant figure's saved command);
+- an interactive app launcher (`Ctrl+Shift+Return` relaunches the pointed-at
+  or first dormant figure's saved command, with no prompt);
 - dormant-figure "click to start" UX (Enter-to-relaunch is wired to the
   launcher key, not to a per-figure prompt);
 - free 2D figure placement — figures live in the document's flow, by
@@ -58,16 +58,17 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 353 cargo (workspace, nix develop; recounted 2026-10-21 — +3 host-keymap tests from 08b2abc landed after the 10-18 measurement, +3 xwayland lock-regression tests from the round-5 flake fix) + 5/5 run.sh E2E green (re-run 2026-10-21; the five-consecutive-run campaign was 2026-10-15 — harness hardened against stale state, see scripts/e2e/README "Stale state" post-mortem; the tier-1 replay scenario and the E2E both run in CI) + 29 emthin-pad host tests (re-measured 2026-10-21, +3 since the 10-20 count of 26; see AGENTS.md #emthin-android) | last_verified: 2026-10-21 -->
+<!-- status: verified | tests: 511 cargo passed, 2 ignored (workspace, nix develop; re-measured 2026-11-18 on the current worktree) + 28/28 wtype (headless sway) and 36/36 xdotool (X11 window on Xvfb) run.sh E2E green, including multi-page navigation and, on xdotool, Find cancel and fcitx5/rime preedit/commit checks (last run 2026-11-18; the earlier five-check run.sh campaign was 2026-10-15 — harness hardened against stale state, see scripts/e2e/README "Stale state" post-mortem; the tier-1 replay scenario and the E2E both run in CI) + 96 emthin-pad Rust host tests and 197 Java host checks (re-measured 2026-11-18; see AGENTS.md #emthin-android) | last_verified: 2026-11-18 -->
 
 ## Verification
 
 ```sh
 nix develop -c bash -c 'cargo fmt --all --check && \
   cargo clippy --workspace --all-targets -- -D warnings && \
-  cargo test --workspace'          # 353 passed, 2 ignored
+  cargo test --workspace'          # 511 passed, 2 ignored (2026-11-18)
 
-./scripts/e2e/run.sh --config xdotool   # 5/5, exit 0
+./scripts/e2e/run.sh --config wtype      # 28/28, exit 0 (headless sway)
+./scripts/e2e/run.sh --config xdotool    # 36/36, exit 0 (sway on Xvfb + Find + fcitx5 IME)
 
 nix-shell -p python3 --run "python3 scripts/check-links"   # relative markdown links (CI: linkcheck.yml)
 ```
@@ -111,7 +112,7 @@ figure to the end of the document, captioned with the app's title.
 
 | Binding | Action |
 |---|---|
-| `Ctrl+Shift+Return` | relaunch the first dormant figure's saved command |
+| `Ctrl+Shift+Return` | relaunch the pointed-at (or first) dormant figure's saved command |
 | `PgUp` / `PgDn` | previous / next document page |
 | `Home` / `End` | start / end of the document |
 | `Ctrl+Home` / `Ctrl+End` | start / end of the line |
@@ -210,6 +211,12 @@ future external frontend observe and drive the document. See
 
 ## Design
 
+- The [native terminal figure specification](docs/HERDR_INTEGRATION_SPEC.md)
+  and [implementation plan](docs/HERDR_INTEGRATION_PLAN.md) cover Android and
+  desktop, both Herdr forks, paired Tailscale access, and OpenShell's shared
+  Nix fleet.
+- [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — the current desktop/shared
+  work plan; the Android plan remains under `emthin-android/`.
 - `docs/REWRITE_PLAN.md` — the rewrite design and work breakdown.
 - `docs/collaboration.md` — the collaboration layers and why AT Protocol is
   reserved for session publication, not live delta transport.

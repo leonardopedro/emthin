@@ -8,8 +8,9 @@
 //!
 //! | Binding | Action |
 //! |---|---|
-//! | `Ctrl+Shift+Return` | relaunch a dormant figure (the pointed-at one) |
+//! | `Ctrl+Shift+Return` | relaunch the pointed-at (or first) dormant figure |
 //! | `PgUp` / `PgDn` | previous / next document page |
+//! | `Alt+Left` / `Alt+Right` | previous / next view (find, citations, pages) |
 //! | `Home` / `End` | start / end of the document |
 //! | `Ctrl+Home` / `Ctrl+End` | start / end of the line |
 //! | `Ctrl+Shift+M` | clone the focused figure (add a mirror) |
@@ -31,11 +32,10 @@
 //! global binding, so it is resolved in `input::edit_document_key` against the
 //! pointer position rather than classified here.
 //!
-//! The table used to describe `Ctrl+Shift+Return` as opening "the app launcher
-//! (`spawn` prompt)". There is no prompt and never was: REWRITE_PLAN §9 lists
-//! the spawn-launcher UX as a deliberate placeholder, and §5.10 requires only
-//! that a dormant figure be relaunchable. What it needs `\app`'s `launch:`
-//! argument for, which is a document concern, not a launcher's.
+//! `Ctrl+Shift+Return` relaunches a dormant figure from its `\app` `launch:`
+//! argument. There is no prompt and never was: REWRITE_PLAN §9 lists the
+//! spawn-launcher UX as a deliberate placeholder, and §5.10 requires only that
+//! a dormant figure be relaunchable.
 
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::keysyms;
@@ -43,7 +43,7 @@ use smithay::input::keyboard::keysyms;
 /// A global document binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Open the app launcher.
+    /// Relaunch a dormant figure from its `\app` `launch:` argument.
     OpenLauncher,
     NextPage,
     PreviousPage,
@@ -76,9 +76,10 @@ pub enum Action {
     ViewSmaller,
     /// `Ctrl+Shift+0`: reset view zoom and pan.
     ViewReset,
-    /// `Alt+Arrow`: pan the zoomed page in that direction.
-    ViewPanLeft,
-    ViewPanRight,
+    /// `Alt+Left` / `Alt+Right`: return to the previous / next view.
+    HistoryBack,
+    HistoryForward,
+    /// `Alt+Up` / `Alt+Down`: pan the zoomed page in that direction.
     ViewPanUp,
     ViewPanDown,
     /// `Ctrl+Shift+S`: cycle the rendered citation style.
@@ -87,6 +88,202 @@ pub enum Action {
     CitationLocaleNext,
     /// `Ctrl+Shift+R`: clear the citation presentation overrides.
     CitationReset,
+}
+
+/// One row of the action catalog: the stable id, the human label, the
+/// documented binding, and the action the input path executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionSpec {
+    pub action: Action,
+    pub id: &'static str,
+    pub label: &'static str,
+    pub binding: &'static str,
+}
+
+/// What the current document makes available. This is the one place a
+/// contextual action's predicate lives; the input path and the catalog tests
+/// consult it rather than spelling the condition twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActionContext {
+    /// The current or last Find query is non-empty.
+    pub has_query: bool,
+    pub can_history_back: bool,
+    pub can_history_forward: bool,
+    pub citation_open: bool,
+}
+
+/// Every global document action, in documentation order.
+pub const ACTION_CATALOG: &[ActionSpec] = &[
+    ActionSpec {
+        action: Action::OpenLauncher,
+        id: "relaunch_figure",
+        label: "relaunch the pointed-at (or first) dormant figure",
+        binding: "Ctrl+Shift+Return",
+    },
+    ActionSpec {
+        action: Action::PreviousPage,
+        id: "previous_page",
+        label: "previous / next document page",
+        binding: "PgUp / PgDn",
+    },
+    ActionSpec {
+        action: Action::NextPage,
+        id: "next_page",
+        label: "previous / next document page",
+        binding: "PgUp / PgDn",
+    },
+    ActionSpec {
+        action: Action::DocumentStart,
+        id: "document_start",
+        label: "start / end of the document",
+        binding: "Home / End",
+    },
+    ActionSpec {
+        action: Action::DocumentEnd,
+        id: "document_end",
+        label: "start / end of the document",
+        binding: "Home / End",
+    },
+    ActionSpec {
+        action: Action::LineStart,
+        id: "line_start",
+        label: "start / end of the line",
+        binding: "Ctrl+Home / Ctrl+End",
+    },
+    ActionSpec {
+        action: Action::LineEnd,
+        id: "line_end",
+        label: "start / end of the line",
+        binding: "Ctrl+Home / Ctrl+End",
+    },
+    ActionSpec {
+        action: Action::CloneFigure,
+        id: "clone_figure",
+        label: "clone the focused figure (add a mirror)",
+        binding: "Ctrl+Shift+M",
+    },
+    ActionSpec {
+        action: Action::VoiceTurn,
+        id: "voice_turn",
+        label: "run a voice turn for the \\voice block at the caret",
+        binding: "Ctrl+Shift+V",
+    },
+    ActionSpec {
+        action: Action::FocusDocument,
+        id: "focus_document",
+        label: "cancel a math completion, close the find bar, else return focus from a figure to the document",
+        binding: "Escape / Ctrl+G",
+    },
+    ActionSpec {
+        action: Action::Find,
+        id: "find",
+        label: "find in the document",
+        binding: "Ctrl+F",
+    },
+    ActionSpec {
+        action: Action::FindNext,
+        id: "find_next",
+        label: "next / previous match",
+        binding: "F3 / Shift+F3",
+    },
+    ActionSpec {
+        action: Action::FindPrevious,
+        id: "find_previous",
+        label: "next / previous match",
+        binding: "F3 / Shift+F3",
+    },
+    ActionSpec {
+        action: Action::TextLarger,
+        id: "text_larger",
+        label: "larger / smaller reading size",
+        binding: "Ctrl++ / Ctrl+-",
+    },
+    ActionSpec {
+        action: Action::TextSmaller,
+        id: "text_smaller",
+        label: "larger / smaller reading size",
+        binding: "Ctrl++ / Ctrl+-",
+    },
+    ActionSpec {
+        action: Action::TextReset,
+        id: "text_reset",
+        label: "reset the reading size",
+        binding: "Ctrl+0",
+    },
+    ActionSpec {
+        action: Action::ViewLarger,
+        id: "view_larger",
+        label: "zoom the view in / out",
+        binding: "Ctrl+Shift++ / Ctrl+Shift+-",
+    },
+    ActionSpec {
+        action: Action::ViewSmaller,
+        id: "view_smaller",
+        label: "zoom the view in / out",
+        binding: "Ctrl+Shift++ / Ctrl+Shift+-",
+    },
+    ActionSpec {
+        action: Action::ViewReset,
+        id: "view_reset",
+        label: "reset the view zoom and pan",
+        binding: "Ctrl+Shift+0",
+    },
+    ActionSpec {
+        action: Action::HistoryBack,
+        id: "history_back",
+        label: "return to the previous / next view",
+        binding: "Alt+Left / Alt+Right",
+    },
+    ActionSpec {
+        action: Action::HistoryForward,
+        id: "history_forward",
+        label: "return to the previous / next view",
+        binding: "Alt+Left / Alt+Right",
+    },
+    ActionSpec {
+        action: Action::ViewPanUp,
+        id: "view_pan_up",
+        label: "pan the zoomed page",
+        binding: "Alt+Up / Alt+Down",
+    },
+    ActionSpec {
+        action: Action::ViewPanDown,
+        id: "view_pan_down",
+        label: "pan the zoomed page",
+        binding: "Alt+Up / Alt+Down",
+    },
+    ActionSpec {
+        action: Action::CitationStyleNext,
+        id: "citation_style_next",
+        label: "cycle citation style / locale while a citation is open",
+        binding: "Ctrl+Shift+S / Ctrl+Shift+L",
+    },
+    ActionSpec {
+        action: Action::CitationLocaleNext,
+        id: "citation_locale_next",
+        label: "cycle citation style / locale while a citation is open",
+        binding: "Ctrl+Shift+S / Ctrl+Shift+L",
+    },
+    ActionSpec {
+        action: Action::CitationReset,
+        id: "citation_reset",
+        label: "reset the citation presentation to the document defaults",
+        binding: "Ctrl+Shift+R",
+    },
+];
+
+/// Whether `action` currently applies. Actions not named here are always
+/// available; the contextual ones make their existing no-op explicit.
+pub fn available(action: Action, context: ActionContext) -> bool {
+    match action {
+        Action::FindNext | Action::FindPrevious => context.has_query,
+        Action::HistoryBack => context.can_history_back,
+        Action::HistoryForward => context.can_history_forward,
+        Action::CitationStyleNext | Action::CitationLocaleNext | Action::CitationReset => {
+            context.citation_open
+        }
+        _ => true,
+    }
 }
 
 /// Classify a key press into a global [`Action`].
@@ -138,8 +335,9 @@ pub fn classify(sym: u32, pressed: KeyState, ctrl: bool, shift: bool, alt: bool)
             Some(Action::ViewReset)
         }
         // Arrows with Alt are view navigation; without it they move the caret.
-        keysyms::KEY_Left if alt && !ctrl => Some(Action::ViewPanLeft),
-        keysyms::KEY_Right if alt && !ctrl => Some(Action::ViewPanRight),
+        // Left/right are history (the browser convention), up/down still pan.
+        keysyms::KEY_Left if alt && !ctrl => Some(Action::HistoryBack),
+        keysyms::KEY_Right if alt && !ctrl => Some(Action::HistoryForward),
         keysyms::KEY_Up if alt && !ctrl => Some(Action::ViewPanUp),
         keysyms::KEY_Down if alt && !ctrl => Some(Action::ViewPanDown),
         keysyms::KEY_s | keysyms::KEY_S if ctrl && shift => Some(Action::CitationStyleNext),
@@ -156,7 +354,10 @@ pub fn classify(sym: u32, pressed: KeyState, ctrl: bool, shift: bool, alt: bool)
 
 /// The human-readable keymap, for the README and `docs/`.
 pub const DOCUMENTED_KEYMAP: &[(&str, &str)] = &[
-    ("Ctrl+Shift+Return", "open the app launcher"),
+    (
+        "Ctrl+Shift+Return",
+        "relaunch the pointed-at (or first) dormant figure",
+    ),
     ("PgUp / PgDn", "previous / next document page"),
     ("Home / End", "start / end of the document"),
     ("Ctrl+Home / Ctrl+End", "start / end of the line"),
@@ -179,7 +380,8 @@ pub const DOCUMENTED_KEYMAP: &[(&str, &str)] = &[
         "Ctrl+wheel / Ctrl+two-finger scroll",
         "zoom the view around the pointer",
     ),
-    ("Alt+Arrows", "pan the zoomed page"),
+    ("Alt+Left / Alt+Right", "return to the previous / next view"),
+    ("Alt+Up / Alt+Down", "pan the zoomed page"),
     ("two-finger drag", "pan the zoomed page"),
     (
         "Ctrl+Shift+S / Ctrl+Shift+L",
@@ -361,14 +563,14 @@ mod tests {
     }
 
     #[test]
-    fn alt_arrows_pan_and_plain_arrows_still_edit() {
+    fn alt_left_and_right_return_through_history_while_up_and_down_pan() {
         assert_eq!(
             classify(keysyms::KEY_Left, KeyState::Pressed, false, false, true),
-            Some(Action::ViewPanLeft)
+            Some(Action::HistoryBack)
         );
         assert_eq!(
             classify(keysyms::KEY_Right, KeyState::Pressed, false, false, true),
-            Some(Action::ViewPanRight)
+            Some(Action::HistoryForward)
         );
         assert_eq!(
             classify(keysyms::KEY_Up, KeyState::Pressed, false, false, true),
@@ -388,6 +590,27 @@ mod tests {
             None,
             "Ctrl+Alt+Left keeps its existing meaning"
         );
+    }
+
+    #[test]
+    fn actions_name_the_context_they_need() {
+        let empty = ActionContext::default();
+        assert!(!available(Action::FindNext, empty));
+        assert!(!available(Action::HistoryBack, empty));
+        assert!(!available(Action::HistoryForward, empty));
+        assert!(!available(Action::CitationReset, empty));
+        assert!(available(Action::Find, empty));
+
+        let ready = ActionContext {
+            has_query: true,
+            can_history_back: true,
+            can_history_forward: false,
+            citation_open: true,
+        };
+        assert!(available(Action::FindNext, ready));
+        assert!(available(Action::HistoryBack, ready));
+        assert!(!available(Action::HistoryForward, ready));
+        assert!(available(Action::CitationStyleNext, ready));
     }
 
     #[test]
@@ -413,8 +636,18 @@ mod tests {
 
     #[test]
     fn every_documented_binding_is_reachable() {
-        // A guard against the table drifting from the classifier.
-        assert!(DOCUMENTED_KEYMAP
+        // A guard against the table drifting from the classifier and the
+        // action catalog drifting from the documentation.
+        for spec in ACTION_CATALOG {
+            assert!(
+                DOCUMENTED_KEYMAP
+                    .iter()
+                    .any(|(binding, label)| *binding == spec.binding && *label == spec.label),
+                "{:?} is missing from DOCUMENTED_KEYMAP",
+                spec
+            );
+        }
+        assert!(!DOCUMENTED_KEYMAP
             .iter()
             .any(|(_, what)| what.contains("app launcher")));
         // The real input path feeds the *modified* keysym (shift

@@ -8,7 +8,7 @@ use std::os::unix::net::UnixListener;
 
 use connection::IpcConn;
 pub use messages::{
-    IncomingMessage, IpcErrorCode, IpcRect, OutgoingMessage, StateFigure, TouchPhase,
+    IncomingMessage, IpcErrorCode, IpcRect, OutgoingMessage, StateFigure, StatePeer, TouchPhase,
 };
 
 /// IPC server: listens for a single control-client connection and exchanges

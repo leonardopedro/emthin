@@ -56,6 +56,24 @@ public final class DocBridge {
     /** Mathed's incremental search, returned as UTF-16 ranges. */
     public static native String search(String text, String query);
 
+    /**
+     * One bounded, scoped search page. {@code scope} is text, source or
+     * selection; {@code pageStart} -1 chooses the page containing the first
+     * match at/after {@code anchorUtf16}. Returns total/replaceable/protected
+     * counts and UTF-16 ranges, each marked when replacement must protect it.
+     */
+    public static native String searchScoped(String text, String query, String scope,
+                                             int selectionStart, int selectionEnd,
+                                             int anchorUtf16, int pageStart,
+                                             int pageSize, int includeAll);
+
+    /**
+     * Applies a checked literal replacement plan as one undo step. The
+     * document must still equal {@code expectedText}; ranges are revalidated
+     * against marker/property ranges before any edit.
+     */
+    public static native String replaceMany(long handle, String expectedText, String opsJson);
+
     public static native int wordBoundary(String text, int caret, int direction);
 
     /**
@@ -67,9 +85,26 @@ public final class DocBridge {
 
     public static native String mathCompletion(String text, int caret);
 
-    /** Citation index and expandable details, resolved from document text. */
-    public static native String citationIndex(String text);
-    public static native String citationDetail(String text, int number, float width, float scale);
+    /**
+     * Definitions, uses, sections and unresolved names from mathed's semantic
+     * index, as UTF-16 source ranges. Stateless and safe on a worker.
+     */
+    public static native String semanticIndex(String text);
+
+    /** Validates a rename against a freshly rebuilt index; returns name/uses. */
+    public static native String renamePreview(String text, int defIndex, String newName);
+
+    /** Applies that checked plan as one grouped undo step. */
+    public static native String renameDefinition(long handle, String expectedText,
+                                                int defIndex, String newName);
+
+    /** Citation index with source snippets; resolving status loads the bound bibliography. */
+    public static native String citationIndex(String text, boolean resolveStatus);
+    /** Shared style/locale choices and their defaults. */
+    public static native String citationChoices();
+    /** One citation detail formatted with presentation-only style/locale overrides. */
+    public static native String citationDetail(String text, int number, float width, float scale,
+                                              String style, String locale);
 
     /** Pushes {@code text} into the model (one undo step) and moves the caret. */
     public static native String sync(long handle, String text, int caretUtf16);
@@ -87,6 +122,16 @@ public final class DocBridge {
     public static native String modifierComparisons(String text, String snapshot,
                                                     String startId, String endId,
                                                     float width, float scale);
+
+    /** Incoming/outgoing relationship metadata without rendering any row. */
+    public static native String modifierRelationships(String text, String snapshot,
+                                                      String startId, String endId);
+
+    /** One expanded relationship row, with and without its excluded modifier. */
+    public static native String modifierComparisonRow(String text, String snapshot,
+                                                      int targetStart, int targetEnd,
+                                                      String excludeStart, String excludeEnd,
+                                                      float width, float scale);
 
     public static native String undo(long handle);
 

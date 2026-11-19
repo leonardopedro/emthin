@@ -28,6 +28,9 @@
 //! page count, while the letterbox keeps each resulting page fitted to the
 //! window.
 
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
+
 use mathed_core::figures::FigureRect;
 use mathed_mini::{
     layout_doc_paged_with_text_size, DEFAULT_TEXT_SIZE_PT, PageLayout, RenderError,
@@ -41,6 +44,156 @@ pub struct PlacedFigure {
     pub page: usize,
     /// The figure's rect in output-local logical px.
     pub rect: Rectangle<i32, Logical>,
+}
+
+/// One layout request. The worker owns the text and transform options for the
+/// duration of the job, so the UI can keep editing.
+struct LayoutRequest {
+    generation: u64,
+    text: String,
+    options: mathed_core::TransformOptions,
+    text_size: f32,
+}
+
+struct LayoutResult {
+    generation: u64,
+    pages: Vec<PageLayout>,
+    compile_time: Duration,
+    raster_time: Duration,
+    error: Option<String>,
+}
+
+/// The timing of an applied layout. `compile_time` is the whole Typst
+/// compile+raster call; the current mathed_mini seam does not expose a
+/// separate raster phase, so `raster_time` is zero.
+#[derive(Debug, Clone, Copy)]
+pub struct AppliedLayout {
+    pub generation: u64,
+    pub compile_time: Duration,
+    pub raster_time: Duration,
+    pub apply_time: Duration,
+}
+
+/// One active layout and at most one owed replacement. This is intentionally
+/// not a queue: a fast typist must not build an unbounded pile of stale
+/// compiles.
+struct LayoutWorker {
+    requests: Sender<LayoutRequest>,
+    results: Receiver<LayoutResult>,
+    active: Option<u64>,
+    pending: Option<LayoutRequest>,
+    newest: u64,
+}
+
+impl LayoutWorker {
+    fn new() -> Self {
+        let (requests, request_rx) = mpsc::channel::<LayoutRequest>();
+        let (result_tx, results) = mpsc::channel::<LayoutResult>();
+        std::thread::Builder::new()
+            .name("emthin-layout".into())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    let result = run_layout(request);
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("start layout worker");
+        Self {
+            requests,
+            results,
+            active: None,
+            pending: None,
+            newest: 0,
+        }
+    }
+
+    fn request(&mut self, text: String, options: mathed_core::TransformOptions, text_size: f32) -> u64 {
+        self.newest = self.newest.wrapping_add(1);
+        let request = LayoutRequest {
+            generation: self.newest,
+            text,
+            options,
+            text_size,
+        };
+        if self.active.is_none() {
+            self.send(request);
+        } else {
+            self.pending = Some(request);
+        }
+        self.newest
+    }
+
+    fn send(&mut self, request: LayoutRequest) {
+        self.active = Some(request.generation);
+        if self.requests.send(request).is_err() {
+            self.active = None;
+        }
+    }
+
+    fn start_pending(&mut self) {
+        if let Some(request) = self.pending.take() {
+            self.send(request);
+        }
+    }
+
+    fn poll(&mut self) -> Option<LayoutResult> {
+        loop {
+            match self.results.try_recv() {
+                Ok(result) => {
+                    if self.active == Some(result.generation) {
+                        self.active = None;
+                        self.start_pending();
+                    }
+                    if result.generation == self.newest {
+                        return Some(result);
+                    }
+                }
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.active = None;
+                    return None;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_newest(&mut self) -> Option<LayoutResult> {
+        loop {
+            let result = self.results.recv().ok()?;
+            if self.active == Some(result.generation) {
+                self.active = None;
+                self.start_pending();
+            }
+            if result.generation == self.newest {
+                return Some(result);
+            }
+        }
+    }
+}
+
+fn run_layout(request: LayoutRequest) -> LayoutResult {
+    let started = Instant::now();
+    let result = layout_doc_paged_with_text_size(&request.text, &request.options, request.text_size);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(pages) => LayoutResult {
+            generation: request.generation,
+            pages,
+            compile_time: elapsed,
+            raster_time: Duration::ZERO,
+            error: None,
+        },
+        Err(error) => LayoutResult {
+            generation: request.generation,
+            pages: Vec::new(),
+            compile_time: elapsed,
+            raster_time: Duration::ZERO,
+            error: Some(format!("{error:?}")),
+        },
+    }
 }
 
 /// The rendered document: every page's raster + glyph index + figure
@@ -66,6 +219,10 @@ pub struct DocLayoutCache {
     /// Output-logical offset from the centred view. Only meaningful when the
     /// zoomed page is larger than the viewport on that axis.
     view_pan: Point<f64, Logical>,
+    /// Number of layout/raster attempts. Tests use this to distinguish a
+    /// caret repaint from a real recompile.
+    rebuild_count: u64,
+    worker: LayoutWorker,
 }
 
 impl Default for DocLayoutCache {
@@ -79,6 +236,8 @@ impl Default for DocLayoutCache {
             text_size_pt: DEFAULT_TEXT_SIZE_PT,
             view_zoom: 1.0,
             view_pan: Point::from((0.0, 0.0)),
+            rebuild_count: 0,
+            worker: LayoutWorker::new(),
         }
     }
 }
@@ -94,7 +253,83 @@ impl DocLayoutCache {
         doc_text: &str,
         opts: &mathed_core::TransformOptions,
     ) -> Result<(), RenderError> {
-        self.pages = layout_doc_paged_with_text_size(doc_text, opts, self.text_size_pt)?;
+        self.rebuild_count = self.rebuild_count.wrapping_add(1);
+        let started = Instant::now();
+        let result = layout_doc_paged_with_text_size(doc_text, opts, self.text_size_pt);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        match &result {
+            Ok(pages) => tracing::debug!(
+                target: "emthin::timing",
+                stage = "layout_raster",
+                elapsed_us,
+                pages = pages.len(),
+                text_bytes = doc_text.len(),
+                "document layout and raster"
+            ),
+            Err(error) => tracing::debug!(
+                target: "emthin::timing",
+                stage = "layout_raster",
+                elapsed_us,
+                text_bytes = doc_text.len(),
+                error = ?error,
+                "document layout and raster failed"
+            ),
+        }
+        self.install_pages(result?);
+        Ok(())
+    }
+
+    /// Schedule a replacement layout. In tests the cache stays synchronous so
+    /// existing geometry assertions remain deterministic; production uses the
+    /// one-active/one-pending worker.
+    pub fn request_rebuild(
+        &mut self,
+        doc_text: &str,
+        opts: &mathed_core::TransformOptions,
+    ) -> Option<Result<AppliedLayout, String>> {
+        #[cfg(test)]
+        {
+            Some(match self.rebuild(doc_text, opts) {
+                Ok(()) => Ok(AppliedLayout {
+                    generation: self.generation,
+                    compile_time: Duration::ZERO,
+                    raster_time: Duration::ZERO,
+                    apply_time: Duration::ZERO,
+                }),
+                Err(error) => Err(format!("{error:?}")),
+            })
+        }
+        #[cfg(not(test))]
+        {
+            self.rebuild_count = self.rebuild_count.wrapping_add(1);
+            self.worker.request(
+                doc_text.to_owned(),
+                opts.clone(),
+                self.text_size_pt,
+            );
+            None
+        }
+    }
+
+    /// Apply the newest completed worker result. Stale generations are
+    /// discarded; a failed newest result keeps the old pages.
+    pub fn poll_rebuild(&mut self) -> Option<Result<AppliedLayout, String>> {
+        let mut result = self.worker.poll()?;
+        if let Some(error) = result.error.take() {
+            return Some(Err(error));
+        }
+        let apply_started = Instant::now();
+        self.install_pages(result.pages);
+        Some(Ok(AppliedLayout {
+            generation: result.generation,
+            compile_time: result.compile_time,
+            raster_time: result.raster_time,
+            apply_time: apply_started.elapsed(),
+        }))
+    }
+
+    fn install_pages(&mut self, pages: Vec<PageLayout>) {
+        self.pages = pages;
         self.generation = self.generation.wrapping_add(1);
         self.page_size = self
             .pages
@@ -106,7 +341,11 @@ impl DocLayoutCache {
             self.current_page = self.page_count().saturating_sub(1);
         }
         self.clamp_view_pan();
-        Ok(())
+    }
+
+    /// Layout/raster attempts since this cache was created.
+    pub fn rebuild_count(&self) -> u64 {
+        self.rebuild_count
     }
 
     /// The reading size, in points, the next layout will use.
@@ -630,6 +869,21 @@ mod tests {
         assert_eq!(cache.text_size(), MAX_TEXT_SIZE_PT);
         assert_eq!(cache.next_text_size(true), MAX_TEXT_SIZE_PT);
         assert_eq!(cache.next_text_size(false), 28.0);
+    }
+
+    #[test]
+    fn the_worker_keeps_one_pending_and_discards_older_work() {
+        let mut worker = LayoutWorker::new();
+        let options = mathed_core::TransformOptions::default();
+        let first = worker.request("first".into(), options.clone(), DEFAULT_TEXT_SIZE_PT);
+        let second = worker.request("second".into(), options.clone(), DEFAULT_TEXT_SIZE_PT);
+        let third = worker.request("third".into(), options, DEFAULT_TEXT_SIZE_PT);
+        assert!(first < second && second < third);
+
+        let result = worker.wait_for_newest().expect("worker result");
+        assert_eq!(result.generation, third, "the newest request wins");
+        assert!(result.error.is_none(), "a simple text layout must succeed");
+        assert!(!result.pages.is_empty());
     }
 
     #[test]

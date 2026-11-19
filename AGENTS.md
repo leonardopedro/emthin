@@ -538,7 +538,7 @@ dialog theme so it matches the pad.
   empty `[workspace]` table on purpose, so it does not join the emthin
   workspace even though it lives inside this checkout (it path-depends on
   `velysterm` and produces its own release artifacts).**Its tests are not
-in the workspace's 353** — see the verification lane below.
+in the workspace's 511** — see the verification lane below.
 - `src/lib.rs` is a `cdylib` (`libemthin_pad.so`, loaded via
   `System.loadLibrary("emthin_pad")`); `android/src/com/emthin/pad/`
   holds `MainActivity.java` + `DocBridge.java` (the JNI surface).
@@ -617,11 +617,13 @@ go stale on a flake update. Overridable: `ANDROID_SDK_ROOT`, `JAVA_HOME`,
 `android.jar` is globbed (`platforms/android-*`), so a new API level
 needs no edit. A missing `aapt2`/`zipalign`/`javac`/`apksigner` fails
 with a pointer at the setup script instead of an ENOEXEC from a raw
-x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
+x86_64 binary. The `android-apk` CI job builds both artifacts on an
+x86_64 runner with an SDK/NDK toolchain and `ANDROID_ABI=arm64-v8a`;
+the box64 setup remains the local aarch64-host path.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **37 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **96 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, the Java autosave source assertions, and the mathed page
   seam — the app's actual starter
@@ -636,8 +638,8 @@ x86_64 binary. Either way the APK build is an owner-run lane, not a gate.
   and no emulator. This is the cheap lane an LLM can drive.
 - **boundary** — the APK build (after `./setup-box64-toolchain.sh`)
   + `../scripts/waydroid-sudo-fixes.sh` (root-side waydroid checks).
-  Neither is wired into CI: the x86_64 toolchain and the root
-  requirement both make it an owner-run surface.
+  The `android-apk` CI job builds both APKs (arm64) and runs the Java
+  host suite; the root-side waydroid checks remain an owner-run surface.
 - **device lane** — `./device-lane.sh e2e` builds for the connected
   device's ABI, installs, cold-launches, writes before/after screenshots
   and `e2e-logcat.txt` under `OUTDIR`, asserts the JIT roundtrip, a

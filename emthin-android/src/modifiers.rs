@@ -141,7 +141,9 @@ fn parse_targets(
         }
         let pair = (start.to_owned(), end.to_owned());
         if !seen.insert(pair.clone()) {
-            return Err(format!("Interval {start} {end} is repeated."));
+            // The field accepts pasted lists; duplicate intervals collapse
+            // to one relationship instead of failing the whole edit.
+            continue;
         }
         source_range(model, start, end)
             .ok_or_else(|| format!("Markers {start} and {end} must exist in that order."))?;
@@ -403,13 +405,18 @@ mod tests {
     fn invalid_marker_lists_do_not_change_existing_links() {
         let mut model = DocModel::new("#a bold #b #c hello #d");
         set_marker_targets(&mut model, "a", "b", "c d").unwrap();
-        for invalid in ["c", "c missing", "d c", "c d, c d", "c d,"] {
+        for invalid in ["c", "c missing", "d c", "c d,"] {
             assert!(set_marker_targets(&mut model, "a", "b", invalid).is_err());
             assert_eq!(
                 marker_targets(&model, "a", "b"),
                 vec![("c".into(), "d".into())]
             );
         }
+        set_marker_targets(&mut model, "a", "b", "c d, #c #d").unwrap();
+        assert_eq!(
+            marker_targets(&model, "a", "b"),
+            vec![("c".into(), "d".into())]
+        );
         set_marker_targets(&mut model, "a", "b", "").unwrap();
         assert!(marker_targets(&model, "a", "b").is_empty());
     }

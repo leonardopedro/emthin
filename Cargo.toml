@@ -4,6 +4,7 @@ members = [
     "crates/emthin",
     "crates/emthin-clipboard",
     "crates/emthin-collab",
+    "crates/emthin-core-client",
     "crates/emthin-dbus",
 ]
 # Guard against rust-analyzer's scratch target directory (which it may create
