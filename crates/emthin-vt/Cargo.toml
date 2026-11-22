@@ -1,0 +1,17 @@
+[package]
+name = "emthin-vt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lee <loyalpartner@163.com>"]
+license = "GPL-3.0"
+description = "Read-only screen snapshots over the pinned libghostty-vt parser"
+publish = false
+
+[dependencies]
+ab_glyph = "0.2"
+emthin-core-client = { path = "../emthin-core-client" }
+ghostty-vt = { path = "../ghostty-vt" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+glow = "0.18"
+khronos-egl = { version = "6", features = ["dynamic"] }

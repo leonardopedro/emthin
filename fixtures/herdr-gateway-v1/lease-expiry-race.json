@@ -1,0 +1,12 @@
+{
+  "name": "lease-expiry-race",
+  "expect": "invalid",
+  "error": "stale viewer",
+  "kind": "scenario",
+  "steps": [
+    {"op": "attach", "channel": 7},
+    {"op": "take_lease", "lease": 1},
+    {"op": "expire"},
+    {"op": "input_lease", "lease": 1}
+  ]
+}

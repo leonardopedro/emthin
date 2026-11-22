@@ -1,0 +1,16 @@
+{
+  "name": "invalid-version",
+  "expect": "invalid",
+  "error": "hello version must be 1",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 13,
+    "method": "hello",
+    "params": {
+      "version": 2,
+      "core_id": "6ab09a20fd1288983dfbbac2bb349231",
+      "features": []
+    }
+  }
+}

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Build the pinned libghostty-vt used by the Herdr VT lane.
+#
+# Zig 0.16 is provided by the emthin devshell. Android additionally needs an
+# NDK discoverable through ANDROID_NDK_HOME (or ANDROID_HOME/ANDROID_SDK_ROOT);
+# when it is absent only the desktop archive is built.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+src=$(realpath "${GHOSTTY_VT_SOURCE:-../herdr-core/vendor/ghostty}")
+out=$(realpath -m "${GHOSTTY_VT_OUT:-target/ghostty-vt}")
+if [[ ! -f "$src/build.zig" ]]; then
+    echo "error: $src is not a Ghostty checkout; run 'git -C ../herdr-core submodule update --init --depth 1 vendor/ghostty'" >&2
+    exit 1
+fi
+
+build() {
+    local target=$1 prefix=$2
+    shift 2
+    echo "==> libghostty-vt: $target"
+    (
+        cd "$src"
+        zig build -Demit-lib-vt -Doptimize=ReleaseFast -Dcpu=baseline \
+            "$@" --prefix "$prefix" --cache-dir "$out/zig-cache-$target"
+    )
+}
+
+mkdir -p "$out"
+build desktop "$out/desktop"
+
+if [[ -n "${ANDROID_NDK_HOME:-}${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}" ]]; then
+    build android "$out/arm64-v8a" -Dtarget=aarch64-linux-android
+else
+    echo "==> Android: skipped (set ANDROID_NDK_HOME to build arm64-v8a)"
+fi

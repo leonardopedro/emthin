@@ -1,0 +1,44 @@
+name: Checkout pinned herdr-core
+description: Check out the herdr-core and Ghostty revisions declared in docs/HERDR_COMPATIBILITY.toml.
+
+runs:
+  using: composite
+  steps:
+    - name: checkout pinned herdr-core + Ghostty
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$(git rev-parse --show-toplevel)"
+        pins="$(python3 - "$root/docs/HERDR_COMPATIBILITY.toml" <<'PY'
+        import sys
+        import tomllib
+
+        with open(sys.argv[1], "rb") as f:
+            manifest = tomllib.load(f)
+        print(manifest["repositories"]["herdr_core"]["revision"])
+        print(manifest["ghostty"]["revision"])
+        PY
+        )"
+        herdr_revision="$(sed -n '1p' <<<"$pins")"
+        ghostty_revision="$(sed -n '2p' <<<"$pins")"
+        repo="$root/../herdr-core"
+
+        rm -rf "$repo"
+        git init -q "$repo"
+        git -C "$repo" remote add origin \
+          https://github.com/leonardopedro/herdr-core.git
+        git -C "$repo" fetch -q --depth 1 origin "$herdr_revision"
+        git -C "$repo" checkout -q --detach FETCH_HEAD
+        git -C "$repo" submodule update --init --depth 1 vendor/ghostty
+
+        actual_herdr="$(git -C "$repo" rev-parse HEAD)"
+        actual_ghostty="$(git -C "$repo" ls-tree HEAD vendor/ghostty | awk '{print $3}')"
+        if [[ "$actual_herdr" != "$herdr_revision" ]]; then
+          echo "error: herdr-core $actual_herdr, pinned $herdr_revision" >&2
+          exit 1
+        fi
+        if [[ "$actual_ghostty" != "$ghostty_revision" ]]; then
+          echo "error: Ghostty $actual_ghostty, pinned $ghostty_revision" >&2
+          exit 1
+        fi
+        printf 'herdr-core %s\nghostty %s\n' "$actual_herdr" "$actual_ghostty"

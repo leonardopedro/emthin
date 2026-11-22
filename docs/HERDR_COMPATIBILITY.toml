@@ -1,0 +1,53 @@
+# Reproducible inputs for the native terminal-figure programme.
+#
+# This file is intentionally readable by both CI and `scripts/check-herdr-inputs`.
+# It pins source revisions, not installed services. Empty optional repositories
+# are reported as unavailable rather than silently accepted.
+schema_version = 1
+
+[architecture]
+tested = ["aarch64-linux"]
+target = ["x86_64-linux", "aarch64-linux"]
+
+[toolchains]
+rust = "1.99.0"
+cargo = "1.99.0"
+java = "17"
+zig = "0.16.0"
+android = "gradle-free arm64 APK lane"
+android_ndk = "r30-beta1 (30.0.14904198)"
+
+[nix]
+flake_lock = "flake.lock"
+nixpkgs_revision = "c59305bab2065cfecc4944690d9eedbb56f3a9fa"
+nixpkgs_nar_hash = "sha256-69xHQhAeMAD2wDXO7T2pcOZIF9Sga2W+JkmY2a11Ops="
+
+[ghostty]
+repository = "herdr_core"
+submodule = "vendor/ghostty"
+revision = "1e5cdb865807abc990181efb8ebfa9122955cce2"
+
+[repositories.emthin]
+path = "."
+revision = "self"
+license = "GPL-3.0"
+
+[repositories.velysterm]
+path = "../velysterm"
+revision = "423a8c453128f085369d72d68b57bb92b13510c8"
+license = "MIT OR Apache-2.0"
+
+[repositories.herdr]
+path = "../herdr"
+revision = "ee5bfb5041bb3e4a49d591c72308aae3c81ecdde"
+license = "Apache-2.0"
+
+[repositories.herdr_core]
+path = "../herdr-core"
+revision = "c7517808d64f06609e4ecf0db1757005373cc3a3"
+license = "Apache-2.0"
+
+[repositories.openshell]
+path = "../OpenShell"
+revision = "b98d464b2f6796f2b612a44378a6ec5fe8282a0a"
+license = "Apache-2.0"

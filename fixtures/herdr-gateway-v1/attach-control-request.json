@@ -1,0 +1,17 @@
+{
+  "name": "attach-control-request",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "terminal.attach",
+    "params": {
+      "address": "t3",
+      "generation": "g-fixture-1",
+      "mode": "control",
+      "grid": {"cols": 80, "rows": 24},
+      "reservation": "res-1"
+    }
+  }
+}

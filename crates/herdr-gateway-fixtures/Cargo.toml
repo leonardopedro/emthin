@@ -1,0 +1,15 @@
+[package]
+name = "herdr-gateway-fixtures"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lee <loyalpartner@163.com>"]
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "validate-herdr-gateway-fixtures"
+path = "src/main.rs"

@@ -1,0 +1,11 @@
+{
+  "name": "control-respond",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "control.respond",
+    "params": {"handoff_id": "h-1", "lease_id": "l-1", "accept": true}
+  }
+}

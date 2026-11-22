@@ -1,0 +1,15 @@
+{
+  "name": "hello-reply",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "version": 1,
+      "core_id": "6ab09a20fd1288983dfbbac2bb349231",
+      "features": ["resize_notifications", "automatic_input"],
+      "methods": ["hello", "sessions.list", "terminal.attach", "control.request", "control.respond"]
+    }
+  }
+}

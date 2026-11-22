@@ -1,0 +1,14 @@
+{
+  "name": "error-core-mismatch",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "error": {
+      "code": -32000,
+      "message": "wrong Core",
+      "data": {"kind": "core_mismatch"}
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# Zig 0.16's compiler_rt archive carries debug sections that binutils' BFD
+# linker rejects; gold links the same archive cleanly. Keep this host-only so
+# Android targets still use their own NDK/clang linker.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=gold"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=gold"]

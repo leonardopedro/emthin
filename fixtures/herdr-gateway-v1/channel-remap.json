@@ -1,0 +1,14 @@
+{
+  "name": "channel-remap",
+  "expect": "valid",
+  "kind": "scenario",
+  "steps": [
+    {"op": "watch", "channel": 7},
+    {"op": "close", "channel": 7},
+    {"op": "attach", "channel": 7},
+    {"op": "input", "channel": 7},
+    {"op": "close", "channel": 7},
+    {"op": "attach", "channel": 8},
+    {"op": "resize", "channel": 8}
+  ]
+}

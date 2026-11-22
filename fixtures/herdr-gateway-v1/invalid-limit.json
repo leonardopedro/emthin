@@ -1,0 +1,12 @@
+{
+  "name": "invalid-limit",
+  "expect": "invalid",
+  "error": "limit must be 1..=64",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 14,
+    "method": "sessions.list",
+    "params": {"limit": 65}
+  }
+}

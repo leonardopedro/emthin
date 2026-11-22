@@ -1,0 +1,13 @@
+{
+  "name": "invalid-duplicate-key",
+  "expect": "invalid",
+  "error": "duplicate key",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 15,
+    "method": "hello",
+    "method": "sessions.list",
+    "params": {"version": 1, "core_id": "6ab09a20fd1288983dfbbac2bb349231"}
+  }
+}

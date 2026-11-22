@@ -1,0 +1,6 @@
+{
+  "name": "frame-data",
+  "expect": "valid",
+  "kind": "frame",
+  "hex": "07 00 00 00 00 03 00 00 00 18 4f 4b"
+}

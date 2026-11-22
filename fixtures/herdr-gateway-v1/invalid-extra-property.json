@@ -1,0 +1,17 @@
+{
+  "name": "invalid-extra-property",
+  "expect": "invalid",
+  "error": "unexpected property",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 11,
+    "method": "terminal.attach",
+    "params": {
+      "address": "t3",
+      "generation": "g-fixture-1",
+      "mode": "watch",
+      "path": "/home/me/t3"
+    }
+  }
+}

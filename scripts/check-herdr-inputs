@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Print and validate the pinned inputs for the terminal-figure programme.
+
+Reads only. Never starts Core, touches a socket, evaluates a NixOS profile, or
+updates a fixture. Missing optional sibling checkouts are validation failures.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "docs" / "HERDR_COMPATIBILITY.toml"
+WARNINGS: list[str] = []
+
+
+def run(*args: str, cwd: Path = ROOT) -> str:
+    result = subprocess.run(
+        args, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"{' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def git(path: Path, *args: str) -> str:
+    return run("git", "-C", str(path), *args)
+
+
+def normalize_arch() -> str:
+    machine = platform.machine().lower()
+    aliases = {"amd64": "x86_64", "arm64": "aarch64"}
+    return f"{aliases.get(machine, machine)}-{sys.platform.replace('linux', 'linux')}"
+
+
+def check_repository(
+    name: str, spec: dict[str, object], require_clean: bool
+) -> list[str]:
+    path = (ROOT / str(spec["path"])).resolve()
+    problems: list[str] = []
+    if not path.is_dir():
+        return [f"{name}: missing checkout at {path}"]
+    try:
+        actual = git(path, "rev-parse", "HEAD")
+    except RuntimeError as error:
+        return [f"{name}: not a git checkout: {error}"]
+    expected = str(spec["revision"])
+    if expected != "self" and actual != expected:
+        problems.append(f"{name}: HEAD {actual}, pinned {expected}")
+    dirty = git(path, "status", "--porcelain")
+    if dirty:
+        message = f"{name}: checkout has local changes"
+        if require_clean:
+            problems.append(message)
+        else:
+            WARNINGS.append(message)
+    if not any((path / name).is_file() for name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "COPYING")):
+        problems.append(f"{name}: no licence file")
+    return problems
+
+
+def check_ghostty(manifest: dict[str, object]) -> list[str]:
+    ghostty = manifest["ghostty"]
+    assert isinstance(ghostty, dict)
+    repo_name = str(ghostty["repository"])
+    repositories = manifest["repositories"]
+    assert isinstance(repositories, dict)
+    repo = (ROOT / str(repositories[repo_name]["path"])).resolve()
+    expected = str(ghostty["revision"])
+    try:
+        line = git(repo, "ls-tree", "HEAD", str(ghostty["submodule"]))
+    except RuntimeError as error:
+        return [f"ghostty: cannot read {repo_name}: {error}"]
+    fields = line.split()
+    if len(fields) < 3 or fields[2] != expected:
+        actual = fields[2] if len(fields) >= 3 else "missing"
+        return [f"ghostty: submodule {actual}, pinned {expected}"]
+    return []
+
+
+def check_nix(manifest: dict[str, object]) -> list[str]:
+    nix = manifest["nix"]
+    assert isinstance(nix, dict)
+    lock_path = ROOT / str(nix["flake_lock"])
+    try:
+        lock = json.loads(lock_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        return [f"nix: cannot read {lock_path}: {error}"]
+    nixpkgs = lock.get("nodes", {}).get("nixpkgs", {}).get("locked", {})
+    problems: list[str] = []
+    if nixpkgs.get("rev") != nix["nixpkgs_revision"]:
+        problems.append(
+            f"nix: nixpkgs {nixpkgs.get('rev')}, pinned {nix['nixpkgs_revision']}"
+        )
+    if nixpkgs.get("narHash") != nix["nixpkgs_nar_hash"]:
+        problems.append("nix: nixpkgs narHash does not match the manifest")
+    return problems
+
+
+def check_openshell_merge_markers(manifest: dict[str, object]) -> list[str]:
+    repositories = manifest["repositories"]
+    assert isinstance(repositories, dict)
+    shell = (ROOT / str(repositories["openshell"]["path"])).resolve()
+    flake = shell / "flake.nix"
+    if not flake.is_file():
+        return ["openshell: flake.nix is missing"]
+    text = flake.read_text()
+    markers = [marker for marker in ("<<<<<<<", "=======", ">>>>>>>") if marker in text]
+    if markers:
+        return [f"openshell: flake.nix still contains merge markers: {', '.join(markers)}"]
+    return []
+
+
+def check_toolchains(manifest: dict[str, object], strict: bool) -> list[str]:
+    toolchains = manifest["toolchains"]
+    assert isinstance(toolchains, dict)
+    problems: list[str] = []
+    for command, key in (("rustc", "rust"), ("cargo", "cargo")):
+        try:
+            version = run(command, "--version").split()[1]
+        except (RuntimeError, IndexError):
+            problems.append(f"toolchain: {command} unavailable")
+            continue
+        if strict and version != toolchains[key]:
+            problems.append(f"toolchain: {command} {version}, pinned {toolchains[key]}")
+    return problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="print a machine-readable report")
+    parser.add_argument(
+        "--strict-toolchains",
+        action="store_true",
+        help="fail when rustc/cargo differ from the measured versions",
+    )
+    parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="fail when a checkout has local changes",
+    )
+    args = parser.parse_args()
+
+    try:
+        manifest = tomllib.loads(MANIFEST.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        print(f"check-herdr-inputs: cannot read {MANIFEST}: {error}", file=sys.stderr)
+        return 2
+
+    repositories = manifest["repositories"]
+    assert isinstance(repositories, dict)
+    report: dict[str, object] = {"architecture": normalize_arch(), "repositories": {}}
+    problems: list[str] = []
+    for name, spec in repositories.items():
+        assert isinstance(spec, dict)
+        path = (ROOT / str(spec["path"])).resolve()
+        entry = {"path": str(path), "expected": spec["revision"], "actual": None}
+        if path.is_dir():
+            try:
+                entry["actual"] = git(path, "rev-parse", "HEAD")
+            except RuntimeError:
+                pass
+        report["repositories"][name] = entry
+        problems.extend(check_repository(name, spec, args.require_clean))
+
+    problems.extend(check_ghostty(manifest))
+    problems.extend(check_nix(manifest))
+    problems.extend(check_openshell_merge_markers(manifest))
+    problems.extend(check_toolchains(manifest, args.strict_toolchains))
+
+    report["ok"] = not problems
+    report["problems"] = problems
+    report["warnings"] = WARNINGS
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"architecture: {report['architecture']}")
+        for name, entry in report["repositories"].items():
+            assert isinstance(entry, dict)
+            print(f"{name}: {entry['actual'] or 'unavailable'} ({entry['path']})")
+        print(f"ghostty: {manifest['ghostty']['revision']}")
+        print(f"nixpkgs: {manifest['nix']['nixpkgs_revision']}")
+        for warning in WARNINGS:
+            print(f"WARN: {warning}", file=sys.stderr)
+        if problems:
+            for problem in problems:
+                print(f"FAIL: {problem}", file=sys.stderr)
+        else:
+            print("compatibility inputs: OK")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

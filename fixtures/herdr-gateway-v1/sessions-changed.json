@@ -1,0 +1,10 @@
+{
+  "name": "sessions-changed",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "method": "sessions.changed",
+    "params": {"revision": 42}
+  }
+}

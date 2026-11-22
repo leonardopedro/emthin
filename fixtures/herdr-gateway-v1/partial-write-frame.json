@@ -1,0 +1,11 @@
+{
+  "name": "partial-write-frame",
+  "expect": "valid",
+  "kind": "chunks",
+  "chunks": [
+    "07 00 00 00 00 03",
+    "00 00 00 18 4f",
+    "4b"
+  ],
+  "frames": 1
+}

@@ -1,0 +1,12 @@
+{
+  "name": "invalid-core-method",
+  "expect": "invalid",
+  "error": "gateway allowlist",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 10,
+    "method": "core.eval",
+    "params": {}
+  }
+}

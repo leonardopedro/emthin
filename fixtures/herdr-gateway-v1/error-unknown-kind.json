@@ -1,0 +1,15 @@
+{
+  "name": "error-unknown-kind",
+  "expect": "invalid",
+  "error": "unknown error kind",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "error": {
+      "code": -32000,
+      "message": "bad",
+      "data": {"kind": "made_up"}
+    }
+  }
+}

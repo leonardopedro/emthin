@@ -1,0 +1,15 @@
+{
+  "name": "stop-request",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "session.stop",
+    "params": {
+      "address": "t3",
+      "generation": "g-fixture-1",
+      "request_id": "req-stop-1"
+    }
+  }
+}

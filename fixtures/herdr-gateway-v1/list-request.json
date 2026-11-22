@@ -1,0 +1,11 @@
+{
+  "name": "list-request",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "sessions.list",
+    "params": {"limit": 32, "addresses": ["t3", "t4"]}
+  }
+}

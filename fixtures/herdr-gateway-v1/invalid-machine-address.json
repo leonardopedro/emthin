@@ -1,0 +1,16 @@
+{
+  "name": "invalid-machine-address",
+  "expect": "invalid",
+  "error": "opaque local terminal address",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 12,
+    "method": "terminal.attach",
+    "params": {
+      "address": "/home/me/t3",
+      "generation": "g-fixture-1",
+      "mode": "watch"
+    }
+  }
+}

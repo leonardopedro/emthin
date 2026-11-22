@@ -1,0 +1,6 @@
+{
+  "name": "frame-credit",
+  "expect": "valid",
+  "kind": "frame",
+  "hex": "07 00 00 00 01 04 00 00 00 03 00 00 00"
+}

@@ -1,0 +1,13 @@
+[package]
+name = "ghostty-vt"
+version = "0.0.0"
+description = "Android linkage for the pinned libghostty-vt archive"
+edition = "2024"
+license = "GPL-3.0"
+publish = false
+links = "ghostty-vt"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]

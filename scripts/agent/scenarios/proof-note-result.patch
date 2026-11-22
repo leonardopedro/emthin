@@ -1,0 +1,11 @@
+--- proof-note.typ
++++ proof-note.typ
+@@ -13,7 +13,7 @@
+ The verification step is #g claim #h \formal(#g, #h, "sort Prop"). Its proof ID
+ and result link are recorded below once the backend returns them.
+ 
+-Proof ID: pending
++Proof ID: 01JTEST
+ Result link: pending
+ 
+ Search match anchor: claim heading appears again so a Find query can land

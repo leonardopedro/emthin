@@ -1,0 +1,11 @@
+--- proof-note.typ
++++ proof-note.typ
+@@ -5,7 +5,7 @@
+ Claim heading: sorting is a proposition. The checker accepts `sort Prop;` and
+ reports a stage for the mismatched proof. The formula is $forall alpha.
+ alpha -> alpha$ (the sort claim), with #a bolded #b and a definition #c sort
+-#d \def(#c, #d, "sort").
++#d \def(#c, #d, "kind").
+ 
+ A dangling reference name is recorded here: ghost. A model statement #e prior
+ #f \model(#e, #f, "prior") records the assumption behind the claim.

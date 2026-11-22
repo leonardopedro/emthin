@@ -1,0 +1,34 @@
+# Disposable MM0 proof-note scenario (development testing plan P1/P2/P4).
+# Document-side coverage only: the verifier verdict and mock upload counts
+# belong to mm0web/tests/e2e.sh, and named-file Save/recovery belongs to
+# live.sh / desktop E2E. No network, no credentials, no device.
+
+doc ../proof-note.typ
+
+# The fixture is a two-page note with one dormant browser figure, a
+# definition, a model statement and two unresolved math identifiers.
+expect pages == 2
+expect figures == 1
+expect diag == 0
+expect defs == 1
+expect models == 1
+expect unresolved == 2
+expect statements model == 1
+expect figure f0 w == 320
+expect figure f0 caption == Proof note
+
+# Rewrite one affected definition. The figure geometry and pagination stay
+# put; the semantic delta in the transcript records the definition change.
+apply proof-note-def.patch
+expect defs == 1
+expect pages == 2
+expect figures == 1
+expect diag == 0
+
+# Copy a proof ID into the note. This is metadata only: no new statement,
+# figure or diagnostic is introduced, and the note still has two pages.
+apply proof-note-result.patch
+expect pages == 2
+expect figures == 1
+expect diag == 0
+expect statements formal == 0

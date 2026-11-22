@@ -1,0 +1,11 @@
+{
+  "name": "fleet-launch",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "method": "fleet.launch",
+    "params": {"profile": "edge0", "slot": "fb-a", "request_id": "req-launch-1"}
+  }
+}

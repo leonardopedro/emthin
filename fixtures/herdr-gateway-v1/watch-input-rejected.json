@@ -1,0 +1,10 @@
+{
+  "name": "watch-input-rejected",
+  "expect": "invalid",
+  "error": "watch channel 7 cannot send input",
+  "kind": "scenario",
+  "steps": [
+    {"op": "watch", "channel": 7},
+    {"op": "input", "channel": 7}
+  ]
+}

@@ -1,0 +1,26 @@
+name: Set up pinned Zig
+description: Install the nixpkgs revision pinned in docs/HERDR_COMPATIBILITY.toml and put its Zig 0.16 on PATH.
+
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa  # DeterminateSystems/nix-installer-action@v23
+
+    - name: install Zig from the pinned nixpkgs
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$(git rev-parse --show-toplevel)"
+        rev="$(python3 - "$root/docs/HERDR_COMPATIBILITY.toml" <<'PY'
+        import sys
+        import tomllib
+
+        with open(sys.argv[1], "rb") as f:
+            manifest = tomllib.load(f)
+        print(manifest["nix"]["nixpkgs_revision"])
+        PY
+        )"
+        zig="$(nix build --no-link --print-out-paths "github:NixOS/nixpkgs/$rev#zig_0_16")"
+        echo "$zig/bin" >> "$GITHUB_PATH"
+        echo "ZIG=$zig/bin/zig" >> "$GITHUB_ENV"
+        "$zig/bin/zig" version

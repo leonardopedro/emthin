@@ -1,0 +1,16 @@
+{
+  "name": "attach-watch-request",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "terminal.attach",
+    "params": {
+      "address": "t3",
+      "generation": "g-fixture-1",
+      "mode": "watch",
+      "history": 0
+    }
+  }
+}

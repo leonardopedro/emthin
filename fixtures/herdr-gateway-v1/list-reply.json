@@ -1,0 +1,24 @@
+{
+  "name": "list-reply",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+      "revision": "rev-1",
+      "rows": [
+        {
+          "address": "t3",
+          "generation": "g-fixture-1",
+          "label": "fixture",
+          "grid": {"cols": 80, "rows": 24},
+          "lifecycle": "live",
+          "status": null,
+          "actions": ["watch"]
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

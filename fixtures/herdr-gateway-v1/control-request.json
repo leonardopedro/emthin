@@ -1,0 +1,11 @@
+{
+  "name": "control-request",
+  "expect": "valid",
+  "kind": "json",
+  "message": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "control.request",
+    "params": {"address": "t3", "generation": "g-fixture-1"}
+  }
+}
