@@ -127,6 +127,7 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
         IncomingMessage::LintRun => ipc_lint_run(state),
         IncomingMessage::PluginCatalog => ipc_plugin_catalog(state),
         IncomingMessage::ClientIdentity => ipc_client_identity(state),
+        IncomingMessage::ProofSearch { query, limit } => ipc_proof_search(state, &query, limit),
         IncomingMessage::ProofQuery => ipc_proof_query(state),
         IncomingMessage::ProofResult {
             share_id,
