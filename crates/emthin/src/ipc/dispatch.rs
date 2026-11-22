@@ -373,6 +373,31 @@ fn ipc_a11y_nodes(state: &mut EmthinState) {
     state.ipc.send(OutgoingMessage::A11yNodes { nodes });
 }
 
+fn ipc_proof_search(state: &mut EmthinState, query: &str, limit: usize) {
+    // A search before any query builds the view first, so the second query is
+    // independent of whether `proof_query` was called.
+    if state.doc.proof_view.is_none() {
+        let share = crate::ipc::hex::encode(state.collab.share_id());
+        let key = state.doc.document_key().unwrap_or("untitled").to_string();
+        let _ = state.doc.proof_view(state.collab.share_id(), &key);
+        let _ = (share, key);
+    }
+    let matches = state.doc.proof_search(query, limit);
+    state.ipc.send(OutgoingMessage::ProofMatches {
+        definitions: matches
+            .definitions
+            .into_iter()
+            .map(|row| (row.name, row.start, row.end))
+            .collect(),
+        references: matches
+            .references
+            .into_iter()
+            .map(|row| (row.name, row.start, row.end))
+            .collect(),
+        missing: matches.missing,
+    });
+}
+
 fn ipc_proof_query(state: &mut EmthinState) {
     let share = crate::ipc::hex::encode(state.collab.share_id());
     let key = state.doc.document_key().unwrap_or("untitled").to_string();

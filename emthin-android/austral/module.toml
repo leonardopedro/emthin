@@ -1,0 +1,9 @@
+[module]
+name = "LinkRule"
+version = "1.0.0"
+archetype = "austral_cps"
+entry = "check"
+
+# Deny-by-default: the rule is pure, so it requests no kernel grants.
+[grants]
+kernel = []

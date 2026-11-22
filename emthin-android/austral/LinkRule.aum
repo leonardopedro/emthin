@@ -1,0 +1,68 @@
+-- K9 rule artifact: proof-dependency completeness, compiled to a real CPS
+-- binary and loaded through the australVM Cranelift bridge.
+--
+-- The CPS v1 ABI is scalar (Int64 in/out), so the rule consumes a bounded
+-- encoding of the typed facts: each distinct opaque id is assigned a digit
+-- 1..9 by the caller (from mathed's validated semantic index — the single
+-- source of string identity). `declared` and `referenced` are base-10 packed
+-- digit sets. `check` returns 0 when every referenced id is declared, the
+-- first missing digit when one is not, and -1 for malformed input.
+--
+-- No host I/O, no clock, no document access: a pure advisory rule. The
+-- capability gate stays at DenyAll; no App node is ever reached.
+module body LinkRule is
+    -- Remainder by repeated subtraction. CPS v1 has no div/mod opcode, so the
+    -- quotient and remainder are derived from Sub + Cmp in a bounded loop.
+    function auxRem(a: Int64, b: Int64): Int64 is
+        var r: Int64 := a;
+        while r >= b do
+            r := r - b;
+        end while;
+        return r;
+    end;
+
+    function auxQuot(a: Int64, b: Int64): Int64 is
+        var q: Int64 := 0;
+        var r: Int64 := a;
+        while r >= b do
+            r := r - b;
+            q := q + 1;
+        end while;
+        return q;
+    end;
+
+    -- Whether digit d appears in the base-10 packed set n.
+    function auxHasDigit(n: Int64, d: Int64): Bool is
+        var ten: Int64 := 10;
+        var zero: Int64 := 0;
+        var x: Int64 := n;
+        while x > zero do
+            if auxRem(x, ten) = d then
+                return true;
+            end if;
+            x := auxQuot(x, ten);
+        end while;
+        return false;
+    end;
+
+    -- The rule itself: the caller maps the missing digit back to its id.
+    function check(declared: Int64, referenced: Int64): Int64 is
+        var zero: Int64 := 0;
+        var minus_one: Int64 := -1;
+        if (declared < zero) or (referenced < zero) then
+            return minus_one;
+        end if;
+        var ten: Int64 := 10;
+        var x: Int64 := referenced;
+        while x > zero do
+            let d: Int64 := auxRem(x, ten);
+            if d > zero then
+                if not auxHasDigit(declared, d) then
+                    return d;
+                end if;
+            end if;
+            x := auxQuot(x, ten);
+        end while;
+        return zero;
+    end;
+end module body.

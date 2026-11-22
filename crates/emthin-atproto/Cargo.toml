@@ -1,0 +1,12 @@
+[package]
+name = "emthin-atproto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional AT Protocol session-descriptor adapter for emthin"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
