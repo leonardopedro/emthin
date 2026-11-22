@@ -145,7 +145,9 @@ impl DocPageTexture {
             pixels.rect.loc.to_f64().to_physical(pixels.scale),
             buffer,
             Some(1.0),
-            Some(Rectangle::from_size((pixels.width as f64, pixels.height as f64).into())),
+            Some(Rectangle::from_size(
+                (pixels.width as f64, pixels.height as f64).into(),
+            )),
             Some(pixels.rect.size),
             Kind::Unspecified,
         )
@@ -184,6 +186,30 @@ mod tests {
         cache.key = Some((0, 1));
         cache.clear();
         assert!(cache.is_stale(0, 1), "a cleared cache must re-import");
+    }
+
+    /// A released raster keeps its full-page geometry but carries a 1x1 image,
+    /// so the raster path must skip it instead of tripping smithay's
+    /// `data.len() >= stride*h` assert.
+    #[test]
+    fn a_released_page_placeholder_is_not_rendered_at_full_page_size() {
+        // PageLayout::release_raster leaves width/height at the full page size
+        // but shrinks the image to 1x1. Building PagePixels from page.width /
+        // page.height would trip the buffer-size check.
+        let skips_placeholder = |image_w: u32, image_h: u32, bytes: usize| {
+            if image_w <= 1 && image_h <= 1 {
+                return true;
+            }
+            bytes < (image_w * image_h * 4) as usize
+        };
+        assert!(
+            skips_placeholder(1, 1, 4),
+            "a released raster must be skipped"
+        );
+        assert!(
+            !skips_placeholder(8, 4, 8 * 4 * 4),
+            "a real raster is rendered normally"
+        );
     }
 
     /// The buffer is owned, so a re-import *replaces* it.

@@ -8,7 +8,7 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData, MotionEvent, RelativeMotionEvent},
     },
     reexports::wayland_server::Resource,
-    utils::{IsAlive, Logical, Point, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER},
     wayland::seat::WaylandFocus,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -38,6 +38,7 @@ impl EmthinState {
                 // consulted here rather than after forwarding.
                 let mut pending: Option<crate::docui::keymap::Action> = None;
                 let mut sym = keysyms::KEY_NoSymbol;
+                let mut ghostty_mods = 0u16;
                 let (is_wakeup, mods_changed) = keyboard.input_intercept(
                     self,
                     event.key_code(),
@@ -57,6 +58,10 @@ impl EmthinState {
                             mods.shift,
                             mods.alt,
                         );
+                        ghostty_mods = u16::from(mods.shift)
+                            | (u16::from(mods.ctrl) << 1)
+                            | (u16::from(mods.alt) << 2)
+                            | (u16::from(mods.logo) << 3);
                         false
                     },
                 );
@@ -84,6 +89,26 @@ impl EmthinState {
                 if let Some(action) = pending {
                     self.run_doc_action(action);
                     return;
+                }
+
+                // A Core terminal has no Wayland surface, so it cannot hold
+                // Smithay keyboard focus. Its focused figure is the fallback
+                // owner while no client surface is focused.
+                if keyboard.current_focus().is_none() {
+                    if let Some(reference) = self.core_sessions.focused().cloned() {
+                        if event.state() == KeyState::Pressed {
+                            let bytes = self
+                                .core_sessions
+                                .key_bytes(&reference, sym, ghostty_mods);
+                            if !bytes.is_empty()
+                                && !self.core_sessions.send_input(&reference, &bytes)
+                            {
+                                self.core_sessions.clear_focus();
+                                self.needs_redraw = true;
+                            }
+                        }
+                        return;
+                    }
                 }
 
                 if keyboard.current_focus().is_some() {
@@ -133,6 +158,36 @@ impl EmthinState {
                 let new_abs = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
                 let delta = self.cursor.consume_raw_location(new_abs);
                 let time_msec = event.time_msec();
+                let core_mods = self
+                    .seat
+                    .get_keyboard()
+                    .map(|keyboard| keyboard.modifier_state())
+                    .map_or((false, false, false), |mods| {
+                        (mods.shift, mods.alt, mods.ctrl)
+                    });
+                if let Some(drag) = self.core_mouse_drag.clone() {
+                    let bytes = self.core_sessions.mouse_motion(
+                        &drag.reference,
+                        drag.rect,
+                        new_abs,
+                        Some(drag.button),
+                        core_mods,
+                    );
+                    if !bytes.is_empty() {
+                        self.core_sessions.send_input(&drag.reference, &bytes);
+                    }
+                    pointer.motion(
+                        self,
+                        None,
+                        &MotionEvent {
+                            location: new_abs,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: time_msec,
+                        },
+                    );
+                    pointer.frame(self);
+                    return;
+                }
                 if let Some(pan) = self.view_pan_drag {
                     let dx = new_abs.x - pan.last.x;
                     let dy = new_abs.y - pan.last.y;
@@ -144,6 +199,31 @@ impl EmthinState {
                 }
                 self.drag_text_selection(new_abs);
                 let new_under = self.surface_under(new_abs);
+                if new_under.is_none() {
+                    if let Some((reference, rect)) = self.core_terminal_at(new_abs) {
+                        let bytes = self.core_sessions.mouse_motion(
+                            &reference,
+                            rect,
+                            new_abs,
+                            None,
+                            core_mods,
+                        );
+                        if !bytes.is_empty() {
+                            self.core_sessions.send_input(&reference, &bytes);
+                            pointer.motion(
+                                self,
+                                None,
+                                &MotionEvent {
+                                    location: new_abs,
+                                    serial: SERIAL_COUNTER.next_serial(),
+                                    time: time_msec,
+                                },
+                            );
+                            pointer.frame(self);
+                            return;
+                        }
+                    }
+                }
 
                 let serial = SERIAL_COUNTER.next_serial();
 
@@ -199,6 +279,55 @@ impl EmthinState {
                 let button = event.button_code();
                 let button_state = event.state();
 
+                if !pointer.is_grabbed() {
+                    let pos = pointer.current_location();
+                    let core_hit = self.core_terminal_at(pos).filter(|(_, rect)| {
+                        crate::grabs::FigureResizeGrab::edge_at(
+                            rect,
+                            pos,
+                        ) == smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge::None
+                    });
+                    if let Some((reference, rect)) = core_hit {
+                        if let Some(button_index) = match event.button() {
+                            Some(MouseButton::Left) => Some(0),
+                            Some(MouseButton::Middle) => Some(1),
+                            Some(MouseButton::Right) => Some(2),
+                            _ => None,
+                        } {
+                            if button_state == ButtonState::Pressed {
+                                self.core_sessions.focus(&reference);
+                                keyboard.set_focus(self, None, serial);
+                                self.core_mouse_drag = Some(crate::state::CoreMouseDrag {
+                                    reference: reference.clone(),
+                                    rect,
+                                    button: button_index,
+                                });
+                                self.needs_redraw = true;
+                            } else if self
+                                .core_mouse_drag
+                                .as_ref()
+                                .is_some_and(|drag| drag.button == button_index)
+                            {
+                                self.core_mouse_drag = None;
+                            }
+                            let mods = keyboard.modifier_state();
+                            let bytes = self.core_sessions.mouse_button(
+                                &reference,
+                                rect,
+                                pos,
+                                button_index,
+                                button_state == ButtonState::Pressed,
+                                (mods.shift, mods.alt, mods.ctrl),
+                            );
+                            if !bytes.is_empty() {
+                                self.core_sessions.send_input(&reference, &bytes);
+                            }
+                            pointer.frame(self);
+                            return;
+                        }
+                    }
+                }
+
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
                     let pos = pointer.current_location();
                     let under = self.surface_under(pos);
@@ -237,6 +366,9 @@ impl EmthinState {
                         })
                     });
                     if !same_client {
+                        if focus.is_some() {
+                            self.core_sessions.clear_focus();
+                        }
                         keyboard.set_focus(self, focus, serial);
                         // A focus change invalidates the document's
                         // caret overlay and the focused figure's
@@ -299,10 +431,25 @@ impl EmthinState {
                 if ctrl
                     && vertical_notches.abs() > 0.01
                     && self.surface_under(pointer_pos).is_none()
+                    && self.core_terminal_at(pointer_pos).is_none()
                 {
                     let factor = wheel_zoom_factor(vertical_notches);
                     if self.doc.zoom_view_at(factor, pointer_pos) {
                         self.relayout_document();
+                        self.needs_redraw = true;
+                    }
+                    pointer.frame(self);
+                    return;
+                }
+
+                if let Some((reference, _)) = self.core_terminal_at(pointer_pos) {
+                    if let Some(bytes) = self
+                        .core_sessions
+                        .wheel(&reference, vertical_notches > 0.0)
+                    {
+                        if !bytes.is_empty() {
+                            self.core_sessions.send_input(&reference, &bytes);
+                        }
                         self.needs_redraw = true;
                     }
                     pointer.frame(self);
@@ -617,6 +764,14 @@ impl EmthinState {
         self.needs_redraw = true;
     }
 
+    fn core_terminal_at(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(mathed_core::figures::TerminalRef, Rectangle<i32, Logical>)> {
+        let figure = self.doc.figure_at(pos)?;
+        Some((figure.spec.terminal.clone()?, figure.rect))
+    }
+
     /// Left click: figure hit-test first, then the document.
     ///
     /// A figure's **edge** starts a resize grab (which rewrites the
@@ -640,6 +795,8 @@ impl EmthinState {
                         if let Err(error) = self.doc.toggle_citation(number) {
                             tracing::debug!("citation: {error}");
                         }
+                    } else {
+                        self.publish_document_page();
                     }
                 } else if let Err(error) = self.doc.toggle_citation(number) {
                     tracing::debug!("citation: {error}");
@@ -674,6 +831,8 @@ impl EmthinState {
             figure.stable_id.clone(),
             figure.rect,
             edge,
+            self.doc.document_instance(),
+            self.doc.model().content_generation(),
         );
         // `Focus::Clear`: a figure resize manipulates the page, not a
         // client surface, so nothing should take pointer focus mid-drag.
@@ -748,10 +907,12 @@ impl EmthinState {
                 // A completion preview is the innermost transient state, then
                 // the find bar, then a citation popup. Escape only leaves the
                 // figure once none of them is open.
-                if !self.doc.cancel_completion()
-                    && !self.doc.close_find()
-                    && !self.doc.close_citation()
-                {
+                if self.doc.cancel_completion() {
+                    // The completion was the innermost transient state.
+                } else if self.doc.close_find() {
+                    // Find may have moved the page while stepping matches.
+                    self.publish_document_page();
+                } else if !self.doc.close_citation() {
                     self.focus_document();
                 }
             }
@@ -828,6 +989,8 @@ impl EmthinState {
                 // steering, which is how every editor behaves.
                 if self.doc.find_step(action == Action::FindNext).is_none() {
                     tracing::debug!("find: no match for {:?}", self.doc.find().query());
+                } else {
+                    self.publish_document_page();
                 }
             }
             Action::OpenLauncher => self.open_launcher(),
@@ -864,6 +1027,8 @@ impl EmthinState {
     /// Drop keyboard focus from the focused figure back to the document
     /// caret.
     fn focus_document(&mut self) {
+        self.core_sessions.clear_focus();
+        self.core_mouse_drag = None;
         let serial = SERIAL_COUNTER.next_serial();
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, None, serial);
@@ -1129,7 +1294,10 @@ impl EmthinState {
             keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
                 // Enter accepts the current match and closes the bar. With no
                 // match yet (the query is still being typed) it steps instead.
-                if !self.doc.accept_find() && self.doc.find_step(true).is_none() {
+                let found = self.doc.accept_find() || self.doc.find_step(true).is_some();
+                if found {
+                    self.publish_document_page();
+                } else {
                     tracing::debug!("find: no match for {:?}", self.doc.find().query());
                 }
                 self.needs_redraw = true;
@@ -1257,7 +1425,7 @@ impl EmthinState {
     /// Move the caret between lines, using the glyph index's line bands so
     /// navigation agrees with what's actually on screen.
     fn move_caret_vertically(&mut self, down: bool) {
-        let Some(glyphs) = self.doc.layout().glyphs() else {
+        let Some(glyphs) = self.doc.current_glyphs() else {
             return;
         };
         let caret = self.doc.model().caret();
@@ -1335,6 +1503,7 @@ impl EmthinState {
         self.text_selection.drag = None;
         self.text_selection.touch_slot = None;
         self.view_pan_drag = None;
+        self.core_mouse_drag = None;
         let serial = SERIAL_COUNTER.next_serial();
         if let Some(keyboard) = self.seat.get_keyboard() {
             self.focus

@@ -1,8 +1,9 @@
-//! A transport-free Herdr Core protocol client.
+//! A transport-independent Herdr Core protocol client.
 //!
-//! The caller owns the Unix socket or WebSocket. This crate owns the protocol:
+//! The caller owns the socket or WebSocket. This crate owns the protocol:
 //! framed bytes, JSON-RPC request correlation, the hello/attach handshake,
 //! per-channel stream state, and the credit returned after consuming output.
+//! The optional [`unix`] adapter is a thin local-socket transport.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -10,6 +11,9 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+pub mod controller;
+#[cfg(unix)]
+pub mod unix;
 pub mod wire;
 
 pub use wire::{Frame, FrameDecoder, FrameError, LineDecoder, CREDIT, DATA, MAX_PAYLOAD, RESIZE};

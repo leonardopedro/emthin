@@ -110,7 +110,7 @@ impl FrameDecoder {
 
     /// Reject a truncated frame at end of stream instead of treating it as a
     /// clean close.
-    pub fn finish(self) -> Result<(), FrameError> {
+    pub fn finish(&mut self) -> Result<(), FrameError> {
         if self.buffer.is_empty() {
             Ok(())
         } else {

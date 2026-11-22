@@ -17,6 +17,13 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.net.Uri;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES20;
+import android.opengl.GLUtils;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.Spannable;
@@ -28,6 +35,9 @@ import android.util.Base64;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.KeyEvent;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.inputmethod.BaseInputConnection;
@@ -41,6 +51,7 @@ import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.FrameLayout;
 import android.widget.Spinner;
 import android.widget.TextView;
 
@@ -99,6 +110,10 @@ public class MainActivity extends Activity {
     private static final int PAGE_GAP_DP = 12;
 
     private long handle;
+    /** Native document-sharing worker handle (K6). Owned by this activity. */
+    private long shareHandle;
+    /** A watching peer can copy content but cannot commit document edits. */
+    private boolean shareWatchOnly;
     private EditText editor;
     private TextView undoButton;
     private TextView redoButton;
@@ -143,6 +158,26 @@ public class MainActivity extends Activity {
     private final Runnable touchLongPress = new Runnable() {
         @Override public void run() {
             if (touchSelectionPage == null || !touchSelectionPage.loaded || pagesStale) return;
+            int terminal = touchSelectionPage.terminalIndexAt(touchDownX, touchDownY);
+            if (terminal >= 0) {
+                if (terminalMousePressed && terminalMousePage == touchSelectionPage) {
+                    int[] cell = touchSelectionPage.terminalCellAt(terminalMouseIndex,
+                            touchDownX, touchDownY);
+                    if (cell != null) {
+                        sendTerminalMouse(touchSelectionPage, terminalMouseIndex,
+                                cell[0], cell[1], 0, false, 0);
+                    }
+                    terminalMousePressed = false;
+                    terminalMousePage = null;
+                    terminalMouseIndex = -1;
+                }
+                selectTerminalWord(touchSelectionPage, terminal, touchDownX, touchDownY);
+                if (terminalSelectionPage == null) return;
+                touchSelectionPage.performHapticFeedback(
+                        android.view.HapticFeedbackConstants.LONG_PRESS);
+                showTerminalSelectionBar();
+                return;
+            }
             int offset = caretOffsetAtPoint(touchSelectionPage, touchDownX, touchDownY);
             if (offset < 0) return;
             selectWordAt(offset);
@@ -165,6 +200,7 @@ public class MainActivity extends Activity {
     private static final int SAVE_DOCUMENT = 42;
     private static final int EXPORT_RECOVERY = 43;
     private static final int SAVE_COPY_DOCUMENT = 44;
+    private static final int REQUEST_PROOF = 45;
     private Uri documentUri;
     /** Human name of the open source file; survives a source-only Open. */
     private String documentLabel;
@@ -238,6 +274,7 @@ public class MainActivity extends Activity {
     private JSONArray documentModifierLinks = new JSONArray();
     private JSONArray documentCitations = new JSONArray();
     private JSONArray documentSegments = new JSONArray();
+    private SessionCatalog sessionCatalog = SessionCatalog.fake();
     private final CitationController citationController = new CitationController();
     private final java.util.LinkedHashMap<String, String[]> expandedSegments = new java.util.LinkedHashMap<>();
     private final NavigationController navigation = new NavigationController();
@@ -249,6 +286,57 @@ public class MainActivity extends Activity {
     private int diagnosticCount;
     private String fixtureText, fixtureModifier, fixtureTargets, fixtureModifier2, fixtureTargets2, fixtureMarker;
     private String fixtureOpenPath;
+    private String fixtureGateway;
+    private String fixtureGatewayGeneration;
+    private GatewayLeaseClient gatewayLease;
+    private boolean gatewayReady;
+    private boolean gatewayConnected;
+    private boolean gatewayAttaching;
+    private boolean sessionPinFixturePending;
+    private boolean figureA11yFixturePending;
+    private boolean vtSceneFixturePending;
+    private boolean vtSceneFixtureRunning;
+    private boolean vtSceneZoomFixture;
+    private boolean vtSceneA11yFixture;
+    private boolean vtScenePagesFixture;
+    private int vtSceneFrame;
+    private String terminalComposing = "";
+    private LinearLayout terminalKeyRow;
+    private LinearLayout terminalSelectionBar;
+    private static final int TERMINAL_CELL_WIDTH = 10;
+    private static final int TERMINAL_CELL_HEIGHT = 18;
+    /** Inclusive cell bounds of a long-press/drag selection in one scene. */
+    private RenderedPage terminalSelectionPage;
+    private int terminalSelectionIndex = -1;
+    private int terminalSelX0, terminalSelY0, terminalSelX1, terminalSelY1;
+    private boolean terminalSelecting;
+    /** Active button press routed to a program that enabled mouse reporting. */
+    private RenderedPage terminalMousePage;
+    private int terminalMouseIndex = -1;
+    private boolean terminalMousePressed;
+    /** Scenes that outlive a page-stack rebuild (view zoom/font reflow). */
+    private final java.util.ArrayList<TerminalTransfer> pendingTerminalTransfers =
+            new java.util.ArrayList<>();
+    /** Document identity that owns the current page stack. */
+    private String pageStackDocumentId = "";
+    private static final class TerminalTransfer {
+        final NativeTerminal scene;
+        final String reference;
+        final int pageIndex;
+        final boolean focused;
+        final boolean watchOnly;
+        final boolean conflict;
+        boolean claimed;
+        TerminalTransfer(NativeTerminal scene, String reference, int pageIndex,
+                boolean focused, boolean watchOnly, boolean conflict) {
+            this.scene = scene;
+            this.reference = reference;
+            this.pageIndex = pageIndex;
+            this.focused = focused;
+            this.watchOnly = watchOnly;
+            this.conflict = conflict;
+        }
+    }
     private boolean fixturePending;
     private String modifierStart;
     private String modifierEnd;
@@ -405,7 +493,18 @@ public class MainActivity extends Activity {
         }
         fixtureMarker = getIntent().getStringExtra("emthin.fixtureMarker");
         fixtureOpenPath = getIntent().getStringExtra("emthin.fixtureOpenPath");
-        fixturePending = fixtureText != null;
+        fixtureGateway = getIntent().getStringExtra("emthin.fixtureGateway");
+        fixtureGatewayGeneration = getIntent().getStringExtra("emthin.fixtureGatewayGeneration");
+        sessionPinFixturePending = getIntent().getBooleanExtra("emthin.fixtureSessionPin", false);
+        figureA11yFixturePending = getIntent().getBooleanExtra("emthin.fixtureFigureA11y", false);
+        vtSceneFixturePending = getIntent().getBooleanExtra("emthin.fixtureVtScene", false);
+        vtSceneZoomFixture = getIntent().getBooleanExtra("emthin.fixtureVtZoom", false);
+        vtSceneA11yFixture = getIntent().getBooleanExtra("emthin.fixtureVtA11y", false);
+        vtScenePagesFixture = getIntent().getBooleanExtra("emthin.fixtureVtPages", false);
+        float fixtureZoom = getIntent().getFloatExtra("emthin.fixtureViewZoom", -1f);
+        if (fixtureZoom >= 1f) viewZoom = Math.min(4f, fixtureZoom);
+        fixturePending = fixtureText != null || sessionPinFixturePending
+                || figureA11yFixturePending || vtSceneFixturePending;
 
         buildUi();
         previewBox.post(new Runnable() {
@@ -851,6 +950,7 @@ public class MainActivity extends Activity {
         captureRecoveryNow();
         resetNavigation();
         if (fixture) installModifierFixture();
+        if (sessionPinFixturePending) runSessionPinFixture();
         if (fixtureOpenPath != null) {
             String path = fixtureOpenPath;
             fixtureOpenPath = null;
@@ -858,6 +958,205 @@ public class MainActivity extends Activity {
             setDocumentLabel(uri.getLastPathSegment());
             readDocument(uri, session.capture(PadSession.OPEN, "fixtureOpen"));
         }
+    }
+
+    /**
+     * Device-lane fixture: pin the first live session, then remove and restore
+     * the figure with Undo/Redo before the normal autosave/reopen check. The
+     * public reference is the only catalogue field used.
+     */
+    private void runSessionPinFixture() {
+        sessionPinFixturePending = false;
+        if (sessionCatalog.entries().isEmpty()) {
+            trace("sessionPin", "phase", "failed", "reason", "empty-catalogue");
+            return;
+        }
+        SessionCatalog.Entry entry = sessionCatalog.entries().get(0);
+        String reference = entry.reference;
+        pinSession(entry);
+        if (!editor.getText().toString().contains(reference)) {
+            trace("sessionPin", "phase", "failed", "reason", "pin-not-applied");
+            return;
+        }
+        trace("sessionPin", "phase", "pinned", "textLen", editor.length(),
+                "reference", reference);
+
+        applyUndo();
+        if (editor.getText().toString().contains(reference)) {
+            trace("sessionPin", "phase", "failed", "reason", "undo-kept-reference");
+            return;
+        }
+        trace("sessionPin", "phase", "undo", "textLen", editor.length());
+
+        applyState(DocBridge.redo(handle), true);
+        if (!editor.getText().toString().contains(reference)) {
+            trace("sessionPin", "phase", "failed", "reason", "redo-lost-reference");
+            return;
+        }
+        trace("sessionPin", "phase", "complete", "textLen", editor.length(),
+                "reference", reference);
+    }
+
+    /**
+     * Device-lane fixture: query the rendered figure node, prove its state and
+     * custom actions, then activate focus, go, detach and Sessions through the
+     * accessibility provider rather than by tapping the page.
+     */
+    private void runFigureA11yFixture(RenderedPage page) {
+        figureA11yFixturePending = false;
+        int index = -1;
+        for (int i = 0; i < page.figures.length(); i++) {
+            JSONObject figure = page.figures.optJSONObject(i);
+            if (figure != null && !jsonString(figure, "reference").isEmpty()) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0) {
+            trace("figureA11y", "phase", "failed", "reason", "no-terminal-figure");
+            return;
+        }
+        int id = RenderedPage.FIGURE_NODE_BASE + index;
+        android.view.accessibility.AccessibilityNodeProvider provider =
+                page.getAccessibilityNodeProvider();
+        android.view.accessibility.AccessibilityNodeInfo info =
+                provider.createAccessibilityNodeInfo(id);
+        if (info == null) {
+            trace("figureA11y", "phase", "failed", "reason", "no-node");
+            return;
+        }
+        String description = String.valueOf(info.getContentDescription());
+        trace("figureA11y", "phase", "nodes", "description", description,
+                "go", hasFigureAction(info, RenderedPage.ACTION_FIGURE_GO),
+                "rebind", hasFigureAction(info, RenderedPage.ACTION_FIGURE_REBIND),
+                "detach", hasFigureAction(info, RenderedPage.ACTION_FIGURE_DETACH),
+                "sessions", hasFigureAction(info, RenderedPage.ACTION_FIGURE_SESSIONS));
+        if (!description.contains("Watching")
+                || !hasFigureAction(info, RenderedPage.ACTION_FIGURE_GO)
+                || !hasFigureAction(info, RenderedPage.ACTION_FIGURE_REBIND)
+                || !hasFigureAction(info, RenderedPage.ACTION_FIGURE_DETACH)
+                || !hasFigureAction(info, RenderedPage.ACTION_FIGURE_SESSIONS)) {
+            trace("figureA11y", "phase", "failed", "reason", "node-contract");
+            return;
+        }
+        trace("figureA11y", "phase", "focus-request");
+        if (!provider.performAction(id,
+                android.view.accessibility.AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null)) {
+            trace("figureA11y", "phase", "failed", "reason", "focus-action");
+            return;
+        }
+        trace("figureA11y", "phase", "focus-action");
+        android.view.accessibility.AccessibilityNodeInfo focused = provider.findFocus(
+                android.view.accessibility.AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
+        trace("figureA11y", "phase", "focus-found", "node", focused != null);
+        if (focused == null || !String.valueOf(focused.getContentDescription()).contains("Watching")) {
+            trace("figureA11y", "phase", "failed", "reason", "focus-not-found");
+            return;
+        }
+        trace("figureA11y", "phase", "focus", "description", focused.getContentDescription());
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_GO, null)) {
+            trace("figureA11y", "phase", "failed", "reason", "go-action");
+            return;
+        }
+        trace("figureA11y", "phase", "go");
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_DETACH, null)) {
+            trace("figureA11y", "phase", "failed", "reason", "detach-action");
+            return;
+        }
+        info = provider.createAccessibilityNodeInfo(id);
+        String detached = info == null ? "" : String.valueOf(info.getContentDescription());
+        if (!detached.contains("Live on")) {
+            trace("figureA11y", "phase", "failed", "reason", "detach-state",
+                    "description", detached);
+            return;
+        }
+        trace("figureA11y", "phase", "detach", "description", detached);
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_SESSIONS, null)) {
+            trace("figureA11y", "phase", "failed", "reason", "sessions-action");
+            return;
+        }
+        trace("figureA11y", "phase", "sessions");
+        trace("figureA11y", "phase", "complete");
+    }
+
+    /** Exercise the terminal figure's accessibility actions through the
+     *  provider, the same path an accessibility service uses. */
+    private void runVtSceneA11yFixture(RenderedPage page, int index) {
+        if (!vtSceneA11yFixture) return;
+        vtSceneA11yFixture = false;
+        int id = RenderedPage.FIGURE_NODE_BASE + index;
+        android.view.accessibility.AccessibilityNodeProvider provider =
+                page.getAccessibilityNodeProvider();
+        android.view.accessibility.AccessibilityNodeInfo info =
+                provider.createAccessibilityNodeInfo(id);
+        boolean focus = info != null && hasFigureAction(info,
+                RenderedPage.ACTION_FIGURE_TERMINAL_FOCUS);
+        boolean copy = info != null && hasFigureAction(info,
+                RenderedPage.ACTION_FIGURE_TERMINAL_COPY);
+        boolean paste = info != null && hasFigureAction(info,
+                RenderedPage.ACTION_FIGURE_TERMINAL_PASTE);
+        trace("vtA11y", "phase", "node", "focus", focus, "copy", copy, "paste", paste);
+        if (!focus || !copy || !paste) {
+            trace("vtA11y", "phase", "failed", "reason", "actions");
+            return;
+        }
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_TERMINAL_FOCUS, null)) {
+            trace("vtA11y", "phase", "failed", "reason", "focus-action");
+            return;
+        }
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_TERMINAL_COPY, null)) {
+            trace("vtA11y", "phase", "failed", "reason", "copy-action");
+            return;
+        }
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        int chars = 0;
+        if (clipboard != null && clipboard.hasPrimaryClip()
+                && clipboard.getPrimaryClip() != null
+                && clipboard.getPrimaryClip().getItemCount() > 0) {
+            CharSequence value = clipboard.getPrimaryClip().getItemAt(0).coerceToText(this);
+            chars = value == null ? 0 : value.length();
+        }
+        trace("vtA11y", "phase", "copy", "chars", chars);
+        if (chars == 0) {
+            trace("vtA11y", "phase", "failed", "reason", "empty-copy");
+            return;
+        }
+        // The initial fixture session is watched. Take control before the
+        // paste action so it reaches the scene rather than the read-only gate.
+        focusTerminal(page, index);
+        setTerminalControl(false);
+        if (clipboard != null) clipboard.setPrimaryClip(
+                android.content.ClipData.newPlainText("Terminal", "a11y-paste"));
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_TERMINAL_PASTE, null)) {
+            trace("vtA11y", "phase", "failed", "reason", "paste-action");
+            return;
+        }
+        // A conflicting lease is also read-only, but it must be shown as a
+        // conflict rather than silently looking like ordinary watching.
+        page.terminalConflict[index] = true;
+        page.invalidate();
+        trace("terminalInput", "control", "conflict",
+                "page", page.index, "index", index);
+        if (!provider.performAction(id, RenderedPage.ACTION_FIGURE_TERMINAL_PASTE, null)) {
+            trace("vtA11y", "phase", "failed", "reason", "conflict-paste-action");
+            return;
+        }
+        trace("vtA11y", "phase", "complete");
+    }
+
+    /** Android's optString turns a JSON null into the text "null". */
+    private static String jsonString(JSONObject object, String key) {
+        return object == null || object.isNull(key) ? "" : object.optString(key, "");
+    }
+
+    private static boolean hasFigureAction(
+            android.view.accessibility.AccessibilityNodeInfo info, int id) {
+        for (android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction action
+                : info.getActionList()) {
+            if (action.getId() == id) return true;
+        }
+        return false;
     }
 
     /** Test-only hook: link a modifier pair to target pairs and open the inspector. */
@@ -1312,6 +1611,11 @@ public class MainActivity extends Activity {
         dismissFileCancel();
         // Invalidate first: a result already posted to `main` must not touch
         // this view while the native handle is being freed.
+        closeGatewayLease();
+        if (shareHandle != 0) {
+            DocBridge.shareClose(shareHandle);
+            shareHandle = 0;
+        }
         session.dispose();
         if (find != null) find.cancel();
         renderWork.close();
@@ -1324,6 +1628,10 @@ public class MainActivity extends Activity {
         // Already-captured bytes may finish; they never touch this view.
         recoveryWorker.shutdown();
         releasePageBitmaps();
+        for (TerminalTransfer transfer : pendingTerminalTransfers) {
+            transfer.scene.close();
+        }
+        pendingTerminalTransfers.clear();
         if (handle != 0) {
             DocBridge.free(handle);
             handle = 0;
@@ -1388,6 +1696,21 @@ public class MainActivity extends Activity {
             }
         }));
         root.addView(selectionBar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        terminalSelectionBar = new LinearLayout(this);
+        terminalSelectionBar.setOrientation(LinearLayout.HORIZONTAL);
+        terminalSelectionBar.setBackgroundColor(Color.parseColor("#1A2229"));
+        terminalSelectionBar.setVisibility(View.GONE);
+        terminalSelectionBar.addView(shortcut("Copy", new Runnable() {
+            @Override public void run() { copyTerminalSelection(); }
+        }));
+        terminalSelectionBar.addView(shortcut("Paste", new Runnable() {
+            @Override public void run() { pasteTerminalClipboard(); }
+        }));
+        terminalSelectionBar.addView(shortcut("Close", new Runnable() {
+            @Override public void run() { clearTerminalSelection(); }
+        }));
+        root.addView(terminalSelectionBar, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         searchBar = new LinearLayout(this);
         searchBar.setOrientation(LinearLayout.VERTICAL);
@@ -1558,7 +1881,34 @@ public class MainActivity extends Activity {
                 }
                 ensureVisiblePages();
                 trimPageBitmaps();
+                for (RenderedPage page : renderedPages) page.clipTerminalSurfaces();
                 rememberReadingAnchor();
+            }
+        });
+        // The IME changes the preview viewport without a scroll. Recompute
+        // the z-ordered scene clip or it keeps the keyboard-shrunk height
+        // after the keyboard closes.
+        previewScroll.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                    int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                if (right - left == oldRight - oldLeft
+                        && bottom - top == oldBottom - oldTop) return;
+                for (RenderedPage page : renderedPages) page.clipTerminalSurfaces();
+            }
+        });
+        // The window's available height can change around the IME without
+        // this view's own layout rectangle changing. Observe the settled
+        // viewport size and re-clip the z-ordered surfaces when it differs.
+        final int[] lastViewport = new int[] {-1, -1};
+        previewScroll.getViewTreeObserver().addOnGlobalLayoutListener(
+                new ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override public void onGlobalLayout() {
+                int width = previewScroll.getWidth();
+                int height = previewScroll.getHeight();
+                if (width == lastViewport[0] && height == lastViewport[1]) return;
+                lastViewport[0] = width;
+                lastViewport[1] = height;
+                for (RenderedPage page : renderedPages) page.clipTerminalSurfaces();
             }
         });
         // A touch means the user owns the reading position now. Drop a
@@ -1577,8 +1927,39 @@ public class MainActivity extends Activity {
         });
         root.addView(previewScroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // A terminal-focused key row supplies named keys the soft keyboard does
+        // not expose. It stays out of the document layout until a figure owns
+        // focus, so the normal reader keeps its full height.
+        terminalKeyRow = new LinearLayout(this);
+        terminalKeyRow.setOrientation(LinearLayout.HORIZONTAL);
+        terminalKeyRow.setVisibility(View.GONE);
+        terminalKeyRow.setBackgroundColor(Color.parseColor("#202830"));
+        terminalKeyRow.addView(terminalKeyButton("Esc", KeyEvent.KEYCODE_ESCAPE));
+        terminalKeyRow.addView(terminalKeyButton("Tab", KeyEvent.KEYCODE_TAB));
+        terminalKeyRow.addView(terminalKeyButton("←", KeyEvent.KEYCODE_DPAD_LEFT));
+        terminalKeyRow.addView(terminalKeyButton("↑", KeyEvent.KEYCODE_DPAD_UP));
+        terminalKeyRow.addView(terminalKeyButton("↓", KeyEvent.KEYCODE_DPAD_DOWN));
+        terminalKeyRow.addView(terminalKeyButton("→", KeyEvent.KEYCODE_DPAD_RIGHT));
+        terminalKeyRow.addView(terminalKeyButton("Ctrl-C", KeyEvent.KEYCODE_C, true));
+        terminalKeyRow.addView(shortcut("Watch", new Runnable() {
+            @Override public void run() { setTerminalControl(true); }
+        }));
+        terminalKeyRow.addView(shortcut("Take", new Runnable() {
+            @Override public void run() { setTerminalControl(false); }
+        }));
+        terminalKeyRow.addView(shortcut("Done", new Runnable() {
+            @Override public void run() { releaseTerminalFocus(); }
+        }));
+        root.addView(terminalKeyRow, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        // The inspector needs room for its relationship list. An equal split
+        // with the preview leaves only ~118dp on a short landscape tablet,
+        // which clips every row after the first.
         root.addView(modifierPanel, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f));
 
         setContentView(root);
     }
@@ -1715,6 +2096,14 @@ public class MainActivity extends Activity {
             exportRecoveryBytes(data.getData());
             return;
         }
+        if (requestCode == REQUEST_PROOF) {
+            if (resultCode != RESULT_OK || data == null) return;
+            String proofId = data.getStringExtra("emthin.proof_id");
+            String proofLink = data.getStringExtra("emthin.proof_link");
+            if (proofId == null || proofId.isEmpty()) return;
+            insertProofResult(proofId, proofLink == null ? "" : proofLink);
+            return;
+        }
         PendingPicker picker = pendingPicker;
         if (picker == null || picker.requestCode != requestCode) {
             if (requestCode == OPEN_DOCUMENT || requestCode == SAVE_DOCUMENT
@@ -1738,6 +2127,23 @@ public class MainActivity extends Activity {
         catch (SecurityException e) { Log.w("emthin-pad", "document access is temporary", e); }
         if (requestCode == OPEN_DOCUMENT) readDocument(uri, picker.owner);
         else beginSave(uri, picker.copy, false, false);
+    }
+
+    /**
+     * Insert a proof result into the note as ordinary prose at the caret. The
+     * editor watcher funnels the change through DocBridge.sync, so this is one
+     * grouped edit and follows the same undo/recovery path as typing.
+     */
+    private void insertProofResult(String proofId, String proofLink) {
+        String line = "\nProof ID: " + proofId
+                + (proofLink.isEmpty() ? "" : "\nResult link: " + proofLink) + "\n";
+        Editable text = editor.getText();
+        int at = editor.getSelectionStart();
+        if (at < 0 || at > text.length()) at = text.length();
+        text.insert(at, line);
+        editor.setSelection(at + line.length());
+        setStatus("Proof " + proofId + " inserted");
+        trace("proof", "inserted", proofId);
     }
 
     private void exportRecoveryBytes(final Uri uri) {
@@ -2464,14 +2870,363 @@ public class MainActivity extends Activity {
         focusSourceCaret();
     }
 
-    private final class RenderedPage extends ImageView {
+    /**
+     * A terminal scene submitted to a real GLES window surface. The native
+     * scene still composes its RGBA raster; this view owns the EGL14 window
+     * surface and uploads that raster into the page's texture layer instead
+     * of blitting it through Canvas.
+     */
+    private final class TerminalSurface extends SurfaceView implements SurfaceHolder.Callback {
+        private final int pageIndex;
+        private final NativeTerminal scene;
+        private int texture;
+        private EGLDisplay eglDisplay = EGL14.EGL_NO_DISPLAY;
+        private EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
+        private EGLSurface eglSurface = EGL14.EGL_NO_SURFACE;
+        private EGLConfig eglConfig;
+        private Surface eglWindow;
+        private int program;
+        private int positionSlot = -1;
+        private int uvSlot = -1;
+        private int textureSlot = -1;
+        private int bufferWidth;
+        private int bufferHeight;
+        private float u0, v0, u1 = 1f, v1 = 1f;
+        private boolean glReady;
+        private boolean rendered;
+        private boolean repaintRequested;
+        private String repaintReason = "layout";
+        private boolean framePosted;
+        private boolean failed;
+
+        TerminalSurface(android.content.Context context, int pageIndex,
+                NativeTerminal scene) {
+            super(context);
+            this.pageIndex = pageIndex;
+            this.scene = scene;
+            setZOrderOnTop(true);
+            setClickable(false);
+            setFocusable(false);
+            setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            getHolder().addCallback(this);
+        }
+
+        boolean submitting() {
+            return rendered;
+        }
+
+        /** Force one fresh submission after the surface was hidden or detached. */
+        void repaint(String reason) {
+            rendered = false;
+            repaintRequested = true;
+            repaintReason = reason;
+            requestFrame();
+        }
+
+        void requestFrame() {
+            if (failed || framePosted || !surfaceReady()) return;
+            framePosted = true;
+            postOnAnimation(new Runnable() {
+                @Override public void run() {
+                    framePosted = false;
+                    renderFrame();
+                }
+            });
+        }
+
+        /** Drop the EGL objects so the fixture can prove a context loss. */
+        /** Visible fraction of the full scene texture for a clipped surface. */
+        void setCrop(float left, float top, float right, float bottom) {
+            u0 = Math.max(0f, Math.min(1f, left));
+            v0 = Math.max(0f, Math.min(1f, top));
+            u1 = Math.max(u0, Math.min(1f, right));
+            v1 = Math.max(v0, Math.min(1f, bottom));
+        }
+
+        void recreateContext() {
+            if (!surfaceReady()) return;
+            releaseGl();
+            if (setupGl(eglWindow)) requestFrame();
+        }
+
+        void release() {
+            releaseGl();
+            eglWindow = null;
+        }
+
+        @Override public void surfaceCreated(SurfaceHolder holder) {
+            eglWindow = holder.getSurface();
+            if (setupGl(eglWindow)) requestFrame();
+        }
+
+        @Override public void surfaceChanged(SurfaceHolder holder, int format,
+                int width, int height) {
+            eglWindow = holder.getSurface();
+            requestFrame();
+        }
+
+        @Override public void surfaceDestroyed(SurfaceHolder holder) {
+            releaseGl();
+            eglWindow = null;
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            releaseGl();
+            super.onDetachedFromWindow();
+        }
+
+        private boolean surfaceReady() {
+            return eglWindow != null && eglWindow.isValid();
+        }
+
+        private boolean setupGl(Surface target) {
+            if (failed) return false;
+            releaseGl();
+            try {
+                eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+                if (eglDisplay == EGL14.EGL_NO_DISPLAY) throw new IllegalStateException("no EGL display");
+                int[] version = new int[2];
+                if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) {
+                    throw new IllegalStateException("eglInitialize failed");
+                }
+                int[] attributes = new int[] {
+                        EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                        EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                        EGL14.EGL_RED_SIZE, 8,
+                        EGL14.EGL_GREEN_SIZE, 8,
+                        EGL14.EGL_BLUE_SIZE, 8,
+                        EGL14.EGL_ALPHA_SIZE, 8,
+                        EGL14.EGL_NONE,
+                };
+                EGLConfig[] configs = new EGLConfig[1];
+                int[] selected = new int[1];
+                if (!EGL14.eglChooseConfig(eglDisplay, attributes, 0, configs, 0, 1, selected, 0)
+                        || selected[0] == 0) {
+                    throw new IllegalStateException("no EGL window config");
+                }
+                eglConfig = configs[0];
+                eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig,
+                        EGL14.EGL_NO_CONTEXT,
+                        new int[] {EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE}, 0);
+                if (eglContext == EGL14.EGL_NO_CONTEXT) {
+                    throw new IllegalStateException("eglCreateContext failed");
+                }
+                eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig,
+                        target, new int[] {EGL14.EGL_NONE}, 0);
+                if (eglSurface == EGL14.EGL_NO_SURFACE) {
+                    throw new IllegalStateException("eglCreateWindowSurface failed");
+                }
+                if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+                    throw new IllegalStateException("eglMakeCurrent failed");
+                }
+                int[] textures = new int[1];
+                GLES20.glGenTextures(1, textures, 0);
+                texture = textures[0];
+                program = GLES20.glCreateProgram();
+                int vertex = compileShader(GLES20.GL_VERTEX_SHADER,
+                        "attribute vec2 a_pos;\n"
+                                + "attribute vec2 a_uv;\n"
+                                + "varying vec2 v_uv;\n"
+                                + "void main(){\n"
+                                + "  gl_Position=vec4(a_pos,0.0,1.0);\n"
+                                + "  v_uv=a_uv;\n"
+                                + "}\n");
+                int fragment = compileShader(GLES20.GL_FRAGMENT_SHADER,
+                        "precision mediump float;\n"
+                                + "uniform sampler2D u_texture;\n"
+                                + "varying vec2 v_uv;\n"
+                                + "void main(){gl_FragColor=texture2D(u_texture,v_uv);}\n");
+                GLES20.glAttachShader(program, vertex);
+                GLES20.glAttachShader(program, fragment);
+                GLES20.glLinkProgram(program);
+                int[] linked = new int[1];
+                GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linked, 0);
+                GLES20.glDeleteShader(vertex);
+                GLES20.glDeleteShader(fragment);
+                if (linked[0] == 0) {
+                    throw new IllegalStateException("shader link: "
+                            + GLES20.glGetProgramInfoLog(program));
+                }
+                positionSlot = GLES20.glGetAttribLocation(program, "a_pos");
+                uvSlot = GLES20.glGetAttribLocation(program, "a_uv");
+                textureSlot = GLES20.glGetUniformLocation(program, "u_texture");
+                glReady = true;
+                rendered = false;
+                failed = false;
+                trace("vtScene", "gl", "surface", "page", pageIndex,
+                        "texture", textureId());
+                return true;
+            } catch (RuntimeException error) {
+                trace("vtScene", "gl", "failed", "page", pageIndex,
+                        "reason", error.getMessage());
+                releaseGl();
+                return false;
+            }
+        }
+
+        private int textureId() {
+            return texture;
+        }
+
+        private int compileShader(int type, String source) {
+            int shader = GLES20.glCreateShader(type);
+            GLES20.glShaderSource(shader, source);
+            GLES20.glCompileShader(shader);
+            int[] compiled = new int[1];
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0);
+            if (compiled[0] == 0) {
+                String log = GLES20.glGetShaderInfoLog(shader);
+                GLES20.glDeleteShader(shader);
+                throw new IllegalStateException("shader compile: " + log);
+            }
+            return shader;
+        }
+
+        private void renderFrame() {
+            if (!glReady || failed || !surfaceReady() || scene == null) return;
+            Bitmap bitmap = scene.bitmap();
+            if (bitmap == null || bitmap.isRecycled()) return;
+            int width = bitmap.getWidth();
+            int height = bitmap.getHeight();
+            if (width <= 0 || height <= 0) return;
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+                releaseGl();
+                return;
+            }
+            try {
+                bufferWidth = width;
+                bufferHeight = height;
+                GLES20.glViewport(0, 0, Math.max(1, getWidth()), Math.max(1, getHeight()));
+                GLES20.glDisable(GLES20.GL_DEPTH_TEST);
+                GLES20.glClearColor(0.078f, 0.094f, 0.114f, 0.0f);
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+                GLES20.glUseProgram(program);
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER,
+                        GLES20.GL_NEAREST);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER,
+                        GLES20.GL_NEAREST);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S,
+                        GLES20.GL_CLAMP_TO_EDGE);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T,
+                        GLES20.GL_CLAMP_TO_EDGE);
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0);
+                GLES20.glUniform1i(textureSlot, 0);
+                GLES20.glEnableVertexAttribArray(positionSlot);
+                GLES20.glVertexAttribPointer(positionSlot, 2, GLES20.GL_FLOAT, false, 0,
+                        floatBuffer(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f));
+                GLES20.glEnableVertexAttribArray(uvSlot);
+                // Bitmap rows are top-down while GL texture rows are
+                // bottom-up, so the top vertices sample v=0. The crop keeps
+                // a clipped surface at the full terminal's scale.
+                GLES20.glVertexAttribPointer(uvSlot, 2, GLES20.GL_FLOAT, false, 0,
+                        floatBuffer(u0, v1, u1, v1, u0, v0, u1, v0));
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                GLES20.glDisableVertexAttribArray(positionSlot);
+                GLES20.glDisableVertexAttribArray(uvSlot);
+                boolean firstFrame = !rendered;
+                String sampleText = "";
+                if (firstFrame) {
+                    java.nio.ByteBuffer sample = ByteBuffer.allocateDirect(4);
+                    GLES20.glReadPixels(Math.max(0, getWidth() / 2),
+                            Math.max(0, getHeight() / 2),
+                            1, 1, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, sample);
+                    sampleText = (sample.get(0) & 0xff) + "," + (sample.get(1) & 0xff)
+                            + "," + (sample.get(2) & 0xff) + "," + (sample.get(3) & 0xff);
+                }
+                int glError = GLES20.glGetError();
+                if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) {
+                    releaseGl();
+                    return;
+                }
+                if (firstFrame) {
+                    rendered = true;
+                    trace("vtScene", "gl", "frame", "page", pageIndex,
+                            "w", width, "h", height, "rgba", sampleText,
+                            "surface", getWidth() + "x" + getHeight(),
+                            "error", glError);
+                    if (repaintRequested) {
+                        repaintRequested = false;
+                        trace("vtScene", "gl", "repaint", "page", pageIndex,
+                                "reason", repaintReason,
+                                "surface", getWidth() + "x" + getHeight());
+                    }
+                }
+            } finally {
+                EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+            }
+        }
+
+        private java.nio.FloatBuffer floatBuffer(float... values) {
+            java.nio.FloatBuffer buffer = ByteBuffer.allocateDirect(values.length * 4)
+                    .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer();
+            buffer.put(values).position(0);
+            return buffer;
+        }
+
+        private void releaseGl() {
+            glReady = false;
+            rendered = false;
+            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                if (eglSurface != EGL14.EGL_NO_SURFACE
+                        && eglContext != EGL14.EGL_NO_CONTEXT) {
+                    EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+                }
+                if (program != 0) GLES20.glDeleteProgram(program);
+                if (texture != 0) GLES20.glDeleteTextures(1, new int[] {texture}, 0);
+                EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+                if (eglSurface != EGL14.EGL_NO_SURFACE) {
+                    EGL14.eglDestroySurface(eglDisplay, eglSurface);
+                }
+                if (eglContext != EGL14.EGL_NO_CONTEXT) {
+                    EGL14.eglDestroyContext(eglDisplay, eglContext);
+                }
+                EGL14.eglTerminate(eglDisplay);
+            }
+            program = 0;
+            texture = 0;
+            eglSurface = EGL14.EGL_NO_SURFACE;
+            eglContext = EGL14.EGL_NO_CONTEXT;
+            eglDisplay = EGL14.EGL_NO_DISPLAY;
+            eglConfig = null;
+            bufferWidth = 0;
+            bufferHeight = 0;
+        }
+    }
+
+    private final class RenderedPage extends FrameLayout {
         final int index;
+        final ImageView image;
         JSONArray hits = new JSONArray();
         TextView caption;
         double textTop = -1;
         double widthPt = PAGE_WIDTH_PT;
         double heightPt = 841.89;
         boolean hasFigures;
+        JSONArray figures = new JSONArray();
+        NativeTerminal[] terminalScenes;
+        TerminalSurface[] terminalSurfaces;
+        int terminalFocus = -1;
+        int[] terminalGridWidths;
+        int[] terminalGridHeights;
+        /** True while this viewer only follows output and cannot input. */
+        boolean[] terminalWatchOnly;
+        /** A conflicting control lease; input stays blocked until resolved. */
+        boolean[] terminalConflict;
+        int accessibilityFocusFigure = -1;
+        static final int FIGURE_NODE_BASE = 100000;
+        // Resource-style custom action ids; the low 0x0102xxxx range belongs
+        // to framework actions such as NEXT_HTML_ELEMENT.
+        static final int ACTION_FIGURE_GO = 0x7f0f0001;
+        static final int ACTION_FIGURE_REBIND = 0x7f0f0002;
+        static final int ACTION_FIGURE_DETACH = 0x7f0f0003;
+        static final int ACTION_FIGURE_SESSIONS = 0x7f0f0004;
+        static final int ACTION_FIGURE_TERMINAL_FOCUS = 0x7f0f0005;
+        static final int ACTION_FIGURE_TERMINAL_COPY = 0x7f0f0006;
+        static final int ACTION_FIGURE_TERMINAL_PASTE = 0x7f0f0007;
         boolean loaded;
         long bitmapBytes;
         long lastVisible;
@@ -2479,11 +3234,17 @@ public class MainActivity extends Activity {
         RenderedPage(android.content.Context context, int index) {
             super(context);
             this.index = index;
+            image = new ImageView(context);
+            image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            addView(image, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
             caretPaint.setColor(Color.parseColor("#B3CFE4"));
             caretPaint.setStyle(Paint.Style.STROKE);
             caretPaint.setStrokeWidth(Math.max(2f, getResources().getDisplayMetrics().density));
             setFocusable(true);
             setFocusableInTouchMode(true);
+            setClipChildren(true);
         }
         float pointScale() {
             return (float) (getWidth() / Math.max(1.0, widthPt));
@@ -2544,44 +3305,136 @@ public class MainActivity extends Activity {
                     createAccessibilityNodeInfo(int virtualViewId) {
                 if (virtualViewId == HOST_VIEW_ID) return hostNode();
                 List<AccessibleBlock> blocks = accessibleBlocks(RenderedPage.this);
-                if (virtualViewId < 0 || virtualViewId >= blocks.size()) return null;
-                return blockNode(virtualViewId, blocks.get(virtualViewId));
+                if (virtualViewId >= 0 && virtualViewId < blocks.size()) {
+                    return blockNode(virtualViewId, blocks.get(virtualViewId));
+                }
+                int figureIndex = virtualViewId - FIGURE_NODE_BASE;
+                if (loaded && figureIndex >= 0 && figureIndex < figures.length()) {
+                    return figureNode(figureIndex, figures.optJSONObject(figureIndex));
+                }
+                return null;
             }
             @Override public boolean performAction(int virtualViewId, int action,
                     android.os.Bundle arguments) {
                 if (!loaded) return false;
                 if (virtualViewId == HOST_VIEW_ID) return false;
                 List<AccessibleBlock> blocks = accessibleBlocks(RenderedPage.this);
-                if (virtualViewId < 0 || virtualViewId >= blocks.size()) return false;
-                AccessibleBlock block = blocks.get(virtualViewId);
-                if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
-                    activateAccessibleBlock(block);
-                    sendAccessibilityNodeEvent(virtualViewId,
-                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED, block);
+                if (virtualViewId >= 0 && virtualViewId < blocks.size()) {
+                    AccessibleBlock block = blocks.get(virtualViewId);
+                    if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
+                        activateAccessibleBlock(block);
+                        sendAccessibilityNodeEvent(virtualViewId,
+                                android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED, block);
+                        return true;
+                    }
+                    if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS) {
+                        accessibilityFocusOffset = block.start;
+                        accessibilityFocusFigure = -1;
+                        invalidate();
+                        sendAccessibilityNodeEvent(virtualViewId,
+                                android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED, block);
+                        return true;
+                    }
+                    if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLEAR_ACCESSIBILITY_FOCUS) {
+                        if (accessibilityFocusOffset >= block.start
+                                && accessibilityFocusOffset < Math.max(block.start + 1, block.end)) {
+                            accessibilityFocusOffset = -1;
+                        }
+                        invalidate();
+                        sendAccessibilityNodeEvent(virtualViewId,
+                                android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED, block);
+                        return true;
+                    }
+                    return false;
+                }
+                int figureIndex = virtualViewId - FIGURE_NODE_BASE;
+                if (figureIndex < 0 || figureIndex >= figures.length()) return false;
+                JSONObject figure = figures.optJSONObject(figureIndex);
+                if (figure == null) return false;
+                String reference = jsonString(figure, "reference");
+                SessionCatalog.Entry entry = reference.isEmpty()
+                        ? null : sessionCatalog.byReference(reference);
+                if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK
+                        || action == ACTION_FIGURE_GO) {
+                    if (!reference.isEmpty() && jsonString(figure, "bindingError").isEmpty()) {
+                        goToFigure(RenderedPage.this, figure);
+                    } else {
+                        showSessions();
+                    }
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED,
+                            figureDescription(figure));
+                    return true;
+                }
+                if (action == ACTION_FIGURE_REBIND && entry != null) {
+                    showRebindDialog(entry);
+                    return true;
+                }
+                if (action == ACTION_FIGURE_DETACH && entry != null && entry.canDetach()) {
+                    sessionCatalog = sessionCatalog.detach(entry.reference);
+                    invalidate();
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED,
+                            entry.caption + ". Detached. The session stays on its host.");
+                    return true;
+                }
+                if (action == ACTION_FIGURE_SESSIONS) {
+                    showSessions();
+                    return true;
+                }
+                boolean hasTerminal = terminalScenes != null
+                        && figureIndex < terminalScenes.length
+                        && terminalScenes[figureIndex] != null;
+                if (hasTerminal && action == ACTION_FIGURE_TERMINAL_FOCUS) {
+                    focusTerminal(RenderedPage.this, figureIndex);
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED,
+                            "Terminal focused. Type to send input.");
+                    return true;
+                }
+                if (hasTerminal && action == ACTION_FIGURE_TERMINAL_COPY) {
+                    copyTerminalOutput(RenderedPage.this, figureIndex);
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED,
+                            "Terminal output copied.");
+                    return true;
+                }
+                if (hasTerminal && action == ACTION_FIGURE_TERMINAL_PASTE) {
+                    focusTerminal(RenderedPage.this, figureIndex);
+                    pasteTerminalClipboard();
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED,
+                            "Pasted into terminal.");
                     return true;
                 }
                 if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS) {
-                    accessibilityFocusOffset = block.start;
+                    accessibilityFocusFigure = figureIndex;
+                    accessibilityFocusOffset = -1;
                     invalidate();
-                    sendAccessibilityNodeEvent(virtualViewId,
-                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED, block);
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED,
+                            figureDescription(figure));
                     return true;
                 }
                 if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLEAR_ACCESSIBILITY_FOCUS) {
-                    if (accessibilityFocusOffset >= block.start
-                            && accessibilityFocusOffset < Math.max(block.start + 1, block.end)) {
-                        accessibilityFocusOffset = -1;
-                    }
+                    if (accessibilityFocusFigure == figureIndex) accessibilityFocusFigure = -1;
                     invalidate();
-                    sendAccessibilityNodeEvent(virtualViewId,
-                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED, block);
+                    sendFigureEvent(virtualViewId,
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED,
+                            figureDescription(figure));
                     return true;
                 }
                 return false;
             }
             @Override public android.view.accessibility.AccessibilityNodeInfo findFocus(int focus) {
-                if (focus != android.view.accessibility.AccessibilityNodeInfo.FOCUS_ACCESSIBILITY
-                        || accessibilityFocusOffset < 0) return null;
+                if (focus != android.view.accessibility.AccessibilityNodeInfo.FOCUS_ACCESSIBILITY) {
+                    return null;
+                }
+                if (accessibilityFocusFigure >= 0 && accessibilityFocusFigure < figures.length()) {
+                    return figureNode(accessibilityFocusFigure,
+                            figures.optJSONObject(accessibilityFocusFigure));
+                }
+                if (accessibilityFocusOffset < 0) return null;
                 List<AccessibleBlock> blocks = accessibleBlocks(RenderedPage.this);
                 for (int i = 0; i < blocks.size(); i++) {
                     AccessibleBlock block = blocks.get(i);
@@ -2628,6 +3481,9 @@ public class MainActivity extends Activity {
             if (loaded) {
                 List<AccessibleBlock> blocks = accessibleBlocks(RenderedPage.this);
                 for (int i = 0; i < blocks.size(); i++) info.addChild(RenderedPage.this, i);
+                for (int i = 0; i < figures.length(); i++) {
+                    info.addChild(RenderedPage.this, FIGURE_NODE_BASE + i);
+                }
             } else if (!pagesStale && renderOwner != null) {
                 // Accessibility focus can reach a placeholder before the
                 // visual viewport does. Load just that page, never the
@@ -2677,7 +3533,474 @@ public class MainActivity extends Activity {
             return info;
         }
 
+        private SessionCatalog.Entry figureEntry(JSONObject figure) {
+            if (figure == null) return null;
+            String reference = jsonString(figure, "reference");
+            return reference.isEmpty() ? null : sessionCatalog.byReference(reference);
+        }
+
+        private String figureDescription(JSONObject figure) {
+            return SessionCatalog.figureDescription(figureEntry(figure),
+                    jsonString(figure, "reference"),
+                    jsonString(figure, "bindingError"));
+        }
+
+        private android.view.accessibility.AccessibilityNodeInfo figureNode(
+                int index, JSONObject figure) {
+            if (figure == null) return null;
+            android.view.accessibility.AccessibilityNodeInfo info =
+                    new android.view.accessibility.AccessibilityNodeInfo();
+            int id = FIGURE_NODE_BASE + index;
+            info.setSource(RenderedPage.this, id);
+            info.setParent(RenderedPage.this);
+            info.setPackageName(getPackageName());
+            info.setClassName("android.view.View");
+            String description = figureDescription(figure);
+            if (terminalScenes != null && index < terminalScenes.length
+                    && terminalScenes[index] != null && terminalWatchOnly != null
+                    && index < terminalWatchOnly.length && terminalWatchOnly[index]) {
+                description += " Read-only; take control to type.";
+            }
+            info.setContentDescription(description);
+            info.setEnabled(true);
+            info.setFocusable(true);
+            info.setClickable(true);
+            float scale = pointScale();
+            int[] location = new int[2];
+            getLocationOnScreen(location);
+            android.graphics.Rect local = new android.graphics.Rect(
+                    Math.round((float) figure.optDouble("x", 0) * scale),
+                    Math.round((float) figure.optDouble("y", 0) * scale),
+                    Math.round((float) (figure.optDouble("x", 0)
+                            + figure.optDouble("w", 0)) * scale),
+                    Math.round((float) (figure.optDouble("y", 0)
+                            + figure.optDouble("h", 0)) * scale));
+            info.setBoundsInScreen(new android.graphics.Rect(local.left + location[0],
+                    local.top + location[1], local.right + location[0],
+                    local.bottom + location[1]));
+            android.graphics.Rect visible = new android.graphics.Rect();
+            info.setVisibleToUser(pageVisibleToUser()
+                    && getLocalVisibleRect(visible) && android.graphics.Rect.intersects(visible, local));
+            boolean focused = accessibilityFocusFigure == index;
+            info.setAccessibilityFocused(focused);
+            info.addAction(android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK);
+            info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                    ACTION_FIGURE_GO, "Go to figure"));
+            SessionCatalog.Entry entry = figureEntry(figure);
+            if (entry != null) {
+                info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                        ACTION_FIGURE_REBIND, SessionCatalog.actionLabel("REBIND", entry)));
+                if (entry.canDetach()) {
+                    info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                            ACTION_FIGURE_DETACH, SessionCatalog.actionLabel("DETACH", entry)));
+                }
+            }
+            info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                    ACTION_FIGURE_SESSIONS, "Sessions"));
+            if (terminalScenes != null && index < terminalScenes.length
+                    && terminalScenes[index] != null) {
+                info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                        ACTION_FIGURE_TERMINAL_FOCUS, "Focus terminal"));
+                info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                        ACTION_FIGURE_TERMINAL_COPY, "Copy terminal output"));
+                info.addAction(new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(
+                        ACTION_FIGURE_TERMINAL_PASTE, "Paste into terminal"));
+            }
+            info.addAction(focused
+                    ? android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_CLEAR_ACCESSIBILITY_FOCUS
+                    : android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_ACCESSIBILITY_FOCUS);
+            return info;
+        }
+
+        private void sendFigureEvent(int id, int type, String description) {
+            // Never make an accessibility action wait on the accessibility
+            // service; without an enabled service this call can block.
+            if (!accessibilityEnabled()) return;
+            post(new Runnable() {
+                @Override public void run() {
+                    if (!accessibilityEnabled()) return;
+                    android.view.accessibility.AccessibilityEvent event =
+                            new android.view.accessibility.AccessibilityEvent();
+                    event.setEventType(type);
+                    event.setSource(RenderedPage.this, id);
+                    event.setPackageName(getPackageName());
+                    event.setClassName("android.view.View");
+                    event.getText().add(description);
+                    if (getParent() != null) {
+                        getParent().requestSendAccessibilityEvent(RenderedPage.this, event);
+                    }
+                }
+            });
+        }
+
+        /** Native scene rectangle in page pixels, or null for a non-terminal slot. */
+        private android.graphics.RectF terminalRect(int index) {
+            JSONObject figure = figures.optJSONObject(index);
+            if (figure == null || jsonString(figure, "reference").isEmpty()) return null;
+            Drawable drawable = image.getDrawable();
+            if (drawable == null || widthPt <= 0) return null;
+            // Figure coordinates are Typst points. Move them into the page
+            // raster's pixel space first, then let the ImageView matrix place
+            // that raster inside this page view (including any letterboxing).
+            float scale = drawable.getIntrinsicWidth() / (float) widthPt;
+            float x = (float) figure.optDouble("x", 0) * scale;
+            float y = (float) figure.optDouble("y", 0) * scale;
+            float w = (float) figure.optDouble("w", 0) * scale;
+            float h = (float) figure.optDouble("h", 0) * scale;
+            if (w <= 0 || h <= 0) return null;
+            android.graphics.RectF placed = new android.graphics.RectF(x, y, x + w, y + h);
+            image.getImageMatrix().mapRect(placed);
+            return placed;
+        }
+
+        int terminalIndexAt(float x, float y) {
+            if (terminalScenes == null) return -1;
+            for (int i = 0; i < terminalScenes.length; i++) {
+                if (terminalScenes[i] == null) continue;
+                android.graphics.RectF rect = terminalRect(i);
+                if (rect != null && rect.contains(x, y)) return i;
+            }
+            return -1;
+        }
+
+        /** Cell under a page-local point in a terminal scene, or null. */
+        int[] terminalCellAt(int index, float x, float y) {
+            if (terminalScenes == null || index < 0 || index >= terminalScenes.length
+                    || terminalScenes[index] == null) return null;
+            android.graphics.RectF rect = terminalRect(index);
+            if (rect == null || rect.isEmpty()) return null;
+            NativeTerminal scene = terminalScenes[index];
+            int cols = Math.max(1, scene.cols());
+            int rows = Math.max(1, scene.rows());
+            int col = (int) ((x - rect.left) / Math.max(1f, rect.width()) * cols);
+            int row = (int) ((y - rect.top) / Math.max(1f, rect.height()) * rows);
+            return new int[] {Math.max(0, Math.min(cols - 1, col)),
+                    Math.max(0, Math.min(rows - 1, row))};
+        }
+
+        /**
+         * Reflow a scene's grid after the page width changed (view zoom).
+         * The fixture's manual resize does not move the page rect, so this
+         * only runs when the placed rectangle actually changed.
+         */
+        private void syncTerminalGrid(int index, NativeTerminal scene, android.graphics.RectF rect) {
+            if (terminalGridWidths == null || terminalGridHeights == null
+                    || index >= terminalGridWidths.length) return;
+            int width = Math.round(rect.width());
+            int height = Math.round(rect.height());
+            if (terminalGridWidths[index] <= 0 || terminalGridHeights[index] <= 0) {
+                terminalGridWidths[index] = width;
+                terminalGridHeights[index] = height;
+                return;
+            }
+            if (Math.abs(width - terminalGridWidths[index]) <= 1
+                    && Math.abs(height - terminalGridHeights[index]) <= 1) return;
+            terminalGridWidths[index] = width;
+            terminalGridHeights[index] = height;
+            int cols = Math.max(20, Math.min(300, width / TERMINAL_CELL_WIDTH));
+            int rows = Math.max(5, Math.min(120, height / TERMINAL_CELL_HEIGHT));
+            if (cols != scene.cols() || rows != scene.rows()) {
+                scene.resize(cols, rows);
+                trace("vtScene", "phase", "reflow", "page", RenderedPage.this.index,
+                        "index", index, "cols", cols, "rows", rows,
+                        "w", width, "h", height);
+            }
+        }
+
+        /** Rectangle covering an inclusive cell range in the scene. */
+        android.graphics.RectF terminalCellRect(int index, int x0, int y0, int x1, int y1) {
+            android.graphics.RectF rect = terminalRect(index);
+            if (rect == null || terminalScenes == null || index < 0
+                    || index >= terminalScenes.length || terminalScenes[index] == null) return null;
+            NativeTerminal scene = terminalScenes[index];
+            int cols = Math.max(1, scene.cols());
+            int rows = Math.max(1, scene.rows());
+            int left = Math.min(x0, x1), right = Math.max(x0, x1) + 1;
+            int top = Math.min(y0, y1), bottom = Math.max(y0, y1) + 1;
+            float cw = rect.width() / cols;
+            float ch = rect.height() / rows;
+            return new android.graphics.RectF(rect.left + left * cw, rect.top + top * ch,
+                    rect.left + Math.min(cols, right) * cw,
+                    rect.top + Math.min(rows, bottom) * ch);
+        }
+
+        void closeTerminalScenes() {
+            if (terminalSelectionPage == this) clearTerminalSelection();
+            if (terminalMousePage == this) {
+                terminalMousePage = null;
+                terminalMouseIndex = -1;
+                terminalMousePressed = false;
+            }
+            if (terminalScenes != null) {
+                for (int i = 0; i < terminalScenes.length; i++) {
+                    if (terminalScenes[i] != null) {
+                        terminalScenes[i].close();
+                        terminalScenes[i] = null;
+                    }
+                }
+            }
+            releaseTerminalSurfaces();
+            terminalWatchOnly = null;
+            terminalConflict = null;
+            terminalFocus = -1;
+        }
+
+        private void releaseTerminalSurfaces() {
+            if (terminalSurfaces != null) {
+                for (int i = 0; i < terminalSurfaces.length; i++) {
+                    TerminalSurface surface = terminalSurfaces[i];
+                    if (surface == null) continue;
+                    surface.release();
+                    removeView(surface);
+                    terminalSurfaces[i] = null;
+                }
+            }
+            terminalSurfaces = null;
+        }
+
+        /** Position one GL surface over its figure rectangle inside the page. */
+        private TerminalSurface syncTerminalSurface(int index, NativeTerminal scene,
+                android.graphics.RectF rect) {
+            if (terminalSurfaces == null || index >= terminalSurfaces.length) {
+                int size = terminalScenes == null ? index + 1 : terminalScenes.length;
+                terminalSurfaces = new TerminalSurface[Math.max(size, index + 1)];
+            }
+            TerminalSurface surface = terminalSurfaces[index];
+            if (surface == null) {
+                surface = new TerminalSurface(getContext(), RenderedPage.this.index, scene);
+                terminalSurfaces[index] = surface;
+                addView(surface);
+            }
+            // A z-ordered SurfaceView is not clipped by its parents. Show
+            // only the part of the figure that intersects this page and the
+            // preview viewport, and crop the texture to the same fraction.
+            android.graphics.RectF visible = new android.graphics.RectF(
+                    Math.max(0f, rect.left), Math.max(0f, rect.top),
+                    Math.min(getWidth(), rect.right), Math.min(getHeight(), rect.bottom));
+            // Screen locations can lag one layout pass behind a scrollTo.
+            // The page sits in the previewBox content, so its own left/top
+            // give a stable page-local viewport from the scroll offsets.
+            float viewportLeft = previewHScroll.getScrollX() - getLeft();
+            float viewportTop = previewScroll.getScrollY() - getTop();
+            android.graphics.RectF viewport = new android.graphics.RectF(
+                    viewportLeft, viewportTop,
+                    viewportLeft + previewScroll.getWidth(),
+                    viewportTop + previewScroll.getHeight());
+            if (visible.width() <= 0 || visible.height() <= 0
+                    || !visible.intersect(viewport)) {
+                surface.setVisibility(View.GONE);
+                return surface;
+            }
+            boolean changed = surface.getVisibility() != View.VISIBLE;
+            surface.setVisibility(View.VISIBLE);
+            surface.setCrop((visible.left - rect.left) / Math.max(1f, rect.width()),
+                    (visible.top - rect.top) / Math.max(1f, rect.height()),
+                    (visible.right - rect.left) / Math.max(1f, rect.width()),
+                    (visible.bottom - rect.top) / Math.max(1f, rect.height()));
+            int left = Math.round(visible.left);
+            int top = Math.round(visible.top);
+            int width = Math.max(1, Math.round(visible.width()));
+            int height = Math.max(1, Math.round(visible.height()));
+            FrameLayout.LayoutParams params;
+            android.view.ViewGroup.LayoutParams current = surface.getLayoutParams();
+            if (current instanceof FrameLayout.LayoutParams) {
+                params = (FrameLayout.LayoutParams) current;
+            } else {
+                params = new FrameLayout.LayoutParams(width, height);
+                surface.setLayoutParams(params);
+                changed = true;
+            }
+            if (params.leftMargin != left || params.topMargin != top
+                    || params.width != width || params.height != height) {
+                params.leftMargin = left;
+                params.topMargin = top;
+                params.width = width;
+                params.height = height;
+                surface.setLayoutParams(params);
+                changed = true;
+            }
+            if (changed) surface.repaint("layout");
+            return surface;
+        }
+
+        void recreateTerminalSurface(int index) {
+            if (terminalSurfaces == null || index < 0 || index >= terminalSurfaces.length
+                    || terminalSurfaces[index] == null) return;
+            terminalSurfaces[index].recreateContext();
+        }
+
+        /** Re-clip z-ordered scene surfaces after a preview scroll. */
+        void clipTerminalSurfaces() {
+            if (terminalScenes == null) return;
+            for (int i = 0; i < terminalScenes.length; i++) {
+                NativeTerminal scene = terminalScenes[i];
+                if (scene == null) continue;
+                android.graphics.RectF rect = terminalRect(i);
+                if (rect != null) syncTerminalSurface(i, scene, rect);
+            }
+        }
+
+        private void drawTerminalScenes(Canvas canvas) {
+            if (terminalScenes == null) return;
+            Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            paint.setFilterBitmap(false);
+            for (int i = 0; i < terminalScenes.length; i++) {
+                NativeTerminal scene = terminalScenes[i];
+                if (scene == null) continue;
+                android.graphics.RectF rect = terminalRect(i);
+                if (rect == null) continue;
+                syncTerminalGrid(i, scene, rect);
+                TerminalSurface surface = syncTerminalSurface(i, scene, rect);
+                Paint fill = new Paint();
+                fill.setColor(Color.parseColor("#14181D"));
+                canvas.drawRect(rect, fill);
+                if (surface == null || !surface.submitting()) {
+                    Bitmap bitmap = scene.bitmap();
+                    if (bitmap != null) {
+                        canvas.save();
+                        canvas.clipRect(rect);
+                        canvas.drawBitmap(bitmap, null, rect, paint);
+                        canvas.restore();
+                    }
+                }
+                if (surface != null) surface.requestFrame();
+                if (terminalSelectionPage == RenderedPage.this
+                        && terminalSelectionIndex == i) {
+                    android.graphics.RectF selected = terminalCellRect(i,
+                            terminalSelX0, terminalSelY0, terminalSelX1, terminalSelY1);
+                    if (selected != null) {
+                        Paint highlight = new Paint();
+                        highlight.setColor(0x66628AB3);
+                        canvas.drawRect(selected, highlight);
+                    }
+                }
+                boolean watchOnly = terminalWatchOnly != null
+                        && i < terminalWatchOnly.length && terminalWatchOnly[i];
+                boolean conflict = terminalConflict != null
+                        && i < terminalConflict.length && terminalConflict[i];
+                if (watchOnly || conflict) {
+                    Paint badge = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    badge.setColor(conflict ? 0xCCB4633A : 0xCC2E6E8E);
+                    float right = Math.min(rect.right, getWidth()) - dp(4);
+                    float left = right - dp(conflict ? 68 : 44);
+                    float top = rect.top + dp(4);
+                    canvas.drawRect(left, top, right, top + dp(16), badge);
+                    Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    label.setColor(0xFFF2F6FA);
+                    label.setTextSize(dp(10));
+                    canvas.drawText(conflict ? "CONFLICT" : "WATCH",
+                            left + dp(4), top + dp(12), label);
+                }
+                if (terminalFocus == i) {
+                    Paint border = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    border.setStyle(Paint.Style.STROKE);
+                    border.setStrokeWidth(dp(2));
+                    border.setColor(Color.parseColor("#B3CFE4"));
+                    canvas.drawRect(rect, border);
+                }
+            }
+        }
+
+        /** The page owns terminal gestures; scene surfaces never consume them. */
+        @Override public boolean onInterceptTouchEvent(MotionEvent event) {
+            return true;
+        }
+
+        @Override public boolean onCheckIsTextEditor() {
+            return terminalFocus >= 0;
+        }
+
+        /** Back releases terminal focus before the IME consumes it. */
+        @Override public boolean onKeyPreIme(int keyCode, KeyEvent event) {
+            if (keyCode == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_DOWN
+                    && terminalFocus >= 0) {
+                releaseTerminalFocus();
+                return true;
+            }
+            return super.onKeyPreIme(keyCode, event);
+        }
+
+        @Override public android.view.inputmethod.InputConnection onCreateInputConnection(
+                android.view.inputmethod.EditorInfo out) {
+            if (terminalFocus < 0) return null;
+            out.inputType = android.text.InputType.TYPE_CLASS_TEXT
+                    | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                    | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+            out.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_NONE;
+            return new android.view.inputmethod.BaseInputConnection(this, true) {
+                @Override public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                    terminalComposing = text == null ? "" : text.toString();
+                    return true;
+                }
+                @Override public boolean finishComposingText() {
+                    String text = terminalComposing;
+                    terminalComposing = "";
+                    sendTerminalText(text);
+                    return true;
+                }
+                @Override public boolean commitText(CharSequence text, int newCursorPosition) {
+                    terminalComposing = "";
+                    sendTerminalText(text == null ? "" : text.toString());
+                    return true;
+                }
+                @Override public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+                    for (int i = 0; i < beforeLength; i++) sendTerminalKey(KeyEvent.KEYCODE_DEL, 0, "", 0);
+                    return true;
+                }
+            };
+        }
+
+        /** Draw the public session state over each terminal figure slot. */
+        private void drawFigureStates(Canvas canvas) {
+            if (figures == null || figures.length() == 0) return;
+            float scale = pointScale();
+            Paint background = new Paint(Paint.ANTI_ALIAS_FLAG);
+            Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
+            label.setTextSize(dp(10));
+            for (int i = 0; i < figures.length(); i++) {
+                JSONObject figure = figures.optJSONObject(i);
+                if (figure == null) continue;
+                String text;
+                int color;
+                String bindingError = jsonString(figure, "bindingError");
+                String reference = jsonString(figure, "reference");
+                if (!bindingError.isEmpty()) {
+                    text = "Invalid binding";
+                    color = 0xCCB4633A;
+                } else if (!reference.isEmpty()) {
+                    SessionCatalog.Entry entry = sessionCatalog.byReference(reference);
+                    if (entry == null) {
+                        text = "Unavailable";
+                        color = 0xCC6E7781;
+                    } else {
+                        if (entry.state == SessionCatalog.State.LIVE) continue;
+                        text = entry.stateLabel();
+                        color = entry.state == SessionCatalog.State.WATCHED
+                                ? 0xCC2E6E8E : 0xCC6E7781;
+                    }
+                } else {
+                    continue;
+                }
+                float x = (float) figure.optDouble("x", 0) * scale;
+                float y = (float) figure.optDouble("y", 0) * scale;
+                float w = (float) figure.optDouble("w", 0) * scale;
+                float h = (float) figure.optDouble("h", 0) * scale;
+                background.setColor(color);
+                canvas.drawRect(x, y + h - dp(18), x + w, y + h, background);
+                label.setColor(0xFFF2F6FA);
+                canvas.drawText(text, x + dp(5), y + h - dp(5), label);
+            }
+        }
+
+        private boolean accessibilityEnabled() {
+            android.view.accessibility.AccessibilityManager manager =
+                    (android.view.accessibility.AccessibilityManager)
+                            getSystemService(android.content.Context.ACCESSIBILITY_SERVICE);
+            return manager != null && manager.isEnabled();
+        }
+
         private void sendAccessibilityNodeEvent(int id, int type, AccessibleBlock block) {
+            if (!accessibilityEnabled()) return;
             android.view.accessibility.AccessibilityEvent event =
                     new android.view.accessibility.AccessibilityEvent();
             event.setEventType(type);
@@ -2688,8 +4011,15 @@ public class MainActivity extends Activity {
             if (getParent() != null) getParent().requestSendAccessibilityEvent(RenderedPage.this, event);
         }
 
-        @Override protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
+        @Override protected void dispatchDraw(Canvas canvas) {
+            super.dispatchDraw(canvas);
+            drawTerminalScenes(canvas);
+            drawPageOverlays(canvas);
+            drawFigureStates(canvas);
+        }
+
+        /** Selection, find hits and the caret stay above the GL surface. */
+        private void drawPageOverlays(Canvas canvas) {
             if (editor == null) return;
             if (selectionAnchor >= 0 && selectionAnchor != editor.getSelectionStart()) {
                 int begin = Math.min(selectionAnchor, editor.getSelectionStart());
@@ -2874,6 +4204,66 @@ public class MainActivity extends Activity {
     }
 
     /** One implementation for every toolbar button and its advertised key. */
+    // ----- native document sharing (K6) ---------------------------------
+
+    private void shareOpen() {
+        if (shareHandle != 0) return;
+        String peer = "pad-" + android.os.Process.myPid();
+        shareHandle = DocBridge.shareOpen(DocBridge.snapshotBytes(handle), peer, peer);
+        shareWatchOnly = false;
+        setStatus(shareHandle != 0 ? "Share ready" : "Share unavailable");
+        trace("share", "opened", shareHandle != 0);
+    }
+
+    private void shareJoin() {
+        if (shareHandle == 0) { setStatus("No share to join"); return; }
+        if (shareWatchOnly) { setStatus("Watching — switch to Edit to join"); return; }
+        DocBridge.shareJoin(shareHandle, "host", "");
+        pollShare();
+    }
+
+    private void shareLeave() {
+        if (shareHandle == 0) return;
+        DocBridge.shareLeave(shareHandle);
+        setStatus("Left share");
+        trace("share", "left");
+    }
+
+    private void shareToggleWatch() {
+        shareWatchOnly = !shareWatchOnly;
+        setStatus(shareWatchOnly ? "Watching share" : "Editing share");
+        trace("share", "watch", shareWatchOnly);
+    }
+
+    /** Drain worker events and apply accepted deltas as one grouped edit each. */
+    private void pollShare() {
+        if (shareHandle == 0) return;
+        try {
+            org.json.JSONObject reply = new org.json.JSONObject(DocBridge.sharePoll(shareHandle));
+            org.json.JSONArray events = reply.optJSONArray("events");
+            if (events == null) return;
+            for (int i = 0; i < events.length(); i++) {
+                org.json.JSONObject event = events.getJSONObject(i);
+                String kind = event.optString("kind", "");
+                if (shareWatchOnly) continue;
+                if ("catch_up".equals(kind) || "applied".equals(kind)) {
+                    org.json.JSONArray deltas = "catch_up".equals(kind)
+                            ? new org.json.JSONArray().put(event.optString("delta", ""))
+                            : event.optJSONArray("deltas");
+                    if (deltas == null) continue;
+                    for (int d = 0; d < deltas.length(); d++) {
+                        String delta = deltas.optString(d, "");
+                        if (!delta.isEmpty()) applyState(DocBridge.shareApply(handle, delta), true);
+                    }
+                } else if ("error".equals(kind)) {
+                    trace("share", "error", event.optString("message", ""));
+                }
+            }
+        } catch (org.json.JSONException e) {
+            trace("share", "malformed_event", e.getMessage());
+        }
+    }
+
     private boolean runAction(ActionCatalog.Id action) {
         switch (action) {
             case NEW: confirmNewDocument(); break;
@@ -2901,6 +4291,13 @@ public class MainActivity extends Activity {
             case ZOOM_OUT: changeViewZoom(-0.5f); break;
             case ZOOM_IN: changeViewZoom(0.5f); break;
             case CLOSE_INSPECTOR: closeInspector(); break;
+            case SESSIONS: showSessions(); break;
+            case SHARE_OPEN: shareOpen(); break;
+            case SHARE_JOIN: shareJoin(); break;
+            case SHARE_LEAVE: shareLeave(); break;
+            case SHARE_WATCH: shareToggleWatch(); break;
+            case PROOF: startActivityForResult(
+                    new Intent(this, ProofClientActivity.class), REQUEST_PROOF); break;
             default: return false;
         }
         return true;
@@ -2908,6 +4305,23 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN && terminalFocusedPage() != null) {
+            if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+                releaseTerminalFocus();
+                return true;
+            }
+            if (event.getKeyCode() != KeyEvent.KEYCODE_VOLUME_UP
+                    && event.getKeyCode() != KeyEvent.KEYCODE_VOLUME_DOWN) {
+                int key = NativeTerminal.ghosttyKey(event.getKeyCode());
+                if (key != 0) {
+                    String text = event.getUnicodeChar() > 0
+                            ? new String(Character.toChars(event.getUnicodeChar())) : "";
+                    sendTerminalKey(event.getKeyCode(), NativeTerminal.ghosttyMods(event),
+                            text, event.getUnicodeChar(0) & 0xffff);
+                    return true;
+                }
+            }
+        }
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
                 && event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
             if (findVisible()) {
@@ -3845,6 +5259,157 @@ public class MainActivity extends Activity {
             }
         }
         return null;
+    }
+
+    /** The Sessions surface: public references and their available actions. */
+    private void showSessions() {
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setPadding(dp(12), dp(8), dp(12), dp(12));
+        rows.addView(panelLabel("Sessions are public references; no socket path or credential is shown."));
+        scroll.addView(rows);
+        final AlertDialog[] holder = new AlertDialog[1];
+        for (final SessionCatalog.Entry entry : sessionCatalog.entries()) {
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(0, dp(8), 0, dp(8));
+            TextView heading = panelLabel(entry.caption + " · " + entry.stateLabel()
+                    + " · " + entry.hostLabel);
+            heading.setContentDescription(entry.caption + ", " + entry.stateLabel()
+                    + ", on " + entry.hostLabel);
+            card.addView(heading);
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            TextView pin = shortcut(SessionCatalog.actionLabel("PIN", entry), new Runnable() {
+                @Override public void run() { pinSession(entry); }
+            });
+            pin.setEnabled(entry.canPin());
+            actions.addView(pin);
+            actions.addView(shortcut(SessionCatalog.actionLabel("REBIND", entry), new Runnable() {
+                @Override public void run() { showRebindDialog(entry); }
+            }));
+            actions.addView(shortcut(SessionCatalog.actionLabel("GO_TO_FIGURE", entry), new Runnable() {
+                @Override public void run() { goToSession(entry); }
+            }));
+            TextView detach = shortcut(SessionCatalog.actionLabel("DETACH", entry), new Runnable() {
+                @Override public void run() {
+                    sessionCatalog = sessionCatalog.detach(entry.reference);
+                    if (holder[0] != null) holder[0].dismiss();
+                    fileMessage("Detached " + entry.caption + "; the session stays on its host");
+                    showSessions();
+                }
+            });
+            detach.setEnabled(entry.canDetach());
+            actions.addView(detach);
+            card.addView(actions);
+            rows.addView(card);
+        }
+        holder[0] = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Sessions").setView(scroll).setNegativeButton("Close", null).show();
+    }
+
+    private void pinSession(SessionCatalog.Entry entry) {
+        if (handle == 0) return;
+        if (goToSession(entry)) return;
+        if (editor.getText().toString().contains(entry.reference)) {
+            fileMessage(entry.caption + " is already pinned outside the loaded pages");
+            return;
+        }
+        String json = DocBridge.appendTerminalFigure(handle, editor.getText().toString(),
+                entry.reference, entry.caption);
+        try {
+            JSONObject result = new JSONObject(json);
+            if (result.has("error")) {
+                fileMessage("Pin refused: " + result.optString("error"));
+                return;
+            }
+            applyState(json, true);
+            sessionCatalog = sessionCatalog.pin(entry.reference);
+            setStatus("Pinned " + entry.caption + " to the document");
+        } catch (Exception e) {
+            fileMessage("Pin failed: " + e.getMessage());
+        }
+    }
+
+    /** Pick a document terminal figure and replace only its reference. */
+    private void showRebindDialog(final SessionCatalog.Entry entry) {
+        if (handle == 0) return;
+        JSONArray figures;
+        try {
+            figures = new JSONArray(DocBridge.terminalFigures(editor.getText().toString()));
+        } catch (Exception e) {
+            fileMessage("Could not read the document figures");
+            return;
+        }
+        if (figures.length() == 0) {
+            fileMessage("This document has no terminal figure to rebind");
+            return;
+        }
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setPadding(dp(12), dp(8), dp(12), dp(12));
+        rows.addView(panelLabel("Rebind " + entry.caption + " to a figure"));
+        scroll.addView(rows);
+        final AlertDialog[] holder = new AlertDialog[1];
+        for (int i = 0; i < figures.length(); i++) {
+            final JSONObject figure = figures.optJSONObject(i);
+            if (figure == null) continue;
+            final String key = figure.optString("key", "");
+            String error = jsonString(figure, "bindingError");
+            String reference = jsonString(figure, "reference");
+            String detail = error.isEmpty() ? reference : error;
+            TextView button = shortcut(figure.optString("caption", "Figure")
+                    + (detail.isEmpty() ? "" : " · " + detail), new Runnable() {
+                @Override public void run() {
+                    if (holder[0] != null) holder[0].dismiss();
+                    rebindSession(entry, key);
+                }
+            });
+            rows.addView(button);
+        }
+        holder[0] = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Rebind session").setView(scroll)
+                .setNegativeButton("Cancel", null).show();
+    }
+
+    private void rebindSession(SessionCatalog.Entry entry, String key) {
+        String json = DocBridge.rebindTerminalFigure(handle,
+                editor.getText().toString(), key, entry.reference);
+        try {
+            JSONObject result = new JSONObject(json);
+            if (result.has("error")) {
+                fileMessage("Rebind refused: " + result.optString("error"));
+                return;
+            }
+            applyState(json, true);
+            setStatus("Rebound " + entry.caption + " to the selected figure");
+        } catch (Exception e) {
+            fileMessage("Rebind failed: " + e.getMessage());
+        }
+    }
+
+    private void goToFigure(RenderedPage page, JSONObject figure) {
+        float scale = page.pointScale();
+        int y = Math.max(0, page.getTop()
+                + Math.round((float) figure.optDouble("y", 0) * scale) - dp(8));
+        previewScroll.scrollTo(0, y);
+        page.requestFocus();
+    }
+
+    private boolean goToSession(SessionCatalog.Entry entry) {
+        for (RenderedPage page : renderedPages) {
+            for (int i = 0; i < page.figures.length(); i++) {
+                JSONObject figure = page.figures.optJSONObject(i);
+                if (figure == null || !entry.reference.equals(jsonString(figure, "reference"))) {
+                    continue;
+                }
+                goToFigure(page, figure);
+                return true;
+            }
+        }
+        return false;
     }
 
     private void showNavigate(int tab) {
@@ -5580,12 +7145,12 @@ public class MainActivity extends Activity {
         final int index, width, height, visiblePixels;
         final double textTop, widthPt, heightPt;
         final boolean hasFigures;
-        final JSONArray hits;
+        final JSONArray figures, hits;
         final Bitmap bitmap;
 
         DecodedPage(int index, int width, int height, int visiblePixels, double textTop,
                     double widthPt, double heightPt, boolean hasFigures,
-                    JSONArray hits, Bitmap bitmap) {
+                    JSONArray figures, JSONArray hits, Bitmap bitmap) {
             this.index = index;
             this.width = width;
             this.height = height;
@@ -5594,6 +7159,7 @@ public class MainActivity extends Activity {
             this.widthPt = widthPt;
             this.heightPt = heightPt;
             this.hasFigures = hasFigures;
+            this.figures = figures == null ? new JSONArray() : figures;
             this.hits = hits;
             this.bitmap = bitmap;
         }
@@ -5722,6 +7288,7 @@ public class MainActivity extends Activity {
             int w = p.getInt("width");
             int h = p.getInt("height");
             JSONArray hits = p.getJSONArray("hits");
+            JSONArray figures = p.optJSONArray("figures");
             byte[] png = Base64.decode(p.getString("png"), Base64.DEFAULT);
             Bitmap bmp = BitmapFactory.decodeByteArray(png, 0, png.length);
             if (bmp == null || bmp.getWidth() != w || bmp.getHeight() != h) {
@@ -5738,7 +7305,8 @@ public class MainActivity extends Activity {
             pages.add(new DecodedPage(page, w, h, visible * 4,
                     p.optDouble("textTop", -1),
                     p.optDouble("widthPt", widthPt), p.optDouble("heightPt", heightPt),
-                    p.optBoolean("hasFigures", false), hits, bmp));
+                    p.optBoolean("hasFigures", false),
+                    figures, hits, bmp));
             decodeMs += (System.nanoTime() - decodeStart) / 1_000_000;
             trace("renderCost", "layoutMs", layoutMs, "rasterMs", rasterMs,
                     "decodeMs", decodeMs, "pages", pages.size(), "layoutId", layoutId);
@@ -5889,6 +7457,7 @@ public class MainActivity extends Activity {
             trace("applyChunk", "total", totalPages, "pages", pages.size(),
                     "start", chunk.start);
             for (DecodedPage p : pages) applyDecodedPage(p);
+            cleanupClaimedTransfers();
             if (!initialPagePending) {
                 initialPagePending = true;
                 locateInitialPage(editor.getSelectionStart());
@@ -5925,8 +7494,128 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Detach scenes before their page views are destroyed. A view zoom or
+     * font reflow keeps the same document and the same public terminal
+     * reference, so the parser, scrollback and input state can be transplanted
+     * into the replacement page. New/Open rotates the document identity and
+     * closes them instead.
+     */
+    private void collectTerminalScenesForRebuild(boolean preserve) {
+        if (!preserve) {
+            for (TerminalTransfer transfer : pendingTerminalTransfers) {
+                transfer.scene.close();
+            }
+            pendingTerminalTransfers.clear();
+        }
+        for (RenderedPage page : renderedPages) {
+            if (page.terminalScenes != null) {
+                for (int i = 0; i < page.terminalScenes.length; i++) {
+                    NativeTerminal scene = page.terminalScenes[i];
+                    if (scene == null) continue;
+                    String reference = i < page.figures.length()
+                            ? jsonString(page.figures.optJSONObject(i), "reference") : "";
+                    if (preserve && !reference.isEmpty()) {
+                        pendingTerminalTransfers.add(new TerminalTransfer(scene,
+                                reference, page.index, page.terminalFocus == i,
+                                page.terminalWatchOnly != null
+                                        && i < page.terminalWatchOnly.length
+                                        && page.terminalWatchOnly[i],
+                                page.terminalConflict != null
+                                        && i < page.terminalConflict.length
+                                        && page.terminalConflict[i]));
+                    } else {
+                        scene.close();
+                    }
+                    page.terminalScenes[i] = null;
+                }
+                page.terminalScenes = null;
+                page.terminalGridWidths = null;
+                page.terminalGridHeights = null;
+                page.terminalWatchOnly = null;
+                page.terminalConflict = null;
+            }
+            page.terminalFocus = -1;
+        }
+        terminalMousePage = null;
+        terminalMouseIndex = -1;
+        terminalMousePressed = false;
+        clearTerminalSelection();
+        if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.GONE);
+        trace("terminalTransfer", "collect", "pending", pendingTerminalTransfers.size(),
+                "preserve", preserve);
+    }
+
+    /** Reattach a surviving scene to the rebuilt page's matching reference. */
+    private void attachTransferredScenes(RenderedPage page, JSONArray figures) {
+        if (pendingTerminalTransfers.isEmpty() || figures == null) return;
+        NativeTerminal[] scenes = null;
+        int[] widths = null;
+        int[] heights = null;
+        boolean[] watchOnly = null;
+        boolean[] conflict = null;
+        int focus = -1;
+        for (int i = 0; i < figures.length(); i++) {
+            JSONObject figure = figures.optJSONObject(i);
+            String reference = jsonString(figure, "reference");
+            if (reference.isEmpty()) continue;
+            for (TerminalTransfer transfer : pendingTerminalTransfers) {
+                if (transfer.claimed || !transfer.reference.equals(reference)) continue;
+                if (scenes == null) {
+                    scenes = new NativeTerminal[figures.length()];
+                    widths = new int[figures.length()];
+                    heights = new int[figures.length()];
+                    watchOnly = new boolean[figures.length()];
+                    conflict = new boolean[figures.length()];
+                }
+                transfer.claimed = true;
+                scenes[i] = transfer.scene;
+                watchOnly[i] = transfer.watchOnly;
+                conflict[i] = transfer.conflict;
+                // Force the first draw after the rebuild to compare the new
+                // placed rect instead of treating the scene as already sized.
+                widths[i] = 1;
+                heights[i] = 1;
+                if (transfer.focused) focus = i;
+                trace("terminalTransfer", "attach", "page", page.index,
+                        "index", i, "reference", reference);
+                break;
+            }
+        }
+        if (scenes == null) return;
+        page.terminalScenes = scenes;
+        page.terminalGridWidths = widths;
+        page.terminalGridHeights = heights;
+        page.terminalWatchOnly = watchOnly;
+        page.terminalConflict = conflict;
+        page.terminalFocus = focus;
+        page.invalidate();
+        final int restoredFocus = focus;
+        if (restoredFocus >= 0) {
+            if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.VISIBLE);
+            main.post(new Runnable() {
+                @Override public void run() {
+                    if (renderedPages.contains(page) && page.terminalFocus == restoredFocus) {
+                        focusTerminal(page, restoredFocus);
+                    }
+                }
+            });
+        }
+    }
+
+    private void cleanupClaimedTransfers() {
+        for (int i = pendingTerminalTransfers.size() - 1; i >= 0; i--) {
+            if (pendingTerminalTransfers.get(i).claimed) {
+                pendingTerminalTransfers.remove(i);
+            }
+        }
+    }
+
     /** Create one full-height placeholder per page, then materialize on demand. */
     private void resetPageStack(int total, JSONArray sizes) {
+        boolean preserve = session.documentId().equals(pageStackDocumentId);
+        collectTerminalScenesForRebuild(preserve);
+        pageStackDocumentId = session.documentId();
         releasePageBitmaps();
         totalPages = total;
         int width = Math.round(basePageWidth() * viewZoom);
@@ -5965,6 +7654,669 @@ public class MainActivity extends Activity {
                 "workingPixels", workingPagePixels);
     }
 
+    private RenderedPage terminalFocusedPage() {
+        for (RenderedPage page : renderedPages) {
+            if (page.terminalFocus >= 0) return page;
+        }
+        return null;
+    }
+
+    /** Fixture/attach entry point: start one native scene in a terminal slot. */
+    private void startVtScene(RenderedPage page) {
+        if (!vtSceneFixturePending || page == null || page.terminalScenes != null) return;
+        int index = -1;
+        for (int i = 0; i < page.figures.length(); i++) {
+            JSONObject figure = page.figures.optJSONObject(i);
+            if (figure != null && !jsonString(figure, "reference").isEmpty()) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0) return;
+        android.graphics.RectF rect = page.terminalRect(index);
+        if (rect == null) return;
+        int cols = Math.max(20, Math.min(100, (int) (rect.width() / TERMINAL_CELL_WIDTH)));
+        int rows = Math.max(5, Math.min(30, (int) (rect.height() / TERMINAL_CELL_HEIGHT)));
+        boolean gatewayFixture = fixtureGateway != null && !fixtureGateway.trim().isEmpty();
+        NativeTerminal scene = new NativeTerminal(cols, rows, TERMINAL_CELL_WIDTH,
+                TERMINAL_CELL_HEIGHT, 14, !gatewayFixture);
+        if (!scene.valid()) {
+            trace("vtScene", "phase", "failed", "reason", "create");
+            return;
+        }
+        page.terminalScenes = new NativeTerminal[page.figures.length()];
+        page.terminalScenes[index] = scene;
+        page.terminalGridWidths = new int[page.figures.length()];
+        page.terminalGridHeights = new int[page.figures.length()];
+        page.terminalWatchOnly = new boolean[page.figures.length()];
+        page.terminalConflict = new boolean[page.figures.length()];
+        String reference = jsonString(page.figures.optJSONObject(index), "reference");
+        SessionCatalog.Entry entry = sessionCatalog.byReference(reference);
+        page.terminalWatchOnly[index] = gatewayFixture || (entry != null
+                && entry.state == SessionCatalog.State.WATCHED);
+        trace("terminalInput", "control", "watch", page.terminalWatchOnly[index],
+                "reason", gatewayFixture ? "gateway-initial" : "initial");
+        page.terminalGridWidths[index] = Math.round(rect.width());
+        page.terminalGridHeights[index] = Math.round(rect.height());
+        vtSceneFixturePending = false;
+        if (gatewayFixture) {
+            // The gateway attach supplies the first DATA after its result. Do
+            // not run the synthetic animation over a real lease stream.
+            startGatewayLease(reference);
+        } else {
+            byte[] initial = ("\u001b[2J\u001b[Hemthin native VT\r\n"
+                    + "frame 0 \u00b7 \u754c e\u0301\r\n$ ").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            JSONObject initialState = scene.feed(initial);
+            String initialStateText = initialState.optString("text", "").replace('\n', '|');
+            trace("vtScene", "phase", "first", "frame", initialState.optInt("frame", -1),
+                    "text", initialStateText.substring(0, Math.min(48, initialStateText.length())));
+            vtSceneFixtureRunning = true;
+            vtSceneFrame = 0;
+        }
+        page.invalidate();
+        int[] loc = new int[2];
+        page.getLocationOnScreen(loc);
+        trace("vtScene", "phase", "ready", "page", page.index, "index", index,
+                "cols", cols, "rows", rows,
+                "x", Math.round(rect.left), "y", Math.round(rect.top),
+                "w", Math.round(rect.width()), "h", Math.round(rect.height()),
+                "sx", loc[0] + Math.round(rect.left), "sy", loc[1] + Math.round(rect.top));
+        revealTerminalTop(page, index);
+        if (!gatewayFixture) {
+            main.postDelayed(vtSceneAnimator(), 120);
+        } else {
+            final RenderedPage placedPage = page;
+            final int placedIndex = index;
+            main.postDelayed(new Runnable() {
+                @Override public void run() { traceScenePlaced(placedPage, placedIndex); }
+            }, 150);
+        }
+    }
+
+    /** Publish the scene's page-local placement once layout has settled. */
+    private void traceScenePlaced(RenderedPage page, int index) {
+        if (page == null) return;
+        android.graphics.RectF placed = page.terminalRect(index);
+        int[] loc = new int[2];
+        page.getLocationOnScreen(loc);
+        if (placed != null) {
+            trace("vtScene", "phase", "placed",
+                    "x", loc[0] + Math.round(placed.left),
+                    "y", loc[1] + Math.round(placed.top),
+                    "w", Math.round(placed.width()),
+                    "h", Math.round(placed.height()));
+        }
+    }
+
+    /**
+     * Connect the visible fixture scene to the scripted gateway peer. The
+     * lease is deliberately transport-owned: Watch/Take request a new attach,
+     * and a CLOSE frame revokes the old viewer rather than mutating a flag.
+     */
+    private void startGatewayLease(String reference) {
+        String target = fixtureGateway == null ? "" : fixtureGateway.trim();
+        int colon = target.lastIndexOf(':');
+        if (colon <= 0 || colon == target.length() - 1) {
+            trace("gatewayLease", "phase", "failed", "reason", "endpoint", "target", target);
+            return;
+        }
+        String host = target.substring(0, colon);
+        int port;
+        try {
+            port = Integer.parseInt(target.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            trace("gatewayLease", "phase", "failed", "reason", "port");
+            return;
+        }
+        int slash = reference.lastIndexOf('/');
+        String address = slash >= 0 && slash + 1 < reference.length()
+                ? reference.substring(slash + 1) : reference;
+        String generation = fixtureGatewayGeneration == null
+                || fixtureGatewayGeneration.isEmpty()
+                ? "g-fixture-1" : fixtureGatewayGeneration;
+        gatewayReady = false;
+        gatewayConnected = false;
+        gatewayAttaching = false;
+        gatewayLease = new GatewayLeaseClient(host, port, address, generation,
+                new GatewayLeaseClient.Listener() {
+                    @Override public void onReady(final String mode, final String leaseId) {
+                        main.post(new Runnable() {
+                            @Override                            public void run() {
+                                gatewayReady = true;
+                                gatewayConnected = true;
+                                gatewayAttaching = false;
+                                RenderedPage page = vtScenePage();
+                                int index = vtSceneIndex(page);
+                                if (page == null || index < 0) return;
+                                boolean control = "control".equals(mode);
+                                page.terminalWatchOnly[index] = !control;
+                                page.terminalConflict[index] = false;
+                                page.invalidate();
+                                trace("gatewayLease", "phase", "ready", "mode", mode,
+                                        "lease", leaseId == null ? "none" : leaseId,
+                                        "page", page.index, "index", index,
+                                        "readOnly", !control);
+                            }
+                        });
+                    }
+
+                    @Override public void onClosed(final String reason, final boolean revoked) {
+                        main.post(new Runnable() {
+                            @Override                            public void run() {
+                                gatewayReady = false;
+                                gatewayAttaching = false;
+                                RenderedPage page = vtScenePage();
+                                int index = vtSceneIndex(page);
+                                if (page == null || index < 0) return;
+                                page.terminalWatchOnly[index] = true;
+                                page.terminalConflict[index] = revoked;
+                                page.invalidate();
+                                trace("gatewayLease", "closed", "reason", reason,
+                                        "revoked", revoked, "page", page.index,
+                                        "index", index);
+                            }
+                        });
+                    }
+
+                    @Override public void onData(final byte[] bytes) {
+                        main.post(new Runnable() {
+                            @Override public void run() {
+                                RenderedPage page = vtScenePage();
+                                int index = vtSceneIndex(page);
+                                if (page == null || index < 0) return;
+                                page.terminalScenes[index].feed(bytes);
+                                page.invalidate();
+                                String text = new String(bytes,
+                                        java.nio.charset.StandardCharsets.UTF_8)
+                                        .replace('\n', '|').replace('\r', ' ');
+                                trace("gatewayLease", "data", "bytes", bytes.length,
+                                        "text", text.substring(0, Math.min(64, text.length())));
+                            }
+                        });
+                    }
+
+                    @Override public void onResize(final int cols, final int rows) {
+                        main.post(new Runnable() {
+                            @Override public void run() {
+                                RenderedPage page = vtScenePage();
+                                int index = vtSceneIndex(page);
+                                if (page == null || index < 0) return;
+                                page.terminalScenes[index].resize(cols, rows);
+                                page.invalidate();
+                                trace("gatewayLease", "resize", "cols", cols, "rows", rows);
+                            }
+                        });
+                    }
+
+                    @Override public void onError(final String kind) {
+                        main.post(new Runnable() {
+                            @Override                            public void run() {
+                                gatewayReady = false;
+                                // A lease conflict is retryable; a transport or
+                                // protocol failure is not.
+                                gatewayConnected = !("transport".equals(kind)
+                                        || "closed".equals(kind)
+                                        || "protocol".equals(kind));
+                                gatewayReady = gatewayConnected;
+                                gatewayAttaching = false;
+                                RenderedPage page = vtScenePage();
+                                int index = vtSceneIndex(page);
+                                if (page != null && index >= 0) {
+                                    page.terminalWatchOnly[index] = true;
+                                    page.terminalConflict[index] = true;
+                                    page.invalidate();
+                                }
+                                trace("gatewayLease", "error", "kind", kind);
+                            }
+                        });
+                    }
+                });
+        trace("gatewayLease", "phase", "connect", "host", host, "port", port,
+                "address", address, "generation", generation);
+        gatewayLease.connect();
+    }
+
+    private void closeGatewayLease() {
+        gatewayReady = false;
+        gatewayConnected = false;
+        gatewayAttaching = false;
+        GatewayLeaseClient current = gatewayLease;
+        gatewayLease = null;
+        if (current != null) current.close();
+    }
+
+    /** A figure near a page edge can start above the preview viewport. */
+    private void revealTerminalTop(RenderedPage page, int index) {
+        if (page == null) return;
+        page.post(new Runnable() {
+            @Override public void run() {
+                android.graphics.RectF placed = page.terminalRect(index);
+                if (placed == null) return;
+                int[] pageLoc = new int[2];
+                int[] scrollLoc = new int[2];
+                page.getLocationOnScreen(pageLoc);
+                previewScroll.getLocationOnScreen(scrollLoc);
+                int topInScroll = pageLoc[1] + Math.round(placed.top) - scrollLoc[1];
+                int target = Math.max(0,
+                        previewScroll.getScrollY() + topInScroll - dp(24));
+                trace("vtScene", "reveal", "scroll", target, "top", topInScroll);
+                previewScroll.scrollTo(previewScroll.getScrollX(), target);
+            }
+        });
+    }
+
+    /** The current page carrying the fixture scene, which may have moved
+     *  across a view-zoom rebuild. */
+    private RenderedPage vtScenePage() {
+        for (RenderedPage page : renderedPages) {
+            if (page.terminalScenes == null) continue;
+            for (NativeTerminal scene : page.terminalScenes) {
+                if (scene != null) return page;
+            }
+        }
+        return null;
+    }
+
+    private int vtSceneIndex(RenderedPage page) {
+        if (page == null || page.terminalScenes == null) return -1;
+        for (int i = 0; i < page.terminalScenes.length; i++) {
+            if (page.terminalScenes[i] != null) return i;
+        }
+        return -1;
+    }
+
+    private Runnable vtSceneAnimator() {
+        return new Runnable() {
+            @Override public void run() {
+                RenderedPage page = vtScenePage();
+                int index = vtSceneIndex(page);
+                if (!vtSceneFixtureRunning || page == null || index < 0) return;
+                NativeTerminal scene = page.terminalScenes[index];
+                vtSceneFrame++;
+                if (vtSceneFrame == 1) {
+                    traceScenePlaced(page, index);
+                    revealTerminalTop(page, index);
+                }
+                if (vtSceneFrame == 4) {
+                    scene.recreate();
+                    page.recreateTerminalSurface(index);
+                    trace("vtScene", "phase", "context-loss", "frame", vtSceneFrame);
+                }
+                if (vtSceneFrame == 7) {
+                    JSONObject before = scene.state();
+                    scene.resize(before.optInt("cols", 20) + 2, before.optInt("rows", 5));
+                    trace("vtScene", "phase", "resize", "cols", before.optInt("cols", 0) + 2,
+                            "rows", before.optInt("rows", 0));
+                }
+                if (vtSceneFrame == 9) {
+                    scene.feed("\u001b[?1000h\u001b[?1006h"
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    trace("vtScene", "phase", "mouse-mode");
+                }
+                if (vtSceneA11yFixture && vtSceneFrame == 12) {
+                    runVtSceneA11yFixture(page, index);
+                }
+                if (vtScenePagesFixture && vtSceneFrame == 10 && renderedPages.size() > 1) {
+                    RenderedPage next = renderedPages.get(
+                            Math.min(page.index + 1, renderedPages.size() - 1));
+                    int[] pageLoc = new int[2];
+                    int[] scrollLoc = new int[2];
+                    next.getLocationOnScreen(pageLoc);
+                    previewScroll.getLocationOnScreen(scrollLoc);
+                    int topInScroll = pageLoc[1] - scrollLoc[1];
+                    int target = Math.max(0,
+                            previewScroll.getScrollY() + topInScroll - dp(24));
+                    trace("vtScene", "phase", "paging", "away", "page", page.index,
+                            "targetPage", next.index, "scroll", target);
+                    previewScroll.scrollTo(previewScroll.getScrollX(), target);
+                }
+                if (vtScenePagesFixture && vtSceneFrame == 14) {
+                    int[] pageLoc = new int[2];
+                    int[] scrollLoc = new int[2];
+                    page.getLocationOnScreen(pageLoc);
+                    previewScroll.getLocationOnScreen(scrollLoc);
+                    android.graphics.RectF placed = page.terminalRect(index);
+                    int topInScroll = pageLoc[1] - scrollLoc[1]
+                            + (placed == null ? 0 : Math.round(placed.top));
+                    int target = Math.max(0,
+                            previewScroll.getScrollY() + topInScroll - dp(24));
+                    trace("vtScene", "phase", "paging", "back", "page", page.index,
+                            "scroll", target);
+                    previewScroll.scrollTo(previewScroll.getScrollX(), target);
+                }
+                if (vtScenePagesFixture && vtSceneFrame == 16) {
+                    RenderedPage current = vtScenePage();
+                    int currentIndex = vtSceneIndex(current);
+                    if (current != null && currentIndex >= 0) {
+                        JSONObject state = current.terminalScenes[currentIndex].state();
+                        TerminalSurface cycleSurface = current.terminalSurfaces != null
+                                && currentIndex < current.terminalSurfaces.length
+                                ? current.terminalSurfaces[currentIndex] : null;
+                        trace("vtScene", "phase", "page-cycle", "page", current.index,
+                                "index", currentIndex, "loaded", current.loaded,
+                                "scroll", previewScroll.getScrollY(),
+                                "frame", state.optInt("frame", 0),
+                                "generation", state.optInt("generation", 0),
+                                "surface", cycleSurface != null,
+                                "visibility", cycleSurface == null ? -1
+                                        : cycleSurface.getVisibility(),
+                                "shown", cycleSurface != null && cycleSurface.isShown());
+                        if (cycleSurface != null) cycleSurface.repaint("page-cycle");
+                    }
+                }
+                if (vtSceneZoomFixture && vtSceneFrame == 8) {
+                    JSONObject before = scene.state();
+                    android.graphics.RectF beforeRect = page.terminalRect(index);
+                    trace("vtScene", "phase", "zoom",
+                            "cols", before.optInt("cols", 0),
+                            "rows", before.optInt("rows", 0),
+                            "w", beforeRect == null ? 0 : Math.round(beforeRect.width()),
+                            "h", beforeRect == null ? 0 : Math.round(beforeRect.height()));
+                    changeViewZoom(0.5f);
+                }
+                String line = "\u001b[1;1H\u001b[2Kframe " + vtSceneFrame
+                        + " \u00b7 \u754c e\u0301";
+                scene.feed(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                if (vtSceneFrame % 5 == 0) {
+                    JSONObject state = scene.state();
+                    if (vtSceneFrame == 5) revealTerminalTop(page, index);
+                    trace("vtScene", "phase", "frame", vtSceneFrame,
+                            "generation", state.optInt("generation", 0),
+                            "input", state.optString("input", ""));
+                }
+                page.invalidate();
+                main.postDelayed(this, 120);
+            }
+        };
+    }
+
+    private void focusTerminal(RenderedPage page, int index) {
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || page.terminalScenes[index] == null) return;
+        RenderedPage previous = terminalFocusedPage();
+        if (previous != null && previous != page) releaseTerminalFocus();
+        page.terminalFocus = index;
+        page.requestFocus();
+        page.invalidate();
+        if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.VISIBLE);
+        android.view.inputmethod.InputMethodManager ime =
+                (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (ime != null) {
+            ime.restartInput(page);
+            ime.showSoftInput(page, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+        }
+        trace("terminalInput", "phase", "focus", "page", page.index, "index", index);
+    }
+
+    private void releaseTerminalFocus() {
+        RenderedPage page = terminalFocusedPage();
+        if (page == null) return;
+        int index = page.terminalFocus;
+        page.terminalFocus = -1;
+        terminalComposing = "";
+        if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.GONE);
+        android.view.inputmethod.InputMethodManager ime =
+                (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (ime != null) ime.hideSoftInputFromWindow(page.getWindowToken(), 0);
+        page.invalidate();
+        focusRenderedCaret();
+        trace("terminalInput", "phase", "release", "page", page.index, "index", index);
+    }
+
+    /** Explicit viewer authority: Watch follows output; Take requests input. */
+    private void setTerminalControl(boolean watchOnly) {
+        RenderedPage page = terminalFocusedPage();
+        if (page == null || page.terminalFocus < 0 || page.terminalWatchOnly == null
+                || page.terminalFocus >= page.terminalWatchOnly.length) return;
+        if (gatewayLease != null) {
+            if (!gatewayConnected || gatewayAttaching) {
+                trace("gatewayLease", "phase", "request-pending",
+                        watchOnly ? "watch" : "control");
+                return;
+            }
+            // Do not expose input while the new attach is in flight. The
+            // gateway result (or an in_use/revoked CLOSE) is authoritative.
+            page.terminalWatchOnly[page.terminalFocus] = true;
+            gatewayReady = false;
+            gatewayAttaching = true;
+            trace("gatewayLease", "phase", "request",
+                    watchOnly ? "watch" : "control",
+                    "page", page.index, "index", page.terminalFocus);
+            page.invalidate();
+            gatewayLease.switchMode(watchOnly);
+            return;
+        }
+        page.terminalWatchOnly[page.terminalFocus] = watchOnly;
+        if (page.terminalConflict != null && page.terminalFocus < page.terminalConflict.length) {
+            page.terminalConflict[page.terminalFocus] = false;
+        }
+        trace("terminalInput", "control", watchOnly ? "watch" : "take",
+                "page", page.index, "index", page.terminalFocus);
+        page.invalidate();
+    }
+
+    private boolean terminalInputBlocked(RenderedPage page, int index, String kind) {
+        if (page == null || index < 0) return true;
+        boolean watchOnly = page.terminalWatchOnly != null
+                && index < page.terminalWatchOnly.length && page.terminalWatchOnly[index];
+        boolean conflict = page.terminalConflict != null
+                && index < page.terminalConflict.length && page.terminalConflict[index];
+        if (!watchOnly && !conflict) return false;
+        trace("terminalInput", "blocked", conflict ? "conflict" : "watch",
+                "kind", kind, "page", page.index, "index", index);
+        return true;
+    }
+
+    private void sendTerminalKey(int androidKey, int extraMods, String text, int unshifted) {
+        RenderedPage page = terminalFocusedPage();
+        if (page == null || page.terminalScenes == null || page.terminalFocus < 0) return;
+        if (terminalInputBlocked(page, page.terminalFocus, "key")) return;
+        NativeTerminal scene = page.terminalScenes[page.terminalFocus];
+        if (scene == null) return;
+        int key = NativeTerminal.ghosttyKey(androidKey);
+        JSONObject state = scene.key(key, extraMods, text, unshifted);
+        trace("terminalInput", "key", androidKey, "ghostty", key,
+                "input", lastInput(state));
+        sendGatewayInput(state);
+        page.invalidate();
+    }
+
+    private void sendTerminalText(String text) {
+        RenderedPage page = terminalFocusedPage();
+        if (page == null || page.terminalFocus < 0) return;
+        sendTerminalTextTo(page, page.terminalFocus, text);
+    }
+
+    private void sendTerminalTextTo(RenderedPage page, int index, String text) {
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || text == null || text.isEmpty()) return;
+        if (terminalInputBlocked(page, index, "text")) return;
+        NativeTerminal scene = page.terminalScenes[index];
+        if (scene == null) return;
+        JSONObject state = scene.text(text);
+        trace("terminalInput", "text", text, "input", lastInput(state));
+        sendGatewayInput(state);
+        page.invalidate();
+    }
+
+    /** Route a button event to a program that enabled mouse reporting. */
+    private void sendTerminalMouse(RenderedPage page, int index, int x, int y,
+            int button, boolean press, int mods) {
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || page.terminalScenes[index] == null) return;
+        if (terminalInputBlocked(page, index, "mouse")) return;
+        NativeTerminal scene = page.terminalScenes[index];
+        JSONObject state = scene.mouse(x, y, button, press, mods);
+        trace("terminalInput", "mouse", "page", page.index, "index", index,
+                "x", x, "y", y, "button", button, "press", press,
+                "input", lastInput(state));
+        sendGatewayInput(state);
+        page.invalidate();
+    }
+
+    private void sendTerminalMouseMotion(RenderedPage page, int index, int x, int y,
+            int button, int mods) {
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || page.terminalScenes[index] == null) return;
+        if (terminalInputBlocked(page, index, "motion")) return;
+        NativeTerminal scene = page.terminalScenes[index];
+        JSONObject state = scene.mouseMotion(x, y, button, mods);
+        trace("terminalInput", "motion", "page", page.index, "index", index,
+                "x", x, "y", y, "button", button, "input", lastInput(state));
+        sendGatewayInput(state);
+        page.invalidate();
+    }
+
+    /** Long-press selection starts at a word and extends by dragging cells. */
+    private void selectTerminalWord(RenderedPage page, int index, float x, float y) {
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || page.terminalScenes[index] == null) return;
+        int[] cell = page.terminalCellAt(index, x, y);
+        if (cell == null) return;
+        int[] bounds = page.terminalScenes[index].wordSelection(cell[0], cell[1]);
+        if (bounds == null) return;
+        terminalSelectionPage = page;
+        terminalSelectionIndex = index;
+        terminalSelX0 = bounds[0];
+        terminalSelY0 = bounds[1];
+        terminalSelX1 = bounds[2];
+        terminalSelY1 = bounds[3];
+        terminalSelecting = true;
+        page.invalidate();
+        trace("terminalSelection", "start", "page", page.index, "index", index,
+                "x0", terminalSelX0, "y0", terminalSelY0,
+                "x1", terminalSelX1, "y1", terminalSelY1);
+    }
+
+    private void updateTerminalSelectionEnd(RenderedPage page, float x, float y) {
+        if (terminalSelectionPage != page) return;
+        int[] cell = page.terminalCellAt(terminalSelectionIndex, x, y);
+        if (cell == null) return;
+        terminalSelX1 = cell[0];
+        terminalSelY1 = cell[1];
+        page.invalidate();
+    }
+
+    private String terminalSelectionText() {
+        RenderedPage page = terminalSelectionPage;
+        if (page == null || page.terminalScenes == null || terminalSelectionIndex < 0
+                || terminalSelectionIndex >= page.terminalScenes.length
+                || page.terminalScenes[terminalSelectionIndex] == null) return "";
+        return page.terminalScenes[terminalSelectionIndex].selection(
+                terminalSelX0, terminalSelY0, terminalSelX1, terminalSelY1);
+    }
+
+    private void copyTerminalSelection() {
+        String text = terminalSelectionText();
+        if (text.isEmpty()) return;
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard != null) clipboard.setPrimaryClip(
+                android.content.ClipData.newPlainText("Terminal", text));
+        trace("terminalSelection", "copy", "chars", text.length());
+        clearTerminalSelection();
+    }
+
+    private void copyTerminalOutput(RenderedPage page, int index) {
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || page.terminalScenes[index] == null) return;
+        NativeTerminal scene = page.terminalScenes[index];
+        String text = scene.selection(0, 0,
+                Math.max(0, scene.cols() - 1), Math.max(0, scene.rows() - 1));
+        if (text.isEmpty()) return;
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard != null) clipboard.setPrimaryClip(
+                android.content.ClipData.newPlainText("Terminal", text));
+        fileMessage("Copied terminal output");
+    }
+
+    private void clearTerminalSelection() {
+        RenderedPage page = terminalSelectionPage;
+        terminalSelectionPage = null;
+        terminalSelectionIndex = -1;
+        terminalSelecting = false;
+        if (page != null) page.invalidate();
+        if (terminalSelectionBar != null) terminalSelectionBar.setVisibility(View.GONE);
+    }
+
+    private void showTerminalSelectionBar() {
+        if (terminalSelectionBar != null && terminalSelectionPage != null) {
+            terminalSelectionBar.setVisibility(View.VISIBLE);
+        }
+    }
+
+    /** Paste clipboard text into a terminal scene as input, not the document. */
+    private void pasteTerminalClipboard() {
+        RenderedPage page = terminalSelectionPage;
+        int index = terminalSelectionIndex;
+        if (page == null || page.terminalScenes == null || index < 0
+                || index >= page.terminalScenes.length || page.terminalScenes[index] == null) {
+            page = terminalFocusedPage();
+            index = page == null ? -1 : page.terminalFocus;
+        }
+        if (page == null || page.terminalScenes == null || index < 0) return;
+        if (terminalInputBlocked(page, index, "paste")) return;
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard == null || !clipboard.hasPrimaryClip() || clipboard.getPrimaryClip() == null
+                || clipboard.getPrimaryClip().getItemCount() == 0) return;
+        CharSequence value = clipboard.getPrimaryClip().getItemAt(0).coerceToText(this);
+        if (value != null && value.length() > 0) {
+            trace("terminalInput", "paste", "chars", value.length());
+            sendTerminalTextTo(page, index, value.toString());
+        }
+        clearTerminalSelection();
+    }
+
+    private static String lastInput(JSONObject state) {
+        String input = state == null ? "" : state.optString("input", "");
+        int space = input.lastIndexOf(' ');
+        return space < 0 ? input : input.substring(space + 1);
+    }
+
+    /** Send the latest VT-encoded input token over a live controller lease. */
+    private void sendGatewayInput(JSONObject state) {
+        GatewayLeaseClient lease = gatewayLease;
+        if (lease == null || !lease.isControlling()) return;
+        String input = state == null ? "" : state.optString("input", "");
+        int space = input.lastIndexOf(' ');
+        String token = space < 0 ? input : input.substring(space + 1);
+        int colon = token.indexOf(':');
+        if (colon < 0) return;
+        byte[] bytes = decodeHex(token.substring(colon + 1));
+        if (bytes == null || bytes.length == 0) return;
+        if (lease.sendInput(bytes)) {
+            trace("gatewayLease", "input", "bytes", bytes.length);
+        } else {
+            trace("gatewayLease", "input", "failed", "bytes", bytes.length);
+        }
+    }
+
+    private static byte[] decodeHex(String hex) {
+        if (hex == null || hex.isEmpty() || (hex.length() & 1) != 0) return null;
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            int high = Character.digit(hex.charAt(i * 2), 16);
+            int low = Character.digit(hex.charAt(i * 2 + 1), 16);
+            if (high < 0 || low < 0) return null;
+            out[i] = (byte) ((high << 4) | low);
+        }
+        return out;
+    }
+
+    private TextView terminalKeyButton(String label, int androidKey) {
+        return terminalKeyButton(label, androidKey, false);
+    }
+
+    private TextView terminalKeyButton(final String label, final int androidKey, final boolean ctrl) {
+        return shortcut(label, new Runnable() {
+            @Override public void run() {
+                sendTerminalKey(androidKey, ctrl ? 2 : 0, "", 0);
+            }
+        });
+    }
+
     private void installPageTouch(final RenderedPage page) {
         page.setOnTouchListener(new View.OnTouchListener() {
             private final int slop = android.view.ViewConfiguration.get(MainActivity.this)
@@ -5974,12 +8326,17 @@ public class MainActivity extends Activity {
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         if (pagesStale) return true;
+                        clearTerminalSelection();
                         touchSelectionPage = page;
                         touchSelectionAnchor = selectionAnchor;
                         touchDownX = event.getX();
                         touchDownY = event.getY();
                         moved = false;
                         touchSelecting = false;
+                        terminalSelecting = false;
+                        terminalMousePage = null;
+                        terminalMouseIndex = -1;
+                        terminalMousePressed = false;
                         touchSelectionHandle = -1;
                         main.removeCallbacks(touchLongPress);
                         if (page.loaded) {
@@ -5995,6 +8352,21 @@ public class MainActivity extends Activity {
                             }
                         }
                         if (!pagesStale && page.loaded) {
+                            int terminal = page.terminalIndexAt(event.getX(), event.getY());
+                            NativeTerminal scene = terminal >= 0
+                                    ? page.terminalScenes[terminal] : null;
+                            if (scene != null && scene.mouseTracking()) {
+                                focusTerminal(page, terminal);
+                                int[] cell = page.terminalCellAt(terminal,
+                                        event.getX(), event.getY());
+                                if (cell != null) {
+                                    terminalMousePage = page;
+                                    terminalMouseIndex = terminal;
+                                    terminalMousePressed = true;
+                                    sendTerminalMouse(page, terminal, cell[0], cell[1],
+                                            0, true, 0);
+                                }
+                            }
                             main.postDelayed(touchLongPress,
                                     android.view.ViewConfiguration.getLongPressTimeout());
                         }
@@ -6006,7 +8378,18 @@ public class MainActivity extends Activity {
                             moved = true;
                             main.removeCallbacks(touchLongPress);
                         }
-                        if (touchSelecting && !pagesStale) {
+                        if (terminalSelecting && !pagesStale) {
+                            updateTerminalSelectionEnd(page, event.getX(), event.getY());
+                        } else if (terminalMousePressed && terminalMousePage == page
+                                && !pagesStale) {
+                            int[] cell = page.terminalCellAt(terminalMouseIndex,
+                                    event.getX(), event.getY());
+                            if (cell != null && page.terminalScenes[terminalMouseIndex]
+                                    .mouseMotionTracking()) {
+                                sendTerminalMouseMotion(page, terminalMouseIndex,
+                                        cell[0], cell[1], 0, 0);
+                            }
+                        } else if (touchSelecting && !pagesStale) {
                             int offset = caretOffsetAtPoint(page, event.getX(), event.getY());
                             if (offset >= 0) {
                                 setDocumentCaret(offset);
@@ -6017,12 +8400,37 @@ public class MainActivity extends Activity {
                         return true;
                     case MotionEvent.ACTION_UP:
                         main.removeCallbacks(touchLongPress);
+                        if (terminalSelecting) {
+                            updateTerminalSelectionEnd(page, event.getX(), event.getY());
+                            terminalSelecting = false;
+                            showTerminalSelectionBar();
+                            touchSelectionPage = null;
+                            return true;
+                        }
+                        if (terminalMousePressed && terminalMousePage == page) {
+                            int[] cell = page.terminalCellAt(terminalMouseIndex,
+                                    event.getX(), event.getY());
+                            if (cell != null) {
+                                sendTerminalMouse(page, terminalMouseIndex, cell[0], cell[1],
+                                        0, false, 0);
+                            }
+                            terminalMousePressed = false;
+                            terminalMousePage = null;
+                            terminalMouseIndex = -1;
+                            moved = true;
+                        }
                         if (touchSelecting) {
                             int offset = caretOffsetAtPoint(page, event.getX(), event.getY());
                             if (offset >= 0) setDocumentCaret(offset);
                             showSelectionBar();
                         } else if (!moved && !pagesStale) {
-                            selectPageGlyph(page, event.getX(), event.getY());
+                            int terminal = page.terminalIndexAt(event.getX(), event.getY());
+                            if (terminal >= 0) {
+                                focusTerminal(page, terminal);
+                            } else {
+                                if (page.terminalFocus >= 0) releaseTerminalFocus();
+                                selectPageGlyph(page, event.getX(), event.getY());
+                            }
                         }
                         touchSelecting = false;
                         touchSelectionHandle = -1;
@@ -6030,6 +8438,18 @@ public class MainActivity extends Activity {
                         return true;
                     case MotionEvent.ACTION_CANCEL:
                         main.removeCallbacks(touchLongPress);
+                        if (terminalMousePressed && terminalMousePage == page) {
+                            int[] cell = page.terminalCellAt(terminalMouseIndex,
+                                    event.getX(), event.getY());
+                            if (cell != null) {
+                                sendTerminalMouse(page, terminalMouseIndex, cell[0], cell[1],
+                                        0, false, 0);
+                            }
+                        }
+                        terminalMousePressed = false;
+                        terminalMousePage = null;
+                        terminalMouseIndex = -1;
+                        terminalSelecting = false;
                         if (!touchSelecting) {
                             touchSelectionPage = null;
                         }
@@ -6138,22 +8558,34 @@ public class MainActivity extends Activity {
     private void applyDecodedPage(DecodedPage p) {
         if (p.index < 0 || p.index >= renderedPages.size()) return;
         RenderedPage page = renderedPages.get(p.index);
-        Bitmap old = page.getDrawable() instanceof BitmapDrawable
-                ? ((BitmapDrawable) page.getDrawable()).getBitmap() : null;
+        Bitmap old = page.image.getDrawable() instanceof BitmapDrawable
+                ? ((BitmapDrawable) page.image.getDrawable()).getBitmap() : null;
         if (old != null && old != p.bitmap && !old.isRecycled()) {
             retainedBitmapBytes = Math.max(0, retainedBitmapBytes - page.bitmapBytes);
             old.recycle();
         }
-        page.setImageBitmap(p.bitmap);
+        page.image.setImageBitmap(p.bitmap);
         page.hits = p.hits;
         page.textTop = p.textTop;
         page.widthPt = p.widthPt;
         page.heightPt = p.heightPt;
         page.hasFigures = p.hasFigures;
+        page.figures = p.figures;
+        attachTransferredScenes(page, p.figures);
+        int terminalFigures = 0;
+        for (int i = 0; i < p.figures.length(); i++) {
+            JSONObject figure = p.figures.optJSONObject(i);
+            if (figure != null && !jsonString(figure, "reference").isEmpty()) terminalFigures++;
+        }
+        trace("figureMetadata", "page", p.index, "figures", p.figures.length(),
+                "terminal", terminalFigures);
         page.bitmapBytes = p.bitmap.getAllocationByteCount();
         if (!page.loaded) {
             page.loaded = true;
             pagesLoaded++;
+        }
+        if (figureA11yFixturePending && p.figures.length() > 0) {
+            runFigureA11yFixture(page);
         }
         retainedBitmapBytes += page.bitmapBytes;
         if (!retainedPages.contains(page)) retainedPages.add(page);
@@ -6167,6 +8599,11 @@ public class MainActivity extends Activity {
                 "visiblePx~", p.visiblePixels, "bytes", page.bitmapBytes);
         trace("pageLayout", "page", p.index, "raster", p.width + "x" + p.height,
                 "pw", width, "ih", height, "textTop", p.textTop);
+        if (vtSceneFixturePending) {
+            page.post(new Runnable() {
+                @Override public void run() { startVtScene(page); }
+            });
+        }
         if (!inspectorOpen && !(getCurrentFocus() instanceof EditText)) focusRenderedCaret();
     }
 
@@ -6319,12 +8756,17 @@ public class MainActivity extends Activity {
     }
 
     private void releasePageBitmap(RenderedPage page) {
-        Drawable drawable = page.getDrawable();
-        page.setImageDrawable(null);
+        Drawable drawable = page.image.getDrawable();
+        page.image.setImageDrawable(null);
         if (drawable instanceof BitmapDrawable) {
             Bitmap bitmap = ((BitmapDrawable) drawable).getBitmap();
             if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
         }
+        if (page.terminalFocus >= 0) {
+            page.terminalFocus = -1;
+            if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.GONE);
+        }
+        page.closeTerminalScenes();
         retainedBitmapBytes = Math.max(0, retainedBitmapBytes - page.bitmapBytes);
         page.bitmapBytes = 0;
         page.hits = new JSONArray();
@@ -6341,6 +8783,10 @@ public class MainActivity extends Activity {
      * its own base64 payload) is in flight.
      */
     private void releasePageBitmaps() {
+        for (int i = 0; i < renderedPages.size(); i++) {
+            renderedPages.get(i).closeTerminalScenes();
+        }
+        if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.GONE);
         renderedPages.clear();
         retainedPages.clear();
         retainedBitmapBytes = 0;
@@ -6348,12 +8794,12 @@ public class MainActivity extends Activity {
         int released = 0;
         for (int i = previewPages.getChildCount() - 1; i >= 0; i--) {
             View child = previewPages.getChildAt(i);
-            if (!(child instanceof ImageView)) {
+            if (!(child instanceof RenderedPage)) {
                 continue;
             }
-            ImageView page = (ImageView) child;
-            Drawable drawable = page.getDrawable();
-            page.setImageDrawable(null);
+            RenderedPage page = (RenderedPage) child;
+            Drawable drawable = page.image.getDrawable();
+            page.image.setImageDrawable(null);
             if (drawable instanceof BitmapDrawable) {
                 Bitmap bmp = ((BitmapDrawable) drawable).getBitmap();
                 if (bmp != null && !bmp.isRecycled()) {

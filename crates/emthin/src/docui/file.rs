@@ -25,6 +25,14 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "source" => Some(Self::Source),
+            "snapshot" => Some(Self::Snapshot),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Source => "source",
@@ -85,6 +93,22 @@ pub struct FileStamp {
 }
 
 impl FileStamp {
+    /// Rebuild the stamp a previous save left behind. Used when a recovered
+    /// session records its explicit destination: the recorded digest is the
+    /// conflict baseline, not whatever the file happens to contain now.
+    pub fn from_baseline(path: &Path, bytes: u64, sha256: String) -> Self {
+        let canonical_path = canonical_target(path);
+        let modified = std::fs::metadata(&canonical_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        Self {
+            canonical_path,
+            bytes,
+            modified,
+            sha256,
+        }
+    }
+
     fn capture(path: &Path, bytes: &[u8]) -> Self {
         let canonical_path = canonical_target(path);
         let modified = std::fs::metadata(&canonical_path)
@@ -181,26 +205,78 @@ pub fn write(
     previous: Option<&FileStamp>,
     force: bool,
 ) -> Result<SavedDocument, FileError> {
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    // Resolve the symlink once and use that target for the conflict check,
+    // the temporary file and the publish. Renaming onto the link itself would
+    // replace it and break the user's stable path.
+    let destination = resolve_destination(path)?;
+    let existed = destination.exists();
+    let same_target = previous.is_some_and(|stamp| stamp.canonical_path == destination);
+
     if !force {
         if let Some(previous) = previous {
-            if previous.canonical_path == canonical_target(path) {
-                let current = std::fs::read(path).map_err(|_| FileError::Conflict(path.into()))?;
-                if current.len() as u64 != previous.bytes || sha256_hex(&current) != previous.sha256
-                {
-                    return Err(FileError::Conflict(path.to_path_buf()));
-                }
+            if same_target {
+                ensure_unchanged(&destination, previous, path)?;
+            } else if existed || is_link {
+                // Save As to a destination this document never observed. Do
+                // not replace it without the caller's explicit force.
+                return Err(FileError::Conflict(path.to_path_buf()));
             }
+        } else if existed {
+            return Err(FileError::Conflict(path.to_path_buf()));
         }
     }
-    crate::session::store::write_atomic(path, bytes)
-        .map_err(|error| FileError::Io(format!("could not write {}: {error}", path.display())))?;
-    let stamp = FileStamp::capture(path, bytes);
+
+    // Re-resolve just before publishing so a retargeted link is a conflict,
+    // not a write into the old target while the link points somewhere else.
+    if resolve_destination(path)? != destination {
+        return Err(FileError::Conflict(path.to_path_buf()));
+    }
+    if !force && same_target {
+        if let Some(previous) = previous {
+            ensure_unchanged(&destination, previous, path)?;
+        }
+    }
+
+    let replace = existed;
+    crate::session::store::write_atomic_publish(&destination, bytes, replace).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            FileError::Conflict(path.to_path_buf())
+        } else {
+            FileError::Io(format!("could not write {}: {error}", path.display()))
+        }
+    })?;
+    let stamp = FileStamp::capture(&destination, bytes);
     Ok(SavedDocument {
         path: stamp.canonical_path.clone(),
         kind,
         digest: stamp.sha256.clone(),
         stamp,
     })
+}
+
+fn resolve_destination(path: &Path) -> Result<PathBuf, FileError> {
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_link {
+        return Ok(canonical_target(path));
+    }
+    std::fs::canonicalize(path).map_err(|_| FileError::Conflict(path.to_path_buf()))
+}
+
+fn ensure_unchanged(
+    destination: &Path,
+    previous: &FileStamp,
+    requested: &Path,
+) -> Result<(), FileError> {
+    let current = std::fs::read(destination).map_err(|_| FileError::Conflict(requested.into()))?;
+    if current.len() as u64 != previous.bytes || sha256_hex(&current) != previous.sha256 {
+        return Err(FileError::Conflict(requested.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn canonical_target(path: &Path) -> PathBuf {
@@ -215,7 +291,7 @@ fn canonical_target(path: &Path) -> PathBuf {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -315,6 +391,115 @@ mod tests {
     }
 
     #[test]
+    fn saving_through_a_stable_symlink_writes_its_target_and_keeps_the_link() {
+        let dir = TempDir::new("symlink");
+        let target = dir.0.join("target.typ");
+        let link = dir.0.join("notes.typ");
+        std::fs::write(&target, "first").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        let opened = read(&link).expect("open through link");
+
+        let saved = write(
+            &link,
+            b"second",
+            FileKind::Source,
+            Some(&opened.stamp),
+            false,
+        )
+        .expect("save through link");
+        assert_eq!(saved.path, target.canonicalize().unwrap());
+        assert_eq!(std::fs::read_to_string(&target).expect("target"), "second");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the stable link still points at the target"
+        );
+    }
+
+    #[test]
+    fn a_retargeted_symlink_is_a_conflict() {
+        let dir = TempDir::new("retargeted-link");
+        let first = dir.0.join("first.typ");
+        let second = dir.0.join("second.typ");
+        let link = dir.0.join("notes.typ");
+        std::fs::write(&first, "first").expect("first");
+        std::fs::write(&second, "second").expect("second");
+        std::os::unix::fs::symlink(&first, &link).expect("link");
+        let opened = read(&link).expect("open");
+        std::fs::remove_file(&link).expect("remove link");
+        std::os::unix::fs::symlink(&second, &link).expect("retarget");
+
+        assert!(matches!(
+            write(
+                &link,
+                b"saved",
+                FileKind::Source,
+                Some(&opened.stamp),
+                false
+            ),
+            Err(FileError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&first).expect("first"), "first");
+        assert_eq!(std::fs::read_to_string(&second).expect("second"), "second");
+    }
+
+    #[test]
+    fn an_unknown_existing_save_as_target_is_not_replaced_without_force() {
+        let dir = TempDir::new("save-as-existing");
+        let source = dir.0.join("source.typ");
+        let destination = dir.0.join("existing.typ");
+        std::fs::write(&source, "source").expect("source");
+        std::fs::write(&destination, "existing").expect("destination");
+        let opened = read(&source).expect("open");
+
+        assert!(matches!(
+            write(
+                &destination,
+                b"copy",
+                FileKind::Source,
+                Some(&opened.stamp),
+                false
+            ),
+            Err(FileError::Conflict(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("destination"),
+            "existing"
+        );
+
+        write(
+            &destination,
+            b"copy",
+            FileKind::Source,
+            Some(&opened.stamp),
+            true,
+        )
+        .expect("forced copy");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("destination"),
+            "copy"
+        );
+    }
+
+    #[test]
+    fn a_new_destination_is_published_without_clobbering_an_existing_file() {
+        let dir = TempDir::new("create-only");
+        let destination = dir.0.join("created.typ");
+        std::fs::write(&destination, "concurrent").expect("concurrent creator");
+
+        assert!(matches!(
+            write(&destination, b"mine", FileKind::Source, None, false),
+            Err(FileError::Conflict(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("destination"),
+            "concurrent"
+        );
+    }
+
+    #[test]
     fn a_failed_atomic_write_leaves_the_old_file() {
         let dir = TempDir::new("atomic");
         let path = dir.0.join("notes.typ");
@@ -326,5 +511,23 @@ mod tests {
 
         assert!(write(&path, b"new", FileKind::Source, Some(&opened.stamp), false).is_err());
         assert_eq!(std::fs::read_to_string(&path).expect("source"), "old");
+    }
+
+    #[test]
+    fn a_failed_publish_keeps_the_previous_destination() {
+        let dir = TempDir::new("publish-failure");
+        let path = dir.0.join("notes.typ");
+        std::fs::create_dir(&path).expect("make destination a directory");
+        std::fs::write(path.join("keep"), "kept").expect("keep");
+
+        assert!(write(&path, b"new", FileKind::Source, None, true).is_err());
+        assert!(
+            path.is_dir(),
+            "the failed rename left the destination alone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep")).expect("kept"),
+            "kept"
+        );
     }
 }

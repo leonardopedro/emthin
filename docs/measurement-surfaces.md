@@ -10,8 +10,9 @@ is that the next seam regression can be placed without re-deriving it.
 
 | surface | measures | cannot see | seam guarded |
 |---|---|---|---|
-| `cargo test --workspace` (511 passed, 2 ignored on 2026-11-18; the 2026-10 suite was 347) | doc-model invariants, keymap tables, session serde, figure binding, IPC protocol units, xwayland-supervisor timing | anything needing a live compositor: a real input path, a real clipboard, a real shutdown signal | `mathed_core` ↔ `emthin` model contract |
-| `scripts/e2e/run.sh` (28 checks; 36 with XTEST) | one real nested session end to end: synthetic keystrokes reaching the document, PgDn/PgUp multi-page navigation, clipboard both directions across the proxy, per-document preferences, touch panning, Find cancel and fcitx5/rime preedit/commit in the XTEST lane, the `list_state` document read, SIGTERM shutdown | rendering quality, performance | input path · IME host · clipboard proxy · control socket · shutdown — the seams *between* crates and processes |
+| `cargo test --locked --workspace` (687 passed, 2 ignored on 2026-11-21; the 2026-11-19 suite was 538) | doc-model invariants, keymap tables, session serde, figure binding, IPC protocol units, xwayland-supervisor timing | anything needing a live compositor: a real input path, a real clipboard, a real shutdown signal | `mathed_core` ↔ `emthin` model contract |
+| `scripts/e2e/run.sh` (28 checks with `wtype`, 36 with XTEST, 0 skipped on 2026-11-21) | one real nested session end to end: synthetic keystrokes reaching the document, PgDn/PgUp multi-page navigation, clipboard both directions across the proxy, per-document preferences, touch panning, Find cancel and fcitx5/rime preedit/commit in the XTEST lane, the `list_state` document read, SIGTERM shutdown | rendering quality (performance is now sampled — see the live-session baseline below) | input path · IME host · clipboard proxy · control socket · shutdown — the seams *between* crates and processes |
+| `scripts/e2e/process-kill.sh` (7 checks, exit 0 on 2026-11-21) | SIGKILL at a committed session-write boundary, then relaunch: the last verified snapshot pair recovers the edited note with no quarantine | rendering, input, the save path between checkpoints | the atomic session store's real-process crash recovery — D1/D8's process-kill case |
 | what a user sees | all of it, eventually | — (they file the bug) | — |
 
 Neither gate is a subset of the other, and neither can absorb the other: the
@@ -56,9 +57,43 @@ The full post-mortem lives there; what belongs here is the rule it taught:
 - `./scripts/e2e/run.sh --list` reports which input configurations the
   machine can run before anything is started.
 
+## Live-session timing baseline (2026-11-21)
+
+D0 asked for a live-session baseline; this is it, from one `wtype` E2E run
+with `RUST_LOG="info,emthin::timing=trace"` (28 checks, exit 0). Host:
+aarch64, rustc 1.99.0, workspace `Cargo.lock`. Source: `.e2e/emthin.log`
+from that run, aggregated by `stage` and field — this is instrumentation on
+the real session, not a synthetic benchmark.
+
+| stage / field | n | p50 | p95 | max | unit |
+|---|---|---|---|---|---|
+| `event_loop_tick` elapsed | 121,656 | 26 | 221 | 155,680 | µs |
+| slow ticks (>1 ms) | 38 | — | — | — | 0.03% of ticks |
+| `doc_relayout` elapsed | 11 | 10 | 1,330 | 1,330 | µs |
+| `layout_worker` compile | 10 | 112.5 | 382.6 | 382.6 | ms |
+| `layout_worker` glyph | 10 | 48.9 | 208.8 | 208.8 | ms |
+| `layout_worker` raster | 10 | 124.6 | 156.7 | 156.7 | ms |
+| `layout_worker` apply | 10 | 0 | 0 | 0 | ms |
+| `session_save` elapsed | 11 | 14,267 | 75,430 | 75,430 | µs |
+| `session_save` snapshot | 11 | 1,393 | 2,239 | 2,239 | µs |
+| `session_save` write | 11 | 11,295 | 73,273 | 73,273 | µs |
+| `autosave` elapsed | 8 | 64,123 | 75,500 | 75,500 | µs |
+
+Reading it: the steady-state event-loop tick is tens of µs with a 221 µs
+p95; only 38 of ~122k ticks crossed the 1 ms debug threshold (mostly startup
+and the first render). Layout work happens off-loop — compile/glyph/raster
+are separately visible in the worker's result event — and a document save's
+dominant cost is the disk write, not the snapshot. The 1,200-line pure
+layout measurement from D3.2 remains the page-work stress figure; this table
+is the ordinary-session counterpart.
+
 ## What no gate covers yet
 
-The IME commit path (needs the host's fcitx engaged, not merely installed)
-and rendering quality ("make it look nice") are user-visible and unmeasured.
-The §9 debuggability workstream in the workspace plan picks rendering up as
-its acceptance lane.
+Rendering quality ("make it look nice") is still not machine-checkable; the
+§9 debuggability workstream picks it up as its acceptance lane. The live
+timing baseline above now samples performance during the E2E, but it is a
+single session, not a gate — there is no p95 threshold a regression fails
+against. The IME commit path is covered behaviourally by both E2E configs
+(fcitx5/rime under XTEST, and the device lane's composing-IME check); what
+remains unmeasured is timing *through* the host IME, which the trace does not
+attribute.

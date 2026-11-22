@@ -15,16 +15,23 @@
 //! The document is the layout authority; there is no window-management
 //! policy anywhere else in the compositor.
 
+pub mod a11y;
 pub mod ascii_interchange;
+pub mod change;
 pub mod citations;
 pub mod edit;
 pub mod figures;
 pub mod file;
 pub mod formals;
+pub mod history;
+pub mod inspect;
 pub mod keymap;
 pub mod layout;
 pub mod model;
+pub mod proof_index;
+pub mod readiness;
 pub mod search;
+pub mod semantic;
 pub mod status;
 pub mod voice;
 
@@ -50,9 +57,10 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq)]
 struct ViewState {
     caret: Option<crate::session::CursorAnchor>,
-    selection_start: Option<crate::session::CursorAnchor>,
-    selection_end: Option<crate::session::CursorAnchor>,
+    selection_anchor: Option<crate::session::CursorAnchor>,
+    selection_caret: Option<crate::session::CursorAnchor>,
     reading: Option<crate::session::CursorAnchor>,
+    reading_offset: Option<f64>,
     page: usize,
     zoom: f64,
     pan: Point<f64, Logical>,
@@ -61,6 +69,26 @@ struct ViewState {
 /// The maximum number of returnable jumps. Old entries fall off the front so
 /// a long reading session cannot grow the history without bound.
 const HISTORY_LIMIT: usize = 30;
+
+/// What an explicit document file last represented. Separate from the
+/// recovery pair so a successful autosave cannot make a named file look
+/// saved, and a source export is not marked dirty by a marks-only edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileBaseline {
+    instance: u64,
+    kind: file::FileKind,
+    content: String,
+}
+
+/// The content and preferences of the last acknowledged recovery pair.
+/// Idle ticks compare against this before writing again.
+#[derive(Debug, Clone, PartialEq)]
+struct RecoveryBaseline {
+    instance: u64,
+    content: String,
+    preferences: crate::session::DocumentPreferences,
+    explicit_file: Option<crate::session::ExplicitFileRecord>,
+}
 
 /// Everything about the document shell: text, layout, figures.
 pub struct DocUi {
@@ -114,6 +142,14 @@ pub struct DocUi {
     document_file: Option<file::FileStamp>,
     /// Stable identity of the open document, used to key its preferences.
     document_key: Option<String>,
+    /// Bumped whenever the whole document model is replaced, so a completion
+    /// stamp from an older document cannot be applied to the new one.
+    document_instance: u64,
+    /// The explicit file's last confirmed representation.
+    document_baseline: Option<FileBaseline>,
+    /// The last acknowledged recovery snapshot, with the preferences written
+    /// beside it.
+    recovery_baseline: Option<RecoveryBaseline>,
     last_autosave: Instant,
     /// The content generation and reveal key the current raster was built
     /// from. `None` means the next layout must run (new document).
@@ -130,9 +166,23 @@ pub struct DocUi {
     /// Loading found files that must not be overwritten by autosave. An
     /// explicit document open clears this.
     persistence_blocked: bool,
-    /// Content generation at the last successful session/document save, so
-    /// the status projection can say whether the current text is unsaved.
-    last_saved_generation: u64,
+    /// The explicit file's save/conflict error. Unlike a recovery failure,
+    /// this survives autosave until an explicit save succeeds.
+    save_error: Option<String>,
+    /// Local/share readiness and acknowledged generations (K2). The facts
+    /// still live in the session store, this document and the collab session;
+    /// this is their single projection and the seed gate.
+    readiness: readiness::Readiness,
+    /// Bounded read-only history of retained frontiers (K5). Entries are
+    /// stamped with share id, frontier and owner and never touch the live
+    /// writable model until an explicit copy export.
+    doc_history: history::HistoryStore,
+    /// Monotonic sequence assigned to retained history entries.
+    history_seq: u64,
+    /// The last built read-only proof/reference view (K8).
+    proof_view: Option<proof_index::ProofView>,
+    /// The last built read-only semantic view (outline / def-use / rename).
+    semantic_view: Option<semantic::SemanticView>,
 }
 
 impl Default for DocUi {
@@ -161,6 +211,9 @@ impl DocUi {
             session_file: None,
             document_file: None,
             document_key: None,
+            document_instance: 1,
+            document_baseline: None,
+            recovery_baseline: None,
             last_autosave: Instant::now(),
             last_content_generation: None,
             last_reveal_key: None,
@@ -168,7 +221,12 @@ impl DocUi {
             persistence_error: None,
             persistence_warning: None,
             persistence_blocked: false,
-            last_saved_generation: 0,
+            save_error: None,
+            readiness: readiness::Readiness::new(),
+            doc_history: history::HistoryStore::default(),
+            history_seq: 0,
+            proof_view: None,
+            semantic_view: None,
         }
     }
 
@@ -180,13 +238,284 @@ impl DocUi {
         &mut self.model
     }
 
-    pub fn citation_popup(&self) -> &citations::CitationPopup { &self.citation_popup }
-
-    pub fn toggle_citation(&mut self, number: u64) -> Result<(), String> {
-        self.citation_popup.toggle(self.model.text(), self.model.revision(), number)
+    /// Drain the typed changes committed since the last drain, stamped with
+    /// this document's instance. Presentation-only activity produces nothing,
+    /// so a caller can forward the result straight to control clients without
+    /// advancing any durable state.
+    pub fn take_changes(&mut self) -> Vec<change::DocChange> {
+        let instance = self.document_instance;
+        self.model.take_changes(instance)
     }
 
-    pub fn close_citation(&mut self) -> bool { self.citation_popup.close() }
+    // ----- readiness and acknowledgement (K2) ---------------------------
+
+    fn committed_generation(&self) -> readiness::Generation {
+        readiness::Generation::new(
+            self.document_instance,
+            self.model.content_generation(),
+            crate::ipc::hex::encode(&self.model.math_doc().version_vector()),
+        )
+    }
+
+    pub fn document_key(&self) -> Option<&str> {
+        self.document_key.as_deref()
+    }
+
+    /// The readiness projection for status/IPC consumers.
+    pub fn readiness_snapshot(&self) -> readiness::ReadinessSnapshot {
+        self.readiness.snapshot()
+    }
+
+    /// A replacement document is loading; clear the previous document's seed
+    /// flags until its origin is known.
+    pub fn note_loading(&mut self) {
+        self.readiness.seed.reset_for_document();
+        self.readiness.local = readiness::LocalState::Loading;
+    }
+
+    /// An existing document was opened (not created, not recovered).
+    pub fn note_existing_document(&mut self) {
+        self.readiness.seed.reset_for_document();
+        self.readiness.local = readiness::LocalState::Available;
+    }
+
+    /// A genuinely new local document: reset the per-document seed flags and
+    /// confirm its creation so it may seed a share once.
+    pub fn confirm_new_document(&mut self) {
+        self.readiness.seed.reset_for_document();
+        self.readiness.seed.confirm_local_creation();
+        self.readiness.local = readiness::LocalState::Available;
+    }
+
+    pub fn note_local_loaded(&mut self, recovered: bool) {
+        self.readiness.local = readiness::LocalState::Available;
+        if recovered {
+            self.readiness.seed.note_recovered();
+        }
+    }
+
+    pub fn note_local_missing(&mut self) {
+        self.readiness.local = readiness::LocalState::Missing;
+    }
+
+    pub fn note_local_failed(&mut self, message: impl Into<String>) {
+        self.readiness.local = readiness::LocalState::Failed(message.into());
+    }
+
+    pub fn note_share_joined(&mut self) {
+        self.readiness.share = readiness::ShareState::CatchingUp {
+            frontier: String::new(),
+        };
+    }
+
+    pub fn note_share_offline(&mut self) {
+        self.readiness.share = readiness::ShareState::Offline;
+    }
+
+    pub fn note_share_refused(&mut self, reason: impl Into<String>) {
+        self.readiness.share = readiness::ShareState::Refused(reason.into());
+    }
+
+    pub fn note_late_arrival(&mut self) {
+        self.readiness.seed.note_late_arrival();
+    }
+
+    pub fn can_seed(&self, shared: bool) -> bool {
+        self.readiness.seed.can_seed(shared)
+    }
+
+    pub fn mark_seeded(&mut self) {
+        self.readiness.seed.mark_seeded();
+    }
+
+    /// Record a peer acknowledgement. A late completion for an older revision
+    /// cannot be turned into a "current" share state or a saved claim.
+    pub fn note_peer_ack(&mut self, caught_up: bool) {
+        let generation = self.committed_generation();
+        self.readiness
+            .acknowledge(readiness::Acknowledgement::peer(generation.clone()));
+        self.readiness.note_peer_response(std::time::Instant::now());
+        if matches!(
+            self.readiness.share,
+            readiness::ShareState::NotShared | readiness::ShareState::Refused(_)
+        ) {
+            return;
+        }
+        self.readiness.share = if caught_up {
+            readiness::ShareState::Current {
+                frontier: generation.version,
+            }
+        } else {
+            readiness::ShareState::CatchingUp {
+                frontier: generation.version,
+            }
+        };
+    }
+
+    /// Refresh the share readiness against the offline timeout.
+    pub fn refresh_share_timeout(&mut self) {
+        self.readiness
+            .refresh_share_timeout(std::time::Instant::now());
+    }
+
+    /// Whether the last acknowledgement of `kind` covers the live generation.
+    pub fn ack_is_current(&self, kind: readiness::AckKind) -> bool {
+        self.readiness.ack_is_current(
+            kind,
+            self.document_instance,
+            self.model.content_generation(),
+        )
+    }
+
+    // ----- read-only proof/reference queries (K8) ---------------------
+
+    /// Build (or refresh) the read-only proof view from the current document
+    /// facts. The owner is explicit so a result from another share cannot be
+    /// applied to it.
+    pub fn proof_view(
+        &mut self,
+        share_id: &emthin_collab::wire::ShareId,
+        document_key: &str,
+    ) -> proof_index::ProofView {
+        let model = &self.model;
+        let view = proof_index::build_view(
+            model.math_doc(),
+            model.scan(),
+            model.segments(),
+            proof_index::ViewOwner::new(
+                crate::ipc::hex::encode(share_id),
+                document_key.to_string(),
+            ),
+            format!("{}:{}", self.document_instance, model.content_generation()),
+        );
+        self.proof_view = Some(view.clone());
+        view
+    }
+
+    /// Apply an independently fetched proof result only to the current view.
+    pub fn apply_proof_result(&mut self, result: proof_index::ProofResult) -> bool {
+        self.proof_view
+            .as_mut()
+            .is_some_and(|view| view.apply_result(result))
+    }
+
+    pub fn proof_dependencies(&self, name: &str, limit: usize) -> Vec<String> {
+        self.proof_view
+            .as_ref()
+            .map(|view| view.dependencies(name, limit))
+            .unwrap_or_default()
+    }
+
+    // ----- semantic outline, navigation and rename (parked item) ------
+
+    /// Build (or refresh) and cache the read-only semantic view.
+    pub fn semantic_view(&mut self) -> &semantic::SemanticView {
+        let model = &self.model;
+        let view = semantic::SemanticView::build(model.text(), model.scan(), model.segments());
+        self.semantic_view = Some(view);
+        self.semantic_view.as_ref().expect("just built")
+    }
+
+    /// Definition at a byte, resolved from the cached view.
+    pub fn definition_at(&self, byte: usize) -> Option<usize> {
+        self.semantic_view.as_ref()?.definition_at(byte)
+    }
+
+    /// Rename a definition as one checked grouped edit. Returns the number of
+    /// replacements applied, or `None` when the plan is empty/invalid.
+    pub fn rename_definition(&mut self, def_idx: usize, new_name: &str) -> Option<usize> {
+        // Build the view if it was invalidated by an edit.
+        if self.semantic_view.is_none() {
+            self.semantic_view();
+        }
+        let ops = self
+            .semantic_view
+            .as_ref()?
+            .plan_rename(def_idx, new_name)?;
+        let count = ops.len();
+        self.model.replace_many(ops);
+        self.semantic_view = None;
+        Some(count)
+    }
+
+    // ----- read-only document history (K5) ----------------------------
+
+    /// Retain a snapshot of the committed document with explicit ownership.
+    pub fn retain_history(&mut self, share_id: emthin_collab::wire::ShareId, owner: &str) {
+        self.history_seq = self.history_seq.wrapping_add(1);
+        self.doc_history.retain(history::RetainedSnapshot {
+            share_id,
+            frontier: self.model.math_doc().version_vector(),
+            owner: owner.to_string(),
+            seq: self.history_seq,
+            snapshot: self.model.snapshot(),
+            content_digest: self.model.content_digest(),
+        });
+    }
+
+    pub fn history_frontiers(&self) -> Vec<String> {
+        self.doc_history
+            .frontiers()
+            .iter()
+            .map(|frontier| crate::ipc::hex::encode(frontier))
+            .collect()
+    }
+
+    /// A read-only preview of a retained frontier. The live model, its save
+    /// baselines and its undo stack are untouched.
+    pub fn history_preview(
+        &self,
+        frontier_hex: &str,
+        share_id: emthin_collab::wire::ShareId,
+    ) -> Result<history::HistoryPreview, history::HistoryStatus> {
+        let frontier = crate::ipc::hex::decode(frontier_hex).map_err(|error| {
+            history::HistoryStatus::Unavailable {
+                reason: format!("invalid frontier token: {error}"),
+            }
+        })?;
+        self.doc_history.preview(&frontier, &share_id)
+    }
+
+    /// Explicit copy export: create a new local document from a retained
+    /// frontier and make it the live document. A preview alone never does
+    /// this, and the previous document's history is discarded.
+    pub fn promote_history_copy(
+        &mut self,
+        frontier_hex: &str,
+        share_id: emthin_collab::wire::ShareId,
+    ) -> Result<(), String> {
+        let preview =
+            self.history_preview(frontier_hex, share_id)
+                .map_err(|status| match status {
+                    history::HistoryStatus::Unavailable { reason } => reason,
+                    history::HistoryStatus::Available => unreachable!(),
+                })?;
+        let model = preview.into_local_document()?;
+        self.model = model;
+        self.document_instance = self.document_instance.wrapping_add(1);
+        self.document_file = None;
+        self.document_baseline = None;
+        self.recovery_baseline = None;
+        self.last_content_generation = None;
+        self.last_reveal_key = None;
+        self.doc_history.clear();
+        self.clear_history();
+        self.relayout();
+        Ok(())
+    }
+
+    pub fn citation_popup(&self) -> &citations::CitationPopup {
+        &self.citation_popup
+    }
+
+    pub fn toggle_citation(&mut self, number: u64) -> Result<(), String> {
+        self.citation_popup
+            .toggle(self.model.text(), self.model.revision(), number)
+    }
+
+    pub fn close_citation(&mut self) -> bool {
+        self.citation_popup.close()
+    }
 
     /// Cycle the presentation style of the open citation without editing the
     /// document. Returns the newly selected style.
@@ -239,7 +568,10 @@ impl DocUi {
         if !self.find.is_open() || self.find.current_range().is_none() {
             return false;
         }
-        let origin = self.find_origin.take().unwrap_or_else(|| self.capture_view());
+        let origin = self
+            .find_origin
+            .take()
+            .unwrap_or_else(|| self.capture_view());
         self.find.close();
         self.push_history(origin);
         self.remember_current();
@@ -265,12 +597,14 @@ impl DocUi {
         let range = self.find.step(&text, forward)?;
         // Bring the page holding the selected glyph into view. A match in
         // hidden marker text has no page and leaves the viewport alone.
-        if let Some(page) = self.layout.page_for_range(range.clone()) {
+        let page = self
+            .geometry_current()
+            .then(|| self.layout.page_for_range(range.clone()))
+            .flatten();
+        if let Some(page) = page {
             if page != self.current_page() {
-                self.layout.set_current_page(page);
-                // A page switch invalidates figure rects; let the next tick
-                // relayout and re-sync them, as `goto_page` does.
-                self.model.mark_dirty();
+                // A page switch needs figure placement, not a Typst compile.
+                self.on_page_changed(page);
             }
         }
         self.model.set_selection(range.clone());
@@ -297,7 +631,8 @@ impl DocUi {
             return;
         }
         self.completion_dismissed = None;
-        self.completion.refresh(self.model.text(), self.model.caret());
+        self.completion
+            .refresh(self.model.text(), self.model.caret());
     }
 
     /// Replace the pending ASCII run with its glyph as one document edit.
@@ -323,7 +658,9 @@ impl DocUi {
         pending
     }
 
-    pub fn clear_citations(&mut self) { self.citation_popup.clear(); }
+    pub fn clear_citations(&mut self) {
+        self.citation_popup.clear();
+    }
 
     /// Re-run the open query after the document changed.
     pub fn find_on_edit(&mut self) {
@@ -343,7 +680,9 @@ impl DocUi {
             .find(|reference| reference.numbers.contains(&number))
             .ok_or_else(|| format!("No citation [{number}]"))?;
         let body = match reference.kind {
-            ReferenceKind::DocumentRef { body: Some(body), .. } => body,
+            ReferenceKind::DocumentRef {
+                body: Some(body), ..
+            } => body,
             ReferenceKind::DocumentRef { body: None, .. } => {
                 return Err(format!("Citation [{number}] is dangling"));
             }
@@ -353,12 +692,15 @@ impl DocUi {
         };
         self.citation_popup.close();
         self.record_jump();
-        let page = self.layout.page_for_range(body.clone());
+        let page = self
+            .geometry_current()
+            .then(|| self.layout.page_for_range(body.clone()))
+            .flatten();
         self.model.set_caret(body.start);
         if let Some(page) = page {
             if page != self.current_page() {
-                self.layout.set_current_page(page);
-                self.model.mark_dirty();
+                // Page-only navigation: re-place figures, do not recompile.
+                self.on_page_changed(page);
             }
         }
         self.remember_current();
@@ -367,20 +709,32 @@ impl DocUi {
 
     /// Hit-test the rendered citation label rather than the hidden source.
     pub fn citation_at(&self, point: Point<f64, Logical>) -> Option<u64> {
+        if !self.geometry_current() {
+            return None;
+        }
         let pos = self.layout.screen_to_doc(point)?;
         let glyphs = self.layout.glyphs()?;
         let glyph = glyphs.entries.iter().find(|entry| {
-            let Some(band) = glyphs.bands.get(entry.band as usize) else { return false };
+            let Some(band) = glyphs.bands.get(entry.band as usize) else {
+                return false;
+            };
             let x = pos.x as f32;
             let y = pos.y as f32;
-            x >= entry.x.min(entry.x + entry.advance) && x <= entry.x.max(entry.x + entry.advance)
-                && y >= band.top && y <= band.bottom
+            x >= entry.x.min(entry.x + entry.advance)
+                && x <= entry.x.max(entry.x + entry.advance)
+                && y >= band.top
+                && y <= band.bottom
         })?;
         let scan = self.model.scan();
-        model::citation_references(scan).into_iter().find_map(|reference| {
-            let range = &scan.stmts[reference.stmt_idx].range;
-            range.contains(&glyph.doc_byte).then(|| reference.numbers.first().copied()).flatten()
-        })
+        model::citation_references(scan)
+            .into_iter()
+            .find_map(|reference| {
+                let range = &scan.stmts[reference.stmt_idx].range;
+                range
+                    .contains(&glyph.doc_byte)
+                    .then(|| reference.numbers.first().copied())
+                    .flatten()
+            })
     }
 
     /// The document byte under a screen point on the visible page.
@@ -388,6 +742,9 @@ impl DocUi {
     /// `None` outside the page or before the first layout. Used by pointer
     /// selection so a click and its drag share one hit test.
     pub fn byte_at(&self, point: Point<f64, Logical>) -> Option<usize> {
+        if !self.geometry_current() {
+            return None;
+        }
         let pos = self.layout.screen_to_doc(point)?;
         self.layout
             .glyphs()?
@@ -407,10 +764,7 @@ impl DocUi {
         // Word navigation treats the newline as the terminator *and* includes
         // it in the right boundary. A selected newline has no rendered glyph,
         // so it would show as an empty sliver past the line's last word.
-        let end = range.start
-            + text[range.clone()]
-                .trim_end_matches(['\n', '\r'])
-                .len();
+        let end = range.start + text[range.clone()].trim_end_matches(['\n', '\r']).len();
         if end <= range.start {
             return false;
         }
@@ -525,11 +879,16 @@ impl DocUi {
     /// Load the document: `path` wins, else the stored session, else an
     /// empty document.
     pub fn load(&mut self, path: Option<&std::path::Path>, session_file: Option<&std::path::Path>) {
+        self.note_loading();
+        self.document_instance = self.document_instance.wrapping_add(1);
         self.clear_history();
         self.pending_preferences = None;
         self.citation_popup.clear();
         self.document_key = None;
         self.document_file = None;
+        self.document_baseline = None;
+        self.recovery_baseline = None;
+        self.save_error = None;
         self.last_content_generation = None;
         self.last_reveal_key = None;
         self.persistence_error = None;
@@ -539,10 +898,15 @@ impl DocUi {
             match file::read(path) {
                 Ok(opened) => {
                     self.model = opened.model;
-                    self.last_saved_generation = self.model.content_generation();
+                    self.document_baseline = Some(FileBaseline {
+                        instance: self.document_instance,
+                        kind: opened.kind,
+                        content: self.content_digest_for(opened.kind),
+                    });
                     self.document_file = Some(opened.stamp);
                     self.document_key = Some(stable_document_key(path));
                     self.session_file = session_file.map(std::path::Path::to_path_buf);
+                    self.note_existing_document();
                     self.relayout();
                     self.restore_preferences_beside(session_file);
                     self.relayout();
@@ -559,21 +923,30 @@ impl DocUi {
                     match DocModel::from_snapshot(&loaded.snapshot) {
                         Ok(model) => {
                             self.model = model;
-                            self.last_saved_generation = self.model.content_generation();
                             self.document_key = Some(stable_document_key(file));
                             self.session_file = Some(file.to_path_buf());
-                            if loaded.source == crate::session::store::LoadSource::Backup {
+                            let key = stable_document_key(file);
+                            let preferences = loaded.preferences.preferences_for(&key);
+                            self.recovery_baseline = Some(RecoveryBaseline {
+                                instance: self.document_instance,
+                                content: self.model.content_digest(),
+                                preferences: preferences.clone(),
+                                explicit_file: loaded.preferences.explicit_file.as_deref().cloned(),
+                            });
+                            self.restore_explicit_record(
+                                loaded.preferences.explicit_file.as_deref(),
+                            );
+                            let recovered =
+                                loaded.source == crate::session::store::LoadSource::Backup;
+                            self.note_local_loaded(recovered);
+                            if recovered {
                                 self.persistence_warning = Some(format!(
                                     "session {} was recovered from its backup pair",
                                     file.display()
                                 ));
                             }
                             self.relayout();
-                            self.apply_document_preferences(
-                                loaded
-                                    .preferences
-                                    .preferences_for(&stable_document_key(file)),
-                            );
+                            self.apply_document_preferences(preferences);
                             return;
                         }
                         Err(error) => {
@@ -582,6 +955,7 @@ impl DocUi {
                                 file.display()
                             );
                             tracing::warn!("{message}");
+                            self.note_local_failed(message.clone());
                             self.persistence_error = Some(message);
                             self.persistence_blocked = true;
                         }
@@ -606,6 +980,7 @@ impl DocUi {
                         )
                     };
                     tracing::warn!("{message}");
+                    self.note_local_failed(message.clone());
                     self.persistence_error = Some(message);
                     self.persistence_blocked = true;
                 }
@@ -614,7 +989,13 @@ impl DocUi {
         self.session_file = session_file.map(std::path::Path::to_path_buf);
         self.document_key = session_file.map(stable_document_key);
         self.model = DocModel::new("");
-        self.last_saved_generation = self.model.content_generation();
+        self.recovery_baseline = Some(RecoveryBaseline {
+            instance: self.document_instance,
+            content: self.model.content_digest(),
+            preferences: crate::session::DocumentPreferences::default(),
+            explicit_file: None,
+        });
+        self.confirm_new_document();
         self.relayout();
     }
 
@@ -623,20 +1004,43 @@ impl DocUi {
     /// target document's saved view and citation format.
     pub fn open_document(&mut self, path: &std::path::Path) -> Result<(), file::FileError> {
         let opened = file::read(path)?;
-        self.save();
+        if !self.persistence_blocked {
+            self.save();
+            if let Some(error) = self.persistence_error.as_deref() {
+                return Err(file::FileError::Io(format!(
+                    "could not checkpoint the current document before opening {}: {error}",
+                    path.display()
+                )));
+            }
+            // `save()` clears its own failure on success; an old explicit-file
+            // conflict is not a reason to block opening another document.
+            self.save_error = None;
+        } else {
+            // An unreadable session is already preserved and must not trap the
+            // reader; an explicit open is the documented way out.
+            self.save();
+        }
+        self.document_instance = self.document_instance.wrapping_add(1);
         self.clear_history();
         self.pending_preferences = None;
         self.persistence_error = None;
         self.persistence_warning = None;
         self.persistence_blocked = false;
+        self.save_error = None;
         self.citation_popup.clear();
         self.find.close();
         self.completion.cancel();
         self.completion_dismissed = None;
         self.model = opened.model;
-        self.last_saved_generation = self.model.content_generation();
+        self.document_baseline = Some(FileBaseline {
+            instance: self.document_instance,
+            kind: opened.kind,
+            content: self.content_digest_for(opened.kind),
+        });
         self.document_file = Some(opened.stamp);
         self.document_key = Some(stable_document_key(path));
+        self.recovery_baseline = None;
+        self.note_existing_document();
         self.last_content_generation = None;
         self.last_reveal_key = None;
         self.relayout();
@@ -662,15 +1066,26 @@ impl DocUi {
         let saved = match file::write(path, &bytes, kind, self.document_file.as_ref(), force) {
             Ok(saved) => saved,
             Err(error) => {
-                self.persistence_error =
-                    Some(format!("save failed {}: {error}", path.display()));
+                self.save_error = Some(format!("save failed {}: {error}", path.display()));
                 return Err(error);
             }
         };
+        self.document_baseline = Some(FileBaseline {
+            instance: self.document_instance,
+            kind,
+            content: self.content_digest_for(kind),
+        });
         self.document_file = Some(saved.stamp.clone());
-        self.persistence_error = None;
-        self.persistence_warning = None;
-        self.last_saved_generation = self.model.content_generation();
+        self.save_error = None;
+        self.readiness.acknowledge(readiness::Acknowledgement::disk(
+            readiness::AckKind::ExplicitFile,
+            self.committed_generation(),
+        ));
+        // Persist the new explicit destination/baseline with the recovery
+        // pair now. Otherwise a crash before the next timer tick would leave
+        // an older recovery snapshot paired with the older file record, and a
+        // relaunch could call that older recovery clean.
+        self.save();
         Ok(saved)
     }
 
@@ -678,12 +1093,32 @@ impl DocUi {
     /// because presence belongs to the collaboration session, not the
     /// document model.
     pub fn status(&self, peers: usize) -> status::StatusModel {
-        let save = if self.persistence_error.is_some() {
+        let save = if self.save_error.is_some() {
             status::SaveState::Failed
-        } else if self.last_saved_generation != self.model.content_generation() {
-            status::SaveState::Unsaved
-        } else {
+        } else if self.document_file.is_some() {
+            if self.explicit_file_matches_current() {
+                status::SaveState::Clean
+            } else {
+                status::SaveState::Unsaved
+            }
+        } else if self.recovery_matches_current() && self.persistence_error.is_none() {
             status::SaveState::Clean
+        } else {
+            status::SaveState::Unsaved
+        };
+        let recovery = if self.persistence_error.is_some() {
+            status::RecoveryState::Failed
+        } else if self.persistence_warning.is_some() {
+            status::RecoveryState::Recovered
+        } else {
+            status::RecoveryState::Clean
+        };
+        let preview = if self.last_error.is_some() {
+            status::PreviewState::Failed
+        } else if self.layout.is_pending() {
+            status::PreviewState::Updating
+        } else {
+            status::PreviewState::Current
         };
         let document = self
             .document_file
@@ -702,7 +1137,10 @@ impl DocUi {
         status::StatusModel {
             document,
             save,
+            recovery,
+            preview,
             save_warning: self.persistence_warning.clone(),
+            recovery_error: self.persistence_error.clone(),
             layout_error: self.last_error.clone(),
             find,
             peers,
@@ -743,8 +1181,13 @@ impl DocUi {
         self.find.close();
         self.completion.cancel();
         self.completion_dismissed = None;
+        self.document_instance = self.document_instance.wrapping_add(1);
         self.model = DocModel::new(text);
+        self.note_existing_document();
         self.document_file = None;
+        self.document_baseline = None;
+        self.recovery_baseline = None;
+        self.save_error = None;
         self.last_content_generation = None;
         self.last_reveal_key = None;
         self.persistence_error = None;
@@ -811,19 +1254,25 @@ impl DocUi {
         self.apply_document_anchors(preferences);
     }
 
-    /// The first rendered source byte on the visible page, used as the
-    /// reading anchor and as the fallback when a caret anchor cannot resolve.
+    /// The first rendered source byte intersecting the actual viewport, used
+    /// as the reading anchor and as the fallback when a caret anchor cannot
+    /// resolve. Figure-only and not-yet-current pages fall back to the first
+    /// glyph on the visible page.
+    fn reading_spot(&self) -> Option<(usize, f64)> {
+        self.layout.reading_spot()
+    }
+
     fn reading_position(&self) -> usize {
-        self.layout
-            .page()
-            .and_then(|page| {
-                page.glyphs
-                    .entries
-                    .iter()
-                    .map(|entry| entry.doc_byte)
-                    .min()
+        self.reading_spot()
+            .map(|(byte, _)| byte)
+            .or_else(|| {
+                self.geometry_current().then(|| {
+                    self.layout.page().and_then(|page| {
+                        page.glyphs.entries.iter().map(|entry| entry.doc_byte).min()
+                    })
+                })?
             })
-            .unwrap_or(0)
+            .unwrap_or_else(|| self.model.caret())
     }
 
     fn capture_anchor(&self, byte: usize, side: i32) -> Option<crate::session::CursorAnchor> {
@@ -857,9 +1306,17 @@ impl DocUi {
         let page_start = self.reading_position();
         if let Some(reading) = &preferences.reading_anchor {
             let position = self.resolve_anchor(reading, page_start);
-            if let Some(page) = self.layout.page_for_range(position..position.saturating_add(1)) {
+            if let Some(page) = self
+                .layout
+                .page_for_range(position..position.saturating_add(1))
+            {
                 if page != self.current_page() {
                     self.layout.set_current_page(page);
+                    self.geometry_dirty = true;
+                }
+            }
+            if let Some(offset) = preferences.reading_offset {
+                if self.layout.place_reading_offset(position, offset) {
                     self.geometry_dirty = true;
                 }
             }
@@ -874,13 +1331,9 @@ impl DocUi {
             preferences.selection_anchor.as_ref(),
             preferences.selection_caret.as_ref(),
         ) {
-            let start = self.resolve_anchor(fixed, caret);
-            let end = self.resolve_anchor(head, caret);
-            if start != end {
-                self.model.set_selection(start..end);
-            } else {
-                self.model.set_caret(caret);
-            }
+            let anchor = self.resolve_anchor(fixed, caret);
+            let active = self.resolve_anchor(head, caret);
+            self.model.set_selection_ends(anchor, active);
         } else {
             self.model.set_caret(caret);
         }
@@ -893,16 +1346,14 @@ impl DocUi {
     /// Capture everything needed to return to the current view. The anchors are
     /// document-bound, so the position survives later edits above it.
     fn capture_view(&self) -> ViewState {
-        let selection = self.model.selection();
+        let selection = self.model.selection_ends();
+        let reading = self.reading_spot();
         ViewState {
             caret: self.capture_anchor(self.model.caret(), -1),
-            selection_start: selection
-                .as_ref()
-                .and_then(|range| self.capture_anchor(range.start, -1)),
-            selection_end: selection
-                .as_ref()
-                .and_then(|range| self.capture_anchor(range.end, 1)),
-            reading: self.capture_anchor(self.reading_position(), -1),
+            selection_anchor: selection.and_then(|(anchor, _)| self.capture_anchor(anchor, -1)),
+            selection_caret: selection.and_then(|(_, caret)| self.capture_anchor(caret, 1)),
+            reading: reading.and_then(|(byte, _)| self.capture_anchor(byte, -1)),
+            reading_offset: reading.map(|(_, offset)| offset),
             page: self.current_page(),
             zoom: self.layout.view_zoom(),
             pan: self.layout.view_pan(),
@@ -934,9 +1385,10 @@ impl DocUi {
             current_page: view.page,
             text_size: self.text_size(),
             caret_anchor: view.caret.clone(),
-            selection_anchor: view.selection_start.clone(),
-            selection_caret: view.selection_end.clone(),
+            selection_anchor: view.selection_anchor.clone(),
+            selection_caret: view.selection_caret.clone(),
             reading_anchor: view.reading.clone(),
+            reading_offset: view.reading_offset,
         };
         self.apply_document_anchors(&preferences);
     }
@@ -955,8 +1407,9 @@ impl DocUi {
     }
 
     fn push_history(&mut self, view: ViewState) {
-        if self.history.last() == Some(&view) {
-            self.history_index = self.history.len().saturating_sub(1);
+        // Compare against the branch head, not the vector tail: after Back the
+        // tail is a forward entry the current view may no longer equal.
+        if self.history.get(self.history_index) == Some(&view) {
             return;
         }
         if self.history_index + 1 < self.history.len() {
@@ -1017,6 +1470,12 @@ impl DocUi {
     /// Returns the apps whose figure disappeared (their `\app` statement
     /// was deleted) so the caller can close them.
     pub fn relayout(&mut self) -> Vec<u64> {
+        // A content edit invalidates the cached semantic/proof views; both are
+        // rebuilt on demand from the accepted model.
+        if self.model.is_dirty() {
+            self.semantic_view = None;
+            self.proof_view = None;
+        }
         self.citation_popup.clear_if_stale(self.model.revision());
         // An IPC edit can change the document while the bar is open; refresh
         // the saved ranges before the renderer reads them.
@@ -1042,7 +1501,11 @@ impl DocUi {
             self.model.take_dirty();
             self.last_content_generation = Some(generation);
             self.last_reveal_key = Some(reveal_key);
-            if let Some(result) = self.layout.request_rebuild(self.model.text(), &options) {
+            let owner = self.current_layout_owner();
+            if let Some(result) = self
+                .layout
+                .request_rebuild(self.model.text(), &options, owner)
+            {
                 released = self.finish_layout(result);
             } else {
                 // The worker owns the replacement. Keep the old pages and
@@ -1052,6 +1515,7 @@ impl DocUi {
             }
         }
         self.geometry_dirty = false;
+        self.layout.ensure_page();
         released.extend(self.figures.sync(&self.model, &mut self.layout));
         tracing::debug!(
             target: "emthin::timing",
@@ -1066,21 +1530,36 @@ impl DocUi {
     /// Apply the newest worker result, if any. The event loop calls this each
     /// tick; the previous raster stays visible while the layout is pending.
     pub fn poll_layout(&mut self) -> Option<Vec<u64>> {
-        let result = self.layout.poll_rebuild()?;
-        Some(self.finish_layout(result))
+        let rebuilt = self.layout.poll_rebuild();
+        let page_arrived = self.layout.poll_page();
+        if page_arrived {
+            // A page raster arrived from the retained compiled generation.
+            self.figures.sync(&self.model, &mut self.layout);
+        }
+        match rebuilt {
+            Some(result) => Some(self.finish_layout(result)),
+            None if page_arrived => Some(Vec::new()),
+            None => None,
+        }
     }
 
-    fn finish_layout(
-        &mut self,
-        result: Result<layout::AppliedLayout, String>,
-    ) -> Vec<u64> {
+    fn finish_layout(&mut self, result: Result<layout::AppliedLayout, String>) -> Vec<u64> {
         match result {
             Ok(applied) => {
                 self.last_error = None;
+                if !self.layout.accepts(self.current_layout_owner()) {
+                    tracing::debug!(
+                        generation = applied.generation,
+                        "layout result is not from the live document/source generation; \
+                         keeping it out of hit-testing and figure placement"
+                    );
+                    return Vec::new();
+                }
                 tracing::debug!(
                     target: "emthin::timing",
                     stage = "layout_worker",
                     layout_compile_ms = applied.compile_time.as_secs_f64() * 1000.0,
+                    layout_glyph_ms = applied.glyph_time.as_secs_f64() * 1000.0,
                     layout_raster_ms = applied.raster_time.as_secs_f64() * 1000.0,
                     layout_apply_ms = applied.apply_time.as_secs_f64() * 1000.0,
                     generation = applied.generation,
@@ -1151,6 +1630,8 @@ impl DocUi {
     pub fn step_view_zoom(&mut self, larger: bool) -> f64 {
         if self.layout.zoom_view(larger) {
             self.geometry_dirty = true;
+            // An explicit view action wins over a deferred session restore.
+            self.pending_preferences = None;
         }
         self.layout.view_zoom()
     }
@@ -1159,6 +1640,7 @@ impl DocUi {
     pub fn zoom_view_at(&mut self, factor: f64, anchor: Point<f64, Logical>) -> bool {
         if self.layout.zoom_view_at(factor, anchor) {
             self.geometry_dirty = true;
+            self.pending_preferences = None;
             true
         } else {
             false
@@ -1169,6 +1651,7 @@ impl DocUi {
     pub fn pan_view(&mut self, dx: f64, dy: f64) -> bool {
         if self.layout.pan_view(dx, dy) {
             self.geometry_dirty = true;
+            self.pending_preferences = None;
             true
         } else {
             false
@@ -1187,6 +1670,7 @@ impl DocUi {
     pub fn reset_view(&mut self) -> bool {
         if self.layout.reset_view() {
             self.geometry_dirty = true;
+            self.pending_preferences = None;
             true
         } else {
             false
@@ -1247,6 +1731,7 @@ impl DocUi {
     pub fn on_page_changed(&mut self, page: usize) {
         self.layout.set_current_page(page);
         self.geometry_dirty = true;
+        self.pending_preferences = None;
     }
 
     /// Record (or clear) an app's title.
@@ -1300,6 +1785,12 @@ impl DocUi {
         if !fig.is_dormant() || fig.page != Some(self.current_page()) {
             return None;
         }
+        if fig.is_terminal() {
+            return Some("Terminal — open Sessions to attach".to_owned());
+        }
+        if fig.is_inert() {
+            return Some("Invalid terminal reference — edit the figure".to_owned());
+        }
         let name = fig
             .spec
             .launch
@@ -1340,6 +1831,9 @@ impl DocUi {
     /// function cannot ever fire. The pointer is also what the user is already
     /// aiming when they press Enter on a dormant figure.
     pub fn dormant_figure_at(&self, pos: Point<f64, Logical>) -> Option<&str> {
+        if !self.geometry_current() {
+            return None;
+        }
         let fig = self.figures.figure_under(pos)?;
         // `figure_under` alone would match a figure on another page: its rect is
         // still in the cache, just not visible.
@@ -1363,7 +1857,7 @@ impl DocUi {
     /// over the top of it.
     pub fn relaunch_target(&self, key: &str) -> Option<(String, Vec<String>)> {
         let fig = self.figures.get(key)?;
-        if !fig.is_dormant() {
+        if !fig.is_dormant() || !fig.spec.is_wayland() {
             return None;
         }
         let words = crate::cli::split_command(fig.spec.launch.as_deref()?);
@@ -1380,7 +1874,7 @@ impl DocUi {
         self.figures
             .figures()
             .iter()
-            .find(|f| f.is_dormant() && f.page == Some(self.current_page()))
+            .find(|f| f.spec.is_wayland() && f.is_dormant() && f.page == Some(self.current_page()))
             .map(|f| f.key.as_str())
     }
 
@@ -1435,27 +1929,37 @@ impl DocUi {
             .document_key
             .clone()
             .unwrap_or_else(|| stable_document_key(&path));
-        let selection = self.model.selection();
-        session.set_preferences(
-            key,
-            crate::session::DocumentPreferences {
-                view_zoom: self.layout.view_zoom(),
-                view_pan_x: pan.x,
-                view_pan_y: pan.y,
-                citation_style: self.citation_popup.style_override().map(str::to_string),
-                citation_locale: self.citation_popup.locale_override().map(str::to_string),
-                current_page: self.current_page(),
-                text_size: self.text_size(),
-                caret_anchor: self.capture_anchor(self.model.caret(), -1),
-                selection_anchor: selection
-                    .as_ref()
-                    .and_then(|range| self.capture_anchor(range.start, -1)),
-                selection_caret: selection
-                    .as_ref()
-                    .and_then(|range| self.capture_anchor(range.end, 1)),
-                reading_anchor: self.capture_anchor(self.reading_position(), -1),
-            },
-        );
+        let selection = self.model.selection_ends();
+        let reading = self.reading_spot();
+        let preferences = crate::session::DocumentPreferences {
+            view_zoom: self.layout.view_zoom(),
+            view_pan_x: pan.x,
+            view_pan_y: pan.y,
+            citation_style: self.citation_popup.style_override().map(str::to_string),
+            citation_locale: self.citation_popup.locale_override().map(str::to_string),
+            current_page: self.current_page(),
+            text_size: self.text_size(),
+            caret_anchor: self.capture_anchor(self.model.caret(), -1),
+            selection_anchor: selection.and_then(|(anchor, _)| self.capture_anchor(anchor, -1)),
+            selection_caret: selection.and_then(|(_, caret)| self.capture_anchor(caret, 1)),
+            reading_anchor: reading.and_then(|(byte, _)| self.capture_anchor(byte, -1)),
+            reading_offset: reading.map(|(_, offset)| offset),
+        };
+        session.set_preferences(key, preferences.clone());
+        session.explicit_file = self.explicit_record().map(Box::new);
+        let content = self.model.content_digest();
+        if self.recovery_baseline.as_ref().is_some_and(|baseline| {
+            baseline.instance == self.document_instance
+                && baseline.content == content
+                && baseline.preferences == preferences
+                && baseline.explicit_file.as_ref() == session.explicit_file.as_deref()
+        }) {
+            tracing::debug!(
+                "session save skipped for {}: content and preferences unchanged",
+                path.display()
+            );
+            return;
+        }
         let write_started = Instant::now();
         let write = store.save(&snapshot, &session);
         let write_us = write_started.elapsed().as_micros() as u64;
@@ -1463,12 +1967,25 @@ impl DocUi {
             Ok(()) => {
                 self.persistence_error = None;
                 self.persistence_warning = None;
-                self.last_saved_generation = self.model.content_generation();
+                // The confirmation covers exactly the generation written. A
+                // later completion for an older generation cannot be mistaken
+                // for a saved newer revision (K2).
+                self.readiness.acknowledge(readiness::Acknowledgement::disk(
+                    readiness::AckKind::Recovery,
+                    self.committed_generation(),
+                ));
+                self.recovery_baseline = Some(RecoveryBaseline {
+                    instance: self.document_instance,
+                    content,
+                    preferences,
+                    explicit_file: session.explicit_file.as_deref().cloned(),
+                });
                 tracing::debug!("session saved to {}", path.display());
             }
             Err(error) => {
                 let message = format!("session save failed {}: {error}", path.display());
                 tracing::warn!("{message}");
+                self.readiness.local = readiness::LocalState::Failed(message.clone());
                 self.persistence_error = Some(message);
             }
         }
@@ -1485,7 +2002,19 @@ impl DocUi {
 
     /// The caret rect in output-local logical px, for the IME bridge.
     pub fn caret_rect(&self) -> Option<Rectangle<i32, Logical>> {
+        if !self.geometry_current() {
+            return None;
+        }
         self.layout.caret_rect(self.model.caret())
+    }
+
+    /// Glyphs for source-derived keyboard navigation, only while the accepted
+    /// layout still belongs to the live document/source generation.
+    pub fn current_glyphs(&self) -> Option<&mathed_core::GlyphIndex> {
+        if !self.geometry_current() {
+            return None;
+        }
+        self.layout.glyphs()
     }
 
     /// The figure at `pos` **on the visible page**, or `None`.
@@ -1502,10 +2031,115 @@ impl DocUi {
     /// sites did; `dormant_figure_at` already re-checked `page` itself, which is how
     /// the hazard was known and not applied.
     pub fn figure_at(&self, pos: Point<f64, Logical>) -> Option<&Figure> {
+        if !self.geometry_current() {
+            return None;
+        }
         let page = self.current_page();
         self.figures
             .figure_under(pos)
             .filter(|f| f.page == Some(page))
+    }
+
+    fn current_layout_owner(&self) -> layout::LayoutOwner {
+        layout::LayoutOwner {
+            document: self.document_instance,
+            content: self.model.content_generation(),
+        }
+    }
+
+    /// Whether the retained glyphs and figure geometry belong to the current
+    /// document and source generation.
+    pub fn geometry_current(&self) -> bool {
+        self.layout.accepts(self.current_layout_owner())
+    }
+
+    /// The document incarnation, for delayed pointer grabs.
+    pub(crate) fn document_instance(&self) -> u64 {
+        self.document_instance
+    }
+
+    fn content_digest_for(&self, kind: file::FileKind) -> String {
+        match kind {
+            file::FileKind::Source => self.model.source_digest(),
+            file::FileKind::Snapshot => self.model.content_digest(),
+        }
+    }
+
+    fn explicit_file_matches_current(&self) -> bool {
+        let Some(baseline) = &self.document_baseline else {
+            return false;
+        };
+        baseline.instance == self.document_instance
+            && baseline.content == self.content_digest_for(baseline.kind)
+    }
+
+    fn recovery_matches_current(&self) -> bool {
+        self.recovery_baseline.as_ref().is_some_and(|baseline| {
+            baseline.instance == self.document_instance
+                && baseline.content == self.model.content_digest()
+        })
+    }
+
+    fn explicit_record(&self) -> Option<crate::session::ExplicitFileRecord> {
+        let stamp = self.document_file.as_ref()?;
+        let baseline = self.document_baseline.as_ref()?;
+        if baseline.instance != self.document_instance {
+            return None;
+        }
+        Some(crate::session::ExplicitFileRecord {
+            path: stamp.canonical_path.clone(),
+            kind: baseline.kind.as_str().to_owned(),
+            bytes: stamp.bytes,
+            sha256: stamp.sha256.clone(),
+            content: baseline.content.clone(),
+        })
+    }
+
+    fn restore_explicit_record(&mut self, record: Option<&crate::session::ExplicitFileRecord>) {
+        let Some(record) = record else {
+            return;
+        };
+        let Some(kind) = file::FileKind::parse(&record.kind) else {
+            tracing::warn!(
+                "ignoring explicit file record {}: unknown format {:?}",
+                record.path.display(),
+                record.kind
+            );
+            return;
+        };
+        self.document_file = Some(file::FileStamp::from_baseline(
+            &record.path,
+            record.bytes,
+            record.sha256.clone(),
+        ));
+        self.document_baseline = Some(FileBaseline {
+            instance: self.document_instance,
+            kind,
+            content: record.content.clone(),
+        });
+        match std::fs::read(&record.path) {
+            Ok(current)
+                if current.len() as u64 == record.bytes
+                    && file::sha256_hex(&current).eq_ignore_ascii_case(&record.sha256) => {}
+            Ok(_) => {
+                self.save_error = Some(format!(
+                    "{} changed on disk since its last confirmed save",
+                    record.path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.save_error = Some(format!(
+                    "{} is missing; recovery still holds the document",
+                    record.path.display()
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "cannot check explicit destination {}: {error}",
+                    record.path.display()
+                );
+            }
+        }
     }
 
     /// The last layout error, if the document currently fails to lay
@@ -1514,9 +2148,27 @@ impl DocUi {
         self.last_error.as_deref()
     }
 
-    /// A session load or save failure that the status surface should show.
+    /// An explicit document or recovery load/save failure that the status
+    /// surface should show.
     pub fn persistence_error(&self) -> Option<&str> {
+        self.save_error
+            .as_deref()
+            .or(self.persistence_error.as_deref())
+    }
+
+    /// The explicit file's save/conflict error only.
+    pub fn file_save_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
+    }
+
+    /// The recovery/session persistence error only.
+    pub fn recovery_error(&self) -> Option<&str> {
         self.persistence_error.as_deref()
+    }
+
+    /// Whether a newer preview is still being laid out.
+    pub fn preview_pending(&self) -> bool {
+        self.layout.is_pending()
     }
 
     /// A non-fatal persistence note, such as a verified backup recovery.
@@ -1620,7 +2272,11 @@ mod relaunch_tests {
         ui.relayout();
         let start = text.find("\\cite").unwrap();
         let glyphs = ui.layout().glyphs().unwrap();
-        let glyph = glyphs.entries.iter().find(|g| g.doc_byte == start).expect("citation glyph");
+        let glyph = glyphs
+            .entries
+            .iter()
+            .find(|g| g.doc_byte == start)
+            .expect("citation glyph");
         let band = &glyphs.bands[glyph.band as usize];
         let point = ui.layout().doc_to_screen(Point::from((
             f64::from(glyph.x + glyph.advance / 2.0),
@@ -1867,7 +2523,10 @@ mod completion_tests {
         ui.refresh_completion();
         ui.model_mut().set_caret(end);
         ui.refresh_completion();
-        assert!(ui.completion().is_some(), "a new caret clears the dismissal");
+        assert!(
+            ui.completion().is_some(),
+            "a new caret clears the dismissal"
+        );
     }
 }
 
@@ -1933,6 +2592,64 @@ mod ascii_interchange_tests {
         assert!(!ui.find().is_open(), "import closes the old query bar");
         assert!(ui.completion().is_none());
         assert_eq!(ui.model().text(), "$ \\to $");
+    }
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+
+    fn ui_with(text: &str) -> DocUi {
+        let mut ui = DocUi::new();
+        ui.model_mut().replace(0..0, text);
+        ui
+    }
+
+    #[test]
+    fn an_outline_uses_and_rename_share_one_semantic_view() {
+        let mut ui = ui_with("#1 $norm$ #2 \\def(#1,#2, norm)\n$norm(x)$");
+        let (uses, at) = {
+            let view = ui.semantic_view();
+            assert_eq!(view.definitions.len(), 1);
+            assert!(!view.uses.is_empty());
+            (
+                view.uses.len(),
+                view.definitions[0].name_range.as_ref().unwrap().start,
+            )
+        };
+        assert_eq!(ui.definition_at(at), Some(0));
+
+        let replacements = ui.rename_definition(0, "kind").expect("a rename plan");
+        assert!(replacements >= 2, "name + uses: got {replacements}");
+        let text = ui.model().text();
+        assert!(text.contains("kind"), "definition renamed");
+        assert!(!text.contains("$norm$"), "the math use was renamed");
+        assert!(
+            ui.semantic_view.is_none(),
+            "the edit invalidated the cached view"
+        );
+        assert!(
+            replacements >= uses,
+            "name literal plus {uses} uses: got {replacements}"
+        );
+    }
+
+    #[test]
+    fn a_rename_on_a_fresh_view_after_edit_is_still_checked() {
+        let mut ui = ui_with("#1 $norm$ #2 \\def(#1,#2, norm)\n$norm(x)$");
+        // Force invalidation by editing through relayout's dirty path.
+        ui.model_mut().insert_at_caret("x");
+        ui.relayout();
+        assert!(ui.semantic_view.is_none());
+        let replacements = ui.rename_definition(0, "kind").expect("rebuilt view");
+        assert!(replacements >= 2);
+    }
+
+    #[test]
+    fn goto_definition_rejects_a_byte_with_no_target() {
+        let mut ui = ui_with("plain text with no definitions");
+        let _ = ui.semantic_view();
+        assert_eq!(ui.definition_at(0), None);
     }
 }
 
@@ -2136,12 +2853,13 @@ mod session_tests {
             "the failed write is state: {:?}",
             ui.persistence_error()
         );
-        assert_eq!(ui.status(0).save, status::SaveState::Failed);
+        assert_eq!(ui.status(0).save, status::SaveState::Unsaved);
+        assert_eq!(ui.status(0).recovery, status::RecoveryState::Failed);
         assert!(
             ui.status(0)
                 .line()
-                .is_some_and(|line| line.contains("save failed")),
-            "the status projection shows the failure"
+                .is_some_and(|line| line.contains("recovery failed")),
+            "the recovery failure is distinct from the file's save state"
         );
         assert_eq!(
             std::fs::read(&snapshot).expect("snapshot"),
@@ -2159,9 +2877,7 @@ mod session_tests {
         ui.model_mut()
             .replace(0..0, "#1 visible #2\n\\app(#1, #2, 300, 200)");
         ui.relayout();
-        let saved = ui
-            .save_document(&path, None, false)
-            .expect("snapshot save");
+        let saved = ui.save_document(&path, None, false).expect("snapshot save");
         assert_eq!(saved.kind, file::FileKind::Snapshot);
 
         let mut reopened = DocUi::new();
@@ -2182,9 +2898,7 @@ mod session_tests {
         let mut first = DocUi::new();
         first.set_viewport(Size::from((1200, 900)));
         first.load(None, Some(&snapshot));
-        first
-            .model_mut()
-            .replace(0..0, "alpha target beta target");
+        first.model_mut().replace(0..0, "alpha target beta target");
         first.relayout();
         let target = first.model().text().find("beta").expect("beta");
         first.model_mut().set_caret(target);
@@ -2229,10 +2943,450 @@ mod session_tests {
             "a refused save does not replace the outside edit"
         );
 
+        assert_eq!(ui.status(0).save, status::SaveState::Failed);
+        assert!(
+            ui.status(0)
+                .line()
+                .is_some_and(|line| line.contains("save failed")),
+            "the conflict stays visible until the file is saved"
+        );
+
+        // A successful recovery write must not clear the explicit conflict.
+        ui.save();
+        assert_eq!(ui.status(0).save, status::SaveState::Failed);
+        assert_eq!(ui.status(0).recovery, status::RecoveryState::Clean);
+
         ui.save_document(&path, None, true).expect("forced save");
         assert_eq!(
             std::fs::read_to_string(&path).expect("source"),
             "saved first source"
+        );
+        assert_eq!(ui.status(0).save, status::SaveState::Clean);
+    }
+
+    #[test]
+    fn a_recovery_autosave_does_not_clear_a_named_files_unsaved_state() {
+        let tmp = TmpDir::new("separate-save");
+        let session = tmp.snapshot();
+        let document = tmp.0.join("notes.typ");
+        std::fs::write(&document, "first").expect("write");
+
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(Some(&document), Some(&session));
+        ui.model_mut().replace(0..0, "edited ");
+        ui.relayout();
+        ui.save();
+
+        assert_eq!(
+            ui.status(0).save,
+            status::SaveState::Unsaved,
+            "the recovery snapshot is current, but the named file is not"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&document).expect("source"),
+            "first",
+            "an autosave must not write the explicit file"
+        );
+
+        ui.save_document(&document, None, false)
+            .expect("explicit source save");
+        assert_eq!(ui.status(0).save, status::SaveState::Clean);
+        assert_eq!(
+            std::fs::read_to_string(&document).expect("source"),
+            "edited first"
+        );
+    }
+
+    #[test]
+    fn a_source_export_stays_clean_after_a_marks_only_edit() {
+        let tmp = TmpDir::new("source-marks");
+        let document = tmp.0.join("notes.typ");
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(0..0, "hello");
+        ui.relayout();
+        ui.save_document(&document, None, false)
+            .expect("source save");
+        assert_eq!(ui.status(0).save, status::SaveState::Clean);
+
+        ui.model_mut()
+            .math_doc_mut()
+            .mark_segment(0..5, "prop:bold", "test");
+        ui.model_mut().math_doc_mut().commit();
+        assert_eq!(
+            ui.status(0).save,
+            status::SaveState::Clean,
+            "the source file does not represent marks, so it still matches its export"
+        );
+
+        ui.model_mut().replace(5..5, " world");
+        assert_eq!(ui.status(0).save, status::SaveState::Unsaved);
+    }
+
+    #[test]
+    fn a_snapshot_export_tracks_marks_but_not_presentation() {
+        let tmp = TmpDir::new("snapshot-marks");
+        let document = tmp.0.join("notes.mathed");
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(0..0, "hello");
+        ui.relayout();
+        let saved = ui
+            .save_document(&document, Some(file::SaveFormat::Snapshot), false)
+            .expect("snapshot save");
+        assert_eq!(saved.kind, file::FileKind::Snapshot);
+        assert_eq!(ui.status(0).save, status::SaveState::Clean);
+
+        ui.model_mut()
+            .math_doc_mut()
+            .mark_segment(0..5, "prop:bold", "test");
+        ui.model_mut().math_doc_mut().commit();
+        assert_eq!(
+            ui.status(0).save,
+            status::SaveState::Unsaved,
+            "a snapshot export represents the mark change"
+        );
+        ui.save_document(&document, Some(file::SaveFormat::Snapshot), false)
+            .expect("snapshot save with marks");
+        assert_eq!(ui.status(0).save, status::SaveState::Clean);
+
+        assert!(ui.set_text_size(24.0));
+        ui.relayout();
+        assert_eq!(
+            ui.status(0).save,
+            status::SaveState::Clean,
+            "reading size is recovery/presentation state, not file content"
+        );
+    }
+
+    #[test]
+    fn a_relaunch_restores_the_explicit_destination_and_its_baseline() {
+        let tmp = TmpDir::new("explicit-record");
+        let session = tmp.snapshot();
+        let document = tmp.0.join("notes.typ");
+        std::fs::write(&document, "first").expect("write");
+
+        let mut first = DocUi::new();
+        first.set_viewport(Size::from((1200, 900)));
+        first.load(Some(&document), Some(&session));
+        first.model_mut().replace(0..0, "saved ");
+        first.relayout();
+        first
+            .save_document(&document, None, false)
+            .expect("explicit save");
+        first.save();
+
+        let mut second = DocUi::new();
+        second.set_viewport(Size::from((1200, 900)));
+        second.load(None, Some(&session));
+        assert_eq!(
+            second.status(0).document,
+            "notes.typ",
+            "the recovered session remembers which file it belongs to"
+        );
+        assert_eq!(
+            second.status(0).save,
+            status::SaveState::Clean,
+            "the recovered content equals the recorded explicit baseline"
+        );
+
+        second.model_mut().replace(0..0, "newer ");
+        assert_eq!(second.status(0).save, status::SaveState::Unsaved);
+    }
+
+    #[test]
+    fn a_relaunch_reports_an_outside_write_to_the_explicit_destination() {
+        let tmp = TmpDir::new("explicit-record-conflict");
+        let session = tmp.snapshot();
+        let document = tmp.0.join("notes.typ");
+        std::fs::write(&document, "first").expect("write");
+
+        let mut first = DocUi::new();
+        first.set_viewport(Size::from((1200, 900)));
+        first.load(Some(&document), Some(&session));
+        first.save_document(&document, None, false).expect("save");
+        first.save();
+
+        std::fs::write(&document, "outside edit").expect("outside write");
+        let mut second = DocUi::new();
+        second.set_viewport(Size::from((1200, 900)));
+        second.load(None, Some(&session));
+        assert_eq!(
+            second.status(0).save,
+            status::SaveState::Failed,
+            "the recorded baseline no longer matches the destination"
+        );
+        assert!(
+            second
+                .status(0)
+                .line()
+                .is_some_and(|line| line.contains("save failed")),
+            "the conflict is visible before the next save attempt"
+        );
+    }
+
+    #[test]
+    fn the_reading_offset_survives_a_relaunch() {
+        let tmp = TmpDir::new("reading-offset-relaunch");
+        let snapshot = tmp.snapshot();
+
+        let mut first = DocUi::new();
+        first.set_viewport(Size::from((1200, 700)));
+        first.load(None, Some(&snapshot));
+        first.model_mut().replace(0..0, &paged_doc());
+        first.relayout();
+        assert!(first.page_count() > 1, "the fixture must paginate");
+        first.layout.set_current_page(1);
+        assert!(first.layout.set_view(2.0, Point::new(0.0, -100.0)));
+        first.geometry_dirty = true;
+        first.relayout();
+        let (byte, offset) = first.reading_spot().expect("a visible reading spot");
+        first.save();
+
+        let mut second = DocUi::new();
+        second.set_viewport(Size::from((1200, 700)));
+        second.load(None, Some(&snapshot));
+        assert_eq!(second.current_page(), 1);
+        assert!((second.view_zoom() - 2.0).abs() < 0.001);
+        let (restored_byte, restored_offset) =
+            second.reading_spot().expect("the relaunched reading spot");
+        assert!(
+            restored_byte.abs_diff(byte) < 64,
+            "the document-bound anchor lands on the same line ({byte} -> {restored_byte})"
+        );
+        assert!(
+            (restored_offset - offset).abs() <= 1.0,
+            "the visible offset is restored ({offset} -> {restored_offset})"
+        );
+    }
+
+    #[test]
+    fn an_old_record_without_an_offset_restores_page_and_pan() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 700)));
+        ui.model_mut().replace(0..0, &paged_doc());
+        ui.relayout();
+        assert!(ui.page_count() > 2, "the fixture must paginate");
+
+        ui.apply_document_preferences(crate::session::DocumentPreferences {
+            view_zoom: 2.0,
+            view_pan_y: -60.0,
+            current_page: 2,
+            text_size: mathed_mini::DEFAULT_TEXT_SIZE_PT,
+            ..Default::default()
+        });
+
+        assert_eq!(ui.current_page(), 2, "the saved page still restores");
+        assert!((ui.view_zoom() - 2.0).abs() < 0.001);
+        assert!((ui.view_pan().y + 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_anchor_from_another_document_falls_back_to_the_visible_page() {
+        let mut first = DocUi::new();
+        first.set_viewport(Size::from((1200, 900)));
+        first
+            .model_mut()
+            .replace(0..0, &"foreign document text ".repeat(20));
+        first.relayout();
+        let foreign = first
+            .capture_anchor(300, -1)
+            .expect("a foreign document anchor");
+
+        let mut second = DocUi::new();
+        second.set_viewport(Size::from((1200, 900)));
+        second.model_mut().replace(0..0, "short");
+        second.relayout();
+        second.apply_document_preferences(crate::session::DocumentPreferences {
+            current_page: 0,
+            view_zoom: 2.0,
+            reading_anchor: Some(foreign),
+            reading_offset: Some(24.0),
+            text_size: mathed_mini::DEFAULT_TEXT_SIZE_PT,
+            ..Default::default()
+        });
+
+        assert_eq!(second.current_page(), 0, "no foreign page is selected");
+        assert_eq!(second.model().caret(), 0, "the fallback position is used");
+        let (_, offset) = second.reading_spot().expect("a visible reading spot");
+        assert!((offset - 24.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn an_explicit_view_move_cancels_a_pending_restore() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 700)));
+        ui.model_mut().replace(0..0, &paged_doc());
+        ui.relayout();
+        assert!(ui.page_count() > 1, "the fixture must paginate");
+        assert!(ui.layout.set_view(2.0, Point::new(0.0, 0.0)));
+        ui.geometry_dirty = true;
+        ui.relayout();
+
+        ui.pending_preferences = Some(crate::session::DocumentPreferences {
+            current_page: 1,
+            view_zoom: 3.0,
+            ..Default::default()
+        });
+        assert!(ui.pan_view(0.0, -10.0));
+        assert!(
+            ui.pending_preferences.is_none(),
+            "an explicit pan wins over the deferred session view"
+        );
+        assert_eq!(
+            ui.current_page(),
+            0,
+            "the pending page is not applied later"
+        );
+    }
+
+    #[test]
+    fn inserting_above_the_reading_spot_keeps_its_visible_offset() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 700)));
+        ui.model_mut().replace(0..0, &paged_doc());
+        ui.relayout();
+        assert!(ui.page_count() > 1, "the fixture must paginate");
+        ui.layout.set_current_page(1);
+        assert!(ui.layout.set_view(2.0, Point::new(0.0, -100.0)));
+        ui.geometry_dirty = true;
+        ui.relayout();
+        let (byte, offset) = ui.reading_spot().expect("a visible reading spot");
+        let view = ui.capture_view();
+
+        ui.model_mut()
+            .replace(0..0, "inserted paragraph. ".repeat(8).as_str());
+        ui.relayout();
+        ui.restore_view(&view);
+
+        let (restored_byte, restored_offset) =
+            ui.reading_spot().expect("the restored reading spot");
+        assert!(restored_byte > byte, "the anchor followed the text down");
+        assert!(
+            (restored_offset - offset).abs() <= 1.0,
+            "the same logical line keeps its visible offset ({offset} -> {restored_offset})"
+        );
+    }
+
+    #[test]
+    fn a_backward_selection_restores_with_the_same_active_end() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(0..0, &paged_doc());
+        ui.relayout();
+        ui.model_mut().set_selection_ends(200, 120);
+        let view = ui.capture_view();
+
+        ui.model_mut().set_caret(0);
+        ui.restore_view(&view);
+
+        assert_eq!(
+            ui.model().selection_ends(),
+            Some((200, 120)),
+            "the fixed end stays put and the caret keeps the backward direction"
+        );
+    }
+
+    #[test]
+    fn a_failed_layout_keeps_pixels_but_withholds_hits() {
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.model_mut().replace(0..0, "hello layout");
+        ui.relayout();
+        let page = ui.layout().page_rect();
+        let point = Point::<f64, Logical>::new(
+            f64::from(page.loc.x + page.size.w / 2),
+            f64::from(page.loc.y + page.size.h / 3),
+        );
+        assert!(ui.byte_at(point).is_some());
+        let pages = ui.page_count();
+        let owner = ui.current_layout_owner();
+        ui.layout.set_owner(layout::LayoutOwner {
+            document: owner.document,
+            content: owner.content.wrapping_add(1),
+        });
+
+        let released = ui.finish_layout(Err("expected `]`".into()));
+        assert!(released.is_empty());
+        assert_eq!(ui.page_count(), pages, "the retained raster stays visible");
+        assert!(ui.last_error().is_some());
+        assert_eq!(ui.status(0).preview, status::PreviewState::Failed);
+        assert_eq!(
+            ui.status(0).save,
+            status::SaveState::Unsaved,
+            "a preview failure does not claim a file result"
+        );
+        assert!(
+            ui.status(0)
+                .line()
+                .is_some_and(|line| line.contains("preview failed")),
+            "the line names the stale preview, not a file failure"
+        );
+        assert!(!ui.geometry_current());
+        assert!(
+            ui.byte_at(point).is_none(),
+            "a failed compile must not publish hit geometry"
+        );
+    }
+
+    #[test]
+    fn a_failed_pre_switch_checkpoint_keeps_the_original_document() {
+        let tmp = TmpDir::new("pre-switch-failure");
+        let session = tmp.snapshot();
+        let other = tmp.0.join("other.typ");
+        std::fs::write(&other, "other document").expect("other");
+
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(None, Some(&session));
+        ui.model_mut().replace(0..0, "original work");
+        ui.relayout();
+
+        let mut temp = session.as_os_str().to_os_string();
+        temp.push(".tmp");
+        std::fs::create_dir(std::path::PathBuf::from(temp)).expect("block the temp path");
+
+        let error = ui.open_document(&other).expect_err("checkpoint fails");
+        assert!(
+            error.to_string().contains("could not checkpoint"),
+            "{error}"
+        );
+        assert_eq!(
+            ui.model().text(),
+            "original work",
+            "the original document remains open and recoverable"
+        );
+    }
+
+    #[test]
+    fn an_idle_autosave_does_not_rewrite_an_unchanged_pair() {
+        let tmp = TmpDir::new("idle-skip");
+        let session = tmp.snapshot();
+        let mut ui = DocUi::new();
+        ui.set_viewport(Size::from((1200, 900)));
+        ui.load(None, Some(&session));
+        ui.model_mut().replace(0..0, "checkpoint me");
+        ui.relayout();
+        ui.save();
+        assert!(ui.persistence_error().is_none());
+
+        let mut temp = session.as_os_str().to_os_string();
+        temp.push(".tmp");
+        std::fs::create_dir(std::path::PathBuf::from(temp)).expect("block the temp path");
+        ui.save();
+        assert!(
+            ui.persistence_error().is_none(),
+            "an unchanged idle tick must not reach the blocked write: {:?}",
+            ui.persistence_error()
+        );
+
+        ui.model_mut().set_caret(1);
+        ui.save();
+        assert!(
+            ui.persistence_error()
+                .is_some_and(|message| message.contains("session save failed")),
+            "a changed preference is owed a write"
         );
     }
 
@@ -2476,7 +3630,9 @@ mod page_tests {
         }
         let mut jumped = None;
         for _ in 0..200 {
-            let Some(range) = ui.find_step(true) else { break };
+            let Some(range) = ui.find_step(true) else {
+                break;
+            };
             let page = ui.layout.page_for_range(range).unwrap_or(0);
             if page != 0 {
                 jumped = Some(page);
@@ -2493,7 +3649,9 @@ mod page_tests {
             ui.find_push(ch);
         }
         for _ in 0..200 {
-            let Some(range) = ui.find_step(true) else { break };
+            let Some(range) = ui.find_step(true) else {
+                break;
+            };
             if ui.layout.page_for_range(range).unwrap_or(0) != 0 {
                 break;
             }
@@ -2504,6 +3662,84 @@ mod page_tests {
         ui.restore_history();
         assert_eq!(ui.current_page(), 0);
         assert_eq!(ui.model().caret(), 0);
+    }
+
+    #[test]
+    fn find_page_moves_are_geometry_only_and_do_not_recompile() {
+        let mut ui = paged();
+        ui.model_mut().set_caret(0);
+        let before = ui.layout.rebuild_count();
+        ui.open_find();
+        for ch in "elit".chars() {
+            ui.find_push(ch);
+        }
+        let mut moved = false;
+        for _ in 0..200 {
+            let Some(range) = ui.find_step(true) else {
+                break;
+            };
+            assert!(
+                !ui.model().is_dirty(),
+                "stepping a match must not dirty the source"
+            );
+            if ui.layout.page_for_range(range).unwrap_or(0) != 0 {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "the fixture must have a match off page 0");
+        assert_eq!(
+            ui.layout.rebuild_count(),
+            before,
+            "a pure cross-page Find jump must not run Typst"
+        );
+        assert!(ui.accept_find());
+        assert!(!ui.model().is_dirty());
+        assert_eq!(ui.layout.rebuild_count(), before);
+    }
+
+    #[test]
+    fn same_page_history_restores_caret_view_and_clears_forward_on_a_new_branch() {
+        let mut ui = paged();
+        ui.model_mut().set_caret(100);
+        assert!(ui.layout.set_view(2.0, Point::new(0.0, -80.0)));
+        ui.geometry_dirty = true;
+        ui.relayout();
+        ui.record_jump();
+
+        ui.model_mut().set_caret(10);
+        assert!(ui.layout.set_view(3.0, Point::new(0.0, -160.0)));
+        ui.geometry_dirty = true;
+        ui.relayout();
+        ui.remember_current();
+
+        assert_eq!(ui.history_back(), Some(0));
+        ui.restore_history();
+        assert_eq!(
+            ui.model().caret(),
+            100,
+            "same-page history restores the caret"
+        );
+        assert!((ui.view_zoom() - 2.0).abs() < 0.001);
+        assert!((ui.view_pan().y + 80.0).abs() < 0.01);
+
+        // Re-recording the branch head must not duplicate it.
+        let len = ui.history.len();
+        ui.record_jump();
+        assert_eq!(ui.history.len(), len, "the branch head is not duplicated");
+
+        // A new destination truncates the old forward entry.
+        ui.model_mut().set_caret(200);
+        ui.record_jump();
+        ui.model_mut().set_caret(300);
+        ui.remember_current();
+        assert!(
+            !ui.can_history_forward(),
+            "the forward branch was truncated"
+        );
+        assert_eq!(ui.history_back(), Some(0));
+        ui.restore_history();
+        assert_eq!(ui.model().caret(), 200);
     }
 
     /// History is bounded, so a long reading session cannot grow it forever.
@@ -2861,12 +4097,15 @@ mod page_tests {
             "an edit must mark the model dirty or no relayout can be triggered"
         );
 
-        // The glyph index still describes "hi", so the caret is measured against
-        // the old page and cannot advance past the new glyph.
-        let caret_stale = ui.caret_rect().expect("a caret").loc.x;
-        assert_eq!(
-            caret_stale, caret_before,
-            "before a re-layout the caret is still measured against the old glyphs"
+        // The glyph index still describes "hi". It is retained for the visible
+        // raster, but must not be used to place a caret for the new text.
+        assert!(
+            ui.caret_rect().is_none(),
+            "before a re-layout no caret may be derived from the old glyphs"
+        );
+        assert!(
+            ui.current_glyphs().is_none(),
+            "stale glyphs are withheld from navigation and IME geometry"
         );
 
         ui.relayout();
@@ -3073,5 +4312,256 @@ mod page_tests {
             (scale - 0.87).abs() < 0.05,
             "both figures must share the page's letterbox factor, got {scale}"
         );
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn a_genuine_new_document_can_seed_once_but_a_recovered_one_cannot() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        assert!(ui.can_seed(false), "a new local document may seed once");
+        assert!(
+            !ui.can_seed(true),
+            "a share needs an explicit create decision"
+        );
+        ui.mark_seeded();
+        assert!(!ui.can_seed(false), "seeding happens at most once");
+    }
+
+    #[test]
+    fn a_recovery_reload_never_seeds_over_the_recovered_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "emthin-k2-recovered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.loro");
+        let mut first = DocUi::new();
+        first.load(None, Some(&session));
+        first.model_mut().insert_at_caret("recovered proof note");
+        first.save();
+        assert!(
+            std::fs::metadata(&session).is_ok(),
+            "the save must have produced a recovery pair"
+        );
+        let mut reloaded = DocUi::new();
+        reloaded.load(None, Some(&session));
+        let readiness = reloaded.readiness_snapshot();
+        assert_eq!(readiness.local, "available");
+        assert!(
+            !reloaded.can_seed(false),
+            "a recovered note must not be seeded over"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_late_peer_ack_cannot_claim_a_newer_revision_saved() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        ui.model_mut().insert_at_caret("original");
+        ui.note_peer_ack(true);
+        let covered = ui.readiness_snapshot().last_peer_ack.unwrap();
+        assert_eq!(covered.content_generation, ui.model().content_generation());
+        // The document moves on; the old ack is now stale.
+        ui.model_mut().insert_at_caret(" and more");
+        assert!(
+            !ui.ack_is_current(readiness::AckKind::Peer),
+            "a late completion must not mark the newer revision saved"
+        );
+        let snapshot = ui.readiness_snapshot();
+        assert_eq!(snapshot.last_peer_ack.unwrap(), covered);
+    }
+
+    #[test]
+    fn a_peer_ack_is_not_a_durable_disk_claim() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        ui.note_share_joined();
+        ui.note_peer_ack(true);
+        let snapshot = ui.readiness_snapshot();
+        assert!(snapshot.last_peer_ack.is_some());
+        assert!(snapshot.last_explicit_ack.is_none());
+        assert_eq!(snapshot.share, "current");
+    }
+
+    #[test]
+    fn a_write_failure_keeps_the_last_valid_recovery_pair() {
+        let dir = std::env::temp_dir().join(format!(
+            "emthin-k2-failed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.loro");
+        let mut ui = DocUi::new();
+        ui.load(None, Some(&session));
+        ui.model_mut().insert_at_caret("keep me");
+        ui.save();
+        let good = std::fs::read(&session).expect("the first write succeeded");
+        let acked = ui.ack_is_current(readiness::AckKind::Recovery);
+        assert!(acked);
+
+        // Block the destination: the next write cannot replace the valid pair.
+        std::fs::remove_file(&session).unwrap();
+        std::fs::create_dir(&session).unwrap();
+        ui.model_mut().insert_at_caret(" plus more");
+        ui.save();
+        assert_eq!(
+            std::fs::read(&session).map(|_| ()).ok(),
+            None,
+            "the blocked path stays a directory; no bytes were replaced"
+        );
+        assert_eq!(ui.readiness_snapshot().local, "failed");
+        // The acknowledged generation was the earlier one, so the newer text
+        // is still owed — no late claim of saved state.
+        assert!(!ui.ack_is_current(readiness::AckKind::Recovery));
+        assert!(!good.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_offline_client_keeps_editing_without_a_durable_claim() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        ui.note_share_joined();
+        ui.note_peer_ack(true);
+        ui.note_share_offline();
+        ui.model_mut().insert_at_caret("offline edit");
+        assert_eq!(ui.model().text(), "offline edit");
+        assert_eq!(ui.readiness_snapshot().share, "offline");
+        // The offline edit is preserved locally; the old ack does not claim it
+        // was delivered or saved.
+        assert!(!ui.ack_is_current(readiness::AckKind::Peer));
+        assert!(ui.readiness_snapshot().last_peer_ack.is_some());
+    }
+
+    #[test]
+    fn undo_of_a_mark_only_batch_emits_a_committed_change() {
+        let mut ui = DocUi::new();
+        // Construct with text so the fresh undo stack holds only the mark.
+        *ui.model_mut() = crate::docui::DocModel::new("abcd");
+        let base = ui.model_mut().text().to_string();
+        let source_digest = ui.model().source_digest();
+        ui.model_mut()
+            .math_doc_mut()
+            .mark_segment(0..4, "prop:bold", "v");
+        ui.model_mut().math_doc_mut().commit();
+        let change = ui.take_changes();
+        assert_eq!(change.len(), 1);
+        let content_digest = change[0].content_digest.clone();
+        assert_eq!(change[0].source_digest, source_digest);
+
+        assert!(ui.model_mut().undo());
+        let undo_change = ui.take_changes();
+        assert_eq!(
+            undo_change.len(),
+            1,
+            "a mark-only undo is a committed change"
+        );
+        assert_eq!(undo_change[0].origin, change::ChangeOrigin::Undo);
+        assert_ne!(undo_change[0].content_digest, content_digest);
+        assert_eq!(ui.model().text(), base, "a marks-only undo keeps the text");
+    }
+
+    #[test]
+    fn a_remote_import_does_not_enter_the_local_undo_stack() {
+        let source = crate::docui::DocModel::new("remote text");
+        let mut target = crate::docui::DocModel::new("");
+        assert!(!target.can_undo());
+        let delta = source.math_doc().export_delta();
+        target.math_doc_mut().import_delta(&delta).unwrap();
+        target.rescan();
+        assert_eq!(target.text(), "remote text");
+        assert!(
+            !target.can_undo(),
+            "a remote edit must never enter this editor's undo stack"
+        );
+    }
+
+    #[test]
+    fn a_history_preview_leaves_the_live_version_save_and_undo_untouched() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        ui.model_mut().insert_at_caret("first");
+        let share = [1u8; 16];
+        ui.retain_history(share, "owner");
+        let frontier = ui.history_frontiers().remove(0);
+
+        ui.model_mut().insert_at_caret(" second");
+        let before_text = ui.model().text().to_string();
+        let before_revision = ui.model().revision();
+        let before_undo = ui.model().can_undo();
+        let before_digest = ui.model().content_digest();
+
+        let preview = ui.history_preview(&frontier, share).unwrap();
+        assert_eq!(preview.text, "first");
+        assert_eq!(ui.model().text(), before_text);
+        assert_eq!(ui.model().revision(), before_revision);
+        assert_eq!(ui.model().can_undo(), before_undo);
+        assert_eq!(ui.model().content_digest(), before_digest);
+    }
+
+    #[test]
+    fn history_export_creates_a_new_local_document() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        ui.model_mut().insert_at_caret("old text");
+        let share = [2u8; 16];
+        ui.retain_history(share, "owner");
+        let frontier = ui.history_frontiers().remove(0);
+        ui.model_mut().insert_at_caret(" and newer");
+
+        ui.promote_history_copy(&frontier, share).unwrap();
+        assert_eq!(ui.model().text(), "old text");
+        assert!(
+            ui.history_frontiers().is_empty(),
+            "promoting a copy discards the old history"
+        );
+    }
+
+    #[test]
+    fn a_compacted_frontier_has_an_explicit_status() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        let share = [3u8; 16];
+        ui.model_mut().insert_at_caret("a");
+        ui.retain_history(share, "owner");
+        let old = ui.history_frontiers().remove(0);
+        // Retain past the bounded ring (30 entries) so the first is compacted.
+        for step in 0..31 {
+            ui.model_mut().insert_at_caret(&format!("{step}"));
+            ui.retain_history(share, "owner");
+        }
+        assert!(matches!(
+            ui.history_preview(&old, share),
+            Err(history::HistoryStatus::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_quiet_share_goes_offline() {
+        let mut ui = DocUi::new();
+        ui.load(None, None);
+        ui.note_share_joined();
+        ui.note_peer_ack(true);
+        assert_eq!(ui.readiness_snapshot().share, "current");
+        // Backdate the last response past the timeout without waiting.
+        ui.refresh_share_timeout();
+        assert_eq!(ui.readiness_snapshot().share, "current");
+        std::thread::sleep(readiness::OFFLINE_TIMEOUT + std::time::Duration::from_millis(20));
+        ui.refresh_share_timeout();
+        assert_eq!(ui.readiness_snapshot().share, "offline");
     }
 }

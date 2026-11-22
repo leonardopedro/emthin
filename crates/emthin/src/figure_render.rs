@@ -131,6 +131,31 @@ pub fn build_figure_elements(
     let mut elements = Vec::new();
     let current_page = state.doc.current_page();
 
+    // Terminal figures have no Wayland surface. Their pixels come from a
+    // desktop Core session source; collect first so the document and the
+    // source registry are not borrowed mutably at the same time.
+    let terminals: Vec<_> = state
+        .doc
+        .figures()
+        .figures()
+        .iter()
+        .rev()
+        .filter(|figure| figure.page == Some(current_page))
+        .filter_map(|figure| {
+            let reference = figure.spec.terminal.clone()?;
+            (figure.rect.size.w > 0 && figure.rect.size.h > 0).then_some((reference, figure.rect))
+        })
+        .collect();
+    for (reference, rect) in terminals {
+        let handle = state.loop_handle.clone();
+        state
+            .core_sessions
+            .ensure_live(&reference, rect, &handle);
+        if let Some(element) = state.core_sessions.element(renderer, &reference, rect, scale) {
+            elements.push(element);
+        }
+    }
+
     for figure in state.doc.figures().figures().iter().rev() {
         // Only figures on the visible page are composited.
         if figure.page != Some(current_page) {
@@ -269,22 +294,25 @@ pub fn build_overlay_elements(
     let mut out = Vec::new();
     let focused = focused_figure_key(state);
 
-    // Selection: one translucent box per glyph band.
-    if let Some(range) = state.doc.model().selection() {
-        for rect in state.doc.layout().selection_rects(range) {
-            out.push(solid(
-                &format!("emthin-sel-{}", out.len()),
-                rect,
-                scale,
-                [0.20, 0.45, 0.85, 0.45],
-            ));
+    // Selection: one translucent box per glyph band. Geometry from an older
+    // source generation must not paint boxes over the retained raster.
+    if state.doc.geometry_current() {
+        if let Some(range) = state.doc.model().selection() {
+            for rect in state.doc.layout().selection_rects(range) {
+                out.push(solid(
+                    &format!("emthin-sel-{}", out.len()),
+                    rect,
+                    scale,
+                    [0.20, 0.45, 0.85, 0.45],
+                ));
+            }
         }
     }
 
     // Find matches: every hit faintly, the current one more strongly. Drawn
     // after the normal selection, because stepping a find sets the selection
     // to the current match and the search colour is the useful one then.
-    if state.doc.find().is_open() {
+    if state.doc.geometry_current() && state.doc.find().is_open() {
         let current = state.doc.find().current_index();
         for (i, range) in state.doc.find().matches().iter().enumerate() {
             let rgba = if current == Some(i) {
@@ -311,7 +339,12 @@ pub fn build_overlay_elements(
         let Some(cursor) = peer.cursor else {
             continue;
         };
-        let Some(caret) = state.doc.layout().caret_rect(cursor.min(text_len)) else {
+        let Some(caret) = state
+            .doc
+            .geometry_current()
+            .then(|| state.doc.layout().caret_rect(cursor.min(text_len)))
+            .flatten()
+        else {
             continue;
         };
         let rect = Rectangle::new(caret.loc, (2, caret.size.h).into());
@@ -401,6 +434,45 @@ pub fn build_overlay_elements(
         };
         let x = rect.loc.x + 8;
         let y = rect.loc.y + 8;
+        if let Some(el) = crate::dormant_label::element(renderer, image, x, y, scale) {
+            out.push(el);
+        }
+    }
+
+    // Live terminal retry state. A disconnected Core figure is otherwise
+    // indistinguishable from a terminal that is simply quiet, so name the
+    // reconnect attempt and its remaining backoff.
+    let retry_terminals: Vec<_> = state
+        .doc
+        .figures()
+        .figures()
+        .iter()
+        .filter(|figure| figure.page == Some(state.doc.current_page()))
+        .filter_map(|figure| {
+            let reference = figure.spec.terminal.clone()?;
+            (figure.rect.size.w > 0 && figure.rect.size.h > 0)
+                .then_some((figure.key.clone(), reference, figure.rect))
+        })
+        .collect();
+    for (key, reference, rect) in retry_terminals {
+        let Some(text) = state.core_sessions.retry_status(&reference) else {
+            continue;
+        };
+        let width_pt = (rect.size.w - 16).max(64) as f64;
+        let cache_key = format!("reconnect-{key}");
+        let Some(image) = state.dormant_labels.get(&cache_key, &text, width_pt) else {
+            continue;
+        };
+        let x = rect.loc.x + 8;
+        let y = rect.loc.y + 8;
+        let w = image.width as i32;
+        let h = image.height as i32;
+        out.push(solid(
+            &format!("emthin-retry-bg-{key}"),
+            Rectangle::new((x - 4, y - 3).into(), (w + 8, h + 6).into()),
+            scale,
+            [0.06, 0.09, 0.12, 0.92],
+        ));
         if let Some(el) = crate::dormant_label::element(renderer, image, x, y, scale) {
             out.push(el);
         }

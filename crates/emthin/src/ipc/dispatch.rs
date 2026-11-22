@@ -51,25 +51,220 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
                 .send_rpc(emthin_dbus::router::BridgeCommand::ListRules);
         }
         IncomingMessage::CollabVersion => ipc_collab_version(state),
-        IncomingMessage::CollabJoin { peer, version } => ipc_collab_join(state, &peer, &version),
-        IncomingMessage::CollabDelta { peer, seq, delta } => {
-            ipc_collab_delta(state, &peer, seq, &delta)
-        }
+        IncomingMessage::CollabJoin {
+            peer,
+            version,
+            scope,
+        } => ipc_collab_join(state, &peer, &version, scope),
+        IncomingMessage::CollabDelta {
+            peer,
+            seq,
+            delta,
+            scope,
+        } => ipc_collab_delta(state, &peer, seq, &delta, scope),
         IncomingMessage::CollabAck { peer, seq } => ipc_collab_ack(state, &peer, seq),
         IncomingMessage::CollabLeave { peer } => {
             tracing::debug!("IPC collab_leave {peer}");
             state.collab.leave(&peer);
             state.needs_redraw = true;
         }
-        IncomingMessage::CollabPresence { peer, blob } => {
-            ipc_collab_presence(state, &peer, &blob)
+        IncomingMessage::CollabPresence { peer, blob, scope } => {
+            ipc_collab_presence(state, &peer, &blob, scope)
         }
         IncomingMessage::CollabName { name } => {
             tracing::debug!("IPC collab_name {name}");
             state.collab_set_name(name);
             state.needs_redraw = true;
         }
+        IncomingMessage::CollabShares { peer } => ipc_collab_shares(state, &peer),
+        IncomingMessage::CollabGrant { peer, grant } => ipc_collab_grant(state, &peer, &grant),
+        IncomingMessage::CollabRevoke { peer } => ipc_collab_revoke(state, &peer),
+        IncomingMessage::CollabAnchor { peer, blob, epoch } => {
+            ipc_collab_anchor(state, &peer, &blob, epoch)
+        }
+        IncomingMessage::HistoryList => ipc_history_list(state),
+        IncomingMessage::HistoryPreview { frontier } => ipc_history_preview(state, &frontier),
+        IncomingMessage::HistoryExport { frontier } => ipc_history_export(state, &frontier),
+        IncomingMessage::InspectStart => {
+            state.inspect.enable();
+        }
+        IncomingMessage::InspectStop => {
+            state.inspect.disable();
+        }
+        IncomingMessage::InspectState => ipc_inspect_state(state),
+        IncomingMessage::SemanticOutline => ipc_semantic_outline(state),
+        IncomingMessage::GotoDefinition { byte } => ipc_goto_definition(state, byte),
+        IncomingMessage::RenameDefinition {
+            def_index,
+            new_name,
+        } => ipc_rename_definition(state, def_index, &new_name),
+        IncomingMessage::A11yNodes => ipc_a11y_nodes(state),
+        IncomingMessage::ProofQuery => ipc_proof_query(state),
+        IncomingMessage::ProofResult {
+            share_id,
+            document_key,
+            proof_id,
+            verdict,
+        } => ipc_proof_result(state, &share_id, &document_key, &proof_id, &verdict),
     }
+}
+
+fn ipc_semantic_outline(state: &mut EmthinState) {
+    let view = state.doc.semantic_view();
+    let definitions = view
+        .definitions
+        .iter()
+        .map(|row| {
+            (
+                row.index,
+                row.name.clone(),
+                row.uses,
+                row.span.start,
+                row.span.end,
+            )
+        })
+        .collect();
+    let uses = view
+        .uses
+        .iter()
+        .map(|row| {
+            (
+                row.name.clone(),
+                row.range.start,
+                row.range.end,
+                row.definition,
+            )
+        })
+        .collect();
+    let unresolved = view
+        .unresolved
+        .iter()
+        .map(|row| (row.name.clone(), row.range.start, row.range.end))
+        .collect();
+    state.ipc.send(OutgoingMessage::SemanticOutline {
+        definitions,
+        uses,
+        unresolved,
+    });
+}
+
+fn ipc_goto_definition(state: &mut EmthinState, byte: usize) {
+    let len = state.doc.model().len();
+    let view = state.doc.semantic_view();
+    let definition = match view.definition_at(byte).or_else(|| {
+        view.use_at(byte)
+            .and_then(|row| (row.definition != usize::MAX).then_some(row.definition))
+    }) {
+        Some(index) => index,
+        None => return error(state, IpcErrorCode::NotFound, "no definition at byte"),
+    };
+    let target = view
+        .definitions
+        .get(definition)
+        .map(|row| {
+            row.name_range
+                .clone()
+                .unwrap_or_else(|| row.span.clone())
+                .start
+        })
+        .unwrap_or(0);
+    state.doc.model_mut().set_caret(target.min(len));
+    state.needs_redraw = true;
+}
+
+fn ipc_rename_definition(state: &mut EmthinState, def_index: usize, new_name: &str) {
+    let replacements = match state.doc.rename_definition(def_index, new_name) {
+        Some(count) => count,
+        None => {
+            return error(
+                state,
+                IpcErrorCode::CollabFailed,
+                "rename plan was empty or invalid",
+            )
+        }
+    };
+    state.ipc.send(OutgoingMessage::RenameResult {
+        replacements,
+        applied: true,
+    });
+    state.needs_redraw = true;
+}
+
+fn ipc_a11y_nodes(state: &mut EmthinState) {
+    let model = state.doc.model();
+    let index = crate::docui::a11y::A11yIndex::build(model.text(), model.scan(), model.segments());
+    let nodes = index
+        .nodes
+        .into_iter()
+        .map(|node| {
+            (
+                node.role.to_string(),
+                node.label,
+                node.value,
+                node.range.as_ref().map(|range| range.start),
+                node.range.as_ref().map(|range| range.end),
+            )
+        })
+        .collect();
+    state.ipc.send(OutgoingMessage::A11yNodes { nodes });
+}
+
+fn ipc_proof_query(state: &mut EmthinState) {
+    let share = crate::ipc::hex::encode(state.collab.share_id());
+    let key = state.doc.document_key().unwrap_or("untitled").to_string();
+    let view = state.doc.proof_view(state.collab.share_id(), &key);
+    let proof_id = view.proof_id().map(str::to_string);
+    let definitions = view
+        .definitions
+        .into_iter()
+        .map(|row| (row.name, row.start, row.end, row.uses))
+        .collect();
+    let references = view
+        .references
+        .into_iter()
+        .map(|row| (row.name, row.start, row.end, row.target))
+        .collect();
+    state.ipc.send(OutgoingMessage::ProofView {
+        share_id: share,
+        document_key: key,
+        revision: view.revision,
+        definitions,
+        references,
+        missing: view.missing,
+        proof_id,
+        verdict: view.proof.map(|p| p.verdict),
+    });
+}
+
+fn ipc_proof_result(
+    state: &mut EmthinState,
+    share_id: &str,
+    document_key: &str,
+    proof_id: &str,
+    verdict: &str,
+) {
+    use crate::docui::proof_index::{ProofResult, ViewOwner};
+    let result = ProofResult {
+        owner: ViewOwner::new(share_id, document_key),
+        proof_id: proof_id.to_string(),
+        verdict: verdict.to_string(),
+    };
+    // A late result for a different proof/document is ignored; no document
+    // state, save baseline or undo entry changes.
+    state.doc.apply_proof_result(result);
+}
+
+fn ipc_inspect_state(state: &mut EmthinState) {
+    let settled = state.inspect_state();
+    state.ipc.send(OutgoingMessage::InspectState {
+        enabled: state.inspect.is_on(),
+        local: settled.local,
+        share: settled.share,
+        frontier: settled.frontier,
+        accepted: settled.accepted,
+        peers: settled.peers,
+        reason: settled.reason,
+    });
 }
 
 /// Emit an `error` notification: a closed-set `code` for clients to
@@ -87,39 +282,67 @@ fn ipc_collab_version(state: &mut EmthinState) {
     state.ipc.send(OutgoingMessage::CollabVersion { version });
 }
 
-fn ipc_collab_join(state: &mut EmthinState, peer: &str, version: &str) {
+fn ipc_collab_join(state: &mut EmthinState, peer: &str, version: &str, scope: Option<u64>) {
     let version = match crate::ipc::hex::decode(version) {
         Ok(v) => v,
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
     };
+    if state.collab.has_explicit_grants() {
+        let principal = emthin_collab::grants::Principal::verified(peer.to_string());
+        if !state
+            .collab
+            .permitted(&principal, emthin_collab::grants::Grant::Read)
+        {
+            return error(
+                state,
+                IpcErrorCode::CollabFailed,
+                "no read grant for this share",
+            );
+        }
+    }
     let result = if state.collab.has_peer(peer) {
         state
             .collab
-            .reconnect(state.doc.model().math_doc(), peer, &version)
+            .reconnect_scoped(state.doc.model().math_doc(), peer, &version, scope)
     } else {
         state
             .collab
-            .join(state.doc.model().math_doc(), peer, &version)
+            .join_scoped(state.doc.model().math_doc(), peer, &version, scope)
     };
     let out = match result {
         Ok(out) => out,
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e.to_string()),
     };
     tracing::debug!("IPC collab_join {peer}");
+    state.inspect_event(crate::docui::inspect::EventKind::Handshake, peer, "", 0, "");
     state.ipc.send(OutgoingMessage::CollabDelta {
         peer: out.peer,
         seq: out.seq,
         delta: crate::ipc::hex::encode(&out.delta),
+        scope: out.scope,
     });
     state.collab_publish_presence(true);
 }
 
-fn ipc_collab_presence(state: &mut EmthinState, peer: &str, blob: &str) {
+fn ipc_collab_presence(state: &mut EmthinState, peer: &str, blob: &str, scope: Option<u64>) {
     let blob = match crate::ipc::hex::decode(blob) {
         Ok(blob) => blob,
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
     };
-    if let Err(e) = state.collab_apply_presence(&blob) {
+    if state.collab.has_explicit_grants() {
+        let principal = emthin_collab::grants::Principal::verified(peer.to_string());
+        if !state
+            .collab
+            .permitted(&principal, emthin_collab::grants::Grant::Read)
+        {
+            return error(
+                state,
+                IpcErrorCode::CollabFailed,
+                "no read grant for this share",
+            );
+        }
+    }
+    if let Err(e) = state.collab_apply_presence_scoped(&blob, scope) {
         return error(
             state,
             IpcErrorCode::CollabFailed,
@@ -129,14 +352,44 @@ fn ipc_collab_presence(state: &mut EmthinState, peer: &str, blob: &str) {
     tracing::debug!("IPC collab_presence {peer} ({} bytes)", blob.len());
 }
 
-fn ipc_collab_delta(state: &mut EmthinState, peer: &str, seq: u64, delta: &str) {
+fn ipc_collab_delta(
+    state: &mut EmthinState,
+    peer: &str,
+    seq: u64,
+    delta: &str,
+    scope: Option<u64>,
+) {
     let delta = match crate::ipc::hex::decode(delta) {
         Ok(delta) => delta,
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
     };
+    // A share with explicit grants enforces them; an unconfigured share keeps
+    // the documented unscoped compatibility path.
+    if state.collab.has_explicit_grants() {
+        let principal = emthin_collab::grants::Principal::verified(peer.to_string());
+        if !state
+            .collab
+            .permitted(&principal, emthin_collab::grants::Grant::Edit)
+        {
+            state.inspect_event(
+                crate::docui::inspect::EventKind::Refused,
+                peer,
+                "",
+                0,
+                "no edit grant for this share",
+            );
+            return error(
+                state,
+                IpcErrorCode::CollabFailed,
+                "no edit grant for this share",
+            );
+        }
+    }
     let outcome = {
-        let doc = state.doc.model_mut().math_doc_mut();
-        state.collab.receive(doc, peer, seq, &delta)
+        let model = state.doc.model_mut();
+        model.set_change_origin(crate::docui::change::ChangeOrigin::Peer);
+        let doc = model.math_doc_mut();
+        state.collab.receive_scoped(doc, peer, seq, &delta, scope)
     };
     // `math_doc_mut` dirtied the model; rebuild the scan even when the
     // import failed after applying some of the buffered commands.
@@ -146,12 +399,33 @@ fn ipc_collab_delta(state: &mut EmthinState, peer: &str, seq: u64, delta: &str) 
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e.to_string()),
     };
     let outbound = match outcome {
-        emthin_collab::ReceiveOutcome::Applied { outbound, .. } => outbound,
-        emthin_collab::ReceiveOutcome::Duplicate => return,
+        emthin_collab::ReceiveOutcome::Applied {
+            operations,
+            outbound,
+        } => {
+            state.inspect_event(
+                crate::docui::inspect::EventKind::AcceptedChanges,
+                peer,
+                "",
+                operations as u64,
+                "",
+            );
+            outbound
+        }
+        emthin_collab::ReceiveOutcome::Duplicate => {
+            state.doc.note_late_arrival();
+            return;
+        }
+        emthin_collab::ReceiveOutcome::Stale => {
+            tracing::debug!("ignored collab delta from a replaced document scope");
+            state.doc.note_late_arrival();
+            return;
+        }
         emthin_collab::ReceiveOutcome::Gap { expected } => {
             tracing::warn!(
                 "collab delta from {peer} arrived at seq {seq} with a gap; expected {expected}"
             );
+            state.doc.note_late_arrival();
             return;
         }
     };
@@ -165,6 +439,7 @@ fn ipc_collab_delta(state: &mut EmthinState, peer: &str, seq: u64, delta: &str) 
             peer: out.peer,
             seq: out.seq,
             delta: crate::ipc::hex::encode(&out.delta),
+            scope: out.scope,
         });
     }
 }
@@ -173,7 +448,96 @@ fn ipc_collab_ack(state: &mut EmthinState, peer: &str, seq: u64) {
     if let Err(e) = state.collab.ack(peer, seq) {
         return error(state, IpcErrorCode::CollabFailed, e.to_string());
     }
+    // The cumulative ack confirms operations through `seq`; it says nothing
+    // about the peer's disk, so it is recorded as a non-durable acknowledgement
+    // of the generation current at this end (K2).
+    state.doc.note_peer_ack(true);
     tracing::debug!("IPC collab_ack {peer} through {seq}");
+}
+
+fn ipc_collab_shares(state: &mut EmthinState, peer: &str) {
+    // Denied and unknown identities both see the same outward result.
+    let visible = state.collab_share_visible(peer);
+    state.ipc.send(OutgoingMessage::CollabShareAccess {
+        peer: peer.to_string(),
+        visible,
+    });
+}
+
+fn ipc_collab_grant(state: &mut EmthinState, peer: &str, grant: &str) {
+    if let Err(message) = state.collab_grant(peer, grant) {
+        error(state, IpcErrorCode::CollabFailed, message);
+    }
+    state.needs_redraw = true;
+}
+
+fn ipc_collab_revoke(state: &mut EmthinState, peer: &str) {
+    if let Err(message) = state.collab_revoke(peer) {
+        error(state, IpcErrorCode::CollabFailed, message);
+    }
+    state.needs_redraw = true;
+}
+
+fn ipc_collab_anchor(state: &mut EmthinState, peer: &str, blob: &str, epoch: Option<u64>) {
+    let blob = match crate::ipc::hex::decode(blob) {
+        Ok(blob) => blob,
+        Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
+    };
+    if let Err(message) = state.collab_apply_anchor(peer, &blob, epoch) {
+        error(state, IpcErrorCode::CollabFailed, message);
+    }
+}
+
+fn ipc_history_list(state: &mut EmthinState) {
+    state.ipc.send(OutgoingMessage::History {
+        frontiers: state.doc.history_frontiers(),
+    });
+}
+
+fn ipc_history_preview(state: &mut EmthinState, frontier: &str) {
+    use crate::docui::history::HistoryStatus;
+    let share_id = *state.collab.share_id();
+    let message = match state.doc.history_preview(frontier, share_id) {
+        Ok(preview) => OutgoingMessage::HistoryPreview {
+            frontier: frontier.to_string(),
+            share_id: crate::ipc::hex::encode(&preview.share_id),
+            owner: preview.owner,
+            seq: preview.seq,
+            text: preview.text,
+            marks: preview
+                .marks
+                .into_iter()
+                .map(|(range, key)| (range.start, range.end, key))
+                .collect(),
+            content_digest: preview.content_digest,
+            status: "available",
+            reason: None,
+        },
+        Err(HistoryStatus::Unavailable { reason }) => OutgoingMessage::HistoryPreview {
+            frontier: frontier.to_string(),
+            share_id: crate::ipc::hex::encode(&share_id),
+            owner: String::new(),
+            seq: 0,
+            text: String::new(),
+            marks: Vec::new(),
+            content_digest: String::new(),
+            status: "unavailable",
+            reason: Some(reason),
+        },
+        Err(HistoryStatus::Available) => unreachable!("Available is not an error status"),
+    };
+    state.ipc.send(message);
+}
+
+fn ipc_history_export(state: &mut EmthinState, frontier: &str) {
+    let share_id = *state.collab.share_id();
+    if let Err(message) = state.doc.promote_history_copy(frontier, share_id) {
+        return error(state, IpcErrorCode::CollabFailed, message);
+    }
+    // A copy export replaces the live document; discard old collab scope and
+    // readiness just as an Open would.
+    state.collab_reset_document_scope();
+    state.needs_redraw = true;
 }
 
 fn ipc_spawn(state: &mut EmthinState, cmd: &str, args: &[String]) {
@@ -284,11 +648,10 @@ fn ipc_open_doc(state: &mut EmthinState, path: &str) {
     let path = std::path::PathBuf::from(path);
     match state.doc.open_document(&path) {
         Ok(()) => {
-            // The session's peer versions belong to the previous document.
-            state.collab.clear_peers();
-            state.collab_revision = state.doc.model().revision();
+            // The session's peers, lines and presence all belong to the
+            // previous document; reset them as one scope.
+            state.collab_reset_document_scope();
             state.relayout_document();
-            state.needs_redraw = true;
             tracing::info!("opened document {}", path.display());
         }
         Err(reason) => error(state, IpcErrorCode::IoFailed, reason.to_string()),
@@ -359,8 +722,9 @@ fn ipc_import_ascii(state: &mut EmthinState, path: &str) {
     };
     match state.doc.import_ascii(&text) {
         Ok(()) => {
+            // A successful import replaces the document just like Open.
+            state.collab_reset_document_scope();
             state.relayout_document();
-            state.needs_redraw = true;
             tracing::info!("imported ASCII projection {}", path.display());
         }
         Err(reason) => error(state, IpcErrorCode::NotAscii, reason),
@@ -391,26 +755,48 @@ fn ipc_list_state(state: &mut EmthinState) {
     let peers = state.collab_peers();
     let collab_local_peer = state.collab.local_peer().to_string();
     let collab_local_name = state.collab_local_name.clone();
-    let status = state.doc.status(peers.len()).line();
-    let layout_error = state.doc.last_error().map(str::to_string);
-    let save_error = state.doc.persistence_error().map(str::to_string);
-    let save_warning = state.doc.persistence_warning().map(str::to_string);
-    let doc = state.doc.model().text().to_string();
+    let status_model = state.doc.status(peers.len());
+    let status = Box::new(status_model.line());
+    let save_state = status_model.save.as_str();
+    let recovery_state = status_model.recovery.as_str();
+    let preview_state = status_model.preview.as_str();
+    let layout_error = Box::new(status_model.layout_error.clone());
+    let save_error = Box::new(state.doc.file_save_error().map(str::to_string));
+    let recovery_error = Box::new(state.doc.recovery_error().map(str::to_string));
+    let save_warning = Box::new(state.doc.persistence_warning().map(str::to_string));
+    let readiness = state.doc.readiness_snapshot();
+    let ack_tuple = |generation: Option<crate::docui::readiness::Generation>| {
+        generation.map(|generation| {
+            (
+                generation.document,
+                generation.content_generation,
+                generation.version,
+            )
+        })
+    };
+    let last_recovery_ack = ack_tuple(readiness.last_recovery_ack.clone());
+    let last_explicit_ack = ack_tuple(readiness.last_explicit_ack.clone());
+    let last_peer_ack = ack_tuple(readiness.last_peer_ack.clone());
+    let doc = Box::new(state.doc.model().text().to_string());
     let page = state.doc.current_page();
     let page_count = state.doc.page_count();
     let text_size = state.doc.text_size();
     let view_zoom = state.doc.view_zoom();
     let pan = state.doc.view_pan();
-    let citation_style = state
-        .doc
-        .citation_popup()
-        .style_override()
-        .map(str::to_string);
-    let citation_locale = state
-        .doc
-        .citation_popup()
-        .locale_override()
-        .map(str::to_string);
+    let citation_style = Box::new(
+        state
+            .doc
+            .citation_popup()
+            .style_override()
+            .map(str::to_string),
+    );
+    let citation_locale = Box::new(
+        state
+            .doc
+            .citation_popup()
+            .locale_override()
+            .map(str::to_string),
+    );
     let figures = state
         .doc
         .figures()
@@ -460,8 +846,20 @@ fn ipc_list_state(state: &mut EmthinState) {
         collab_local_peer,
         collab_local_name,
         status,
+        save_state,
+        recovery_state,
+        preview_state,
         layout_error,
         save_error,
+        recovery_error,
         save_warning,
+        local_state: readiness.local,
+        share_state: readiness.share,
+        local_state_detail: Box::new(readiness.local_detail),
+        share_state_detail: Box::new(readiness.share_detail),
+        seed_granted: readiness.seeded,
+        last_recovery_ack: Box::new(last_recovery_ack),
+        last_explicit_ack: Box::new(last_explicit_ack),
+        last_peer_ack: Box::new(last_peer_ack),
     });
 }

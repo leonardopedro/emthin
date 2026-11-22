@@ -4,6 +4,12 @@ Reviewed and expanded 2026-11-15. Scope: `emthin-android`, its shared document/r
 dependencies, and the Android build and verification lanes. This is a plan;
 the tasks below have not all been implemented by this review. Desktop and
 shared-core work is tracked separately in [../DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md).
+The [MM0 proof workflow fixture](../DEVELOPMENT_PLAN.md#mm0-proof-workflow-fixture)
+adds a cross-app Android acceptance run to the existing disposable lane.
+The [native Kyneta plan](../docs/KYNETA_NATIVE_PLAN.md) adds offline
+collaboration, peer readiness, history and proof-note views through the
+shared Rust model and existing JNI bridge. It also specifies an AustralVM
+rule candidate and the device acceptance run.
 
 The [native terminal figure plan](../docs/HERDR_INTEGRATION_PLAN.md) defines
 the later Herdr Core and OpenShell work. The scope exclusions below apply

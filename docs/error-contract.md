@@ -35,6 +35,7 @@ change — enum variant and doc row — and that is the point.
 | `not_bound` | not_found | no | The figure exists but no app is mapped into it. Spawn into it (or wait for `figure_bound`) before `close`/`focus`. | `close`, `focus` |
 | `app_gone` | unavailable | no | The figure's app exited after binding. Re-`spawn`; the next `figure_bound` re-establishes the mapping. | `focus` |
 | `unknown_figure` | not_found | no | No figure with that key exists — check `list_state`'s `figures` and the figure keys in the document. | `set_figure_size`, `clone_figure` |
+| `not_found` | not_found | no | No target exists at that document position — check the byte and `semantic_outline` for definitions and uses. | `goto_definition` |
 | `voice_failed` | execution_failure | yes | The turn could not be queued (no `\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry. | `voice` (and async turn failures spliced into the transcript) |
 | `io_failed` | io | no | The document path could not be read/written — check the path exists and is writable by the compositor's user. | `open_doc`, `save_doc`, `export_ascii`, `import_ascii` |
 | `doc_conflict` | io | no | The file changed on disk since it was opened or last saved. Re-open it or save to a new path; repeat with `force: true` only to discard the outside change intentionally. | `save_doc` |

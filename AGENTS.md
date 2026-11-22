@@ -538,7 +538,7 @@ dialog theme so it matches the pad.
   empty `[workspace]` table on purpose, so it does not join the emthin
   workspace even though it lives inside this checkout (it path-depends on
   `velysterm` and produces its own release artifacts).**Its tests are not
-in the workspace's 511** — see the verification lane below.
+in the workspace's 538** — see the verification lane below.
 - `src/lib.rs` is a `cdylib` (`libemthin_pad.so`, loaded via
   `System.loadLibrary("emthin_pad")`); `android/src/com/emthin/pad/`
   holds `MainActivity.java` + `DocBridge.java` (the JNI surface).

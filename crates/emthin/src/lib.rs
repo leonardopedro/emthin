@@ -2,6 +2,7 @@ pub mod activation;
 pub mod cli;
 pub mod clipboard_bridge;
 pub mod completion_hint;
+pub mod core_session;
 pub mod doc_render;
 pub mod docui;
 pub mod dormant_label;

@@ -107,17 +107,26 @@ fn render_frame(
         // in first. Re-imported only when the page's pixels changed
         // (see DocPageTexture's cache key).
         if let Some(page) = state.doc.layout().page() {
-            let pixels = crate::doc_render::PagePixels {
-                rgba: &page.image.data,
-                width: page.width,
-                height: page.height,
-                page: state.doc.current_page(),
-                revision: state.doc.layout().generation(),
-                rect: state.doc.layout().page_rect(),
-                scale,
-            };
-            if let Some(element) = state.doc_page.element(renderer, &pixels) {
-                extras.push(element);
+            // A page whose raster was released to bound memory keeps its
+            // geometry but carries a 1x1 placeholder image. Do not feed that
+            // to MemoryRenderBuffer with the full-page size: from_slice
+            // asserts data.len() >= width*height*4. Geometry queries keep
+            // using `page()`; only the raster path skips a released page.
+            if page.image.width <= 1 && page.image.height <= 1 {
+                tracing::debug!("skipping raster for an unrendered page");
+            } else {
+                let pixels = crate::doc_render::PagePixels {
+                    rgba: &page.image.data,
+                    width: page.image.width,
+                    height: page.image.height,
+                    page: state.doc.current_page(),
+                    revision: state.doc.layout().generation(),
+                    rect: state.doc.layout().page_rect(),
+                    scale,
+                };
+                if let Some(element) = state.doc_page.element(renderer, &pixels) {
+                    extras.push(element);
+                }
             }
         }
 
@@ -145,15 +154,28 @@ fn render_frame(
             let viewport = state.doc.layout().viewport();
             let width = (image.width as i32).min((viewport.w - 24).max(1));
             let height = (image.height as i32).min((viewport.h - 24).max(1));
-            let rect = Rectangle::new(((viewport.w - width) / 2, (viewport.h - height) / 2).into(),
-                (width, height).into());
-            extras.push(crate::figure_render::solid("citation-background", rect, scale,
-                [0.10, 0.14, 0.18, 0.98]));
+            let rect = Rectangle::new(
+                ((viewport.w - width) / 2, (viewport.h - height) / 2).into(),
+                (width, height).into(),
+            );
+            extras.push(crate::figure_render::solid(
+                "citation-background",
+                rect,
+                scale,
+                [0.10, 0.14, 0.18, 0.98],
+            ));
             let pixels = crate::doc_render::PagePixels {
-                rgba: &image.rgba, width: image.width, height: image.height,
-                page: 0, revision: state.doc.citation_popup().revision, rect, scale,
+                rgba: &image.rgba,
+                width: image.width,
+                height: image.height,
+                page: 0,
+                revision: state.doc.citation_popup().revision,
+                rect,
+                scale,
             };
-            if let Some(element) = state.citation_page.element(renderer, &pixels) { extras.push(element); }
+            if let Some(element) = state.citation_page.element(renderer, &pixels) {
+                extras.push(element);
+            }
         }
 
         // --- 4. software cursor (topmost) ---
@@ -361,42 +383,67 @@ pub fn init_winit(
                 WinitEvent::Ime(event) => {
                     tracing::debug!("winit Ime event: {event:?}");
 
-                    // Relay to the DBus fcitx5 active IC so embedded clients
-                    // (WeChat / Electron via GTK_IM_MODULE=fcitx) receive
-                    // inline preedit + commit.
-                    if let Some(ic_path) = state.ime.active_dbus_ic().map(|p| p.to_string()) {
-                        match &event {
-                            winit_crate::event::Ime::Commit(text) => {
-                                state.dbus.send_rpc(
-                                    emthin_dbus::router::BridgeCommand::ImeCommit {
-                                        ic_path: ic_path.clone(),
-                                        text: text.clone(),
-                                    },
-                                );
+                    // A Core terminal has no text_input_v3 surface to receive
+                    // the committed string, so the focused figure is the IME
+                    // owner while no Wayland client has focus. Preedit stays
+                    // local to the host IME.
+                    let core_target = if state
+                        .seat
+                        .get_keyboard()
+                        .is_some_and(|keyboard| keyboard.current_focus().is_none())
+                    {
+                        state.core_sessions.focused().cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(reference) = core_target {
+                        if let winit_crate::event::Ime::Commit(text) = &event {
+                            if !state.core_sessions.commit_text(&reference, text) {
+                                state.core_sessions.clear_focus();
                             }
-                            winit_crate::event::Ime::Preedit(text, cursor) => {
-                                let (cursor_begin, cursor_end) = cursor
-                                    .map(|(b, e)| (b as i32, e as i32))
-                                    .unwrap_or((-1, -1));
-                                state.dbus.send_rpc(
-                                    emthin_dbus::router::BridgeCommand::ImePreedit {
-                                        ic_path,
-                                        text: text.clone(),
-                                        cursor_begin,
-                                        cursor_end,
-                                    },
-                                );
-                            }
-                            _ => {}
                         }
+                    } else {
+                        // Relay to the DBus fcitx5 active IC so embedded clients
+                        // (WeChat / Electron via GTK_IM_MODULE=fcitx) receive
+                        // inline preedit + commit.
+                        if let Some(ic_path) = state.ime.active_dbus_ic().map(|p| p.to_string()) {
+                            match &event {
+                                winit_crate::event::Ime::Commit(text) => {
+                                    state.dbus.send_rpc(
+                                        emthin_dbus::router::BridgeCommand::ImeCommit {
+                                            ic_path: ic_path.clone(),
+                                            text: text.clone(),
+                                        },
+                                    );
+                                }
+                                winit_crate::event::Ime::Preedit(text, cursor) => {
+                                    let (cursor_begin, cursor_end) = cursor
+                                        .map(|(b, e)| (b as i32, e as i32))
+                                        .unwrap_or((-1, -1));
+                                    state.dbus.send_rpc(
+                                        emthin_dbus::router::BridgeCommand::ImePreedit {
+                                            ic_path,
+                                            text: text.clone(),
+                                            cursor_begin,
+                                            cursor_end,
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Then forward to the text_input_v3 path (for
+                        // Wayland-native clients like Chromium with
+                        // `--enable-wayland-ime` that bypass DBus).
+                        state.ime.on_host_ime_event(
+                            event,
+                            &state.seat,
+                            &state.apps,
+                            backend.window(),
+                        );
                     }
 
-                    // Then forward to the text_input_v3 path (for
-                    // Wayland-native clients like Chromium with
-                    // `--enable-wayland-ime` that bypass DBus).
-                    state
-                        .ime
-                        .on_host_ime_event(event, &state.seat, &state.apps, backend.window());
                     state.needs_redraw = true;
                 }
 

@@ -34,8 +34,46 @@ emthin itself exposes the document side over its existing control IPC:
 `collab_version`, `collab_join`, `collab_delta`, `collab_ack`,
 `collab_leave`, `collab_presence`, and `collab_name` in, `collab_delta` /
 `collab_version` / `collab_presence` out. Binary fields are hex encoded. The
-event loop compares the document revision each tick and forwards local edits
-once; a remote import updates the revision so it is not echoed back.
+event loop compares the committed Loro version vector each tick, so text and
+mark-only edits are forwarded once; a remote import updates the vector so it
+is not echoed back.
+
+Each session has a document-scope generation. Open and a successful ASCII
+import clear peers, reliable lines and remote presence, advance the scope, and
+publish an empty peer snapshot immediately. Scope-aware frames carry the
+generation in an optional `scope` field; a frame from the previous document is
+ignored even if the same peer id rejoins. Frames without `scope` keep the
+legacy path: after a document replacement, a legacy relay must leave and join
+again before it can send. Presence remains ephemeral and out of snapshots.
+
+### Scoped exchange (K3)
+
+`Session` also owns a stable random **share id** (16 bytes), independent of
+the document path, display names and Loro peer ids. Changing the document —
+Open, a successful ASCII import, or an explicit scope reset — replaces the
+share id as well as the scope generation, so a delayed frame from the previous
+share is rejected before any document state is touched.
+
+A v2 handshake uses the `HelloV2` frame: peer id, share id, protocol version
+(2), envelope version (1), an epoch field and the Loro frontier the sender has
+already seen. A v1 `Hello` keeps the legacy unscoped path unchanged. The
+acceptor validates share id and both versions before creating a peer, assigns a
+**fresh epoch** to every accepted connection (`join_v2` / `reconnect_v2`), and
+echoes the share id and epoch in its reply. `receive_v2`, `ack_v2` and
+`apply_presence_v2` reject a stale epoch or scope before importing a delta,
+advancing a reliable cursor or merging presence. A deliberate share switch
+therefore discards old runtime state without touching the saved document.
+
+Each reliable line has a byte ceiling (the 16 MiB wire cap by default).
+`send_checked` / `receive_checked` account for retained and buffered bytes; on
+overflow the peer is isolated rather than allowed to grow an unbounded queue,
+so a stalled reader neither delays a healthy peer nor exhausts memory.
+`Line` still deduplicates, reorders and replays contiguous commands. A gap
+beyond retained history, a queue overflow, or an isolated peer is signalled by
+a `Resync` frame carrying the share id, epoch, frontier and a reason — the next
+step is explicit, and the frontier is the live document's version vector, so
+uncommitted local edits are never discarded. Legacy frames keep `Wire::Delta`
+/ `Ack` / `Presence` exactly as before.
 
 Presence publishes the local caret on a one-second heartbeat and immediately
 when the caret, document focus or display name changes. The same notification

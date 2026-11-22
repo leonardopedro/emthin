@@ -96,7 +96,15 @@ the bytes written.
 `format` is optional; absent, `.loro` and `.mathed` paths save a snapshot and
 all other paths save source. `force` is optional and defaults to `false`.
 Without it, a target that changed since it was opened or last saved is refused
-with `doc_conflict`; `force: true` replaces it. The file is replaced atomically.
+with `doc_conflict`; `force: true` replaces it. A destination this document has
+never opened or saved is also refused unless `force` is set, and a newly
+created path is published without replacing a file another process created in
+the meantime. Saving through a symlink writes and stamps its resolved target
+while keeping the link; retargeting that link is a conflict.
+
+The replacement is atomic on a local filesystem. The final check cannot stop a
+separate process that writes the same existing target between that check and
+the rename; use `force` deliberately and do not treat this as mutual exclusion.
 
 ```json
 {"jsonrpc":"2.0","method":"open_doc","params":{"path":"/tmp/notes.typ"}}
@@ -165,10 +173,13 @@ is the peer's hex-encoded version token, or `""` for a new peer that needs
 the whole document. The answer is `collab_delta`; `seq` is the first frame
 on that peer's reliable stream. Calling it again for a peer that is already
 joined is a reconnect: the peer's stream restarts at sequence 1 and the
-delta is calculated from the supplied token.
+delta is calculated from the supplied token. The optional `scope` is the
+caller's document generation; a scope-aware peer learns this host's generation
+from the response and echoes it on later frames. Omitting it keeps the legacy
+unscoped path.
 
 ```json
-{"jsonrpc":"2.0","method":"collab_join","params":{"peer":"alice","version":""}}
+{"jsonrpc":"2.0","method":"collab_join","params":{"peer":"alice","version":"","scope":1}}
 ```
 
 ### `collab_delta`
@@ -176,10 +187,13 @@ delta is calculated from the supplied token.
 Apply one delta frame from a peer. `delta` is the hex-encoded Loro delta and
 `seq` is that peer's reliable-stream sequence number. Missing sequence numbers
 are buffered; a duplicate is ignored. Applying a delta may answer with
-`collab_delta` notifications for the other peers.
+`collab_delta` notifications for the other peers. `scope` echoes the receiving
+host's document generation; a mismatch is stale traffic from a replaced
+document and is ignored. Scope-aware peers must include it; omitting it keeps
+the legacy path and is accepted only for a legacy join.
 
 ```json
-{"jsonrpc":"2.0","method":"collab_delta","params":{"peer":"alice","seq":1,"delta":"0a0b"}}
+{"jsonrpc":"2.0","method":"collab_delta","params":{"peer":"alice","seq":1,"delta":"0a0b","scope":1}}
 ```
 
 ### `collab_ack`
@@ -205,9 +219,11 @@ Apply one peer's presence payload. `peer` is the transmitting peer and `blob`
 is the hex-encoded payload produced by another instance's `collab_presence`
 notification. Presence is advisory: it never edits the document, revision or
 undo history. An expired or malformed payload is rejected as `collab_failed`.
+The optional `scope` is the document generation from the sender's
+`collab_presence` notification; a stale generation is ignored.
 
 ```json
-{"jsonrpc":"2.0","method":"collab_presence","params":{"peer":"alice","blob":"0a0b"}}
+{"jsonrpc":"2.0","method":"collab_presence","params":{"peer":"alice","blob":"0a0b","scope":1}}
 ```
 
 ### `collab_name`
@@ -217,6 +233,118 @@ name defaults to a short stable peer id; there is no account system.
 
 ```json
 {"jsonrpc":"2.0","method":"collab_name","params":{"name":"Ada"}}
+```
+
+### `collab_shares`
+
+Ask whether `peer` may discover this share. The answer is a
+`collab_share_access` notification with `visible: false` for both a denied and
+an unknown identity, so a client cannot enumerate shares.
+
+```json
+{"jsonrpc":"2.0","method":"collab_shares","params":{"peer":"bob"}}
+```
+
+### `collab_grant` / `collab_revoke`
+
+Grant `read`, `edit` or `invite` on this share to `peer`, or revoke all its
+grants and invalidate its pending connection work. Only the verified owner may
+call them; a display name in presence carries no authority. Once any grant is
+made, every non-owner join, delta and presence is checked against the owner's
+grant table. An unconfigured share keeps the legacy unscoped path.
+
+```json
+{"jsonrpc":"2.0","method":"collab_grant","params":{"peer":"bob","grant":"edit"}}
+{"jsonrpc":"2.0","method":"collab_revoke","params":{"peer":"bob"}}
+```
+
+### `collab_anchor`
+
+Apply a share-scoped, anchored collaborator caret. `blob` is hex encoded and
+`epoch` (optional) fences a stale connection. An anchor is resolved only in a
+compatible document view; a caret whose source is missing is hidden. Presence
+never edits the document, undo history or saved file.
+
+```json
+{"jsonrpc":"2.0","method":"collab_anchor","params":{"peer":"bob","blob":"0a0b","epoch":1}}
+```
+
+### `history_list` / `history_preview` / `history_export`
+
+Read-only local document history. `history_list` answers with `history`, the
+retained frontiers (hex, oldest first). `history_preview` answers with a
+`history_preview` carrying the share id, owner, text, marks and content digest
+at that frontier, or `status: "unavailable"` with a reason when the frontier
+was compacted or belongs to another share. A preview is read-only: it changes
+neither the live document, its save baselines nor its undo stack.
+`history_export` is the only explicit copy-export path — it makes the retained
+frontier a new local document (and resets the collaboration scope).
+
+```json
+{"jsonrpc":"2.0","method":"history_list","params":{}}
+{"jsonrpc":"2.0","method":"history_preview","params":{"frontier":"0a0b"}}
+{"jsonrpc":"2.0","method":"history_export","params":{"frontier":"0a0b"}}
+```
+
+### `inspect_start` / `inspect_stop` / `inspect_state`
+
+Opt-in bounded session diagnostics (K7). `inspect_start` enables a 512-event
+metadata buffer; `inspect_stop` disables it and drops the buffer — observation
+creates no file, timer or event queue of its own. Events correlate by run,
+share id, peer, frontier and connection epoch and never carry note text,
+terminal bytes, presence blobs or keys. `inspect_state` answers with
+`inspect_state`, the settled state computed by the same reducer an NDJSON
+replay uses, so a fixture and a live session show the same result.
+
+```json
+{"jsonrpc":"2.0","method":"inspect_start","params":{}}
+{"jsonrpc":"2.0","method":"inspect_state","params":{}}
+{"jsonrpc":"2.0","method":"inspect_stop","params":{}}
+```
+
+### `semantic_outline` / `goto_definition` / `rename_definition`
+
+Read-only semantic navigation over mathed's existing `SemanticIndex` (parked
+item). `semantic_outline` answers with `semantic_outline`: definitions with use
+counts, resolved uses and unresolved names, all with `[start,end]` UTF-8 byte
+ranges. `goto_definition` moves the caret to the definition covering a byte (a
+resolved use also resolves to its definition); a missing target returns
+`not_found`. `rename_definition` replaces the definition's name and every
+resolved use as one checked grouped edit, answering with `rename_result` and
+the number of ranges changed; one undo step reverses it.
+
+```json
+{"jsonrpc":"2.0","method":"semantic_outline","params":{}}
+{"jsonrpc":"2.0","method":"goto_definition","params":{"byte":42}}
+{"jsonrpc":"2.0","method":"rename_definition","params":{"def_index":0,"new_name":"kind"}}
+```
+
+### `a11y_nodes`
+
+Read-only rendered-text accessibility nodes (parked item). Because the
+compositor disables `mathed_mini`'s `gui` feature, the nodes come from
+`mathed_core::accessibility::build_access_nodes`, which is always available.
+Each node is `{role,label,value,start,end}` with UTF-8 byte ranges (`start`/
+`end` null when the node has no source span). This is the testable desktop
+authority a platform AT bridge maps to a native tree; the query itself calls
+no platform API.
+
+```json
+{"jsonrpc":"2.0","method":"a11y_nodes","params":{}}
+```
+
+### `proof_query` / `proof_result`
+
+Read-only proof/reference queries (K8). `proof_query` answers with `proof_view`:
+definitions and references from mathed's existing semantic index, missing
+targets, and the last accepted proof result with explicit ownership. `proof_result`
+delivers an independently fetched verdict with its `share_id`, `document_key`
+and `proof_id`; a late result for another proof or document is ignored and
+never changes the document, its save baselines or its undo history.
+
+```json
+{"jsonrpc":"2.0","method":"proof_query","params":{}}
+{"jsonrpc":"2.0","method":"proof_result","params":{"share_id":"01","document_key":"proof.typ","proof_id":"f0","verdict":"verified"}}
 ```
 
 ### `list_state`
@@ -281,7 +409,8 @@ protocol).
 | `figure_unbound` | an app left a figure (closed or exited) | `figure`, `window_id` |
 | `app_title_changed` | a bound app's title changed | `window_id`, `title` |
 | `page_changed` | the visible page changed | `page` |
-| `state` | reply to `list_state` | `page`, `page_count`, `text_size`, `view_zoom`, `view_pan_x`, `view_pan_y`, `citation_style`, `citation_locale`, `doc`, `figures`, `peers`, `collab_local_peer`, `collab_local_name`, `status`, `layout_error`, `save_error`, `save_warning` |
+| `doc_changed` | one grouped, committed document edit | `seq`, `document`, `content_generation`, `version` (hex Loro version vector), `origin` (`local`/`peer`/`undo`/`redo`/`restore`), `scope` (`content`/`presentation`), `ranges` (`[start,end]` byte pairs), `source_digest`, `content_digest` |
+| `state` | reply to `list_state` | `page`, `page_count`, `text_size`, `view_zoom`, `view_pan_x`, `view_pan_y`, `citation_style`, `citation_locale`, `doc`, `figures`, `peers`, `collab_local_peer`, `collab_local_name`, `status`, `save_state`, `recovery_state`, `preview_state`, `layout_error`, `save_error`, `recovery_error`, `save_warning`, `local_state`, `share_state`, `local_state_detail`, `share_state_detail`, `seed_granted`, `last_recovery_ack`, `last_explicit_ack`, `last_peer_ack` |
 | `doc_saved` | reply to `save_doc` | `path` |
 | `ascii_exported` | reply to `export_ascii` | `path` |
 | `text_size_changed` | reply to `set_text_size` | `pt`, `page_count` |
@@ -290,15 +419,46 @@ protocol).
 | `dbus_router_rule_added` | a DBus routing rule was added | `id`, `rule` |
 | `dbus_router_rule_removed` | a DBus routing rule was removed | `id` |
 | `dbus_router_rules` | the full routing rule list changed | `rules` |
-| `collab_delta` | a peer has a delta frame to apply, or a local edit must be forwarded | `peer`, `seq`, `delta` (hex) |
+| `collab_delta` | a peer has a delta frame to apply, or a local edit must be forwarded | `peer`, `seq`, `delta` (hex), `scope` (null for legacy) |
 | `collab_version` | reply to `collab_version` | `version` (hex) |
-| `collab_presence` | the local heartbeat/join published a presence blob, or a remote peer snapshot changed | `local_peer`, `local_name`, `peers`, `blob` (hex or `null`) |
+| `collab_presence` | the local heartbeat/join published a presence blob, or a remote peer snapshot changed | `local_peer`, `local_name`, `peers`, `blob` (hex or `null`), `scope` |
+| `collab_share_access` | reply to `collab_shares` | `peer`, `visible` |
+| `semantic_outline` | reply to `semantic_outline` | `definitions` (`[index,name,uses,start,end]`), `uses` (`[name,start,end,definition]`), `unresolved` (`[name,start,end]`) |
+| `rename_result` | reply to `rename_definition` | `replacements`, `applied` |
+| `a11y_nodes` | reply to `a11y_nodes` | `nodes` (`[role,label,value,start,end]`) |
+| `proof_view` | reply to `proof_query` | `share_id`, `document_key`, `revision`, `definitions` (`[name,start,end,uses]`), `references` (`[name,start,end,target]`), `missing`, `proof_id`, `verdict` |
+| `inspect_state` | reply to `inspect_state` | `enabled`, `local`, `share`, `frontier`, `accepted`, `peers`, `reason` |
+| `history` | reply to `history_list` | `frontiers` (hex) |
+| `history_preview` | reply to `history_preview` | `frontier`, `share_id`, `owner`, `seq`, `text`, `marks` (`[start,end,key]`), `content_digest`, `status`, `reason` |
 | `error` | a command failed | `code`, `message`, `category`, `retryable`, `remediation` — the tagged error contract, see [error-contract.md](error-contract.md) |
 
 The three `dbus_router_*` notifications are **unsolicited**: they are emitted
 from the broker's per-tick drain whenever its rule set changes, so a client
 learns about a rule it did not add. `dbus_router_rules` carries the whole list
 and supersedes any incremental state a client built from the other two.
+
+`doc_changed` is one summary per grouped content edit, drained once per event
+loop tick. `version` is the committed Loro version vector (which includes mark
+operations); `source_digest` covers text only while `content_digest` also
+covers marks, so a marks-only edit keeps the source digest but changes the
+content digest and still publishes a change. `origin` names the edit source;
+`document` is the open document's instance, so a change from a replaced
+document is never applied to a new one. Caret moves, page/pan changes, status
+updates and presence are read-only projections: they publish **no**
+`doc_changed` and never advance `version`.
+
+`state.local_state` (`loading`/`available`/`missing`/`failed`) and
+`state.share_state` (`not_shared`/`catching_up`/`current`/`offline`/`refused`)
+are reported separately: a missing local recovery copy does not prove a shared
+document is empty, and a share with no recent acknowledgement is `offline`.
+`*_state_detail` carries the failure/refusal text. The three `last_*_ack`
+objects are `{document, content_generation, version}` and name the generation
+each confirmation covered; a late completion for an older generation never
+marks a newer revision saved. A peer ack confirms applied operations only — it
+is **not** a claim about the peer's disk. `seed_granted` is true only for a
+genuine new local document with confirmed creation, or a shared document with
+an explicit create decision at its owning host; a recovered or late-arriving
+note is never seeded over.
 
 A `rule` is `{id, priority, destination?, interface?, method?, target}`, where
 `destination` is a glob (`None` is the wildcard) and `target` is `"host"`,
@@ -346,10 +506,14 @@ history. The `collab_presence` notification carries the same `peers` list so
 a transport can relay the optional `blob` field to the other peer.
 
 `state.status` is the same compact line the bottom overlay draws, or `null`
-when the document is quiet. `state.layout_error` and `state.save_error` carry
-the full failure text for a client that needs more than the line; they remain
-until a successful layout or save clears them. `state.save_warning` reports a
-non-fatal recovery such as loading the verified backup pair.
+when the document is quiet. `save_state` (`clean`/`unsaved`/`failed`),
+`recovery_state` (`clean`/`recovered`/`failed`) and `preview_state`
+(`current`/`updating`/`failed`) are separate: a recovery failure does not make
+the explicit file look unsaved, and a failed preview leaves the file state
+alone. `state.layout_error`, `state.save_error` and `state.recovery_error`
+carry the full failure text; they remain until a successful layout or save
+clears them. `state.save_warning` reports a non-fatal recovery such as loading
+the verified backup pair.
 
 ## Figure keys
 

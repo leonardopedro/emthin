@@ -43,6 +43,8 @@ jobs:
           git clone --depth 1 --branch main \
             https://github.com/leonardopedro/dynamic-arctic.git ../dynamic-arctic
 
+      - uses: ./.github/actions/checkout-herdr-core
+
       # System dependencies, as documented in `docs/build-notes.md` and the
       # same set unfer's CI installs for this workspace:
       #   * glib/udev/input/seat/gbm/drm/egl — pkg-config lookups at
@@ -64,6 +66,9 @@ jobs:
       # rustfmt/clippy components) — rustup activates it per-checkout, so the
       # gate runs the version the repo pins rather than whatever is ambient.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # Swatinem/rust-cache@v2
+
+      # ghostty-vt's build script compiles the pinned checkout with Zig 0.16.
+      - uses: ./.github/actions/setup-pinned-zig
 
       # Deliberately NOT `--all`: this cargo-fmt walks the whole path-dep
       # closure, so `--all` would format-check the sibling repos too (and a
@@ -140,12 +145,15 @@ jobs:
           git clone --depth 1 --branch main \
             https://github.com/leonardopedro/australVM.git ../australVM
 
+      - uses: ./.github/actions/checkout-herdr-core
+      - uses: ./.github/actions/setup-pinned-zig
+
       # The A1 acceptance asks for the sibling revisions that produced the
       # verdict, not just "main". Keep them in the job log so a failure can
       # be reproduced against the same path-dependency set.
       - name: record sibling revisions
         run: |
-          for repo in velysterm unfer australVM; do
+          for repo in velysterm unfer australVM herdr-core; do
             printf '%s %s\n' "$repo" "$(git -C "../$repo" rev-parse HEAD)"
           done | tee /tmp/emthin_android_siblings.txt
 
@@ -222,6 +230,9 @@ jobs:
           git clone --depth 1 --branch main \
             https://github.com/leonardopedro/australVM.git ../australVM
 
+      - uses: ./.github/actions/checkout-herdr-core
+      - uses: ./.github/actions/setup-pinned-zig
+
       # JDK 21 is what build-apk.sh and test-java.sh were verified with. The
       # runner's default Java may be older, so pin the downloaded JDK path in
       # the environment rather than relying on update-alternatives.
@@ -285,6 +296,13 @@ jobs:
             "$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" \
             "$sdk_root/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
             2>/dev/null || true
+
+      # emthin-pad -> emthin-vt -> ghostty-vt links the archive matching the
+      # APK ABI, so build it from the pinned checkout before cargo runs.
+      - name: build pinned libghostty-vt (desktop + arm64-v8a)
+        run: |
+          ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018" \
+            ./scripts/build-ghostty-vt
 
       # rustup reads emthin-android/rust-toolchain.toml from this directory.
       - name: add Android Rust target
@@ -365,6 +383,8 @@ jobs:
             https://github.com/leonardopedro/unfer.git ../unfer
           git clone --depth 1 --branch main \
             https://github.com/leonardopedro/dynamic-arctic.git ../dynamic-arctic
+
+      - uses: ./.github/actions/checkout-herdr-core
 
       # Flakes on a stock runner: enable the experimental features and put
       # nix on PATH. cache.nixos.org is public, so the devshell's binary

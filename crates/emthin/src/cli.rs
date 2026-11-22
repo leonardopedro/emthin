@@ -41,6 +41,11 @@ pub struct Cli {
     #[arg(long)]
     pub ipc_path: Option<std::path::PathBuf>,
 
+    /// Local Herdr Core socket used by `terminal:` figures. When omitted,
+    /// terminal sources remain externally fed (the headless/test path).
+    #[arg(long, value_name = "PATH")]
+    pub core_socket: Option<std::path::PathBuf>,
+
     /// Pin the Wayland display socket name (default: auto-chosen wayland-N
     /// by smithay).
     #[arg(long)]

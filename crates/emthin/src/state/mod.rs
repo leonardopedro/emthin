@@ -122,6 +122,15 @@ pub struct ViewPanDrag {
     pub last: Point<f64, Logical>,
 }
 
+/// A button held over a Core terminal figure, reported as drag motion in the
+/// terminal's 1002/1003 mouse modes.
+#[derive(Debug, Clone)]
+pub struct CoreMouseDrag {
+    pub reference: mathed_core::figures::TerminalRef,
+    pub rect: Rectangle<i32, Logical>,
+    pub button: u8,
+}
+
 /// One active touch contact.
 #[derive(Debug, Clone, Copy)]
 pub struct TouchPoint {
@@ -236,6 +245,9 @@ pub struct EmthinState {
     pub ipc: crate::ipc::IpcServer,
     pub apps: crate::apps::AppManager,
 
+    /// Desktop terminal figures, fed by Core attach events.
+    pub core_sessions: crate::core_session::CoreSessions,
+
     /// Workspace model: the document's page state. Pages replace the
     /// old Emacs-frame workspaces; there is exactly **one** `Space`
     /// (the compositor never holds a second screenful of app surfaces
@@ -275,6 +287,9 @@ pub struct EmthinState {
 
     /// Middle-button drag panning the zoomed page.
     pub view_pan_drag: Option<ViewPanDrag>,
+
+    /// Button drag over a Core terminal figure.
+    pub core_mouse_drag: Option<CoreMouseDrag>,
 
     /// Touch contacts and the two-finger pan gesture.
     pub touch: TouchGestureState,
@@ -329,6 +344,10 @@ pub struct EmthinState {
     /// not cover.  When true the next Redraw calls render_frame; cleared after.
     pub needs_redraw: bool,
 
+    /// Opt-in bounded session diagnostics. Off by default: no buffer, no file,
+    /// no queue is created by observation itself (K7).
+    pub inspect: crate::docui::inspect::EventLog,
+
     /// Bridge to the in-process DBus broker that impersonates fcitx5
     /// for embedded clients. Populated in `main.rs` after `init_winit`;
     /// stays [`dbus::DbusBridge::default`] (inert) if the host has no
@@ -338,10 +357,10 @@ pub struct EmthinState {
     /// Collaboration peers and presence. The document stays in `doc`;
     /// the session only tracks peer streams and versions.
     pub collab: emthin_collab::Session,
-    /// Document revision last offered to the collaboration session, so a
-    /// local edit is forwarded once and a remote import is not echoed back
-    /// as a local edit.
-    pub collab_revision: u64,
+    /// Document version last offered to the collaboration session, so a
+    /// local edit — including a mark-only edit that does not bump the text
+    /// revision — is forwarded once and a remote import is not echoed back.
+    pub collab_version: Vec<u8>,
     /// This process's display name, also published in presence blobs.
     pub collab_local_name: String,
     /// The caret last published, including `None` when the document had no
@@ -425,6 +444,7 @@ impl EmthinState {
 
             ipc,
             apps: crate::apps::AppManager::default(),
+            core_sessions: crate::core_session::CoreSessions::default(),
 
             page: crate::page::PageState::new(workspace_protocol),
 
@@ -461,6 +481,7 @@ impl EmthinState {
             doc: crate::docui::DocUi::new(),
             text_selection: TextSelectionState::default(),
             view_pan_drag: None,
+            core_mouse_drag: None,
             touch: TouchGestureState::default(),
             doc_page: crate::doc_render::DocPageTexture::new(),
             citation_page: crate::doc_render::DocPageTexture::new(),
@@ -475,13 +496,14 @@ impl EmthinState {
             ime,
             cursor: cursor::CursorState::default(),
             needs_redraw: true,
+            inspect: crate::docui::inspect::EventLog::off(),
             dbus: dbus::DbusBridge::default(),
             collab: emthin_collab::Session::new(
                 &collab_peer,
                 &collab_peer,
                 collab_timeout,
             ),
-            collab_revision: 0,
+            collab_version: Vec::new(),
             collab_local_name: collab_peer,
             collab_presence_cursor: None,
             collab_presence_last: None,
@@ -543,6 +565,35 @@ impl EmthinState {
         Ok(socket_name)
     }
 
+    /// Record one metadata-only diagnostic event when observation is on.
+    /// This is a no-op otherwise — no buffer or queue is created by the call.
+    pub fn inspect_event(
+        &mut self,
+        kind: crate::docui::inspect::EventKind,
+        peer: &str,
+        frontier: &str,
+        count: u64,
+        reason: &str,
+    ) {
+        use crate::docui::inspect::SessionEvent;
+        let mut event = SessionEvent::new(kind).with(
+            &std::process::id().to_string(),
+            &crate::ipc::hex::encode(self.collab.share_id()),
+            peer,
+        );
+        event.frontier = frontier.to_string();
+        event.epoch = self.collab.epoch();
+        event.count = count;
+        event.reason = reason.to_string();
+        self.inspect.push(event);
+    }
+
+    /// The settled state both frontends display, from the same reducer used
+    /// by NDJSON replay.
+    pub fn inspect_state(&self) -> crate::docui::inspect::SettledState {
+        self.inspect.settled()
+    }
+
     /// Forward local document changes to the collaboration peers.
     ///
     /// Called once per tick: the document revision is the trigger, so every
@@ -551,12 +602,13 @@ impl EmthinState {
     pub fn collab_local_edit(
         &mut self,
     ) -> Result<Vec<emthin_collab::Outbound>, emthin_collab::SessionError> {
-        let revision = self.doc.model().revision();
-        if revision == self.collab_revision {
+        // Version vectors include mark operations; the text revision does not.
+        let version = self.doc.model().math_doc().version_vector();
+        if version == self.collab_version {
             return Ok(Vec::new());
         }
         let out = self.collab.local_edit(self.doc.model().math_doc())?;
-        self.collab_revision = revision;
+        self.collab_version = version;
         Ok(out)
     }
 
@@ -579,6 +631,23 @@ impl EmthinState {
         }
         self.collab.set_cursor(cursor);
         self.collab_presence_cursor = Some(cursor);
+        // Publish a biased Loro anchor alongside the legacy byte cursor so a
+        // collaborator's caret follows its text across insertions above it.
+        if let Some(byte) = cursor {
+            let math_doc = self.doc.model().math_doc();
+            if let Some(anchored) = math_doc.create_anchor(byte, -1) {
+                let anchor = emthin_collab::anchor::CaretAnchor::new(
+                    self.collab.local_peer(),
+                    *self.collab.share_id(),
+                    self.collab.epoch().saturating_sub(1).max(1),
+                    math_doc.version_vector(),
+                    anchored.encoded,
+                    anchored.side,
+                    anchored.fallback,
+                );
+                self.collab.publish_anchor(anchor);
+            }
+        }
         self.collab_presence_last = Some(Instant::now());
         let blob = self.collab.presence_blob();
         self.send_collab_presence(Some(blob));
@@ -599,12 +668,89 @@ impl EmthinState {
 
     /// Merge an inbound presence blob and publish the resulting peer snapshot.
     pub fn collab_apply_presence(&mut self, blob: &[u8]) -> Result<(), String> {
-        self.collab
-            .apply_presence(blob)
+        self.collab_apply_presence_scoped(blob, None)
+    }
+
+    /// Merge scoped presence. A stale document generation is ignored.
+    pub fn collab_apply_presence_scoped(
+        &mut self,
+        blob: &[u8],
+        scope: Option<u64>,
+    ) -> Result<(), String> {
+        let applied = self
+            .collab
+            .apply_presence_scoped(blob, scope)
             .map_err(|e| e.to_string())?;
+        if !applied {
+            tracing::debug!("ignored presence from a replaced document scope");
+            return Ok(());
+        }
         self.send_collab_presence(None);
         self.needs_redraw = true;
         Ok(())
+    }
+
+    /// Apply a share-scoped caret anchor from a granted reader. Stale epochs
+    /// and ungranted peers are ignored without touching the document.
+    pub fn collab_apply_anchor(
+        &mut self,
+        peer: &str,
+        blob: &[u8],
+        epoch: Option<u64>,
+    ) -> Result<(), String> {
+        let principal = emthin_collab::grants::Principal::verified(peer.to_string());
+        if !self
+            .collab
+            .permitted(&principal, emthin_collab::grants::Grant::Read)
+        {
+            return Err("no grant for this share".to_string());
+        }
+        if self
+            .collab
+            .apply_anchor_blob(blob, &principal, epoch)
+            .map_err(|error| error.to_string())?
+        {
+            self.needs_redraw = true;
+        }
+        Ok(())
+    }
+
+    /// Grant a permission on this share. Only the verified owner may do this.
+    pub fn collab_grant(&mut self, peer: &str, grant: &str) -> Result<(), String> {
+        let grant = match grant {
+            "read" => emthin_collab::grants::Grant::Read,
+            "edit" => emthin_collab::grants::Grant::Edit,
+            "invite" => emthin_collab::grants::Grant::Invite,
+            other => return Err(format!("unknown grant {other}")),
+        };
+        let owner = self.collab.local_principal();
+        self.collab
+            .grant_table_mut()
+            .grant(&owner, peer, grant)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Revoke every grant for `peer` and invalidate its pending work.
+    pub fn collab_revoke(&mut self, peer: &str) -> Result<(), String> {
+        let owner = self.collab.local_principal();
+        let epoch = self.collab.epoch();
+        self.collab
+            .grant_table_mut()
+            .revoke(&owner, peer, epoch)
+            .map_err(|error| error.to_string())?;
+        self.collab.remove_outdated_anchors(peer);
+        self.collab.leave(peer);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Whether a peer may discover this share. Denied and unknown identities
+    /// both return `false`, so shares cannot be enumerated.
+    pub fn collab_share_visible(&self, peer: &str) -> bool {
+        self.collab.permitted(
+            &emthin_collab::grants::Principal::verified(peer.to_string()),
+            emthin_collab::grants::Grant::Read,
+        )
     }
 
     /// Set the local display name and republish presence immediately.
@@ -615,19 +761,36 @@ impl EmthinState {
         self.collab_publish_presence(true);
     }
 
-    /// The current peer snapshot, clamped to this document's text length.
+    /// The current peer snapshot. A caret is resolved from the peer's
+    /// share-scoped anchor in the accepted document view; a raw byte cursor is
+    /// the fallback for legacy presence. A caret whose source no longer
+    /// resolves in this view is hidden rather than guessed.
     pub fn collab_peers(&self) -> Vec<crate::ipc::StatePeer> {
         let now = collab_now_ms();
         let len = self.doc.model().len();
+        let math_doc = self.doc.model().math_doc();
         self.collab
             .present()
             .into_iter()
-            .map(|peer| crate::ipc::StatePeer {
-                connected: self.collab.has_peer(&peer.peer),
-                cursor: peer.cursor.map(|cursor| cursor.min(len)),
-                last_seen_age_ms: now.saturating_sub(peer.last_seen_ms).max(0),
-                peer: peer.peer,
-                name: peer.name,
+            .map(|peer| {
+                let cursor = self
+                    .collab
+                    .resolved_caret(&peer.peer, math_doc)
+                    .or(peer.cursor)
+                    .map(|cursor| cursor.min(len));
+                crate::ipc::StatePeer {
+                    connected: self.collab.has_peer(&peer.peer),
+                    cursor,
+                    last_seen_age_ms: now.saturating_sub(peer.last_seen_ms).max(0),
+                    peer: peer.peer,
+                    name: peer.name,
+                }
+            })
+            .filter(|peer| {
+                !self.collab.has_explicit_grants()
+                    || self.collab.grant_table().can_read(
+                        &emthin_collab::grants::Principal::verified(peer.peer.clone()),
+                    )
             })
             .collect()
     }
@@ -639,13 +802,25 @@ impl EmthinState {
             local_name: self.collab_local_name.clone(),
             peers,
             blob: blob.map(|blob| crate::ipc::hex::encode(&blob)),
+            scope: self.collab.scope(),
         });
+    }
+
+    /// Replace every document-scoped collaboration fact after Open or a
+    /// successful ASCII import: peers, reliable lines, remote presence, and
+    /// the local mutation token. The empty peer snapshot is published at once
+    /// so a UI cannot keep rendering old collaborators.
+    pub fn collab_reset_document_scope(&mut self) {
+        self.collab.reset_document_scope();
+        self.collab_version = self.doc.model().math_doc().version_vector();
+        self.collab_publish_presence(true);
+        self.needs_redraw = true;
     }
 
     /// Mark the current revision as already synchronized after a remote
     /// import, and rebuild the derived document state around it.
     pub fn collab_after_remote(&mut self) {
-        self.collab_revision = self.doc.model().revision();
+        self.collab_version = self.doc.model().math_doc().version_vector();
         self.doc.model_mut().rescan();
         self.relayout_document();
         self.needs_redraw = true;
@@ -820,34 +995,6 @@ impl EmthinState {
     /// dismissed — an orphaned popup surface keeps its client committing
     /// forever.
     pub fn goto_page(&mut self, page: usize) -> bool {
-        self.goto_page_inner(page, true)
-    }
-
-    /// Return to the previous view in the document history. The page switch is
-    /// the same as `goto_page`, but it must not append a new history entry.
-    pub fn history_back(&mut self) -> bool {
-        let Some(page) = self.doc.history_back() else {
-            return false;
-        };
-        let moved = self.goto_page_inner(page, false);
-        self.doc.restore_history();
-        moved
-    }
-
-    /// Return to the next view in the document history.
-    pub fn history_forward(&mut self) -> bool {
-        let Some(page) = self.doc.history_forward() else {
-            return false;
-        };
-        let moved = self.goto_page_inner(page, false);
-        self.doc.restore_history();
-        moved
-    }
-
-    fn goto_page_inner(&mut self, page: usize, record_history: bool) -> bool {
-        if page == self.page.current_page {
-            return false;
-        }
         if page >= self.doc.page_count() {
             tracing::warn!(
                 "goto_page({page}) out of range ({} pages)",
@@ -855,50 +1002,77 @@ impl EmthinState {
             );
             return false;
         }
-
-        for window in self.page.active_space.elements() {
-            dismiss_popups_for_window(window);
+        if page == self.doc.current_page() {
+            return false;
         }
-
-        if record_history {
-            self.doc.record_jump();
-        }
-        self.page.current_page = page;
-        self.focus.reset_on_page_switch();
-        self.ime.reset_on_page_switch();
-        self.cursor.reset_on_page_switch();
-        // The document keeps its own copy of the page index (the layout owns
-        // everything visual reads), so it has to be told, not merely consulted.
+        self.doc.record_jump();
+        // The layout owns the page every visual path reads; make it the new
+        // page before publishing that page to the compositor.
         self.doc.on_page_changed(page);
-
-        self.ipc
-            .send(crate::ipc::OutgoingMessage::PageChanged { page });
-
-        // Clear pointer focus so stale hover events don't reach surfaces
-        // that are now on a hidden page.
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        if let Some(pointer) = self.seat.get_pointer() {
-            pointer.motion(
-                self,
-                None,
-                &smithay::input::pointer::MotionEvent {
-                    location: pointer.current_location(),
-                    serial,
-                    time: 0,
-                },
-            );
-            pointer.frame(self);
-        }
-
-        // `on_page_changed` marked the document dirty so the figure rects get
-        // re-placed against the new page; this is what does the work.
-        self.relayout_document();
-        if record_history {
-            self.doc.remember_current();
-        }
-
+        self.publish_document_page();
+        self.doc.remember_current();
         tracing::info!("switched to page {page}");
+        true
+    }
+
+    /// Publish the document's current page to the compositor, focus state and
+    /// IPC. Every navigation destination (page, Find, citation, history) ends
+    /// here; the document has already resolved which page it wants visible.
+    pub(crate) fn publish_document_page(&mut self) -> bool {
+        let page = self.doc.current_page();
+        let changed = page != self.page.current_page;
+        if changed {
+            for window in self.page.active_space.elements() {
+                dismiss_popups_for_window(window);
+            }
+            self.page.current_page = page;
+            self.focus.reset_on_page_switch();
+            self.ime.reset_on_page_switch();
+            self.cursor.reset_on_page_switch();
+            self.ipc
+                .send(crate::ipc::OutgoingMessage::PageChanged { page });
+
+            // Clear pointer focus so stale hover events don't reach surfaces
+            // that are now on a hidden page.
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            if let Some(pointer) = self.seat.get_pointer() {
+                pointer.motion(
+                    self,
+                    None,
+                    &smithay::input::pointer::MotionEvent {
+                        location: pointer.current_location(),
+                        serial,
+                        time: 0,
+                    },
+                );
+                pointer.frame(self);
+            }
+        }
+        // Page switches only re-place figures; a pure page move never compiles.
+        self.relayout_document();
         self.needs_redraw = true;
+        changed
+    }
+
+    /// Return to the previous view in the document history. Same-page entries
+    /// still restore caret, selection, zoom and pan; only the page publication
+    /// is conditional.
+    pub fn history_back(&mut self) -> bool {
+        if self.doc.history_back().is_none() {
+            return false;
+        }
+        self.doc.restore_history();
+        self.publish_document_page();
+        true
+    }
+
+    /// Return to the next view in the document history.
+    pub fn history_forward(&mut self) -> bool {
+        if self.doc.history_forward().is_none() {
+            return false;
+        }
+        self.doc.restore_history();
+        self.publish_document_page();
         true
     }
 

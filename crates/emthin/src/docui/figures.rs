@@ -78,6 +78,17 @@ impl Figure {
     pub fn mirror_id(&self) -> Option<&str> {
         self.spec.id.as_deref()
     }
+
+    /// True for a valid native terminal reference. Such a figure never hosts
+    /// a Wayland surface and never runs `launch:`.
+    pub fn is_terminal(&self) -> bool {
+        self.spec.is_terminal()
+    }
+
+    /// True for a malformed or mixed binding. The rectangle stays inert.
+    pub fn is_inert(&self) -> bool {
+        self.spec.binding_error.is_some()
+    }
 }
 
 /// The document's figures and their app bindings.
@@ -296,6 +307,8 @@ mod tests {
                 h,
                 id: None,
                 launch: None,
+                terminal: None,
+                binding_error: None,
             },
             span: 0..0,
             w_arg: 0..0,

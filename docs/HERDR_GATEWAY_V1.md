@@ -264,7 +264,10 @@ and hyphens. Never interpret them as file paths.
 | Retry after loss between host launch and receipt of reply | Reconcile slot and Core record. Return its existing identity or `needs_reconciliation`. No second process. |
 | Host CLI exits but guest workload remains | Stop stays unverified. Other workloads and VM are unaffected. |
 
-Commit the JSON examples and binary frame vectors as machine-readable
-test inputs in T11. Go gateway and Rust client tests use the same
-fixtures. Real pairing, fleet and renderer results belong to the
+The machine-readable corpus lives in `fixtures/herdr-gateway-v1/` and is
+validated by `cargo test -p herdr-gateway-fixtures` or
+`cargo run -p herdr-gateway-fixtures --bin validate-herdr-gateway-fixtures`.
+It includes single frames (`kind: "frame"`), frames split across reads
+(`kind: "chunks"`), and channel/lease state scenarios (`kind: "scenario"`).
+Go gateway and Rust client tests use the same files. Real pairing, fleet and renderer results belong to the
 [integrated acceptance run](HERDR_ACCEPTANCE_RUN.md).

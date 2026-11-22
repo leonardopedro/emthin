@@ -356,9 +356,25 @@ impl SessionStore {
 /// Write one file through a same-directory temporary and rename it into
 /// place. Used for metadata-only legacy migration.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_publish(path, bytes, true)
+}
+
+/// Publish a completed temporary file. `replace` selects rename semantics;
+/// `false` uses a hard link so a concurrent creator wins with `AlreadyExists`
+/// instead of being silently clobbered.
+pub(crate) fn write_atomic_publish(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
     let temp = temp_path(path);
     write_file(&temp, bytes)?;
-    if let Err(error) = fs::rename(&temp, path) {
+    let publish = if replace {
+        fs::rename(&temp, path)
+    } else {
+        fs::hard_link(&temp, path).map(|()| {
+            // The destination is published; a stale temp must not turn a
+            // successful create into a reported failure.
+            let _ = fs::remove_file(&temp);
+        })
+    };
+    if let Err(error) = publish {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
@@ -568,6 +584,18 @@ mod tests {
         let dir = TempDir::new("missing");
         let store = SessionStore::new(&dir.file());
         assert!(matches!(store.load(), LoadResult::Missing));
+    }
+
+    #[test]
+    fn create_only_publication_does_not_clobber_a_concurrent_creator() {
+        let dir = TempDir::new("create-only");
+        let path = dir.0.join("created.bin");
+        fs::write(&path, b"concurrent").expect("concurrent creator");
+
+        let error = write_atomic_publish(&path, b"mine", false)
+            .expect_err("an existing destination must win");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).expect("destination"), b"concurrent");
     }
 
     #[test]

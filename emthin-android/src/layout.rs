@@ -184,9 +184,11 @@ pub fn prepare(
     if let Some(value) = RETAINED.with(|slot| {
         let slot = slot.borrow();
         slot.as_ref()
-            .filter(|layout| layout.id == layout_id
-                && layout.snapshot_digest == snapshot_digest
-                && (layout.text_size - text_size).abs() < f32::EPSILON)
+            .filter(|layout| {
+                layout.id == layout_id
+                    && layout.snapshot_digest == snapshot_digest
+                    && (layout.text_size - text_size).abs() < f32::EPSILON
+            })
             .map(metadata)
     }) {
         return Ok(value);
@@ -203,11 +205,7 @@ pub fn prepare(
 
     let mut warnings = Vec::new();
     let (world, document, map, theme_len, typst) = match compile(
-        doc_text,
-        &options,
-        text_size,
-        &model,
-        capture,
+        doc_text, &options, text_size, &model, capture,
     ) {
         Ok(compiled) => compiled,
         Err((original, failures)) => {
@@ -271,8 +269,14 @@ pub fn prepare(
     };
     diagnostics.extend(typst);
     diagnostics.sort_by(|a, b| {
-        let a = (a["severity"].as_str().unwrap_or(""), a["start"].as_u64().unwrap_or(u64::MAX));
-        let b = (b["severity"].as_str().unwrap_or(""), b["start"].as_u64().unwrap_or(u64::MAX));
+        let a = (
+            a["severity"].as_str().unwrap_or(""),
+            a["start"].as_u64().unwrap_or(u64::MAX),
+        );
+        let b = (
+            b["severity"].as_str().unwrap_or(""),
+            b["start"].as_u64().unwrap_or(u64::MAX),
+        );
         a.cmp(&b)
     });
     let total = document.pages().len();
@@ -315,6 +319,29 @@ fn text_top(layout: &RetainedLayout, page: usize) -> Option<f32> {
         None => glyphs.entries.first(),
     }?;
     glyphs.bands.get(entry.band as usize).map(|band| band.top)
+}
+
+/// Resolve the terminal binding for each figure key in one document pass.
+/// The page frame only carries the key, so the pad needs this side table to
+/// tell a native terminal slot from an ordinary dormant/Wayland figure.
+pub(crate) fn figure_bindings(
+    doc_text: &str,
+) -> std::collections::HashMap<String, (Option<String>, Option<String>)> {
+    let scan = mathed_core::markers::scan(doc_text);
+    let mut bindings = std::collections::HashMap::new();
+    for segment in mathed_core::markers::resolve_segments(&scan) {
+        let Some(figure) = mathed_core::figures::resolve_figure(&segment) else {
+            continue;
+        };
+        bindings.insert(
+            figure.key,
+            (
+                figure.spec.terminal.as_ref().map(|reference| reference.canonical()),
+                figure.spec.binding_error,
+            ),
+        );
+    }
+    bindings
 }
 
 fn page_hits(doc_text: &str, glyphs: &GlyphIndex) -> Vec<Value> {
@@ -376,7 +403,28 @@ pub fn render_page(
         let png = png_page(width, height, &image.data)?;
         use base64::Engine as _;
         let encoded = base64::engine::general_purpose::STANDARD.encode(png);
-        let glyphs = layout.glyphs[page].as_ref().expect("glyph index built above");
+        let glyphs = layout.glyphs[page]
+            .as_ref()
+            .expect("glyph index built above");
+        let bindings = figure_bindings(doc_text);
+        let figures: Vec<Value> = mathed_core::figures::figures_in_frame(frame)
+            .into_iter()
+            .map(|figure| {
+                let (reference, binding_error) = bindings
+                    .get(&figure.key)
+                    .cloned()
+                    .unwrap_or((None, None));
+                json!({
+                    "key": figure.key,
+                    "x": figure.rect.x0,
+                    "y": figure.rect.y0,
+                    "w": figure.rect.x1 - figure.rect.x0,
+                    "h": figure.rect.y1 - figure.rect.y0,
+                    "reference": reference,
+                    "bindingError": binding_error,
+                })
+            })
+            .collect();
         let value = json!({
             "page": page,
             "width": width,
@@ -385,12 +433,15 @@ pub fn render_page(
             "heightPt": size.y.to_pt(),
             "scale": scale,
             "textTop": text_top(layout, page),
-            "hasFigures": !mathed_core::figures::figures_in_frame(frame).is_empty(),
+            "hasFigures": !figures.is_empty(),
+            "figures": figures,
             "hits": page_hits(doc_text, glyphs),
             "png": encoded,
         });
         let from = retain_from.min(page);
-        let to = retain_to.max(page).min(layout.glyphs.len().saturating_sub(1));
+        let to = retain_to
+            .max(page)
+            .min(layout.glyphs.len().saturating_sub(1));
         for (index, glyphs) in layout.glyphs.iter_mut().enumerate() {
             if index < from || index > to {
                 *glyphs = None;
@@ -422,16 +473,13 @@ pub fn locate_range(
             // first raster request, especially for a jump to a late page.
             let had_index = layout.glyphs[page].is_some();
             ensure_glyphs(layout, page);
-            let found = layout.glyphs[page]
-                .as_ref()
-                .and_then(|glyphs| {
-                    glyphs
-                        .entries
-                        .iter()
-                        .find(|entry| entry.doc_byte >= start
-                            && (start == end || entry.doc_byte < end))
-                        .map(|entry| byte_to_utf16(doc_text, entry.doc_byte))
-                });
+            let found = layout.glyphs[page].as_ref().and_then(|glyphs| {
+                glyphs
+                    .entries
+                    .iter()
+                    .find(|entry| entry.doc_byte >= start && (start == end || entry.doc_byte < end))
+                    .map(|entry| byte_to_utf16(doc_text, entry.doc_byte))
+            });
             if let Some(found_start) = found {
                 return Ok(json!({
                     "page": page,

@@ -32,9 +32,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use mathed_core::figures::FigureRect;
-use mathed_mini::{
-    layout_doc_paged_with_text_size, DEFAULT_TEXT_SIZE_PT, PageLayout, RenderError,
-};
+use mathed_mini::{layout_doc_paged_with_text_size, PageLayout, RenderError, DEFAULT_TEXT_SIZE_PT};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 /// Where one figure landed.
@@ -46,56 +44,168 @@ pub struct PlacedFigure {
     pub rect: Rectangle<i32, Logical>,
 }
 
+/// Which document incarnation and source generation a layout belongs to.
+/// Accepted hit-testing data is usable only while this matches the live model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayoutOwner {
+    pub document: u64,
+    pub content: u64,
+}
+
 /// One layout request. The worker owns the text and transform options for the
 /// duration of the job, so the UI can keep editing.
 struct LayoutRequest {
     generation: u64,
+    owner: LayoutOwner,
     text: String,
     options: mathed_core::TransformOptions,
     text_size: f32,
+    /// Page whose raster the caller needs first.
+    page: usize,
+}
+
+struct PageRequest {
+    owner: LayoutOwner,
+    page: usize,
 }
 
 struct LayoutResult {
     generation: u64,
+    owner: LayoutOwner,
     pages: Vec<PageLayout>,
+    materialized_page: usize,
     compile_time: Duration,
+    glyph_time: Duration,
     raster_time: Duration,
     error: Option<String>,
 }
 
-/// The timing of an applied layout. `compile_time` is the whole Typst
-/// compile+raster call; the current mathed_mini seam does not expose a
-/// separate raster phase, so `raster_time` is zero.
+enum LayoutEvent {
+    Layout(LayoutResult),
+    Page {
+        owner: LayoutOwner,
+        page: usize,
+        result: Result<PageLayout, String>,
+    },
+}
+
+/// The timing of an applied layout. `compile_time` is Typst compilation,
+/// `glyph_time` is source-map/glyph extraction for every page, and
+/// `raster_time` is the one materialized page.
 #[derive(Debug, Clone, Copy)]
 pub struct AppliedLayout {
     pub generation: u64,
     pub compile_time: Duration,
+    pub glyph_time: Duration,
     pub raster_time: Duration,
     pub apply_time: Duration,
 }
 
-/// One active layout and at most one owed replacement. This is intentionally
-/// not a queue: a fast typist must not build an unbounded pile of stale
-/// compiles.
+/// One active layout, at most one owed replacement, and page materialization
+/// requests served from the retained compiled generation.
 struct LayoutWorker {
-    requests: Sender<LayoutRequest>,
-    results: Receiver<LayoutResult>,
+    requests: Sender<LayoutJob>,
+    results: Receiver<LayoutEvent>,
     active: Option<u64>,
     pending: Option<LayoutRequest>,
     newest: u64,
+    ready_pages: std::collections::VecDeque<(LayoutOwner, usize, PageLayout)>,
+}
+
+enum LayoutJob {
+    Layout(Box<LayoutRequest>),
+    Page(PageRequest),
 }
 
 impl LayoutWorker {
     fn new() -> Self {
-        let (requests, request_rx) = mpsc::channel::<LayoutRequest>();
-        let (result_tx, results) = mpsc::channel::<LayoutResult>();
+        let (requests, request_rx) = mpsc::channel::<LayoutJob>();
+        let (result_tx, results) = mpsc::channel::<LayoutEvent>();
         std::thread::Builder::new()
             .name("emthin-layout".into())
             .spawn(move || {
-                while let Ok(request) = request_rx.recv() {
-                    let result = run_layout(request);
-                    if result_tx.send(result).is_err() {
-                        break;
+                let mut retained: Option<mathed_mini::RetainedPaged> = None;
+                let mut current_owner: Option<LayoutOwner> = None;
+                while let Ok(job) = request_rx.recv() {
+                    match job {
+                        LayoutJob::Layout(request) => {
+                            let request = *request;
+                            let started = Instant::now();
+                            let compiled = mathed_mini::RetainedPaged::compile(
+                                &request.text,
+                                &request.options,
+                                request.text_size,
+                            );
+                            let compile_time = started.elapsed();
+                            let result = match compiled {
+                                Ok(retained_doc) => {
+                                    let glyph_started = Instant::now();
+                                    let mut pages = retained_doc.skeleton();
+                                    let glyph_time = glyph_started.elapsed();
+                                    let page = request.page.min(pages.len().saturating_sub(1));
+                                    let raster_started = Instant::now();
+                                    let materialized = pages.get_mut(page).map(|slot| {
+                                        match retained_doc.page(page, 1.0) {
+                                            Ok(layout) => *slot = layout,
+                                            Err(error) => {
+                                                tracing::warn!(
+                                                    ?error,
+                                                    page,
+                                                    "materializing the visible page failed"
+                                                );
+                                            }
+                                        }
+                                        page
+                                    });
+                                    let raster_time = raster_started.elapsed();
+                                    retained = Some(retained_doc);
+                                    current_owner = Some(request.owner);
+                                    LayoutResult {
+                                        generation: request.generation,
+                                        owner: request.owner,
+                                        pages,
+                                        materialized_page: materialized.unwrap_or(0),
+                                        compile_time,
+                                        glyph_time,
+                                        raster_time,
+                                        error: None,
+                                    }
+                                }
+                                Err(error) => LayoutResult {
+                                    generation: request.generation,
+                                    owner: request.owner,
+                                    pages: Vec::new(),
+                                    materialized_page: 0,
+                                    compile_time,
+                                    glyph_time: Duration::ZERO,
+                                    raster_time: Duration::ZERO,
+                                    error: Some(format!("{error:?}")),
+                                },
+                            };
+                            if result_tx.send(LayoutEvent::Layout(result)).is_err() {
+                                break;
+                            }
+                        }
+                        LayoutJob::Page(request) => {
+                            let result = match (&retained, current_owner) {
+                                (Some(retained_doc), Some(owner)) if owner == request.owner => {
+                                    retained_doc
+                                        .page(request.page, 1.0)
+                                        .map_err(|error| format!("{error:?}"))
+                                }
+                                _ => Err("render layout was replaced; request a new frame".into()),
+                            };
+                            if result_tx
+                                .send(LayoutEvent::Page {
+                                    owner: request.owner,
+                                    page: request.page,
+                                    result,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
             })
@@ -106,16 +216,26 @@ impl LayoutWorker {
             active: None,
             pending: None,
             newest: 0,
+            ready_pages: std::collections::VecDeque::new(),
         }
     }
 
-    fn request(&mut self, text: String, options: mathed_core::TransformOptions, text_size: f32) -> u64 {
+    fn request(
+        &mut self,
+        owner: LayoutOwner,
+        text: String,
+        options: mathed_core::TransformOptions,
+        text_size: f32,
+        page: usize,
+    ) -> u64 {
         self.newest = self.newest.wrapping_add(1);
         let request = LayoutRequest {
             generation: self.newest,
+            owner,
             text,
             options,
             text_size,
+            page,
         };
         if self.active.is_none() {
             self.send(request);
@@ -127,9 +247,19 @@ impl LayoutWorker {
 
     fn send(&mut self, request: LayoutRequest) {
         self.active = Some(request.generation);
-        if self.requests.send(request).is_err() {
+        if self
+            .requests
+            .send(LayoutJob::Layout(Box::new(request)))
+            .is_err()
+        {
             self.active = None;
         }
+    }
+
+    fn request_page(&mut self, owner: LayoutOwner, page: usize) {
+        let _ = self
+            .requests
+            .send(LayoutJob::Page(PageRequest { owner, page }));
     }
 
     fn start_pending(&mut self) {
@@ -138,10 +268,23 @@ impl LayoutWorker {
         }
     }
 
+    #[cfg(not(test))]
+    fn is_pending(&self) -> bool {
+        self.active.is_some() || self.pending.is_some()
+    }
+
     fn poll(&mut self) -> Option<LayoutResult> {
         loop {
             match self.results.try_recv() {
-                Ok(result) => {
+                Ok(LayoutEvent::Page {
+                    owner,
+                    page,
+                    result,
+                }) => match result {
+                    Ok(layout) => self.ready_pages.push_back((owner, page, layout)),
+                    Err(error) => tracing::warn!(?owner, page, "page materialization: {error}"),
+                },
+                Ok(LayoutEvent::Layout(result)) => {
                     if self.active == Some(result.generation) {
                         self.active = None;
                         self.start_pending();
@@ -159,10 +302,20 @@ impl LayoutWorker {
         }
     }
 
+    fn poll_page(&mut self) -> Option<(LayoutOwner, usize, PageLayout)> {
+        self.ready_pages.pop_front()
+    }
+
     #[cfg(test)]
     fn wait_for_newest(&mut self) -> Option<LayoutResult> {
         loop {
-            let result = self.results.recv().ok()?;
+            let event = self.results.recv().ok()?;
+            if let LayoutEvent::Page { .. } = event {
+                continue;
+            }
+            let LayoutEvent::Layout(result) = event else {
+                unreachable!()
+            };
             if self.active == Some(result.generation) {
                 self.active = None;
                 self.start_pending();
@@ -174,28 +327,6 @@ impl LayoutWorker {
     }
 }
 
-fn run_layout(request: LayoutRequest) -> LayoutResult {
-    let started = Instant::now();
-    let result = layout_doc_paged_with_text_size(&request.text, &request.options, request.text_size);
-    let elapsed = started.elapsed();
-    match result {
-        Ok(pages) => LayoutResult {
-            generation: request.generation,
-            pages,
-            compile_time: elapsed,
-            raster_time: Duration::ZERO,
-            error: None,
-        },
-        Err(error) => LayoutResult {
-            generation: request.generation,
-            pages: Vec::new(),
-            compile_time: elapsed,
-            raster_time: Duration::ZERO,
-            error: Some(format!("{error:?}")),
-        },
-    }
-}
-
 /// The rendered document: every page's raster + glyph index + figure
 /// rects, plus the letterbox mapping for the visible page.
 ///
@@ -203,6 +334,12 @@ fn run_layout(request: LayoutRequest) -> LayoutResult {
 /// dumping a whole page's pixels into a log line helps nobody.
 pub struct DocLayoutCache {
     pages: Vec<PageLayout>,
+    /// The source owner currently being requested (set before a rebuild is
+    /// scheduled). Hit-testing stays disabled while this differs from the
+    /// accepted owner below.
+    owner: Option<LayoutOwner>,
+    /// The owner of the pages and glyph indexes currently held.
+    accepted_owner: Option<LayoutOwner>,
     /// Changes after every successful raster rebuild, even without a text edit.
     generation: u64,
     /// Size of one page in logical px (from the first page's raster).
@@ -222,6 +359,8 @@ pub struct DocLayoutCache {
     /// Number of layout/raster attempts. Tests use this to distinguish a
     /// caret repaint from a real recompile.
     rebuild_count: u64,
+    /// Pages whose full raster is resident. At most one on the live worker.
+    materialized: Vec<bool>,
     worker: LayoutWorker,
 }
 
@@ -229,6 +368,8 @@ impl Default for DocLayoutCache {
     fn default() -> Self {
         Self {
             pages: Vec::new(),
+            owner: None,
+            accepted_owner: None,
             generation: 0,
             page_size: Size::default(),
             viewport: Size::default(),
@@ -237,6 +378,7 @@ impl Default for DocLayoutCache {
             view_zoom: 1.0,
             view_pan: Point::from((0.0, 0.0)),
             rebuild_count: 0,
+            materialized: Vec::new(),
             worker: LayoutWorker::new(),
         }
     }
@@ -245,6 +387,25 @@ impl Default for DocLayoutCache {
 impl DocLayoutCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark which document/source generation the next layout belongs to.
+    /// Geometry from an older accepted owner is not valid hit-test data.
+    pub(crate) fn set_owner(&mut self, owner: LayoutOwner) {
+        self.owner = Some(owner);
+    }
+
+    /// Whether the retained glyphs/figures belong to `owner`.
+    pub(crate) fn accepts(&self, owner: LayoutOwner) -> bool {
+        self.accepted_owner == Some(owner) && self.owner == Some(owner)
+    }
+
+    fn geometry_current(&self) -> bool {
+        match (self.owner, self.accepted_owner) {
+            (None, _) => true,
+            (Some(owner), Some(accepted)) => owner == accepted,
+            (Some(_), None) => false,
+        }
     }
 
     /// Re-lay out the document. Cheap no-op when nothing changed.
@@ -275,24 +436,27 @@ impl DocLayoutCache {
                 "document layout and raster failed"
             ),
         }
-        self.install_pages(result?);
+        self.install_pages(result?, self.owner);
         Ok(())
     }
 
     /// Schedule a replacement layout. In tests the cache stays synchronous so
     /// existing geometry assertions remain deterministic; production uses the
     /// one-active/one-pending worker.
-    pub fn request_rebuild(
+    pub(crate) fn request_rebuild(
         &mut self,
         doc_text: &str,
         opts: &mathed_core::TransformOptions,
+        owner: LayoutOwner,
     ) -> Option<Result<AppliedLayout, String>> {
+        self.set_owner(owner);
         #[cfg(test)]
         {
             Some(match self.rebuild(doc_text, opts) {
                 Ok(()) => Ok(AppliedLayout {
                     generation: self.generation,
                     compile_time: Duration::ZERO,
+                    glyph_time: Duration::ZERO,
                     raster_time: Duration::ZERO,
                     apply_time: Duration::ZERO,
                 }),
@@ -303,11 +467,26 @@ impl DocLayoutCache {
         {
             self.rebuild_count = self.rebuild_count.wrapping_add(1);
             self.worker.request(
+                owner,
                 doc_text.to_owned(),
                 opts.clone(),
                 self.text_size_pt,
+                self.current_page,
             );
             None
+        }
+    }
+
+    /// Whether a requested layout has not been applied yet. Tests use the
+    /// synchronous path, where a request is always applied immediately.
+    pub fn is_pending(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.owner != self.accepted_owner && self.owner.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            self.worker.is_pending()
         }
     }
 
@@ -315,21 +494,73 @@ impl DocLayoutCache {
     /// discarded; a failed newest result keeps the old pages.
     pub fn poll_rebuild(&mut self) -> Option<Result<AppliedLayout, String>> {
         let mut result = self.worker.poll()?;
+        if Some(result.owner) != self.owner {
+            tracing::debug!(
+                owner = ?result.owner,
+                current = ?self.owner,
+                "discarding a layout from a superseded document/source owner"
+            );
+            return None;
+        }
         if let Some(error) = result.error.take() {
             return Some(Err(error));
         }
         let apply_started = Instant::now();
-        self.install_pages(result.pages);
+        let materialized_page = result.materialized_page;
+        self.install_pages(result.pages, Some(result.owner));
+        self.materialized = vec![false; self.pages.len()];
+        if let Some(slot) = self.materialized.get_mut(materialized_page) {
+            *slot = true;
+        }
         Some(Ok(AppliedLayout {
             generation: result.generation,
             compile_time: result.compile_time,
+            glyph_time: result.glyph_time,
             raster_time: result.raster_time,
             apply_time: apply_started.elapsed(),
         }))
     }
 
-    fn install_pages(&mut self, pages: Vec<PageLayout>) {
+    /// Ask the retained worker for the visible page's raster. A page turn
+    /// inside one compiled generation never asks for a compile.
+    pub fn ensure_page(&mut self) {
+        let page = self.current_page;
+        let Some(false) = self.materialized.get(page) else {
+            return;
+        };
+        if let Some(owner) = self.accepted_owner {
+            self.worker.request_page(owner, page);
+        }
+    }
+
+    /// Apply a page raster from the retained generation, if one arrived.
+    /// Only the visible page keeps pixels resident.
+    pub fn poll_page(&mut self) -> bool {
+        let Some((owner, page, layout)) = self.worker.poll_page() else {
+            return false;
+        };
+        if Some(owner) != self.accepted_owner || page >= self.pages.len() {
+            return false;
+        }
+        self.pages[page] = layout;
+        self.materialized[page] = true;
+        let stale: Vec<usize> = self
+            .materialized
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resident)| (*resident && index != page).then_some(index))
+            .collect();
+        for index in stale {
+            self.pages[index].release_raster();
+            self.materialized[index] = false;
+        }
+        true
+    }
+
+    fn install_pages(&mut self, pages: Vec<PageLayout>, owner: Option<LayoutOwner>) {
+        self.materialized = vec![true; pages.len()];
         self.pages = pages;
+        self.accepted_owner = owner;
         self.generation = self.generation.wrapping_add(1);
         self.page_size = self
             .pages
@@ -451,8 +682,14 @@ impl DocLayoutCache {
         );
         let anchor = if old.size.w > 0 && old.size.h > 0 {
             Point::new(
-                anchor.x.max(f64::from(old.loc.x)).min(f64::from(old.loc.x + old.size.w)),
-                anchor.y.max(f64::from(old.loc.y)).min(f64::from(old.loc.y + old.size.h)),
+                anchor
+                    .x
+                    .max(f64::from(old.loc.x))
+                    .min(f64::from(old.loc.x + old.size.w)),
+                anchor
+                    .y
+                    .max(f64::from(old.loc.y))
+                    .min(f64::from(old.loc.y + old.size.h)),
             )
         } else {
             center
@@ -583,6 +820,9 @@ impl DocLayoutCache {
 
     /// Glyph index for caret/selection geometry on the visible page.
     pub fn glyphs(&self) -> Option<&mathed_core::GlyphIndex> {
+        if !self.geometry_current() {
+            return None;
+        }
         self.page().map(|p| &p.glyphs)
     }
 
@@ -593,12 +833,108 @@ impl DocLayoutCache {
     /// leave the view where it is. A rendered match moves the visible page so
     /// F3 works even when the next hit is on another page.
     pub fn page_for_range(&self, range: std::ops::Range<usize>) -> Option<usize> {
+        if !self.geometry_current() {
+            return None;
+        }
         self.pages.iter().position(|page| {
             page.glyphs
                 .entries
                 .iter()
                 .any(|entry| range.contains(&entry.doc_byte))
         })
+    }
+
+    /// The first rendered glyph intersecting the actual viewport, and its
+    /// vertical displacement in page points from the viewport top. `None`
+    /// when the page is not visible or its geometry is stale.
+    pub fn reading_spot(&self) -> Option<(usize, f64)> {
+        if !self.geometry_current() {
+            return None;
+        }
+        let page = self.page()?;
+        let rect = self.page_rect();
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return None;
+        }
+        let scale = page_scale(self.page_size, rect.size);
+        let doc_top = ((0.0 - f64::from(rect.loc.y)) / scale).max(0.0);
+        let doc_bottom = ((f64::from(self.viewport.h) - f64::from(rect.loc.y)) / scale)
+            .min(f64::from(self.page_size.h));
+        if doc_bottom <= doc_top {
+            return None;
+        }
+        let entry = page
+            .glyphs
+            .entries
+            .iter()
+            .filter(|entry| {
+                page.glyphs
+                    .bands
+                    .get(entry.band as usize)
+                    .is_some_and(|band| {
+                        f64::from(band.bottom) > doc_top && f64::from(band.top) < doc_bottom
+                    })
+            })
+            .min_by(|a, b| {
+                let a_band = &page.glyphs.bands[a.band as usize];
+                let b_band = &page.glyphs.bands[b.band as usize];
+                a_band
+                    .top
+                    .partial_cmp(&b_band.top)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+            })?;
+        let band = &page.glyphs.bands[entry.band as usize];
+        Some((entry.doc_byte, f64::from(band.top) - doc_top))
+    }
+
+    /// Place `doc_byte` at `offset` page points below the viewport top,
+    /// choosing the page that holds it and clamping the resulting pan. Returns
+    /// whether the visible page or transform changed.
+    pub(crate) fn place_reading_offset(&mut self, doc_byte: usize, offset: f64) -> bool {
+        if !offset.is_finite() || !self.geometry_current() {
+            return false;
+        }
+        let Some(page_idx) = self.pages.iter().position(|page| {
+            page.glyphs
+                .entries
+                .iter()
+                .any(|entry| entry.doc_byte >= doc_byte)
+        }) else {
+            return false;
+        };
+        let Some(entry) = self.pages[page_idx]
+            .glyphs
+            .entries
+            .iter()
+            .find(|entry| entry.doc_byte >= doc_byte)
+        else {
+            return false;
+        };
+        let Some(band) = self.pages[page_idx].glyphs.bands.get(entry.band as usize) else {
+            return false;
+        };
+        let band_top = f64::from(band.top);
+
+        let before = (self.current_page, self.view_pan);
+        if page_idx != self.current_page {
+            self.set_current_page(page_idx);
+        }
+        let rect = self.page_rect();
+        let scale = page_scale(self.page_size, rect.size);
+        let centered = view_page_rect(
+            self.page_size,
+            self.viewport,
+            self.view_zoom,
+            Point::from((0.0, 0.0)),
+        );
+        // `offset = band.top - doc_top`, so the line's page position at the
+        // viewport top is `band.top - offset`; place that at screen y 0.
+        self.view_pan.y = offset * scale - band_top * scale - f64::from(centered.loc.y);
+        self.clamp_view_pan();
+        self.current_page != before.0
+            || (self.view_pan.x - before.1.x).abs() > 0.01
+            || (self.view_pan.y - before.1.y).abs() > 0.01
     }
 
     /// The size of one page, in logical px.
@@ -664,6 +1000,9 @@ impl DocLayoutCache {
     /// the visible page. Returns `None` when the point is outside the
     /// page (in the letterbox margin).
     pub fn screen_to_doc(&self, screen: Point<f64, Logical>) -> Option<Point<f64, Logical>> {
+        if !self.geometry_current() {
+            return None;
+        }
         let page = self.page_rect();
         if page.size.w <= 0 || page.size.h <= 0 {
             return None;
@@ -875,15 +1214,67 @@ mod tests {
     fn the_worker_keeps_one_pending_and_discards_older_work() {
         let mut worker = LayoutWorker::new();
         let options = mathed_core::TransformOptions::default();
-        let first = worker.request("first".into(), options.clone(), DEFAULT_TEXT_SIZE_PT);
-        let second = worker.request("second".into(), options.clone(), DEFAULT_TEXT_SIZE_PT);
-        let third = worker.request("third".into(), options, DEFAULT_TEXT_SIZE_PT);
+        let owner = LayoutOwner {
+            document: 1,
+            content: 1,
+        };
+        let first = worker.request(
+            owner,
+            "first".into(),
+            options.clone(),
+            DEFAULT_TEXT_SIZE_PT,
+            0,
+        );
+        let second = worker.request(
+            owner,
+            "second".into(),
+            options.clone(),
+            DEFAULT_TEXT_SIZE_PT,
+            0,
+        );
+        let third = worker.request(owner, "third".into(), options, DEFAULT_TEXT_SIZE_PT, 0);
         assert!(first < second && second < third);
 
         let result = worker.wait_for_newest().expect("worker result");
         assert_eq!(result.generation, third, "the newest request wins");
         assert!(result.error.is_none(), "a simple text layout must succeed");
         assert!(!result.pages.is_empty());
+    }
+
+    #[test]
+    fn the_worker_rasterizes_only_requested_pages() {
+        let mut worker = LayoutWorker::new();
+        let options = mathed_core::TransformOptions::default();
+        let owner = LayoutOwner {
+            document: 2,
+            content: 2,
+        };
+        let long = "lorem ipsum dolor sit amet consectetur adipiscing elit\n".repeat(220);
+        let generation = worker.request(owner, long, options, DEFAULT_TEXT_SIZE_PT, 0);
+        let result = worker.wait_for_newest().expect("worker result");
+        assert_eq!(result.generation, generation);
+        assert!(result.pages.len() > 1, "fixture must paginate");
+        assert!(result.pages[0].image.width > 100, "visible page has pixels");
+        assert_eq!(
+            result.pages[1].image.width, 1,
+            "offscreen page keeps only metadata"
+        );
+
+        worker.request_page(owner, 1);
+        let (page_owner, page, layout) = loop {
+            let _ = worker.poll();
+            if let Some(page) = worker.poll_page() {
+                break page;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(page_owner, owner);
+        assert_eq!(page, 1);
+        assert!(layout.image.width > 100, "later page materializes");
+        assert_eq!(
+            worker.newest, generation,
+            "a page turn inside the retained generation does not request a compile"
+        );
     }
 
     #[test]
@@ -902,6 +1293,48 @@ mod tests {
             "28pt must paginate longer than 12pt: {} vs {small_pages}",
             cache.page_count()
         );
+    }
+
+    #[test]
+    fn stale_owners_keep_pixels_but_withhold_hit_geometry() {
+        let mut cache = DocLayoutCache::new();
+        cache.set_viewport(Size::from((1200, 900)));
+        let opts = mathed_core::TransformOptions::default();
+        let first = LayoutOwner {
+            document: 1,
+            content: 1,
+        };
+        cache.set_owner(first);
+        cache.rebuild("first document", &opts).expect("layout");
+        assert!(cache.accepts(first));
+        let page = cache.page().expect("retained pixels").image.data.clone();
+        let point = cache.doc_to_screen(Point::from((20.0, 20.0)));
+        assert!(cache.screen_to_doc(point.to_f64()).is_some());
+
+        let newer = LayoutOwner {
+            document: 1,
+            content: 2,
+        };
+        cache.set_owner(newer);
+        assert!(!cache.accepts(newer), "the old layout is not accepted yet");
+        assert_eq!(
+            cache.page().expect("old pixels stay visible").image.data,
+            page
+        );
+        assert!(
+            cache.screen_to_doc(point.to_f64()).is_none(),
+            "stale hit geometry must be withheld while the replacement runs"
+        );
+        assert!(cache.glyphs().is_none());
+
+        cache
+            .rebuild("second document", &opts)
+            .expect("replacement");
+        assert!(
+            cache.accepts(newer),
+            "the accepted replacement restores hits"
+        );
+        assert!(cache.glyphs().is_some());
     }
 
     #[test]

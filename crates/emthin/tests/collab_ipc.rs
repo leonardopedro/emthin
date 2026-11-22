@@ -163,7 +163,7 @@ impl Peer {
         }
     }
 
-    fn wait_collab_delta(&mut self, peer: &str) -> (u64, String) {
+    fn wait_collab_delta_frame(&mut self, peer: &str) -> (u64, String, Option<u64>) {
         let message = self.wait_for("a collaboration delta", |message| {
             message["method"] == "collab_delta" && message["params"]["peer"] == peer
         });
@@ -174,13 +174,26 @@ impl Peer {
                 .as_str()
                 .expect("delta")
                 .to_string(),
+            message["params"]["scope"].as_u64(),
         )
+    }
+
+    fn wait_collab_delta(&mut self, peer: &str) -> (u64, String) {
+        let (seq, delta, _) = self.wait_collab_delta_frame(peer);
+        (seq, delta)
     }
 
     fn send_delta(&mut self, peer: &str, seq: u64, delta: &str) {
         self.client.send(
             "collab_delta",
             json!({"peer": peer, "seq": seq, "delta": delta}),
+        );
+    }
+
+    fn send_delta_scoped(&mut self, peer: &str, seq: u64, delta: &str, scope: Option<u64>) {
+        self.client.send(
+            "collab_delta",
+            json!({"peer": peer, "seq": seq, "delta": delta, "scope": scope}),
         );
     }
 
@@ -213,7 +226,11 @@ fn relay_presence(from: &mut Peer, to: &mut Peer) -> Vec<Value> {
             if let Some(blob) = message["params"]["blob"].as_str() {
                 to.client.send(
                     "collab_presence",
-                    json!({"peer": from_peer, "blob": blob}),
+                    json!({
+                        "peer": from_peer,
+                        "blob": blob,
+                        "scope": message["params"]["scope"],
+                    }),
                 );
             }
         }
@@ -332,6 +349,202 @@ fn presence_is_visible_expires_and_reconnects_without_editing() {
         1,
         "reconnect must not duplicate the peer"
     );
+}
+
+#[test]
+fn mark_edits_converge_and_a_replaced_document_rejects_old_frames() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut a = Peer::new("scope-a", "base");
+    let mut b = Peer::new("scope-b", "");
+    let a_peer = a.state.collab.local_peer().to_string();
+    let b_peer = b.state.collab.local_peer().to_string();
+    let a_scope = a.state.collab.scope();
+    let b_scope = b.state.collab.scope();
+
+    a.client.send(
+        "collab_join",
+        json!({"peer": b_peer, "version": "", "scope": b_scope}),
+    );
+    b.client.send(
+        "collab_join",
+        json!({"peer": a_peer, "version": "", "scope": a_scope}),
+    );
+    let (a_seq, a_delta, a_frame_scope) = a.wait_collab_delta_frame(&b_peer);
+    let (b_seq, b_delta, b_frame_scope) = b.wait_collab_delta_frame(&a_peer);
+    b.send_delta_scoped(&a_peer, a_seq, &a_delta, a_frame_scope);
+    a.send_delta_scoped(&b_peer, b_seq, &b_delta, b_frame_scope);
+    assert_eq!(b.document(), "base");
+
+    // A mark-only edit does not bump the text revision, but the committed
+    // Loro version changes and must still travel.
+    a.state
+        .doc
+        .model_mut()
+        .math_doc_mut()
+        .mark_segment(0..2, "prop:function", "marked");
+    a.state.doc.model_mut().math_doc_mut().commit();
+    a.pump();
+    let (mark_seq, mark_delta, mark_scope) = a.wait_collab_delta_frame(&b_peer);
+    b.send_delta_scoped(&a_peer, mark_seq, &mark_delta, mark_scope);
+    b.pump();
+    assert_eq!(
+        b.state.doc.model().math_doc().segment_marks(),
+        a.state.doc.model().math_doc().segment_marks(),
+        "a mark-only edit converges"
+    );
+    assert_eq!(b.document(), "base");
+
+    // Capture a frame that must become stale when A replaces its document.
+    a.state
+        .doc
+        .model_mut()
+        .math_doc_mut()
+        .mark_segment(2..4, "prop:function", "old");
+    a.state.doc.model_mut().math_doc_mut().commit();
+    a.pump();
+    let (old_seq, old_delta, old_scope) = a.wait_collab_delta_frame(&b_peer);
+    assert_eq!(old_scope, Some(b_scope));
+
+    // Open/ASCII import both run the same document-scope reset.
+    let path = b.dir.join("replacement.typ");
+    std::fs::write(&path, "replacement").expect("write replacement");
+    b.client.send(
+        "import_ascii",
+        json!({"path": path.display().to_string()}),
+    );
+    b.pump();
+    assert_eq!(b.state.doc.model().text(), "replacement");
+    assert!(b.state.collab_peers().is_empty(), "old peers are gone");
+    assert!(b.state.collab.scope() > b_scope, "the scope advances");
+
+    // A uses Open; both entry points must reset the same scope.
+    let a_path = a.dir.join("replacement.mathed");
+    std::fs::write(&a_path, "replacement").expect("write replacement");
+    a.client.send(
+        "open_doc",
+        json!({"path": a_path.display().to_string()}),
+    );
+    a.pump();
+    assert_eq!(a.state.doc.model().text(), "replacement");
+
+    // Establish fresh peer sessions on the new document.
+    a.client.send(
+        "collab_join",
+        json!({
+            "peer": b_peer,
+            "version": "",
+            "scope": b.state.collab.scope(),
+        }),
+    );
+    b.client.send(
+        "collab_join",
+        json!({
+            "peer": a_peer,
+            "version": "",
+            "scope": a.state.collab.scope(),
+        }),
+    );
+    let _ = a.wait_collab_delta_frame(&b_peer);
+    let _ = b.wait_collab_delta_frame(&a_peer);
+
+    let before_text = b.state.doc.model().text().to_string();
+    let before_revision = b.state.doc.model().revision();
+    let before_snapshot = b.state.doc.model().math_doc().snapshot();
+    let before_undo = b.state.doc.model().math_doc().can_undo();
+    b.send_delta_scoped(&a_peer, old_seq, &old_delta, old_scope);
+    b.pump();
+    assert_eq!(b.state.doc.model().text(), before_text);
+    assert_eq!(b.state.doc.model().revision(), before_revision);
+    assert_eq!(b.state.doc.model().math_doc().snapshot(), before_snapshot);
+    assert_eq!(b.state.doc.model().math_doc().can_undo(), before_undo);
+
+    // Both sides established fresh peer sessions on the replacement.
+    assert!(a.state.collab.has_peer(&b_peer));
+    assert!(b.state.collab.has_peer(&a_peer));
+}
+
+#[test]
+fn grants_gate_commits_and_discovery_over_ipc() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut a = Peer::new("grant-a", "base");
+    let mut b = Peer::new("grant-b", "");
+    let a_peer = a.state.collab.local_peer().to_string();
+    let b_peer = b.state.collab.local_peer().to_string();
+
+    // The owner grants read to B. A share with explicit grants checks every
+    // non-owner join, delta and presence.
+    a.client
+        .send("collab_grant", json!({"peer": b_peer, "grant": "read"}));
+    a.pump();
+    assert!(a.state.collab.has_explicit_grants());
+
+    // Discovery: a granted peer is visible, a stranger is not.
+    a.client
+        .send("collab_shares", json!({"peer": b_peer}));
+    let reply = a.wait_for("granted share access", |m| {
+        m["method"] == "collab_share_access"
+    });
+    assert_eq!(reply["params"]["visible"], true);
+    a.client
+        .send("collab_shares", json!({"peer": "stranger"}));
+    let reply = a.wait_for("stranger share access", |m| {
+        m["method"] == "collab_share_access"
+    });
+    assert_eq!(reply["params"]["visible"], false, "denied == missing");
+
+    // B joins and receives the catch-up; the read grant permits it.
+    a.client.send(
+        "collab_join",
+        json!({"peer": b_peer, "version": "", "scope": b.state.collab.scope()}),
+    );
+    b.client.send(
+        "collab_join",
+        json!({"peer": a_peer, "version": "", "scope": a.state.collab.scope()}),
+    );
+    let (seq, delta, scope) = a.wait_collab_delta_frame(&b_peer);
+    b.send_delta_scoped(&a_peer, seq, &delta, scope);
+    b.pump();
+    // B's own handshake catch-up is held until B has an edit grant; until
+    // then even a catch-up cannot be applied at the owner.
+    let (b_seq, b_delta, b_scope) = b.wait_collab_delta_frame(&a_peer);
+    assert_eq!(b.document(), "base");
+
+    // B edits, but only has read: A refuses the commit and its document,
+    // revision and undo history are untouched.
+    b.state.doc.model_mut().insert_at_caret("X");
+    let (edit_seq, edit_delta, edit_scope) = b.wait_collab_delta_frame(&a_peer);
+    let before_text = a.state.doc.model().text().to_string();
+    let before_revision = a.state.doc.model().revision();
+    let before_undo = a.state.doc.model().math_doc().can_undo();
+    a.send_delta_scoped(&b_peer, edit_seq, &edit_delta, edit_scope);
+    a.pump();
+    assert_eq!(a.state.doc.model().text(), before_text);
+    assert_eq!(a.state.doc.model().revision(), before_revision);
+    assert_eq!(a.state.doc.model().math_doc().can_undo(), before_undo);
+
+    // Grant edit, then deliver B's handshake frame and the edit in order.
+    a.client
+        .send("collab_grant", json!({"peer": b_peer, "grant": "edit"}));
+    a.pump();
+    a.send_delta_scoped(&b_peer, b_seq, &b_delta, b_scope);
+    a.pump();
+    a.send_delta_scoped(&b_peer, edit_seq, &edit_delta, edit_scope);
+    a.pump();
+    assert_eq!(a.state.doc.model().text(), b.state.doc.model().text());
+
+    // Revoke stops further exchange and removes discovery.
+    a.client.send("collab_revoke", json!({"peer": b_peer}));
+    a.pump();
+    // Drop the earlier denial notifications so the discovery reply is read
+    // without tripping the harness's no-error guard.
+    let _ = a.client.drain();
+    a.client
+        .send("collab_shares", json!({"peer": b_peer}));
+    let reply = a.wait_for("revoked share access", |m| {
+        m["method"] == "collab_share_access"
+    });
+    assert_eq!(reply["params"]["visible"], false);
+    assert!(!a.state.collab.has_peer(&b_peer));
 }
 
 #[test]

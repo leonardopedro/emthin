@@ -105,13 +105,20 @@ pub enum IncomingMessage {
     CollabVersion,
     /// Join a collaborating peer at a version token. The answer is a
     /// `collab_delta` notification carrying everything the peer missed.
-    CollabJoin { peer: String, version: String },
+    /// `scope` is the caller's document generation; omitting it keeps the
+    /// legacy unscoped path.
+    CollabJoin {
+        peer: String,
+        version: String,
+        scope: Option<u64>,
+    },
     /// Apply a delta frame from a peer. `seq` is that peer's reliable-stream
     /// sequence number; `delta` is hex encoded.
     CollabDelta {
         peer: String,
         seq: u64,
         delta: String,
+        scope: Option<u64>,
     },
     /// Acknowledge every frame through `seq` from `peer`.
     CollabAck { peer: String, seq: u64 },
@@ -120,9 +127,58 @@ pub enum IncomingMessage {
     /// Apply one remote presence payload. `peer` is the transmitting peer and
     /// `blob` is hex encoded. Presence is advisory: it never edits the
     /// document.
-    CollabPresence { peer: String, blob: String },
+    CollabPresence {
+        peer: String,
+        blob: String,
+        scope: Option<u64>,
+    },
     /// Set this process's collaboration display name.
     CollabName { name: String },
+    /// Ask whether `peer` may discover this share. The reply is
+    /// `collab_share_access`; a denied and an unknown identity both see
+    /// `visible: false`.
+    CollabShares { peer: String },
+    /// Grant `read`/`edit`/`invite` on this share to `peer` (owner only).
+    CollabGrant { peer: String, grant: String },
+    /// Revoke all grants for `peer` and invalidate pending work (owner only).
+    CollabRevoke { peer: String },
+    /// Apply a share-scoped, anchored collaborator caret. `blob` is hex
+    /// encoded; `epoch` fences a stale connection.
+    CollabAnchor {
+        peer: String,
+        blob: String,
+        epoch: Option<u64>,
+    },
+    /// List the retained document-history frontiers (hex).
+    HistoryList,
+    /// Preview a retained frontier without touching the live document.
+    HistoryPreview { frontier: String },
+    /// Explicit copy export: make a retained frontier the new local document.
+    HistoryExport { frontier: String },
+    /// Read-only semantic outline: definitions, uses and unresolved names.
+    SemanticOutline,
+    /// Go to the definition at a document byte (moves the caret).
+    GotoDefinition { byte: usize },
+    /// Rename a definition across its name and all resolved uses (one edit).
+    RenameDefinition { def_index: usize, new_name: String },
+    /// Read-only rendered-text accessibility nodes (opt-in query).
+    A11yNodes,
+    /// Enable opt-in bounded session diagnostics.
+    InspectStart,
+    /// Disable diagnostics and drop the event buffer.
+    InspectStop,
+    /// Report the settled state from the shared event reducer.
+    InspectState,
+    /// Build and return the read-only proof/reference view (K8).
+    ProofQuery,
+    /// Apply an independently fetched, read-only proof result. Ownership is
+    /// explicit so a late result for another proof/document is ignored.
+    ProofResult {
+        share_id: String,
+        document_key: String,
+        proof_id: String,
+        verdict: String,
+    },
 }
 
 /// Contact phase for [`IncomingMessage::InjectTouch`].
@@ -147,6 +203,10 @@ impl TouchPhase {
         }
     }
 }
+
+/// One accessible node on the wire: `(role, label, value, start, end)`. Byte
+/// offsets are null when the node has no source range.
+type A11yNodeRow = (String, String, Option<String>, Option<usize>, Option<usize>);
 
 /// emthin → control client.
 #[derive(Debug, Clone)]
@@ -183,6 +243,21 @@ pub enum OutgoingMessage {
     PageChanged {
         page: usize,
     },
+    /// One grouped, committed document change (K1). A presentation-only
+    /// edit produces no notification, so this never advances a durable
+    /// version on the client. `version` is the committed Loro version vector
+    /// (hex); `ranges` are `[start, end]` UTF-8 byte pairs.
+    DocChanged {
+        seq: u64,
+        document: u64,
+        content_generation: u64,
+        version: String,
+        origin: String,
+        scope: String,
+        ranges: Vec<[usize; 2]>,
+        source_digest: String,
+        content_digest: String,
+    },
     /// Response to `list_state`.
     State {
         page: usize,
@@ -193,9 +268,9 @@ pub enum OutgoingMessage {
         view_zoom: f64,
         view_pan_x: f64,
         view_pan_y: f64,
-        citation_style: Option<String>,
-        citation_locale: Option<String>,
-        doc: String,
+        citation_style: Box<Option<String>>,
+        citation_locale: Box<Option<String>>,
+        doc: Box<String>,
         figures: Vec<StateFigure>,
         /// Live peers, self excluded. Empty when no peer is connected.
         peers: Vec<StatePeer>,
@@ -203,13 +278,37 @@ pub enum OutgoingMessage {
         collab_local_peer: String,
         collab_local_name: String,
         /// The compact status line, or `null` in quiet state.
-        status: Option<String>,
+        status: Box<Option<String>>,
+        /// Explicit-file status: `clean`, `unsaved`, or `failed`.
+        save_state: &'static str,
+        /// Recovery/session status: `clean`, `recovered`, or `failed`.
+        recovery_state: &'static str,
+        /// Preview status: `current`, `updating`, or `failed`.
+        preview_state: &'static str,
         /// The full last layout failure, for a client that needs the detail.
-        layout_error: Option<String>,
-        /// The full last save/persistence failure, or `null`.
-        save_error: Option<String>,
+        layout_error: Box<Option<String>>,
+        /// The full explicit-file save/conflict failure, or `null`. Boxed so
+        /// the already-large `State` variant does not grow the whole enum.
+        save_error: Box<Option<String>>,
+        /// The full recovery/session failure, or `null`.
+        recovery_error: Box<Option<String>>,
         /// A non-fatal persistence recovery note, or `null`.
-        save_warning: Option<String>,
+        save_warning: Box<Option<String>>,
+        /// Local availability: `loading`, `available`, `missing`, `failed`.
+        local_state: &'static str,
+        /// Share readiness: `not_shared`, `catching_up`, `current`, `offline`,
+        /// `refused`. Reported separately from the local document (K2).
+        share_state: &'static str,
+        local_state_detail: Box<Option<String>>,
+        share_state_detail: Box<Option<String>>,
+        /// Whether this document may seed a share.
+        seed_granted: bool,
+        /// The generation each kind of confirmation last covered:
+        /// `(document, content_generation, version-hex)`. A peer ack confirms
+        /// applied operations only, never disk.
+        last_recovery_ack: Box<Option<(u64, u64, String)>>,
+        last_explicit_ack: Box<Option<(u64, u64, String)>>,
+        last_peer_ack: Box<Option<(u64, u64, String)>>,
     },
     /// The document was written to disk. `format` is `source` or `snapshot`;
     /// `digest` is the SHA-256 of the bytes actually written.
@@ -260,6 +359,7 @@ pub enum OutgoingMessage {
         peer: String,
         seq: u64,
         delta: String,
+        scope: Option<u64>,
     },
     /// The document's current version token, hex encoded.
     CollabVersion {
@@ -273,6 +373,70 @@ pub enum OutgoingMessage {
         local_name: String,
         peers: Vec<StatePeer>,
         blob: Option<String>,
+        scope: u64,
+    },
+    /// Reply to `collab_shares`. `visible` is false for both a denied and an
+    /// unknown identity, so a client cannot enumerate shares (K4).
+    CollabShareAccess {
+        peer: String,
+        visible: bool,
+    },
+    /// Reply to `semantic_outline`: definitions with use counts, resolved uses
+    /// and unresolved names. Ranges are `[start,end]` UTF-8 byte pairs.
+    SemanticOutline {
+        definitions: Vec<(usize, String, usize, usize, usize)>,
+        uses: Vec<(String, usize, usize, usize)>,
+        unresolved: Vec<(String, usize, usize)>,
+    },
+    /// Reply to `rename_definition`: how many ranges changed, or an error.
+    RenameResult {
+        replacements: usize,
+        applied: bool,
+    },
+    /// Reply to `a11y_nodes`: read-only accessible nodes, each
+    /// `{role,label,value,start,end}`. `start`/`end` are null when a node has
+    /// no source range.
+    A11yNodes {
+        nodes: Vec<A11yNodeRow>,
+    },
+    /// Reply to `proof_query`: the read-only proof/reference projection.
+    ProofView {
+        share_id: String,
+        document_key: String,
+        revision: String,
+        definitions: Vec<(String, usize, usize, usize)>,
+        references: Vec<(String, usize, usize, Option<String>)>,
+        missing: Vec<String>,
+        proof_id: Option<String>,
+        verdict: Option<String>,
+    },
+    /// Reply to `inspect_state`: the settled state from the shared reducer.
+    InspectState {
+        enabled: bool,
+        local: String,
+        share: String,
+        frontier: String,
+        accepted: u64,
+        peers: usize,
+        reason: Option<String>,
+    },
+    /// Reply to `history_list`: the retained frontiers, oldest first.
+    History {
+        frontiers: Vec<String>,
+    },
+    /// Reply to `history_preview`. `status` is `available` or `unavailable`;
+    /// an unavailable preview carries a `reason` and no document content.
+    /// A preview never changes the live model, save state or undo stack (K5).
+    HistoryPreview {
+        frontier: String,
+        share_id: String,
+        owner: String,
+        seq: u64,
+        text: String,
+        marks: Vec<(usize, usize, String)>,
+        content_digest: String,
+        status: &'static str,
+        reason: Option<String>,
     },
     /// A command failed. `code` is the machine-readable reason from the
     /// closed [`IpcErrorCode`] set; `message` is the human detail and is
@@ -301,6 +465,8 @@ pub enum IpcErrorCode {
     AppGone,
     /// No figure with that key exists in the document.
     UnknownFigure,
+    /// A requested navigation target (e.g. a definition at a byte) was absent.
+    NotFound,
     /// A voice turn could not be queued.
     VoiceFailed,
     /// A document file could not be read or written.
@@ -321,6 +487,7 @@ impl IpcErrorCode {
             Self::NotBound => "not_bound",
             Self::AppGone => "app_gone",
             Self::UnknownFigure => "unknown_figure",
+            Self::NotFound => "not_found",
             Self::VoiceFailed => "voice_failed",
             Self::IoFailed => "io_failed",
             Self::NotAscii => "not_ascii",
@@ -335,7 +502,7 @@ impl IpcErrorCode {
     /// failures without maintaining its own code→category table.
     pub fn category(self) -> &'static str {
         match self {
-            Self::NotBound | Self::UnknownFigure => "not_found",
+            Self::NotBound | Self::UnknownFigure | Self::NotFound => "not_found",
             Self::AppGone => "unavailable",
             Self::VoiceFailed => "execution_failure",
             Self::IoFailed => "io",
@@ -362,6 +529,7 @@ impl IpcErrorCode {
             Self::NotBound => "The figure exists but no app is mapped into it. Spawn into it (or wait for `figure_bound`) before `close`/`focus`.",
             Self::AppGone => "The figure's app exited after binding. Re-`spawn`; the next `figure_bound` re-establishes the mapping.",
             Self::UnknownFigure => "No figure with that key exists — check `list_state`'s `figures` and the figure keys in the document.",
+            Self::NotFound => "No target exists at that document position — check the byte and `semantic_outline` for definitions and uses.",
             Self::VoiceFailed => "The turn could not be queued (no `\\voice` block under the target, a pending harness error, …). The message carries the reason; fix the block and retry.",
             Self::IoFailed => "The document path could not be read/written — check the path exists and is writable by the compositor's user.",
             Self::NotAscii => "The file is not the ASCII interchange projection. Re-export it with `export_ascii`, or convert its non-ASCII characters, before importing.",
@@ -371,10 +539,11 @@ impl IpcErrorCode {
     }
 
     /// Every code, for the doc-sync test.
-    pub const ALL: [IpcErrorCode; 8] = [
+    pub const ALL: [IpcErrorCode; 9] = [
         Self::NotBound,
         Self::AppGone,
         Self::UnknownFigure,
+        Self::NotFound,
         Self::VoiceFailed,
         Self::IoFailed,
         Self::NotAscii,
@@ -514,11 +683,13 @@ impl IncomingMessage {
             "collab_join" => Self::CollabJoin {
                 peer: params_get_string(params, "peer")?,
                 version: params_get_string(params, "version")?,
+                scope: params_get_optional_u64(params, "scope")?,
             },
             "collab_delta" => Self::CollabDelta {
                 peer: params_get_string(params, "peer")?,
                 seq: params_get_u64(params, "seq")?,
                 delta: params_get_string(params, "delta")?,
+                scope: params_get_optional_u64(params, "scope")?,
             },
             "collab_ack" => Self::CollabAck {
                 peer: params_get_string(params, "peer")?,
@@ -530,9 +701,51 @@ impl IncomingMessage {
             "collab_presence" => Self::CollabPresence {
                 peer: params_get_string(params, "peer")?,
                 blob: params_get_string(params, "blob")?,
+                scope: params_get_optional_u64(params, "scope")?,
             },
             "collab_name" => Self::CollabName {
                 name: params_get_string(params, "name")?,
+            },
+            "collab_shares" => Self::CollabShares {
+                peer: params_get_string(params, "peer")?,
+            },
+            "collab_grant" => Self::CollabGrant {
+                peer: params_get_string(params, "peer")?,
+                grant: params_get_string(params, "grant")?,
+            },
+            "collab_revoke" => Self::CollabRevoke {
+                peer: params_get_string(params, "peer")?,
+            },
+            "collab_anchor" => Self::CollabAnchor {
+                peer: params_get_string(params, "peer")?,
+                blob: params_get_string(params, "blob")?,
+                epoch: params_get_optional_u64(params, "epoch")?,
+            },
+            "history_list" => Self::HistoryList,
+            "history_preview" => Self::HistoryPreview {
+                frontier: params_get_string(params, "frontier")?,
+            },
+            "history_export" => Self::HistoryExport {
+                frontier: params_get_string(params, "frontier")?,
+            },
+            "semantic_outline" => Self::SemanticOutline,
+            "goto_definition" => Self::GotoDefinition {
+                byte: params_get_usize(params, "byte")?,
+            },
+            "rename_definition" => Self::RenameDefinition {
+                def_index: params_get_usize(params, "def_index")?,
+                new_name: params_get_string(params, "new_name")?,
+            },
+            "a11y_nodes" => Self::A11yNodes,
+            "inspect_start" => Self::InspectStart,
+            "inspect_stop" => Self::InspectStop,
+            "inspect_state" => Self::InspectState,
+            "proof_query" => Self::ProofQuery,
+            "proof_result" => Self::ProofResult {
+                share_id: params_get_string(params, "share_id")?,
+                document_key: params_get_string(params, "document_key")?,
+                proof_id: params_get_string(params, "proof_id")?,
+                verdict: params_get_string(params, "verdict")?,
             },
             other => return Err(format!("unknown IPC method: {other}")),
         })
@@ -584,10 +797,7 @@ fn params_get_u64(params: &serde_json::Value, key: &str) -> Result<u64, String> 
 }
 
 /// An optional boolean param: absent or `null` is `None`.
-fn params_get_optional_bool(
-    params: &serde_json::Value,
-    key: &str,
-) -> Result<Option<bool>, String> {
+fn params_get_optional_bool(params: &serde_json::Value, key: &str) -> Result<Option<bool>, String> {
     match params.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
@@ -612,6 +822,16 @@ fn params_get_optional_string(
 
 /// An optional non-negative integer param, same rules as
 /// [`params_get_optional_string`].
+fn params_get_optional_u64(params: &serde_json::Value, key: &str) -> Result<Option<u64>, String> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("field '{key}' must be an unsigned integer")),
+    }
+}
+
 fn params_get_optional_usize(
     params: &serde_json::Value,
     key: &str,
@@ -641,6 +861,7 @@ impl OutgoingMessage {
             Self::FigureUnbound { .. } => "figure_unbound",
             Self::AppTitleChanged { .. } => "app_title_changed",
             Self::PageChanged { .. } => "page_changed",
+            Self::DocChanged { .. } => "doc_changed",
             Self::State { .. } => "state",
             Self::DocSaved { .. } => "doc_saved",
             Self::AsciiExported { .. } => "ascii_exported",
@@ -653,6 +874,14 @@ impl OutgoingMessage {
             Self::CollabDelta { .. } => "collab_delta",
             Self::CollabVersion { .. } => "collab_version",
             Self::CollabPresence { .. } => "collab_presence",
+            Self::CollabShareAccess { .. } => "collab_share_access",
+            Self::SemanticOutline { .. } => "semantic_outline",
+            Self::RenameResult { .. } => "rename_result",
+            Self::A11yNodes { .. } => "a11y_nodes",
+            Self::ProofView { .. } => "proof_view",
+            Self::InspectState { .. } => "inspect_state",
+            Self::History { .. } => "history",
+            Self::HistoryPreview { .. } => "history_preview",
             Self::Error { .. } => "error",
         }
     }
@@ -687,6 +916,27 @@ impl OutgoingMessage {
                 serde_json::json!({"window_id": window_id, "title": title})
             }
             Self::PageChanged { page } => serde_json::json!({"page": page}),
+            Self::DocChanged {
+                seq,
+                document,
+                content_generation,
+                version,
+                origin,
+                scope,
+                ranges,
+                source_digest,
+                content_digest,
+            } => serde_json::json!({
+                "seq": seq,
+                "document": document,
+                "content_generation": content_generation,
+                "version": version,
+                "origin": origin,
+                "scope": scope,
+                "ranges": ranges,
+                "source_digest": source_digest,
+                "content_digest": content_digest,
+            }),
             Self::State {
                 page,
                 page_count,
@@ -702,9 +952,21 @@ impl OutgoingMessage {
                 collab_local_peer,
                 collab_local_name,
                 status,
+                save_state,
+                recovery_state,
+                preview_state,
                 layout_error,
                 save_error,
+                recovery_error,
                 save_warning,
+                local_state,
+                share_state,
+                local_state_detail,
+                share_state_detail,
+                seed_granted,
+                last_recovery_ack,
+                last_explicit_ack,
+                last_peer_ack,
             } => serde_json::json!({
                 "page": page,
                 "page_count": page_count,
@@ -720,9 +982,27 @@ impl OutgoingMessage {
                 "collab_local_peer": collab_local_peer,
                 "collab_local_name": collab_local_name,
                 "status": status,
+                "save_state": save_state,
+                "recovery_state": recovery_state,
+                "preview_state": preview_state,
                 "layout_error": layout_error,
                 "save_error": save_error,
+                "recovery_error": recovery_error,
                 "save_warning": save_warning,
+                "local_state": local_state,
+                "share_state": share_state,
+                "local_state_detail": local_state_detail,
+                "share_state_detail": share_state_detail,
+                "seed_granted": seed_granted,
+                "last_recovery_ack": last_recovery_ack.map(|(document, generation, version)| {
+                    serde_json::json!({"document": document, "content_generation": generation, "version": version})
+                }),
+                "last_explicit_ack": last_explicit_ack.map(|(document, generation, version)| {
+                    serde_json::json!({"document": document, "content_generation": generation, "version": version})
+                }),
+                "last_peer_ack": last_peer_ack.map(|(document, generation, version)| {
+                    serde_json::json!({"document": document, "content_generation": generation, "version": version})
+                }),
             }),
             Self::DocSaved {
                 path,
@@ -751,20 +1031,108 @@ impl OutgoingMessage {
                 "rule": serde_json::to_value(rule).unwrap_or_default(),
             }),
             Self::DbusRouterRuleRemoved { id } => serde_json::json!({"id": id}),
-            Self::CollabDelta { peer, seq, delta } => {
-                serde_json::json!({"peer": peer, "seq": seq, "delta": delta})
-            }
+            Self::CollabDelta {
+                peer,
+                seq,
+                delta,
+                scope,
+            } => serde_json::json!({
+                "peer": peer,
+                "seq": seq,
+                "delta": delta,
+                "scope": scope,
+            }),
             Self::CollabVersion { version } => serde_json::json!({"version": version}),
             Self::CollabPresence {
                 local_peer,
                 local_name,
                 peers,
                 blob,
+                scope,
             } => serde_json::json!({
                 "local_peer": local_peer,
                 "local_name": local_name,
                 "peers": peers,
                 "blob": blob,
+                "scope": scope,
+            }),
+            Self::CollabShareAccess { peer, visible } => {
+                serde_json::json!({"peer": peer, "visible": visible})
+            }
+            Self::SemanticOutline {
+                definitions,
+                uses,
+                unresolved,
+            } => serde_json::json!({
+                "definitions": definitions,
+                "uses": uses,
+                "unresolved": unresolved,
+            }),
+            Self::RenameResult {
+                replacements,
+                applied,
+            } => serde_json::json!({
+                "replacements": replacements,
+                "applied": applied,
+            }),
+            Self::A11yNodes { nodes } => serde_json::json!({ "nodes": nodes }),
+            Self::ProofView {
+                share_id,
+                document_key,
+                revision,
+                definitions,
+                references,
+                missing,
+                proof_id,
+                verdict,
+            } => serde_json::json!({
+                "share_id": share_id,
+                "document_key": document_key,
+                "revision": revision,
+                "definitions": definitions,
+                "references": references,
+                "missing": missing,
+                "proof_id": proof_id,
+                "verdict": verdict,
+            }),
+            Self::InspectState {
+                enabled,
+                local,
+                share,
+                frontier,
+                accepted,
+                peers,
+                reason,
+            } => serde_json::json!({
+                "enabled": enabled,
+                "local": local,
+                "share": share,
+                "frontier": frontier,
+                "accepted": accepted,
+                "peers": peers,
+                "reason": reason,
+            }),
+            Self::History { frontiers } => serde_json::json!({"frontiers": frontiers}),
+            Self::HistoryPreview {
+                frontier,
+                share_id,
+                owner,
+                seq,
+                text,
+                marks,
+                content_digest,
+                status,
+                reason,
+            } => serde_json::json!({
+                "frontier": frontier,
+                "share_id": share_id,
+                "owner": owner,
+                "seq": seq,
+                "text": text,
+                "marks": marks,
+                "content_digest": content_digest,
+                "status": status,
+                "reason": reason,
             }),
             // N2 (2026-10-13, REAdapt R16): the error notification now
             // carries `category`, `retryable` and `remediation` alongside
@@ -838,12 +1206,11 @@ mod tests {
 
     #[test]
     fn parses_a_finite_text_size_and_rejects_missing_or_non_numeric_ones() {
-        let m = IncomingMessage::from_jsonrpc(
-            "set_text_size",
-            &serde_json::json!({"pt": 24.0}),
-        )
-        .expect("set_text_size");
-        assert!(matches!(m, IncomingMessage::SetTextSize { pt } if (pt - 24.0).abs() < f32::EPSILON));
+        let m = IncomingMessage::from_jsonrpc("set_text_size", &serde_json::json!({"pt": 24.0}))
+            .expect("set_text_size");
+        assert!(
+            matches!(m, IncomingMessage::SetTextSize { pt } if (pt - 24.0).abs() < f32::EPSILON)
+        );
         assert!(IncomingMessage::from_jsonrpc("set_text_size", &serde_json::json!({})).is_err());
         assert!(
             IncomingMessage::from_jsonrpc("set_text_size", &serde_json::json!({"pt": "24"}))
@@ -992,7 +1359,7 @@ mod tests {
         .expect("presence");
         assert!(matches!(
             m,
-            IncomingMessage::CollabPresence { ref peer, ref blob }
+            IncomingMessage::CollabPresence { ref peer, ref blob, .. }
                 if peer == "alice" && blob == "beef"
         ));
 
@@ -1019,12 +1386,14 @@ mod tests {
             peer: "alice".into(),
             seq: 2,
             delta: "00ff".into(),
+            scope: Some(7),
         };
         assert_eq!(msg.method_name(), "collab_delta");
         let json = msg.into_params_value();
         assert_eq!(json["peer"], "alice");
         assert_eq!(json["seq"], 2);
         assert_eq!(json["delta"], "00ff");
+        assert_eq!(json["scope"], 7);
 
         let msg = OutgoingMessage::CollabVersion {
             version: "0a0b".into(),
@@ -1043,6 +1412,7 @@ mod tests {
                 last_seen_age_ms: 12,
             }],
             blob: Some("beef".into()),
+            scope: 3,
         };
         assert_eq!(msg.method_name(), "collab_presence");
         let json = msg.into_params_value();
@@ -1050,6 +1420,32 @@ mod tests {
         assert_eq!(json["peers"][0]["cursor"], 2);
         assert_eq!(json["peers"][0]["connected"], true);
         assert_eq!(json["blob"], "beef");
+    }
+
+    #[test]
+    fn doc_changed_carries_owner_origin_and_both_digests() {
+        let msg = OutgoingMessage::DocChanged {
+            seq: 4,
+            document: 7,
+            content_generation: 3,
+            version: "0a0b".into(),
+            origin: "undo".into(),
+            scope: "content".into(),
+            ranges: vec![[2, 8]],
+            source_digest: "source".into(),
+            content_digest: "content".into(),
+        };
+        assert_eq!(msg.method_name(), "doc_changed");
+        let json = msg.into_params_value();
+        assert_eq!(json["seq"], 4);
+        assert_eq!(json["document"], 7);
+        assert_eq!(json["version"], "0a0b");
+        assert_eq!(json["origin"], "undo");
+        assert_eq!(json["scope"], "content");
+        assert_eq!(json["ranges"][0][0], 2);
+        assert_eq!(json["ranges"][0][1], 8);
+        assert_eq!(json["source_digest"], "source");
+        assert_eq!(json["content_digest"], "content");
     }
 
     #[test]
@@ -1111,6 +1507,17 @@ mod tests {
                 title: "t".into(),
             },
             OutgoingMessage::PageChanged { page: 0 },
+            OutgoingMessage::DocChanged {
+                seq: 1,
+                document: 7,
+                content_generation: 3,
+                version: "0a0b".into(),
+                origin: "local".into(),
+                scope: "content".into(),
+                ranges: vec![[0, 5]],
+                source_digest: "src".into(),
+                content_digest: "content".into(),
+            },
             OutgoingMessage::AsciiExported {
                 path: "/tmp/out.typ".into(),
             },
@@ -1129,6 +1536,7 @@ mod tests {
                 peer: "a".into(),
                 seq: 1,
                 delta: "00".into(),
+                scope: Some(1),
             },
             OutgoingMessage::CollabVersion {
                 version: "00".into(),
@@ -1138,6 +1546,7 @@ mod tests {
                 local_name: "Ada".into(),
                 peers: Vec::new(),
                 blob: None,
+                scope: 1,
             },
             OutgoingMessage::Error {
                 code: IpcErrorCode::VoiceFailed,

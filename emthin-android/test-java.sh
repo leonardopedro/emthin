@@ -40,6 +40,7 @@ trap 'rm -rf "$OUT"' EXIT
     android/src/com/emthin/pad/InspectorView.java \
     android/src/com/emthin/pad/StatusModel.java \
     android/src/com/emthin/pad/ActionCatalog.java \
+    android/src/com/emthin/pad/SessionCatalog.java \
     android/test/com/emthin/pad/OwnershipTest.java \
     android/test/com/emthin/pad/RecoveryCodecTest.java \
     android/test/com/emthin/pad/ProviderIoTest.java \
@@ -48,7 +49,8 @@ trap 'rm -rf "$OUT"' EXIT
     android/test/com/emthin/pad/CitationControllerTest.java \
     android/test/com/emthin/pad/InspectorViewTest.java \
     android/test/com/emthin/pad/StatusModelTest.java \
-    android/test/com/emthin/pad/ActionCatalogTest.java
+    android/test/com/emthin/pad/ActionCatalogTest.java \
+    android/test/com/emthin/pad/SessionCatalogTest.java
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.OwnershipTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.RecoveryCodecTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.ProviderIoTest
@@ -58,3 +60,4 @@ trap 'rm -rf "$OUT"' EXIT
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.InspectorViewTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.StatusModelTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.ActionCatalogTest
+"$JAVA" -ea -cp "$OUT" com.emthin.pad.SessionCatalogTest

@@ -17,6 +17,9 @@ use std::fmt;
 /// A command sequence number. Sequence 0 is reserved as "nothing yet".
 pub type Seq = u64;
 
+/// One retained command with the byte count the caller supplied for it.
+type Entry<T> = (T, usize);
+
 /// The result of delivering one inbound command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivery<T> {
@@ -37,12 +40,18 @@ pub enum LineError {
     /// Sequence numbers start at 1; 0 means "nothing yet" and is never a
     /// valid command.
     ZeroSequence,
+    /// A peer's retained or buffered bytes would exceed its bound. The caller
+    /// must isolate the peer and restart from a frontier.
+    QueueOverflow { bytes: usize, max: usize },
 }
 
 impl fmt::Display for LineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroSequence => f.write_str("sequence numbers start at 1"),
+            Self::QueueOverflow { bytes, max } => {
+                write!(f, "queue would hold {bytes} bytes, over the {max} cap")
+            }
         }
     }
 }
@@ -57,10 +66,15 @@ impl std::error::Error for LineError {}
 #[derive(Debug, Clone)]
 pub struct Line<T> {
     next_send: Seq,
-    unacked: BTreeMap<Seq, T>,
+    unacked: BTreeMap<Seq, Entry<T>>,
     acked_through: Seq,
     next_recv: Seq,
-    buffered: BTreeMap<Seq, T>,
+    buffered: BTreeMap<Seq, Entry<T>>,
+    /// Bytes held for retransmit / gap buffering and the hard ceiling. The
+    /// caller supplies the byte count because `T` is opaque here.
+    retained_bytes: usize,
+    buffered_bytes_count: usize,
+    max_bytes: usize,
 }
 
 impl<T> Default for Line<T> {
@@ -72,25 +86,49 @@ impl<T> Default for Line<T> {
 impl<T> Line<T> {
     /// Create an empty line. The first command sent or expected is 1.
     pub fn new() -> Self {
+        Self::with_byte_limit(usize::MAX)
+    }
+
+    /// A line with an explicit byte ceiling. Frame bytes are counted by the
+    /// caller through [`Self::send_checked`] / [`Self::receive_checked`].
+    pub fn with_byte_limit(max_bytes: usize) -> Self {
         Self {
             next_send: 1,
             unacked: BTreeMap::new(),
             acked_through: 0,
             next_recv: 1,
             buffered: BTreeMap::new(),
+            retained_bytes: 0,
+            buffered_bytes_count: 0,
+            max_bytes,
         }
     }
 
     /// Assign the next sequence number and retain `command` for replay until
-    /// the peer acknowledges it.
+    /// the peer acknowledges it. Legacy path: no byte accounting.
     pub fn send(&mut self, command: T) -> Seq {
+        self.send_checked(command, 0)
+            .expect("an unbounded line cannot overflow")
+    }
+
+    /// Like [`Self::send`], but refuses to retain `bytes` more than the line's
+    /// byte ceiling. A stalled peer's queue cannot grow without bound.
+    pub fn send_checked(&mut self, command: T, bytes: usize) -> Result<Seq, LineError> {
+        let next = self.retained_bytes.saturating_add(bytes);
+        if next > self.max_bytes {
+            return Err(LineError::QueueOverflow {
+                bytes: next,
+                max: self.max_bytes,
+            });
+        }
         let seq = self.next_send;
         self.next_send = self
             .next_send
             .checked_add(1)
             .expect("command sequence exhausted");
-        self.unacked.insert(seq, command);
-        seq
+        self.retained_bytes = next;
+        self.unacked.insert(seq, (command, bytes));
+        Ok(seq)
     }
 
     /// Unacknowledged commands from `seq` onward, in sequence order.
@@ -102,7 +140,7 @@ impl<T> Line<T> {
         let start = seq.max(self.acked_through.saturating_add(1));
         self.unacked
             .range(start..)
-            .map(|(&seq, command)| (seq, command))
+            .map(|(&seq, (command, _))| (seq, command))
     }
 
     /// Acknowledge every command through `seq`.
@@ -120,13 +158,31 @@ impl<T> Line<T> {
         if seq <= self.acked_through {
             return;
         }
-        self.unacked = self.unacked.split_off(&(seq + 1));
+        let all = std::mem::take(&mut self.unacked);
+        let (acked, keep): (BTreeMap<Seq, Entry<T>>, BTreeMap<Seq, Entry<T>>) = all
+            .into_iter()
+            .partition(|(command_seq, _)| *command_seq <= seq);
+        for (_, bytes) in acked.values() {
+            self.retained_bytes = self.retained_bytes.saturating_sub(*bytes);
+        }
+        self.unacked = keep;
         self.acked_through = seq;
     }
 
     /// Deliver one inbound command, buffering it if an earlier command is
-    /// still missing.
+    /// still missing. Legacy path: no byte accounting.
     pub fn receive(&mut self, seq: Seq, command: T) -> Result<Delivery<T>, LineError> {
+        self.receive_checked(seq, command, 0)
+    }
+
+    /// Like [`Self::receive`], but refuses to buffer `bytes` more than the
+    /// line's byte ceiling.
+    pub fn receive_checked(
+        &mut self,
+        seq: Seq,
+        command: T,
+        bytes: usize,
+    ) -> Result<Delivery<T>, LineError> {
         if seq == 0 {
             return Err(LineError::ZeroSequence);
         }
@@ -137,7 +193,15 @@ impl<T> Line<T> {
             if self.buffered.contains_key(&seq) {
                 return Ok(Delivery::Duplicate);
             }
-            self.buffered.insert(seq, command);
+            let next = self.buffered_bytes_count.saturating_add(bytes);
+            if next > self.max_bytes {
+                return Err(LineError::QueueOverflow {
+                    bytes: next,
+                    max: self.max_bytes,
+                });
+            }
+            self.buffered_bytes_count = next;
+            self.buffered.insert(seq, (command, bytes));
             return Ok(Delivery::Gap {
                 expected: self.next_recv,
             });
@@ -145,7 +209,8 @@ impl<T> Line<T> {
 
         let mut commands = vec![command];
         self.next_recv += 1;
-        while let Some(command) = self.buffered.remove(&self.next_recv) {
+        while let Some((command, bytes)) = self.buffered.remove(&self.next_recv) {
+            self.buffered_bytes_count = self.buffered_bytes_count.saturating_sub(bytes);
             commands.push(command);
             self.next_recv += 1;
         }
@@ -178,11 +243,37 @@ impl<T> Line<T> {
     pub fn buffered_len(&self) -> usize {
         self.buffered.len()
     }
+
+    /// Bytes retained for retransmission.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Bytes buffered waiting for a gap.
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes_count
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_byte_bounded_line_refuses_to_retain_past_its_ceiling() {
+        let mut line = Line::with_byte_limit(10);
+        assert_eq!(line.send_checked("abcd", 4), Ok(1));
+        assert_eq!(line.send_checked("efgh", 4), Ok(2));
+        assert_eq!(line.retained_bytes(), 8);
+        assert_eq!(
+            line.send_checked("ijkl", 4),
+            Err(LineError::QueueOverflow { bytes: 12, max: 10 })
+        );
+        // Acknowledging releases the retained bytes.
+        line.ack(1);
+        assert_eq!(line.retained_bytes(), 4);
+        assert_eq!(line.send_checked("ijkl", 4), Ok(3));
+    }
 
     #[test]
     fn send_assigns_monotonic_sequences() {

@@ -173,7 +173,11 @@ fn claim_figure(
         .figures()
         .figures()
         .iter()
-        .filter(|f| f.is_dormant() && matches_id(f.spec.id.as_deref(), app_id, title))
+        .filter(|f| {
+            f.spec.is_wayland()
+                && f.is_dormant()
+                && matches_id(f.spec.id.as_deref(), app_id, title)
+        })
         .map(|f| f.key.clone())
         .collect();
     if let Some(primary) = by_id.first().cloned() {
@@ -189,7 +193,7 @@ fn claim_figure(
         .figures()
         .figures()
         .iter()
-        .find(|f| f.is_dormant())
+        .find(|f| f.spec.is_wayland() && f.is_dormant())
         .map(|f| f.key.clone())
     {
         state.doc.figures_mut().bind(&key, window_id);

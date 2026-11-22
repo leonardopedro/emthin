@@ -459,6 +459,57 @@ impl Host {
                     self.establish(peer.clone(), &version, link)?;
                     return Ok(Some(peer));
                 }
+                Ok(LinkRead::Message(Wire::HelloV2 {
+                    peer,
+                    share_id,
+                    protocol_version,
+                    envelope_version,
+                    epoch: _,
+                    version,
+                })) => {
+                    let mut link = self.handshaking.remove(index);
+                    let handshake = if self.links.contains_key(&peer) {
+                        self.session.reconnect_v2(
+                            &self.doc,
+                            &peer,
+                            &version,
+                            &share_id,
+                            protocol_version,
+                            envelope_version,
+                            None,
+                        )?
+                    } else {
+                        self.session.join_v2(
+                            &self.doc,
+                            peer.clone(),
+                            &version,
+                            &share_id,
+                            protocol_version,
+                            envelope_version,
+                            None,
+                        )?
+                    };
+                    // Echo the accepted share id and the assigned epoch so the
+                    // client can fence every later frame by it.
+                    link.queue(&Wire::HelloV2 {
+                        peer: self.session.local_peer().to_string(),
+                        share_id: *self.session.share_id(),
+                        protocol_version,
+                        envelope_version,
+                        epoch: handshake.epoch,
+                        version: self.doc.version_vector(),
+                    });
+                    link.queue(&Wire::Delta {
+                        seq: handshake.outbound.seq,
+                        delta: handshake.outbound.delta,
+                    });
+                    self.links.insert(peer.clone(), link);
+                    if let Err(e) = self.flush_peer(&peer) {
+                        self.drop_link(&peer);
+                        return Err(e);
+                    }
+                    return Ok(Some(peer));
+                }
                 Ok(LinkRead::Message(_)) => {
                     self.handshaking.remove(index);
                     return Err(HostError::BadHandshake);
@@ -515,7 +566,10 @@ impl Host {
                     .apply_presence(&blob)
                     .map_err(HostError::Session)?;
             }
-            Wire::Hello { .. } => return Err(HostError::BadHandshake),
+            Wire::Hello { .. } | Wire::HelloV2 { .. } => return Err(HostError::BadHandshake),
+            // A Resync is a host→client instruction. A client sending one to
+            // the host is a protocol error, not document traffic.
+            Wire::Resync { .. } => return Err(HostError::BadHandshake),
         }
         Ok(())
     }
@@ -608,6 +662,67 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn two_instances_converge_through_the_unix_host() {
+        // Two disposable instances start from the same share identity and edit
+        // independently, then exchange deltas through their Unix hosts (K6).
+        let base = MathDoc::with_text("shared");
+        let snapshot = base.snapshot();
+        let path_a = socket_path();
+        let path_b = socket_path();
+        let mut a = Host::bind(
+            &path_a,
+            MathDoc::from_snapshot(&snapshot).unwrap(),
+            "instance-a",
+            "A",
+            60_000,
+        )
+        .expect("bind a");
+        let mut b = Host::bind(
+            &path_b,
+            MathDoc::from_snapshot(&snapshot).unwrap(),
+            "instance-b",
+            "B",
+            60_000,
+        )
+        .expect("bind b");
+
+        // Each instance connects to the other and handshakes as a client.
+        let mut a_to_b = UnixLink::new(UnixStream::connect(&path_b).expect("a connects to b"));
+        a_to_b.send(&hello("instance-a", Vec::new())).unwrap();
+        let mut b_to_a = UnixLink::new(UnixStream::connect(&path_a).expect("b connects to a"));
+        b_to_a.send(&hello("instance-b", Vec::new())).unwrap();
+        assert_eq!(b.accept().unwrap().as_deref(), Some("instance-a"));
+        assert_eq!(a.accept().unwrap().as_deref(), Some("instance-b"));
+
+        // Apply each side's catch-up delta to its own document.
+        if let Some(Wire::Delta { delta, .. }) = a_to_b.recv().unwrap() {
+            a.doc_mut().import_delta(&delta).unwrap();
+        }
+        if let Some(Wire::Delta { delta, .. }) = b_to_a.recv().unwrap() {
+            b.doc_mut().import_delta(&delta).unwrap();
+        }
+        assert_eq!(a.doc().text(), b.doc().text());
+
+        // Offline-style independent edits, then exchange and converge.
+        a.doc_mut().insert(0, "A");
+        a.local_edit().unwrap();
+        // A's host routes the edit to B's client link; apply it there.
+        if let Some(Wire::Delta { delta, .. }) = b_to_a.recv().unwrap() {
+            b.doc_mut().import_delta(&delta).unwrap();
+        }
+
+        let b_len = b.doc().text().len();
+        b.doc_mut().insert(b_len, "B");
+        b.local_edit().unwrap();
+        if let Some(Wire::Delta { delta, .. }) = a_to_b.recv().unwrap() {
+            a.doc_mut().import_delta(&delta).unwrap();
+        }
+
+        assert_eq!(a.doc().text(), b.doc().text());
+        assert_eq!(a.doc().version_vector(), b.doc().version_vector());
     }
 
     #[test]

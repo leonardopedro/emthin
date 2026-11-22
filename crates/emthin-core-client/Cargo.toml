@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Lee <loyalpartner@163.com>"]
 license = "GPL-3.0"
 repository = "https://github.com/emthin/emthin"
-description = "Transport-free Herdr Core protocol client for emthin terminal figures"
+description = "Herdr Core protocol client for emthin terminal figures, with an optional Unix-socket adapter"
 publish = false
 
 [dependencies]

@@ -542,11 +542,23 @@ mod tests {
             Some(Action::ViewLarger)
         );
         assert_eq!(
-            classify(keysyms::KEY_underscore, KeyState::Pressed, true, true, false),
+            classify(
+                keysyms::KEY_underscore,
+                KeyState::Pressed,
+                true,
+                true,
+                false
+            ),
             Some(Action::ViewSmaller)
         );
         assert_eq!(
-            classify(keysyms::KEY_parenright, KeyState::Pressed, true, true, false),
+            classify(
+                keysyms::KEY_parenright,
+                KeyState::Pressed,
+                true,
+                true,
+                false
+            ),
             Some(Action::ViewReset),
             "Ctrl+Shift+0 arrives as the modified `)` keysym on some layouts"
         );

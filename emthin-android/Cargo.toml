@@ -19,6 +19,11 @@ crate-type = ["cdylib"]
 [dependencies]
 jni = "0.22"
 serde_json = "1"
+emthin-vt = { path = "../crates/emthin-vt" }
+emthin-core-client = { path = "../crates/emthin-core-client" }
+# std-only collaboration engine; the worker owns the transport-side replica so
+# the live DocModel never crosses a thread boundary (K6).
+emthin-collab = { path = "../crates/emthin-collab" }
 mathed_core = { path = "../../velysterm/crates/mathed_core" }
 mathed_biblio = { path = "../../velysterm/crates/mathed_biblio" }
 hayagriva = "0.10"

@@ -13,16 +13,102 @@ use emthin::docui::DocUi;
 use serde_json::json;
 use smithay::utils::Size;
 
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("emthin-docui-async-{}", std::process::id()));
+fn temp_dir(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "emthin-docui-async-{name}-{}-{seq}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
 
+fn wait_current(ui: &mut DocUi) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        while ui.poll_layout().is_some() {}
+        if ui.geometry_current() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[test]
+fn stale_geometry_is_withheld_and_the_accepted_replacement_restores_it() {
+    let dir = temp_dir("stale-geometry");
+    let doc = dir.join("paper.typ");
+    fs::write(
+        &doc,
+        "#1 visible caption #2 \\app(#1, #2, 300, 200)\n\nA line of prose.",
+    )
+    .expect("write document");
+
+    let mut ui = DocUi::new();
+    ui.set_viewport(Size::from((1200, 900)));
+    ui.load(Some(&doc), None);
+    assert!(wait_current(&mut ui), "initial layout did not arrive");
+
+    let page = ui.layout().page_rect();
+    let point = smithay::utils::Point::<f64, smithay::utils::Logical>::new(
+        f64::from(page.loc.x + page.size.w / 2),
+        f64::from(page.loc.y + page.size.h / 10),
+    );
+    assert!(ui.byte_at(point).is_some(), "the initial hit must be current");
+    let figure = ui.figures().figures().first().cloned();
+    if let Some(figure) = &figure {
+        let centre = smithay::utils::Point::<f64, smithay::utils::Logical>::new(
+            f64::from(figure.rect.loc.x + figure.rect.size.w / 2),
+            f64::from(figure.rect.loc.y + figure.rect.size.h / 2),
+        );
+        assert!(ui.figure_at(centre).is_some(), "the figure is hittable initially");
+    }
+
+    // A multibyte insert changes every following byte offset. Until the worker
+    // accepts a replacement, no source-derived hit may use the old glyph index.
+    ui.model_mut().replace(0..0, "é ");
+    assert!(!ui.geometry_current(), "the edit invalidates geometry immediately");
+    assert!(ui.byte_at(point).is_none(), "no hit against stale offsets");
+    assert!(ui.caret_rect().is_none(), "no IME caret against stale offsets");
+    if let Some(figure) = &figure {
+        let centre = smithay::utils::Point::<f64, smithay::utils::Logical>::new(
+            f64::from(figure.rect.loc.x + figure.rect.size.w / 2),
+            f64::from(figure.rect.loc.y + figure.rect.size.h / 2),
+        );
+        assert!(
+            ui.figure_at(centre).is_none(),
+            "a stale figure rect must not accept a launch/resize hit"
+        );
+    }
+    assert!(ui.model().text().starts_with("é "), "keyboard editing continues");
+
+    ui.relayout();
+    assert!(wait_current(&mut ui), "the replacement did not restore geometry");
+    assert!(ui.byte_at(point).is_some(), "the accepted replacement restores hits");
+
+    // Open while a layout is in flight: the new document owns geometry, not
+    // the result the worker still has queued.
+    let other = dir.join("other.typ");
+    fs::write(&other, "a different document").expect("other document");
+    ui.model_mut().replace(0..0, "newer edit ");
+    ui.relayout();
+    ui.open_document(&other).expect("open while in flight");
+    assert!(
+        !ui.geometry_current(),
+        "Open invalidates geometry before the new result arrives"
+    );
+    assert!(wait_current(&mut ui), "the opened document's layout did not arrive");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn saved_page_and_zoom_survive_an_async_relayout() {
-    let dir = temp_dir();
+    let dir = temp_dir("saved-view");
     let doc = dir.join("paper.typ");
     let text =
         "A paragraph long enough that the fixture paginates at the default size.\n\n".repeat(200);

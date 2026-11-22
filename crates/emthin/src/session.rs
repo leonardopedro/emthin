@@ -87,6 +87,11 @@ pub struct DocumentPreferences {
     /// Top-visible source position for the reading page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reading_anchor: Option<CursorAnchor>,
+    /// Vertical displacement in page points from the viewport top to the
+    /// reading anchor's line. Absent in older records, which fall back to the
+    /// saved page and pan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_offset: Option<f64>,
 }
 
 impl Default for DocumentPreferences {
@@ -103,6 +108,7 @@ impl Default for DocumentPreferences {
             selection_anchor: None,
             selection_caret: None,
             reading_anchor: None,
+            reading_offset: None,
         }
     }
 }
@@ -122,7 +128,23 @@ impl DocumentPreferences {
             && self.selection_anchor.is_none()
             && self.selection_caret.is_none()
             && self.reading_anchor.is_none()
+            && self.reading_offset.is_none()
     }
+}
+
+/// The explicit document file and the bytes last acknowledged as written.
+/// This is recovery bookkeeping, not the session snapshot: a recovery save
+/// must not claim the file is clean, and a file save must not discard an
+/// unsafe recovery pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExplicitFileRecord {
+    pub path: PathBuf,
+    pub kind: String,
+    pub bytes: u64,
+    pub sha256: String,
+    /// Digest of the content this representation covers: source text for a
+    /// source export, text plus marks for a snapshot.
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +187,11 @@ pub struct SessionFile {
     /// accepted as legacy and migrated on the next successful load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_digest: Option<String>,
+    /// Explicit destination and its confirmed baseline. Absent in older
+    /// sessions; such a recovery reports only its own clean state until the
+    /// user opens or saves a file again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_file: Option<Box<ExplicitFileRecord>>,
 }
 
 /// Why a metadata file could not be trusted.
@@ -214,6 +241,7 @@ impl Default for SessionFile {
             view_pan_y: 0.0,
             xwayland_display: None,
             snapshot_digest: None,
+            explicit_file: None,
         }
     }
 }
@@ -381,6 +409,38 @@ mod tests {
     }
 
     #[test]
+    fn old_preferences_without_a_reading_offset_still_load() {
+        let dir = tmp("old-reading-offset");
+        let path = dir.join("session.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"documents":{"/documents/notes.doc":{"current_page":2,"view_zoom":2.0,"reading_anchor":{"encoded":"","side":-1,"fallback":0}}}}"#,
+        )
+        .expect("write");
+        let preferences = SessionFile::load(&path).preferences_for("/documents/notes.doc");
+        assert_eq!(preferences.current_page, 2);
+        assert!(preferences.reading_anchor.is_some());
+        assert_eq!(preferences.reading_offset, None);
+    }
+
+    #[test]
+    fn reading_offset_round_trips() {
+        let dir = tmp("reading-offset-roundtrip");
+        let path = dir.join("session.json");
+        let mut session = SessionFile::default();
+        session.set_preferences(
+            "/documents/notes.doc".into(),
+            DocumentPreferences {
+                reading_offset: Some(37.5),
+                ..Default::default()
+            },
+        );
+        session.save(&path);
+        let loaded = SessionFile::load(&path).preferences_for("/documents/notes.doc");
+        assert_eq!(loaded.reading_offset, Some(37.5));
+    }
+
+    #[test]
     fn missing_file_yields_the_default() {
         let loaded = SessionFile::load(Path::new("/nonexistent/emthin/session.json"));
         assert_eq!(loaded.current_page, 0);
@@ -477,6 +537,28 @@ mod tests {
         assert_eq!(preferences.citation_style.as_deref(), Some("apa"));
         assert_eq!(preferences.current_page, 2);
         assert_eq!(preferences.text_size, 14.0);
+    }
+
+    #[test]
+    fn explicit_destination_record_round_trips_and_old_sessions_default_to_none() {
+        let dir = tmp("explicit-record");
+        let path = dir.join("session.json");
+        let session = SessionFile {
+            explicit_file: Some(Box::new(ExplicitFileRecord {
+                path: PathBuf::from("/documents/notes.typ"),
+                kind: "source".into(),
+                bytes: 12,
+                sha256: "a".repeat(64),
+                content: "b".repeat(64),
+            })),
+            ..Default::default()
+        };
+        session.save(&path);
+        let loaded = SessionFile::load(&path);
+        assert_eq!(loaded.explicit_file, session.explicit_file);
+
+        std::fs::write(&path, br#"{"version":1,"current_page":2}"#).expect("old write");
+        assert_eq!(SessionFile::load(&path).explicit_file, None);
     }
 
     #[test]

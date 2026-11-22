@@ -16,7 +16,9 @@
 //! std-only Unix-socket implementation of that boundary; a host that already
 //! has a socket loop can use [`Session`] directly and ignore them.
 
+pub mod anchor;
 mod exchange;
+pub mod grants;
 mod line;
 mod session;
 #[cfg(unix)]

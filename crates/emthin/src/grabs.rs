@@ -428,6 +428,10 @@ pub struct FigureResizeGrab {
     /// Live preview rect during the drag.
     pub current_rect: Rectangle<i32, Logical>,
     pub edges: ResizeEdge,
+    /// Document incarnation and source generation captured at press time.
+    /// A delayed commit against a replaced/edited document is discarded.
+    document_instance: u64,
+    content_generation: u64,
     /// Set once the document write has happened, so `unset` (which
     /// runs after `button`) doesn't emit a duplicate IPC event.
     committed: bool,
@@ -440,6 +444,8 @@ impl FigureResizeGrab {
         figure_stable_id: String,
         initial_rect: Rectangle<i32, Logical>,
         edges: ResizeEdge,
+        document_instance: u64,
+        content_generation: u64,
     ) -> Self {
         Self {
             start_data,
@@ -448,6 +454,8 @@ impl FigureResizeGrab {
             initial_rect,
             current_rect: initial_rect,
             edges,
+            document_instance,
+            content_generation,
             committed: false,
         }
     }
@@ -547,6 +555,15 @@ impl FigureResizeGrab {
             return;
         }
         self.committed = true;
+        if data.doc.document_instance() != self.document_instance
+            || data.doc.model().content_generation() != self.content_generation
+        {
+            tracing::debug!(
+                "figure {} resize discarded: the document or source changed during the drag",
+                self.figure_key
+            );
+            return;
+        }
         let (w, h) = (self.current_rect.size.w, self.current_rect.size.h);
         let Some(figure) = data
             .doc

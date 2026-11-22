@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc = emthin::ipc::IpcServer::bind(ipc_path)?;
     let loop_handle = event_loop.handle();
     let mut state = EmthinState::new(&mut event_loop, loop_handle, display, ipc, xkb_config)?;
+    state.core_sessions.set_socket(cli.core_socket.clone());
 
     register_ipc_source(&mut event_loop, &state)?;
 

@@ -13,12 +13,63 @@ pub enum SaveState {
     Failed,
 }
 
+/// Recovery/session persistence, separate from the explicit file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryState {
+    Clean,
+    Recovered,
+    Failed,
+}
+
+/// The rendered preview: current, rebuilding, or retaining a stale raster
+/// because the newest compile failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewState {
+    Current,
+    Updating,
+    Failed,
+}
+
+impl SaveState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Unsaved => "unsaved",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl RecoveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Recovered => "recovered",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl PreviewState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Updating => "updating",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// One status line's worth of applicable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusModel {
     pub document: String,
     pub save: SaveState,
+    pub recovery: RecoveryState,
+    pub preview: PreviewState,
     pub save_warning: Option<String>,
+    /// A recovery failure that is separate from the explicit file's state.
+    pub recovery_error: Option<String>,
     pub layout_error: Option<String>,
     pub find: Option<String>,
     pub peers: usize,
@@ -34,7 +85,10 @@ impl StatusModel {
     /// there is something else to say, which keeps the quiet state empty.
     pub fn line(&self) -> Option<String> {
         let quiet = self.save == SaveState::Clean
+            && self.recovery == RecoveryState::Clean
+            && self.preview == PreviewState::Current
             && self.save_warning.is_none()
+            && self.recovery_error.is_none()
             && self.layout_error.is_none()
             && self.find.is_none()
             && self.peers == 0
@@ -45,15 +99,38 @@ impl StatusModel {
         }
 
         let mut parts = vec![self.document.clone()];
-        if let Some(error) = &self.layout_error {
-            parts.push(format!("layout error: {}", first_line(error)));
+        match self.preview {
+            PreviewState::Failed => parts.push(format!(
+                "preview failed: {}",
+                self.layout_error
+                    .as_deref()
+                    .map(first_line)
+                    .unwrap_or_else(|| "unknown error".to_owned())
+            )),
+            PreviewState::Updating => parts.push("preview updating".to_owned()),
+            PreviewState::Current => {
+                if let Some(error) = &self.layout_error {
+                    parts.push(format!("preview failed: {}", first_line(error)));
+                }
+            }
         }
         match self.save {
             SaveState::Clean => {}
             SaveState::Unsaved => parts.push("unsaved".to_owned()),
             SaveState::Failed => parts.push("save failed".to_owned()),
         }
-        if self.save_warning.is_some() {
+        match self.recovery {
+            RecoveryState::Clean => {}
+            RecoveryState::Recovered => parts.push("recovered copy".to_owned()),
+            RecoveryState::Failed => {
+                if let Some(error) = &self.recovery_error {
+                    parts.push(format!("recovery failed: {}", first_line(error)));
+                } else {
+                    parts.push("recovery failed".to_owned());
+                }
+            }
+        }
+        if self.save_warning.is_some() && self.recovery != RecoveryState::Recovered {
             parts.push("recovered backup".to_owned());
         }
         if let Some(find) = &self.find {
@@ -94,7 +171,10 @@ mod tests {
         StatusModel {
             document: "paper.typ".into(),
             save: SaveState::Clean,
+            recovery: RecoveryState::Clean,
+            preview: PreviewState::Current,
             save_warning: None,
+            recovery_error: None,
             layout_error: None,
             find: None,
             peers: 0,
@@ -112,12 +192,13 @@ mod tests {
     fn failures_precede_find_then_peers() {
         let mut m = model();
         m.save = SaveState::Failed;
+        m.preview = PreviewState::Failed;
         m.layout_error = Some("expected `]`".into());
         m.find = Some("Find 2/3".into());
         m.peers = 2;
         m.voice = true;
         let line = m.line().expect("a line");
-        let layout = line.find("layout error").expect("layout");
+        let layout = line.find("preview failed").expect("preview");
         let save = line.find("save failed").expect("save");
         let find = line.find("Find 2/3").expect("find");
         let peers = line.find("2 peers").expect("peers");
@@ -129,12 +210,26 @@ mod tests {
     #[test]
     fn a_recovered_backup_is_a_warning_not_a_failure() {
         let mut m = model();
+        m.recovery = RecoveryState::Recovered;
         m.save_warning = Some("loaded the backup pair".into());
         assert_eq!(m.save, SaveState::Clean);
         assert_eq!(
             m.line().as_deref(),
-            Some("paper.typ  recovered backup"),
+            Some("paper.typ  recovered copy"),
             "a recovery is visible without claiming the save failed"
+        );
+    }
+
+    #[test]
+    fn a_recovery_failure_is_visible_while_the_file_is_clean() {
+        let mut m = model();
+        m.recovery = RecoveryState::Failed;
+        m.recovery_error = Some("session save failed: disk full".into());
+        assert_eq!(m.save, SaveState::Clean);
+        assert_eq!(
+            m.line().as_deref(),
+            Some("paper.typ  recovery failed: session save failed: disk full"),
+            "a failed recovery does not make the explicit file look unsaved"
         );
     }
 
@@ -146,8 +241,38 @@ mod tests {
     }
 
     #[test]
+    fn preview_updating_and_failed_are_distinct_from_save_state() {
+        let mut m = model();
+        m.preview = PreviewState::Updating;
+        assert_eq!(m.line().as_deref(), Some("paper.typ  preview updating"));
+
+        m.preview = PreviewState::Failed;
+        m.layout_error = Some("expected `]`\nsecond line".into());
+        assert_eq!(
+            m.line().as_deref(),
+            Some("paper.typ  preview failed: expected `]`")
+        );
+        assert_eq!(m.save, SaveState::Clean, "the file state is untouched");
+    }
+
+    #[test]
+    fn file_and_recovery_failures_are_reported_independently() {
+        let mut m = model();
+        m.save = SaveState::Failed;
+        m.recovery = RecoveryState::Failed;
+        m.recovery_error = Some("session write failed".into());
+        let line = m.line().expect("both failures are visible");
+        assert!(line.contains("save failed"), "{line}");
+        assert!(
+            line.contains("recovery failed: session write failed"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn a_long_layout_error_is_truncated_to_one_line() {
         let mut m = model();
+        m.preview = PreviewState::Failed;
         m.layout_error = Some(format!("{}\nsecond line", "x".repeat(200)));
         let line = m.line().expect("a line");
         assert!(line.ends_with('…'), "{line}");

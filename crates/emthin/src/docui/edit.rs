@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use mathed_core::figures::{resolve_figure, FigureSpec};
+use mathed_core::figures::{resolve_figure, FigureSpec, TerminalRef};
 use mathed_core::markers::{
     auto_marker_id, auto_marker_token, lowest_free_marker_numbers, Arg, Segment,
 };
@@ -116,6 +116,9 @@ fn current_arg_range(model: &DocModel, key: &str, index: usize) -> Option<Range<
 /// `None` removes the `"id"` argument entirely rather than writing an
 /// empty string, so a cleared figure parses back as id-less.
 pub fn set_figure_id(model: &mut DocModel, figure: &Figure, id: Option<&str>) -> bool {
+    if !figure.spec.is_wayland() {
+        return false;
+    }
     if figure.spec.id.as_deref() == id {
         return false;
     }
@@ -215,6 +218,7 @@ pub fn append_figure(
         w,
         h,
         id.map(escape_arg).as_deref(),
+        None,
     )
 }
 
@@ -235,6 +239,7 @@ fn append_figure_source(
     w: i32,
     h: i32,
     id_source: Option<&str>,
+    terminal: Option<&TerminalRef>,
 ) -> String {
     let ids = lowest_free_marker_numbers(model.scan(), 2);
     let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
@@ -247,8 +252,12 @@ fn append_figure_source(
     let start = format!("#{}", auto_marker_id(a));
     let end = format!("#{}", auto_marker_id(b));
     let id_arg = id_source.map_or_else(String::new, |id| format!(", \"{id}\""));
-    let statement =
-        format!("{start} {caption_source} {end} \\app({start}, {end}, {w}, {h}{id_arg})\n");
+    let terminal_arg = terminal.map_or_else(String::new, |reference| {
+        format!(", terminal: \"{}\"", escape_arg(&reference.canonical()))
+    });
+    let statement = format!(
+        "{start} {caption_source} {end} \\app({start}, {end}, {w}, {h}{id_arg}{terminal_arg})\n"
+    );
     // A statement is a block: never glue it onto the tail of the last
     // line, or it lands inside the previous statement's argument list.
     let at = model.text().len();
@@ -272,7 +281,14 @@ pub fn clone_figure(model: &mut DocModel, figure: &Figure) -> String {
     // text, and `spec.id` is the literal as written (unquoted, not unescaped).
     let caption = model.text()[figure.span.clone()].trim().to_string();
     let id = figure.spec.id.clone();
-    append_figure_source(model, &caption, figure.spec.w, figure.spec.h, id.as_deref())
+    append_figure_source(
+        model,
+        &caption,
+        figure.spec.w,
+        figure.spec.h,
+        id.as_deref(),
+        figure.spec.terminal.as_ref(),
+    )
 }
 
 /// The default size a new app should get: the size of the first
@@ -289,6 +305,8 @@ pub fn spec_of(w: i32, h: i32) -> FigureSpec {
         h,
         id: None,
         launch: None,
+        terminal: None,
+        binding_error: None,
     }
 }
 
@@ -430,6 +448,21 @@ mod tests {
         assert!(set_figure_id(&mut model, &figs[0], Some("new")));
         assert!(model.text().contains("\"new\""), "{}", model.text());
         assert!(!model.text().contains("\"old\""));
+    }
+
+    #[test]
+    fn a_terminal_figure_clones_its_reference_and_refuses_a_wayland_id() {
+        let mut model = DocModel::new(
+            r##"#1 Term #2 \app(#1, #2, 300, 200, terminal: "hc://6ab09a20fd1288983dfbbac2bb349231/t3")"##,
+        );
+        let figure = figures(&model).remove(0);
+        assert!(figure.is_terminal());
+        assert!(!set_figure_id(&mut model, &figure, Some("wayland")));
+        clone_figure(&mut model, &figure);
+        let cloned = figures(&model);
+        assert_eq!(cloned.len(), 2);
+        assert_eq!(cloned[1].spec.terminal, figure.spec.terminal);
+        assert!(cloned[1].spec.id.is_none());
     }
 
     #[test]

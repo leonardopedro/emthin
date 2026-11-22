@@ -44,6 +44,15 @@ manifest for all integrated checkpoints.
   cannot accidentally use the user's Core socket, change a NixOS profile,
   start production state or update fixtures from unrelated upstream code.
 
+**Result (2026-11-19).** Added `docs/HERDR_COMPATIBILITY.toml` and the
+read-only `scripts/check-herdr-inputs`. The validator pins emthin, velysterm,
+Herdr, Core and OpenShell revisions, the Ghostty gitlink, nixpkgs revision and
+narHash, licences, and local checkout state. `--require-clean` makes dirty
+checkouts fatal for CI; the current execution worktree reports warnings. The
+OpenShell flake is checked for merge markers. Blocked: OpenShell flake
+evaluation/source builds and hermetic Core/OpenShell profiles were not run, so
+the clean-checkout reproduction is only local-input validated, not built.
+
 ### T02. Add the shared figure binding
 
 - **Contract.** H2 and H7. Repos: velysterm
@@ -61,6 +70,14 @@ manifest for all integrated checkpoints.
   property inserted above, page reflow and save/reopen. Resize edits only
   W/H. Bad input cannot become an executable Wayland launch. Existing
   document and app tests pass in both repositories.
+
+**Result (2026-11-19).** `mathed_core::figures` now has typed `TerminalRef`
+(`hc://` and `herdr-local://`), canonical validation, `FigureBinding`, and inert
+`binding_error` diagnostics for malformed, duplicate or mixed bindings. Emthin
+keeps Wayland claim/relaunch/first-dormant selection off terminal and invalid
+figures, labels terminal/invalid dormant slots, preserves the reference through
+clone, and refuses `set_figure_id` on a terminal figure. Tests cover canonical
+and rejected references, mixed/duplicate bindings, and clone preservation.
 
 ### T03. Build the pure Core protocol client
 
@@ -103,6 +120,22 @@ passes 17 tests, and clippy is clean. T03 is complete.
   Closing a figure leaves its holder running. Reconnect watches; an
   intentional new control action then starts an interactive channel.
 
+**Result (2026-11-19, fixture complete).** Added
+`emthin-core-client::controller` with an atomic catalogue (`created`, `lost`,
+`restarted`, `finished`, `removed`, `status`, `turn`, `title`, `labels`, `size`,
+`foreground`, `doc`, `missed`, heartbeat), program generations, and `Session`
+viewer leases. Reconnect always starts watching; endpoint mismatch, restart,
+release and detach invalidate old leases before input or resize. Five tests
+cover replacement snapshots, stale events, finish/status clearing, reconnect
+and endpoint mismatch. Added `unix::Connection`, which applies the existing
+`Client` to a real `UnixStream`, rejects relative and parent-traversal socket
+paths, and maps a truncated frame to an error rather than EOF. The
+`unix_fixture` integration test runs a deterministic holder over a real socket:
+dropping an attached view does not stop it; a second connection reattaches and
+sees the prior lines; resize, status, exit, and attaching after exit are
+reported correctly. Remaining: run the lane against a real Core endpoint and
+verify OS-level holder ownership after process teardown.
+
 ### T05. Android figure geometry and picker with a fake host
 
 - **Contract.** H2 and Android parts of H4. Depends on T02 and T04.
@@ -120,7 +153,46 @@ passes 17 tests, and clippy is clean. T03 is complete.
   recycled page checks reject mismatched geometry. Documents without a
   native figure still follow the existing renderer.
 
+**Result (2026-11-19, Sessions surface).** Retained and chunked page JSON now
+carries per-figure key/rect geometry plus the public terminal reference and any
+binding error. The fake `SessionCatalog` provides live, watched, offline and
+unavailable entries with Pin/Rebind/Go to figure/Detach labels. `SESSIONS`
+opens a dialog listing those sessions; Pin appends a typed terminal figure as
+one undo step and marks the catalogue entry pinned. Rebind lists the document's
+public terminal figures and rewrites only the selected figure's `terminal:`
+argument in one undo step; Detach transitions the live entry from watched to
+live without removing it from the host. Go scrolls to a loaded figure. Terminal
+figures draw watched, offline, unavailable and invalid-binding tags in
+`RenderedPage.onDraw`. Each terminal figure also has an accessibility virtual
+node whose description carries its caption, state and host, with Go to figure,
+Rebind, Detach and Sessions activation actions wired to the same handlers as
+the visual UI. Rust tests cover page metadata, reference-only rebind,
+append/undo and stale-text refusal; 22 Java checks cover the catalogue states
+and descriptions. The disposable test APK has a `device-lane.sh session-pin` fixture that pins a
+public reference, proves Undo removes and Redo restores the figure, then
+force-stops and reopens to assert the persisted `figureMetadata terminal 1`; it
+passes on the arm64 Waydroid image. A second `figure-a11y` fixture builds a
+watched figure, queries its virtual node, then activates accessibility focus,
+Go, Detach and Sessions through the provider and checks the detached state; it
+also passes there. Remaining: TalkBack traversal with a real accessibility
+service enabled, and an actual remote host lease behind detach.
+
 ## T06–T10. VT, native scenes and input
+
+**Result (2026-11-19, build gate passed).** Added Zig 0.16.0 to the emthin
+devshell (the pinned Ghostty's exact minimum) and `scripts/build-ghostty-vt`.
+The script builds the desktop and, with `ANDROID_NDK_HOME`, the arm64 Android
+static/shared VM libraries from the pinned submodule. Verified: the desktop
+archive and an AArch64 Android 29 ELF built with NDK r30-beta1. Remaining: the
+emthin's `emthin-vt` wrapper, which now snapshots styled cells (including full
+combining clusters and wide/spacer cells), cursor position/visibility/style,
+DEC modes, row-run damage, generated replies, and mode-aware key/wheel encoding.
+Nine VT/stream fixtures pass, including a `Pane` that turns Core attach
+data, resize and close events into damage plus owed replies while ignoring
+other channels and post-close data. Remaining: draw the snapshots and load the
+result in a real arm64 APK. The NDK is
+not currently in the default emthin devshell, so Android builds need
+`ANDROID_NDK_HOME`.
 
 ### T06. Build the shared native VT client
 
@@ -153,6 +225,22 @@ passes 17 tests, and clippy is clean. T03 is complete.
   no allocations per unchanged row after warmup. A hidden figure
   schedules no glyph work.
 
+**Result (2026-11-19, batching layer).** Added `emthin-vt::render`: a bounded
+shelf atlas keyed by glyph text, weight, italic and pixel size; retained
+per-row solids/glyphs/decoration quads; damage-only row rebuilds; a separate
+cursor quad; hidden-pane gating; and GL generations that preserve the CPU
+atlas. Nine batching/font/GLES fixtures cover damage-only rebuilds with glyph reuse
+across two densities, hidden panes doing no raster work, atlas budget
+enforcement, cursor geometry, real DejaVu coverage, software composition,
+byte-exact goldens at two densities and two backgrounds, real GLES 3 upload and
+draw, one-row-only GPU re-upload, and a live context-loss recreation. The GL
+path uses EGL surfaceless GLES 3, normalized atlas sampling, retained per-row
+vertex buffers, and no atlas upload on an unchanged or cached-glyph update.
+Scrollback is a clamped viewport over the parser's bounded history (the live
+cursor is hidden in history), and zoom is clamped to 50–300%, rescaling cell,
+baseline and glyph density. Two further fixtures cover oldest/live clamping,
+close behavior and zoom limits. The crate now has 23 tests.
+
 ### T08. Android native scene
 
 - **Contract.** H4. Depends on T05–T07. Repos: Android JNI and preview.
@@ -167,6 +255,33 @@ passes 17 tests, and clippy is clean. T03 is complete.
   Pan, scale and switch pages while streaming. Test context loss,
   eviction, and closed-document cleanup. Confirm the existing editor,
   Find, screen-reader and recovery lanes.
+- **Result (2026-11-20).** `emthin-pad` now links the shared
+  `emthin-vt` scene (`emthin-android/src/scene.rs`) and draws its RGBA
+  buffer in the Typst figure rectangle. The rect is mapped through the
+  page `ImageView` matrix, which is required because the bitmap is
+  letterboxed inside the page view; using layout points directly put
+  the scene above the visible viewport. `terminal-scene` on the arm64
+  Waydroid device passes: placed rect 1134x709, frames 1..n without a
+  page re-render, renderer context loss, resize/reflow, CJK/emoji
+  commit-once, Enter/Backspace encoding, and Back releasing focus.
+  Scenes close on page eviction and document replacement. A view zoom or
+  font reflow that rebuilds the page stack now transfers the live scene
+  by its public terminal reference, preserving parser, scrollback and
+  input state; the next draw reconciles the new placed rectangle and
+  resizes cols/rows instead of stretching one fixed raster. The
+  `terminal-reflow` device lane proves a zoom from 102x30 to 113x39 cells
+  across the page rebuild, continued animation after a pan, and the
+  terminal accessibility Focus/Copy/Paste actions. The full `e2e` sweep
+  also passes the existing editor, Find, composing-IME, screen-reader
+  and recovery lanes. The `terminal-pages` lane starts an eight-page
+  stream, scrolls to another page, returns, and proves the same parser
+  keeps advancing. A page-figure `SurfaceView` now owns a real EGL14
+  window surface: the CPU RGBA raster is uploaded and submitted by GLES,
+  with the surface clipped and texture-cropped to the preview viewport so
+  it cannot cover the toolbar or navigation bar. Returning to a page
+  forces a fresh submission, and the lane asserts that repaint rather than
+  only the parser frame. Not yet exercised on device: a real
+  closed-document/Core stream (the fixture has no lease).
 
 ### T09. Android terminal focus and control
 
@@ -183,6 +298,30 @@ passes 17 tests, and clippy is clean. T03 is complete.
   choose the intended target, reflow grid changes come from document
   size, and a late commit after release reaches neither the shell nor
   the document.
+- **Result (2026-11-20).** Terminal focus, a named-key row (Esc, Tab,
+  arrows, Ctrl-C, Watch), hardware key/modifier routing, an
+  `InputConnection` with composition buffering, Back-before-IME release
+  and late-commit rejection are implemented. The `terminal-scene` lane
+  proves CJK `你好` and emoji `😀` commit once, Enter/Backspace reach the
+  VT encoder, Back releases focus, long-press selects a word and copies
+  it, and a tap in an app that enabled mouse tracking is delivered as an
+  SGR press/release. Selection extends by dragging cell bounds; paste
+  sends clipboard text to the selected or focused scene instead of the
+  document; figure accessibility exposes Focus terminal, Copy terminal
+  output and Paste into terminal actions, and the `terminal-reflow`
+  fixture executes those provider actions. The key row now has explicit
+  Watch and Take authority: a watched session is read-only at the input
+  boundary, Take grants local input, and the fixture proves blocked text,
+  a conflicting lease and a late composition after Back reach neither
+  terminal nor document. Hardware Escape and arrows are encoded as
+  terminal keys. Remaining: a
+  real gateway/Core handoff for Watch/Take and viewer-generation
+  revocation, a real shell lease, and TalkBack traversal (no
+  accessibility service is installed on the test image). The z-ordered
+  GL surface also occludes page-drawn WATCH/CONFLICT badges, focus
+  borders and selection chrome inside the figure rectangle; those remain
+  in the model and accessibility tree, but their visual overlay still
+  needs to move above the scene surface.
 
 ### T10. Desktop render element and figure focus
 
@@ -198,6 +337,31 @@ passes 17 tests, and clippy is clean. T03 is complete.
   and selection do not seize a terminal's grid. Direct attach, release and
   reopen verify unchanged holder identity.
 
+**Result (2026-11-19, desktop source).** `core_session.rs` registers desktop
+Core session sources keyed by canonical `hc://` terminal reference. Each source
+owns the Core viewer `Session`, a `Pane`, a retained VT renderer and a cached
+GPU buffer; attach data/resize events produce RGBA frames, generated replies
+are returned to Core, and a reference/endpoint Core mismatch is refused.
+`figure_render` now collects terminal figures on the visible page and
+composites their cached textures in the existing Smithay custom-element pass,
+without a Wayland surface. `--core-socket PATH` connects each Core figure once
+via hello/attach and registers a calloop reader; DATA, RESIZE and CLOSE feed
+the matching source, CREDIT and generated replies go back to Core, and a
+mismatched Core ID is refused. Clicking a terminal figure focuses it; keys are
+encoded through the program's modes (ASCII plus common named keys and shifted
+punctuation), clicks use SGR/X10 reporting, 1002/1003 modes receive held-button
+and hover motion, and the wheel scrolls local history when the program did not
+request mouse reports. Failed or closed endpoints retry with bounded
+exponential backoff (250 ms doubling to an 8 s cap, five attempts); the figure
+overlay names the next attempt and its backoff delay, or reports exhaustion.
+Committed non-ASCII IME text is routed to the focused Core terminal while no
+Wayland client owns the keyboard. Nine source tests cover render/revision,
+ignored channels, resize/replacement, Core identity, key/mouse/drag encoding,
+retry bounds and overlay text, a real Unix-socket attach stream, a live socket
+that carries input, IME text and output through the figure state, and a
+second attach after a closed socket and backoff. Still not done: the mixed
+compositor acceptance run.
+
 ## T11–T16. Remote observation and pairing
 
 ### T11. Fixture the scoped gateway protocol
@@ -212,6 +376,22 @@ passes 17 tests, and clippy is clean. T03 is complete.
   and its state transition. Use fixtures to prove watch cannot send
   input and arbitrary Core methods have no passthrough. Include invalid
   Core ID, addresses, origins, channels, kinds, lengths and quotas.
+
+**Result (2026-11-19, fixture corpus).** Added
+`fixtures/herdr-gateway-v1/` (32 files) and the `herdr-gateway-fixtures`
+workspace crate. The corpus covers hello, list, watch/control attach,
+`control.request`/`respond`, stop, launch, `sessions.changed`, stable error
+kinds, resize/data/credit/close/focus frames, and invalid methods, extra
+properties, machine paths, versions, limits, duplicate keys, frame lengths,
+control-channel stream frames and unknown error kinds. The Rust validator
+rejects duplicate object keys before value decoding, enforces method/param
+allowlists and 1–64 list limits, validates grid 20x5..300x120, and enforces
+control 64 KiB, DATA 16 KiB, CLOSE/FACTS 1 KiB and CREDIT/FOCUS/RESIZE
+shapes. Chunked fixtures prove a frame decodes across several transport reads,
+and scenario fixtures cover channel reuse after CLOSE, watch-input rejection and
+an expired viewer lease. `cargo test -p herdr-gateway-fixtures` and the
+`validate-herdr-gateway-fixtures` binary pass. The Unix fixture Core itself and
+real socket races are still not represented.
 
 ### T12. Scoped gateway attach and handoff
 
@@ -306,6 +486,17 @@ passes 17 tests, and clippy is clean. T03 is complete.
   Interrupted apply yields one running program or an explicit uncertain
   record, with no duplicate launch on retry.
 
+**Result (2026-11-19, OpenShell launcher).** `fb-fleet` now defaults to a
+write-free `--plan`; `--apply` stages the shared Freebuff executable and the
+exact Infinity release binaries, holds a lock, records the VM ID, verifies
+provider/policy hash/mounts, and starts no terminal until the exact sandbox ID
+is Ready. Retries reconcile by terminal name and `launching`/`uncertain`
+records instead of blind relaunch, and credentials are never copied. The stub
+lane `tests/fb-fleet-test.sh` passes 21 checks: plan writes nothing and starts
+no CLI, repeat apply reuses the VM and terminals, stale policy/wrong VM/failed
+create/not-Ready start no terminal, and an interrupted launch is reconciled
+without duplication. Not run against a real VM here.
+
 ### T18. Surface approved launch and stop in emthin
 
 - **Contract.** H5–H6. Depends on T12, T16–T17. Repos: gateway profile
@@ -338,6 +529,12 @@ passes 17 tests, and clippy is clean. T03 is complete.
   Verify expected flags reach the libkrun driver. Existing data and
   rollback retain their stores and private state.
 
+**Result (2026-11-19, flake).** Removed leftover conflict markers from
+`openshell-nixos/flake.nix`; `nix eval .#packages.x86_64-linux.fleet.name`
+evaluates to `agent-fleet-0.1.0`. Building it needs x86_64 and fails here with
+`platform mismatch` because this host is aarch64; no remote builder, VM start
+or service activation was used.
+
 ### T20. Verify and report sharing
 
 - **Contract.** H6, H8. Depends on T17, T19. Repos: OpenShell mount/cache
@@ -369,6 +566,14 @@ passes 17 tests, and clippy is clean. T03 is complete.
   the actual source, or show Unknown. A failing process never shows
   success from a generic EXIT trap. No change to Core's status
   detection contract.
+
+**Result (2026-11-19, runner status).** `herdr-core-agent` no longer reports
+`done` from a generic EXIT trap. The runner emits `idle`, then `done` only for
+a zero child status and `error` for failure or an interrupt, preserving the
+child's exit code. `tests/herdr-core-agent-test.sh` passes seven fixture
+checks for success, failure, signal interruption and the absence of a false
+success report. The Sessions projection of these reports and an Infinity turn
+event source are still pending.
 
 ### T22. Desktop Herdr 0.9.5 compatibility
 
@@ -424,7 +629,7 @@ passes 17 tests, and clippy is clean. T03 is complete.
 |---|---|
 | Shared figures | mathed_core/mathed_mini tests and emthin tests, headless geometry and replay fixtures. |
 | emthin desktop | `bash scripts/verify-invariants`, applicable Rust workspace checks and existing nested compositor E2E. Update/verify IPC docs if an emthin IPC method changes. |
-| Android | Standalone Cargo tests, `test-java.sh`, gradle-free arm64 APK build, disposable `device-lane.sh`, and the real device checkpoints. |
+| Android | Standalone Cargo tests, `test-java.sh`, gradle-free arm64 APK build, disposable `device-lane.sh` (including `terminal-reflow` and `terminal-pages`), and the real device checkpoints. |
 | Core and Herdr | Follow their `just` lanes. Use fresh Core session and XDG state. Run schema/API compatibility checks for protocol edits and stable codec fixtures for Herdr. Run Herdr render scaling benchmark if its surface hot path changes. |
 | Gateway | Independent Go and Rust fixture tests, concurrent lease/credit tests with scripted peers, disposable tailnet integration. |
 | OpenShell and Nix | Fake CLI tests for launch/reconciliation first, then flake evaluation and source builds. Run the DAX probe only on a selected disposable VM. |
@@ -434,3 +639,34 @@ remote access scopes and OpenShell deployment. Routine UI wiring, state
 reducers, diagnostics, fixture scripts and integration test automation can
 use the cheaper model. Keep run evidence in the task's review notes with
 commands, versions and expected versus observed results.
+
+## Execution blockers at this checkpoint
+
+The foundation cards above are implemented and tested in-repo. The remaining
+cards cannot be completed from this checkout without their owning inputs:
+
+- **T08–T09** now have a native scene, terminal focus, explicit local
+  Watch/Take gating, zoom-time scene transfer, grid reflow, GLES
+  window-surface submission, multi-page survival and arm64 device lanes
+  covering pan while streaming. Real shell/gateway control remains.
+  Mouse-mode target dispatch, terminal selection, copy/paste and figure
+  accessibility actions have code and device coverage. T05 has its
+  Sessions dialog and
+  figure-state overlays; T06's pinned desktop and arm64 Android libraries
+  and `emthin-vt` styled-cell snapshot exist, T07 has bounded
+  scrollback/zoom, and T10 has a desktop Core source and figure pass.
+- **T12–T16** need the gateway sources, scripted auth identities, a disposable
+  tailnet and a physical arm64 phone. T11 has a shared corpus and Rust
+  validator, but no response from a real gateway, Core lease or phone exists
+  here.
+- **T17–T21**: the launcher plan/apply and runner status now have stub
+  acceptance, and the OpenShell flake evaluates cleanly after removing conflict
+  markers. Real VM/DAX measurements, source builds, live fleet status
+  projection and service activation still need disposable VMs.
+- **T22** needs an isolated Herdr 0.9.5 endpoint and its released protocol
+  fixtures.
+- **T23–T24** depend on the above and on matched benchmark hardware.
+
+Those are external-input blockers, not simulated successes. T04 now has its
+real Unix fixture transport and deterministic holder; T05’s native document
+wiring and T06 remain the next implementation steps once their inputs exist.

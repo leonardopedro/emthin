@@ -46,6 +46,8 @@
               clippy
               rustfmt
               pkg-config
+              # Pinned libghostty-vt (T06) requires exactly Zig 0.16.0.
+              zig_0_16
 
               # ── what the -sys crates and the linker need ───────────────
               glib
@@ -154,6 +156,34 @@
               # not of emthin, so emthin needs no screencopy protocol of
               # its own.
               grim
+
+              # ── remaining debug lanes: device, browser, Java host ─────
+              # P0b's disposable-phone lane needs adb. Without it the gap
+              # reads "command not found" instead of the real reason (a
+              # stopped waydroid session), so the tool belongs in the shell
+              # even when no device is attached.
+              android-tools
+
+              # P0a's browser coverage needs a headless browser and a driver.
+              # The host Firefox profile is owned by a running instance, so
+              # Chromium under Playwright is the reproducible path for the
+              # proof UI pages (form, status, search, proof detail).
+              chromium
+              # `playwright` in nixpkgs is the Node core package (no CLI and no
+              # Python module); the browser driver used here is the Python one.
+              python3Packages.playwright
+
+              # The device lane's status was unreadable because /usr/bin/waydroid
+              # uses a system Python without dbus-python. The nixpkgs wrapper
+              # carries its own dependencies, so `waydroid status` gives a
+              # precise reason instead of an import traceback.
+              waydroid
+
+              # The Android host suite and APK inspection (javac, jar,
+              # keytool) were otherwise reachable only through build-apk.sh's
+              # absolute JDK store path. Putting the JDK in the shell makes
+              # those checks debuggable directly from `nix develop`.
+              jdk21
 
               # ── E2E: the harness itself is python + coreutils ────────
               # scripts/e2e/ipc.py speaks the control protocol and state.py

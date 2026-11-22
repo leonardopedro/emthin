@@ -17,13 +17,7 @@ pub const CITATION_STYLES: &[&str] = &[
 /// Locales offered by `Ctrl+Shift+L`. The archive carries more; these are the
 /// common choices in a stable order.
 pub const CITATION_LOCALES: &[&str] = &[
-    "en-US",
-    "en-GB",
-    "de-DE",
-    "fr-FR",
-    "es-ES",
-    "zh-CN",
-    "ja-JP",
+    "en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "zh-CN", "ja-JP",
 ];
 
 /// Resolve one rendered CSL locale from Hayagriva's bundled archive.
@@ -58,7 +52,9 @@ pub fn bibliography_detail(
     use mathed_core::semantics::SemanticIndex;
     let scan = mathed_core::markers::scan(text);
     let references = super::model::citation_references(&scan);
-    let reference = references.iter().find(|r| r.numbers.contains(&number))
+    let reference = references
+        .iter()
+        .find(|r| r.numbers.contains(&number))
         .ok_or_else(|| "Citation no longer exists".to_string())?;
     if !matches!(&reference.kind, ReferenceKind::Bibliography { .. }) {
         return Err("This is a document reference".to_string());
@@ -68,7 +64,9 @@ pub fn bibliography_detail(
     let mut bib_name = None;
     let mut cite_style = None;
     for arg in &stmt.args {
-        let Arg::Literal { text, .. } = arg else { continue };
+        let Arg::Literal { text, .. } = arg else {
+            continue;
+        };
         let value = text.trim();
         if let Some((name, value)) = value.split_once(':') {
             let value = value.trim().trim_matches('"').to_owned();
@@ -81,17 +79,29 @@ pub fn bibliography_detail(
             keys.push(value.trim_matches('"').to_owned());
         }
     }
-    if keys.is_empty() { return Err("Citation has no bibliography key".to_string()); }
+    if keys.is_empty() {
+        return Err("Citation has no bibliography key".to_string());
+    }
     let statements = SemanticIndex::scan_biblio_statements(text);
-    let bibliographies: Vec<_> = statements.iter().filter(|s| s.kind == PropKind::Bibliography).collect();
+    let bibliographies: Vec<_> = statements
+        .iter()
+        .filter(|s| s.kind == PropKind::Bibliography)
+        .collect();
     let bib = match bib_name.as_deref() {
-        Some(name) => bibliographies.iter().find(|b| b.name.as_deref() == Some(name)).copied(),
+        Some(name) => bibliographies
+            .iter()
+            .find(|b| b.name.as_deref() == Some(name))
+            .copied(),
         None if bibliographies.len() == 1 => bibliographies.first().copied(),
         _ => None,
-    }.ok_or_else(|| "No matching bibliography is bound to this citation".to_string())?;
+    }
+    .ok_or_else(|| "No matching bibliography is bound to this citation".to_string())?;
     let library = if bib.format.as_deref() == Some("bibtex") {
         mathed_biblio::load_bibtex(&bib.body_text)
-    } else { mathed_biblio::load_yaml(&bib.body_text) }.map_err(|e| e.to_string())?;
+    } else {
+        mathed_biblio::load_yaml(&bib.body_text)
+    }
+    .map_err(|e| e.to_string())?;
     let style_name = style_override
         .or(cite_style.as_deref())
         .or(bib.style.as_deref())
@@ -99,34 +109,66 @@ pub fn bibliography_detail(
     let style = hayagriva::archive::ArchivedStyle::by_name(style_name)
         .ok_or_else(|| format!("Unknown citation style: {style_name}"))?;
     let hayagriva::citationberg::Style::Independent(style) = style.get() else {
-        return Err(format!("Citation style {style_name} is dependent; select its parent style"));
+        return Err(format!(
+            "Citation style {style_name} is dependent; select its parent style"
+        ));
     };
     let locale = citation_locale(locale)?;
     let locales = [locale];
-    let selected = keys.iter().map(|key| library.get(key)
-        .ok_or_else(|| {
-            let suggestions = bibliography_suggestions(&library, key);
-            if suggestions.is_empty() { format!("Unknown bibliography entry key: {key}") }
-            else { format!("Unknown bibliography entry key: {key}. Possible keys: {}", suggestions.join(", ")) }
-        }))
+    let selected = keys
+        .iter()
+        .map(|key| {
+            library.get(key).ok_or_else(|| {
+                let suggestions = bibliography_suggestions(&library, key);
+                if suggestions.is_empty() {
+                    format!("Unknown bibliography entry key: {key}")
+                } else {
+                    format!(
+                        "Unknown bibliography entry key: {key}. Possible keys: {}",
+                        suggestions.join(", ")
+                    )
+                }
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let items = selected.iter().map(|&entry| hayagriva::CitationItem::with_entry(entry)).collect();
+    let items = selected
+        .iter()
+        .map(|&entry| hayagriva::CitationItem::with_entry(entry))
+        .collect();
     let request = hayagriva::CitationRequest::new(items, &style, None, &locales, None);
     let mut citation = String::new();
-    hayagriva::standalone_citation(request).write_buf(&mut citation, hayagriva::BufWriteFormat::Plain)
+    hayagriva::standalone_citation(request)
+        .write_buf(&mut citation, hayagriva::BufWriteFormat::Plain)
         .map_err(|e| e.to_string())?;
     let mut driver = hayagriva::BibliographyDriver::new();
     for entry in selected {
         driver.citation(hayagriva::CitationRequest::new(
-            vec![hayagriva::CitationItem::with_entry(entry)], &style, None, &locales, None));
+            vec![hayagriva::CitationItem::with_entry(entry)],
+            &style,
+            None,
+            &locales,
+            None,
+        ));
     }
-    let result = driver.finish(hayagriva::BibliographyRequest { style: &style, locale: None, locale_files: &locales });
-    let bibliography = result.bibliography.ok_or_else(|| "This style produces no bibliography".to_string())?;
-    let entries = bibliography.items.into_iter().map(|item| {
-        let mut text = String::new();
-        item.content.write_buf(&mut text, hayagriva::BufWriteFormat::Plain).map_err(|e| e.to_string())?;
-        Ok(text)
-    }).collect::<Result<Vec<_>, String>>()?;
+    let result = driver.finish(hayagriva::BibliographyRequest {
+        style: &style,
+        locale: None,
+        locale_files: &locales,
+    });
+    let bibliography = result
+        .bibliography
+        .ok_or_else(|| "This style produces no bibliography".to_string())?;
+    let entries = bibliography
+        .items
+        .into_iter()
+        .map(|item| {
+            let mut text = String::new();
+            item.content
+                .write_buf(&mut text, hayagriva::BufWriteFormat::Plain)
+                .map_err(|e| e.to_string())?;
+            Ok(text)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok((citation, entries))
 }
 
@@ -136,31 +178,45 @@ pub fn bibliography_detail(
 fn bibliography_suggestions(library: &hayagriva::Library, key: &str) -> Vec<String> {
     let split = key.find(|c: char| c.is_ascii_digit()).unwrap_or(key.len());
     let (author, rest) = key.split_at(split);
-    if author.is_empty() || rest.len() < 2 || !rest.as_bytes()[..2].iter().all(u8::is_ascii_digit)
-        || !author.chars().all(|c| c.is_alphabetic()) { return Vec::new(); }
+    if author.is_empty()
+        || rest.len() < 2
+        || !rest.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        || !author.chars().all(|c| c.is_alphabetic())
+    {
+        return Vec::new();
+    }
     let year = &rest[..2];
     let author = author.to_lowercase();
     let mut ranked = Vec::new();
     for entry in library.iter() {
-        let Some(person) = entry.authors().and_then(|authors| authors.first()) else { continue };
+        let Some(person) = entry.authors().and_then(|authors| authors.first()) else {
+            continue;
+        };
         let Some(date) = entry.date() else { continue };
-        if format!("{:02}", date.year.rem_euclid(100)) != year { continue; }
+        if format!("{:02}", date.year.rem_euclid(100)) != year {
+            continue;
+        }
         let candidate = person.name.to_lowercase();
         let mut previous: Vec<usize> = (0..=candidate.chars().count()).collect();
         for (i, a) in author.chars().enumerate() {
             let mut row = vec![i + 1];
             for (j, b) in candidate.chars().enumerate() {
-                row.push((previous[j + 1] + 1).min(row[j] + 1).min(previous[j] + usize::from(a != b)));
+                row.push(
+                    (previous[j + 1] + 1)
+                        .min(row[j] + 1)
+                        .min(previous[j] + usize::from(a != b)),
+                );
             }
             previous = row;
         }
         let distance = *previous.last().unwrap_or(&usize::MAX);
-        if distance <= 2 { ranked.push((distance, entry.key().to_string())); }
+        if distance <= 2 {
+            ranked.push((distance, entry.key().to_string()));
+        }
     }
     ranked.sort();
     ranked.into_iter().take(3).map(|(_, key)| key).collect()
 }
-
 
 /// A citation overlay is derived presentation state; it never changes the CRDT.
 #[derive(Default)]
@@ -194,7 +250,9 @@ pub struct PopupRaster {
 }
 
 impl CitationPopup {
-    pub fn is_open(&self) -> bool { !self.stack.is_empty() }
+    pub fn is_open(&self) -> bool {
+        !self.stack.is_empty()
+    }
 
     /// The selected style override, or the CSL default when none is selected.
     pub fn style(&self) -> &str {
@@ -219,7 +277,9 @@ impl CitationPopup {
     }
 
     pub fn close(&mut self) -> bool {
-        if self.stack.pop().is_none() { return false; }
+        if self.stack.pop().is_none() {
+            return false;
+        }
         self.refresh();
         true
     }
@@ -291,47 +351,77 @@ impl CitationPopup {
 
     /// Toggle a numbered citation; nested numbers resolve within the open
     /// document reference, as they do in mathed's citation stack.
-    pub fn toggle(&mut self, document: &str, document_revision: u64, number: u64) -> Result<(), String> {
-        if self.is_open() && self.document_revision != document_revision { self.clear(); }
+    pub fn toggle(
+        &mut self,
+        document: &str,
+        document_revision: u64,
+        number: u64,
+    ) -> Result<(), String> {
+        if self.is_open() && self.document_revision != document_revision {
+            self.clear();
+        }
         self.document_revision = document_revision;
         if self.stack.last().is_some_and(|top| top.number == number) {
             self.close();
             return Ok(());
         }
         let scope = match self.stack.last() {
-            Some(level) => level.child_scope.as_deref().ok_or("This citation contains no nested document")?,
+            Some(level) => level
+                .child_scope
+                .as_deref()
+                .ok_or("This citation contains no nested document")?,
             None => document,
         };
         let scope = scope.to_string();
         let (child_scope, markup) = self.render_level(&scope, number)?;
-        self.stack.push(PopupLevel { number, scope, child_scope, markup });
+        self.stack.push(PopupLevel {
+            number,
+            scope,
+            child_scope,
+            markup,
+        });
         self.refresh();
         Ok(())
     }
 
     pub fn clear_if_stale(&mut self, document_revision: u64) {
-        if self.is_open() && self.document_revision != document_revision { self.clear(); }
+        if self.is_open() && self.document_revision != document_revision {
+            self.clear();
+        }
     }
 
     fn render_level(&self, scope: &str, number: u64) -> Result<(Option<String>, String), String> {
         let scan = mathed_core::markers::scan(scope);
         let normalized = super::model::citation_references(&scan);
-        let target = normalized.iter().find(|r| r.numbers.contains(&number))
+        let target = normalized
+            .iter()
+            .find(|r| r.numbers.contains(&number))
             .ok_or_else(|| format!("No citation [{number}]"))?;
         let upstream = mathed_core::markers::scan_references(&scan);
-        let upstream_number = upstream.iter().find(|r| r.stmt_idx == target.stmt_idx)
-            .and_then(|r| r.numbers.first()).copied().ok_or("Citation no longer exists")?;
+        let upstream_number = upstream
+            .iter()
+            .find(|r| r.stmt_idx == target.stmt_idx)
+            .and_then(|r| r.numbers.first())
+            .copied()
+            .ok_or("Citation no longer exists")?;
         let body = mathed_mini::cite_popup::resolve_popup_body(scope, upstream_number)
             .ok_or("Citation no longer exists")?;
         match body {
-            mathed_mini::cite_popup::PopupBody::DocumentRef { body_text, body_markup } => {
-                let markup = if body_text.is_empty() { body_markup } else {
+            mathed_mini::cite_popup::PopupBody::DocumentRef {
+                body_text,
+                body_markup,
+            } => {
+                let markup = if body_text.is_empty() {
+                    body_markup
+                } else {
                     let scan = mathed_core::markers::scan(&body_text);
                     let segments = mathed_core::markers::resolve_segments(&scan);
                     let options = mathed_core::TransformOptions {
-                        references: super::model::citation_references(&scan), ..Default::default()
+                        references: super::model::citation_references(&scan),
+                        ..Default::default()
                     };
-                    mathed_core::transform::to_render_text(&body_text, &scan, &segments, &options).text
+                    mathed_core::transform::to_render_text(&body_text, &scan, &segments, &options)
+                        .text
                 };
                 Ok((Some(body_text), markup))
             }
@@ -394,7 +484,10 @@ mod tests {
         let mut popup = CitationPopup::default();
         popup.toggle(text, 1, 1).unwrap();
         assert!(popup.is_open());
-        assert!(popup.raster.as_ref().is_some_and(|r| r.width > 0 && r.height > 0));
+        assert!(popup
+            .raster
+            .as_ref()
+            .is_some_and(|r| r.width > 0 && r.height > 0));
         assert!(popup.close());
         assert!(!popup.is_open());
         assert!(popup.raster.is_none());
@@ -425,7 +518,10 @@ mod tests {
         let (apa, _) = bibliography_detail(text, 1, None, DEFAULT_CITATION_LOCALE).unwrap();
         let (vancouver, _) =
             bibliography_detail(text, 1, Some("vancouver"), DEFAULT_CITATION_LOCALE).unwrap();
-        assert_ne!(apa, vancouver, "selecting a style must change the rendering");
+        assert_ne!(
+            apa, vancouver,
+            "selecting a style must change the rendering"
+        );
     }
 
     #[test]

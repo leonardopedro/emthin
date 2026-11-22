@@ -54,11 +54,29 @@
 #                (used by e2e; requires the disposable test APK)
 #   modifier-inspector  deterministic modifier/target fixture -> incoming and
 #                outgoing rows -> expand one comparison (used by e2e)
+#   session-pin  fixture pin -> Undo -> Redo -> force-stop/reopen -> persisted
+#                terminal figure (used by e2e; requires the disposable test APK)
+#   figure-a11y  fixture watched terminal figure -> accessibility node state
+#                and Go/Rebind/Detach/Sessions actions through the provider
+#                (used by e2e; requires the disposable test APK)
+#   terminal-scene  native VT scene -> placed rect, animation, context loss,
+#                resize, keys, long-press copy, mouse-mode tap and Back
+#                releasing focus (used by e2e; requires the disposable test APK)
+#   terminal-pages   multi-page stream -> leave page -> return -> still streaming
+#                (used by e2e; requires the disposable test APK)
+#   terminal-lease   scripted gateway peer -> watch attach -> take control ->
+#                controller input over DATA -> operator revoke -> read-only
+#                (used by e2e; requires the disposable test APK and python3)
+#   terminal-reflow  streaming scene -> view zoom -> page rebuild -> grid
+#                reflow -> continued animation after a pan
+#                (used by e2e; requires the disposable test APK)
 #   e2e          authorize, connect, build, install, launch, screencap,
 #                swipe, screencap, logcat, persistence, new-reset,
 #                scroll-anchor, search-replace, focus-stack, composing-ime,
 #                accessibility, diagnostics, named-document, modifier-inspector,
-#                pull + byte-identity (the repeatable device proof)
+#                session-pin, figure-a11y, terminal-scene, terminal-reflow,
+#                terminal-pages, terminal-lease, pull + byte-identity
+#                (the repeatable device proof)
 #
 # Env overrides:
 #   DEVICE       adb serial (default: waydroid status IP + :5555; an explicit
@@ -216,7 +234,17 @@ cmd_build() {
     fi
     # build-apk.sh asks adb for the device ABI when ANDROID_ABI is unset;
     # pass both the serial and the adb executable it should use.
-    if env DEVICE="$DEVICE" ADB="$ADB" "${test_env[@]}" "$SCRIPT_DIR/build-apk.sh"; then
+    # The devshell's nix rustc (1.98) has no Android target on this host; the
+    # rustup 1.99 toolchain does. Prefer /usr/bin's rustup shims when present
+    # so a devshell-invoked lane can cross-build, without forcing it on hosts
+    # where cargo comes only from nix.
+    local build_path="$PATH"
+    if [ -x /usr/bin/rustup ] && /usr/bin/rustup target list --installed 2>/dev/null \
+            | grep -qx aarch64-linux-android; then
+        build_path="/usr/bin:$build_path"
+    fi
+    if env PATH="$build_path" DEVICE="$DEVICE" ADB="$ADB" "${test_env[@]}" \
+            "$SCRIPT_DIR/build-apk.sh"; then
         pass "build-apk.sh (device ABI)"
     else
         fail "build-apk.sh"
@@ -408,7 +436,7 @@ keyboard_shown() {
 
 wait_for_log() {
     local out="$1" pattern="$2" tries=0
-    while [ "$tries" -lt 25 ]; do
+    while [ "$tries" -lt 50 ]; do
         D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$out"
         if grep -q "$pattern" "$out"; then
             return 0
@@ -1674,46 +1702,62 @@ _modifier_inspector() {
     grep -q '#5 #6' "$ui" \
         || { fail "incoming relationship for #5/#6 is missing"; return; }
 
-    # The inspector sheet is shorter than its content; scroll it to the
-    # outgoing rows before asserting on them.
-    D shell input swipe 1400 850 1400 720 300 >/dev/null 2>&1
-    sleep 0.5
-    D shell input swipe 1400 850 1400 720 300 >/dev/null 2>&1
-    sleep 0.8
-    cmd_uidump "$ui" || return
-    grep -q '#1 #2' "$ui" \
+    # The relationship list is its own small scroll viewport. On a short
+    # landscape tablet even the two outgoing rows do not fit in it at once,
+    # so collect each row over successive scroll positions instead of
+    # requiring one dump to contain both.
+    local saw12=0 saw34=0
+    for i in $(seq 1 8); do
+        cmd_uidump "$ui" || return
+        grep -q '#1 #2' "$ui" && saw12=1
+        grep -q '#3 #4' "$ui" && saw34=1
+        [ "$saw12" = 1 ] && [ "$saw34" = 1 ] && break
+        D shell input swipe 1400 850 1400 780 300 >/dev/null 2>&1
+        sleep 0.4
+    done
+    [ "$saw12" = 1 ] \
         || { fail "outgoing target relationship for #1/#2 is missing"; return; }
-    grep -q '#3 #4' "$ui" \
+    [ "$saw34" = 1 ] \
         || { fail "outgoing target relationship for #3/#4 is missing"; return; }
     pass "fixture shows an incoming modifier and both outgoing targets"
 
-    D shell input swipe 1400 730 1400 900 300 >/dev/null 2>&1
-    sleep 0.8
-    cmd_uidump "$ui" || return
-    b=$(node_bounds '#5 #6') \
-        || { fail "incoming relationship heading not tappable"; return; }
+    # Scroll back to the top of the relationship list before tapping the
+    # incoming heading. A downward swipe inside the small viewport is the
+    # only reliable way to return there without touching the fields above.
+    for i in $(seq 1 12); do
+        cmd_uidump "$ui" || return
+        b=$(node_bounds '#5 #6') && break
+        b=
+        D shell input swipe 1400 780 1400 850 300 >/dev/null 2>&1
+        sleep 0.35
+    done
+    [ -n "$b" ] || { fail "incoming relationship heading not tappable"; return; }
     tap_center "$b"
     sleep 1.2
     # The preview renders below the sheet's fold. The exact number of swipes
-    # depends on system-bar and sheet height, so scroll until both labels and
-    # the rendered comparison are in the accessibility window.
-    for i in $(seq 1 5); do
+    # depends on system-bar and sheet height, so scroll and collect both
+    # labels and the rendered comparison; they need not share one viewport.
+    local saw_with=0 saw_without=0 saw_rendered=0
+    for i in $(seq 1 12); do
         cmd_uidump "$ui" || return
-        if grep -q 'text="With modifier"' "$ui" \
-                && grep -q 'text="Without modifier"' "$ui" \
-                && grep -q 'content-desc="Rendered comparison"' "$ui"; then
+        grep -q 'text="With modifier"' "$ui" && saw_with=1
+        grep -q 'text="Without modifier"' "$ui" && saw_without=1
+        grep -q 'content-desc="Rendered comparison"' "$ui" && saw_rendered=1
+        if [ "$saw_with" = 1 ] && [ "$saw_without" = 1 ] && [ "$saw_rendered" = 1 ]; then
             expanded=1
             break
         fi
-        # Stay inside the sheet: a swipe starting near the page/sheet boundary
-        # scrolls the page instead. x=1400,y=1200 is over the relationship rows.
-        D shell input swipe 1400 1200 1400 800 300 >/dev/null 2>&1
-        sleep 0.6
+        # Stay inside the relationship viewport: a swipe starting near the
+        # source field scrolls the panel instead of the comparison list.
+        D shell input swipe 1400 850 1400 780 300 >/dev/null 2>&1
+        sleep 0.5
     done
     if [ "$expanded" != 1 ]; then
-        grep -q 'text="With modifier"' "$ui" \
+        [ "$saw_with" = 1 ] \
             || { fail "expanded row is missing the With modifier preview"; return; }
-        fail "expanded row is missing the Without modifier preview"
+        [ "$saw_without" = 1 ] \
+            || { fail "expanded row is missing the Without modifier preview"; return; }
+        fail "expanded row is missing the rendered comparison"
         return
     fi
     pass "one comparison row expanded with both rendered sides"
@@ -1740,6 +1784,625 @@ cmd_logcat() {
         return 1
     fi
     pass "logcat -> $out"
+}
+
+# T05: pin a public terminal reference through the real Sessions action,
+# prove the figure/Undo/Redo contract, then reopen and prove autosave kept it.
+cmd_session_pin() {
+    local log="$OUTDIR/session-pin-logcat.txt"
+    local fixture shot
+
+    say "==> session pin: pin -> Undo -> Redo -> reopen"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' 'Session pin fixture.')
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureSessionPin true \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        pass "launched the disposable session-pin fixture"
+    else
+        fail "launch the disposable session-pin fixture"
+        return
+    fi
+    wait_for_log "$log" 'sessionPin phase pinned' \
+        || { fail "fixture did not pin a terminal figure"; return; }
+    pass "fixture pinned the public terminal reference"
+    wait_for_log "$log" 'sessionPin phase undo' \
+        || { fail "Undo did not remove the pinned figure"; return; }
+    pass "Undo removed the pinned figure"
+    wait_for_log "$log" 'sessionPin phase complete' \
+        || { fail "Redo did not restore the pinned figure"; return; }
+    pass "Redo restored the pinned figure"
+
+    # Reopen through the normal recovery/autosave path with no fixture extra.
+    sleep 1.2
+    D shell input keyevent KEYCODE_HOME >/dev/null 2>&1
+    sleep 1.2
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    sleep 0.3
+    D logcat -c >/dev/null 2>&1 || true
+    cmd_launch || return
+    wait_for_log "$log" 'figureMetadata .*terminal 1' \
+        || { fail "reopened document did not restore the pinned terminal figure"; return; }
+    pass "reopened document carries one terminal figure"
+
+    if shot=$(cmd_screencap "$OUTDIR/session-pin-after-reopen.png"); then
+        say "    captured $shot"
+    fi
+}
+
+# T08/T09: native VT scene geometry, animation, context loss, resize, keys.
+cmd_terminal_scene() {
+    local log="$OUTDIR/terminal-scene-logcat.txt"
+    local fixture placed x y w h cx cy
+    local test_ime="$PKG/com.emthin.pad.TestComposingIme"
+    local enabled_was default_was
+
+    say "==> terminal scene: placed rect -> animate -> context loss -> resize -> keys"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' \
+        '#1 Build log #2 \app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")')
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureVtScene true \
+            --ef emthin.fixtureViewZoom 1.0 \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        pass "launched the disposable VT-scene fixture"
+    else
+        fail "launch the VT-scene fixture"
+        return
+    fi
+    wait_for_log "$log" 'vtScene phase ready' \
+        || { fail "native scene did not start"; return; }
+    pass "native scene started in a terminal figure"
+    wait_for_log "$log" 'vtScene gl frame page 0' \
+        || { fail "native scene was not submitted through a GLES window surface"; return; }
+    pass "scene submitted through a GLES window surface"
+
+    wait_for_log "$log" 'vtScene phase placed' \
+        || { fail "scene did not publish its placed rect"; return; }
+    placed=$(sed -n 's/.*vtScene phase placed x \([-0-9]*\) y \([-0-9]*\) w \([0-9]*\) h \([0-9]*\).*/\1 \2 \3 \4/p' "$log" | tail -1)
+    x=$(printf '%s' "$placed" | cut -d' ' -f1)
+    y=$(printf '%s' "$placed" | cut -d' ' -f2)
+    w=$(printf '%s' "$placed" | cut -d' ' -f3)
+    h=$(printf '%s' "$placed" | cut -d' ' -f4)
+    if [ -z "$x" ] || [ -z "$y" ] || [ -z "$w" ] || [ -z "$h" ]; then
+        fail "could not parse the placed scene rect from $log"
+        return
+    fi
+    if [ "$w" -le 0 ] || [ "$h" -le 0 ]; then
+        fail "placed scene rect is empty ($placed)"
+        return
+    fi
+    pass "scene reports a placed rect ($w x $h)"
+
+    enabled_was=$(D shell settings get secure enabled_input_methods 2>/dev/null | tr -d '\r')
+    default_was=$(D shell settings get secure default_input_method 2>/dev/null | tr -d '\r')
+    D shell ime enable "$test_ime" >/dev/null 2>&1
+    D shell ime set "$test_ime" >/dev/null 2>&1
+    sleep 0.5
+
+    wait_for_log "$log" 'vtScene phase frame 5' \
+        || { fail "scene did not animate"; return; }
+    pass "scene animated without a page re-render"
+    wait_for_log "$log" 'vtScene phase context-loss' \
+        || { fail "scene did not survive context loss"; return; }
+    pass "scene survived renderer context loss"
+    wait_for_log "$log" 'vtScene phase resize' \
+        || { fail "scene did not reflow on resize"; return; }
+    pass "scene reflowed after resize"
+
+    cx=$((x + w / 2))
+    cy=$((y + h / 2))
+    D shell input tap "$cx" "$cy" >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput phase focus' \
+        || { fail "tapping the scene did not take terminal focus"; return; }
+    pass "tap focused the terminal figure"
+
+    # The fixture starts watched, like a session that has not taken control.
+    # Input is blocked until the explicit Take action.
+    if cmd_uidump >/dev/null 2>&1; then
+        if b=$(node_bounds 'text="Take"'); then
+            tap_center "$b"
+            wait_for_log "$log" 'terminalInput control take page' \
+                || { fail "Take did not grant terminal input"; return; }
+            pass "Take granted terminal input"
+        else
+            fail "terminal key row has no Take action"
+            return
+        fi
+    fi
+
+    _ime_action compose 你好
+    _ime_action finish
+    wait_for_log "$log" 'terminalInput text 你好' \
+        || { fail "CJK composition did not commit once to the terminal"; return; }
+    pass "CJK composition committed once to the terminal"
+    _ime_action commit 😀
+    wait_for_log "$log" 'terminalInput text 😀' \
+        || { fail "emoji commit did not reach the terminal"; return; }
+    pass "emoji commit reached the terminal"
+
+    D shell input keyevent KEYCODE_ENTER >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput key 66 ghostty 58' \
+        || { fail "Enter did not reach the VT encoder"; return; }
+    pass "Enter was encoded as a terminal key"
+    D shell input keyevent KEYCODE_DEL >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput key 67 ghostty 53' \
+        || { fail "Backspace did not reach the VT encoder"; return; }
+    pass "Backspace was encoded as a terminal key"
+
+    D shell input keyevent KEYCODE_ESCAPE >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput key 111 ghostty 120' \
+        || { fail "Escape did not reach the VT encoder"; return; }
+    pass "Escape was encoded as a terminal key"
+    D shell input keyevent KEYCODE_DPAD_LEFT >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput key 21 ghostty 76' \
+        || { fail "the left arrow did not reach the VT encoder"; return; }
+    pass "arrow key was encoded as a terminal key"
+
+    # Long-press a word, copy it through the terminal selection bar, then
+    # clear logcat and prove a tap is delivered as a mouse report when the
+    # program enabled tracking.
+    # Use the same on-screen centre as the focus tap: the page can be
+    # wider than a rotated viewport, so the figure's top-left corner is
+    # not necessarily reachable.
+    D shell input swipe "$cx" "$cy" "$cx" "$cy" 800 >/dev/null 2>&1
+    wait_for_log "$log" 'terminalSelection start' \
+        || { fail "long-press did not select a terminal word"; return; }
+    pass "long-press selected a terminal word"
+    if cmd_uidump >/dev/null 2>&1; then
+        if b=$(node_bounds 'text="Copy"'); then
+            tap_center "$b"
+            wait_for_log "$log" 'terminalSelection copy' \
+                || { fail "terminal Copy action did not run"; return; }
+            pass "terminal selection copied to the clipboard"
+        else
+            fail "terminal selection bar has no Copy action"
+            return
+        fi
+    fi
+
+    wait_for_log "$log" 'vtScene phase mouse-mode' \
+        || { fail "terminal fixture did not enable mouse tracking"; return; }
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input tap "$cx" "$cy" >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput mouse .*press true' \
+        || { fail "tap was not sent as a mouse press"; return; }
+    wait_for_log "$log" 'terminalInput mouse .*press false' \
+        || { fail "tap was not sent as a mouse release"; return; }
+    pass "mouse-mode tap reached the terminal"
+
+    # Watch is a real read-only state: keystrokes are rejected at the input
+    # boundary instead of being dropped later by a transport.
+    if cmd_uidump >/dev/null 2>&1; then
+        if b=$(node_bounds 'text="Watch"'); then
+            tap_center "$b"
+            wait_for_log "$log" 'terminalInput control watch page' \
+                || { fail "Watch did not enter read-only mode"; return; }
+            D logcat -c >/dev/null 2>&1 || true
+            _ime_action commit 只读
+            wait_for_log "$log" 'terminalInput blocked watch' \
+                || { fail "watched terminal did not reject input"; return; }
+            if grep -q 'terminalInput text 只读' "$log"; then
+                fail "watched terminal accepted text"
+                return
+            fi
+            pass "Watch blocked terminal input"
+            if b=$(node_bounds 'text="Take"'); then
+                tap_center "$b"
+                wait_for_log "$log" 'terminalInput control take page' \
+                    || { fail "Take did not restore terminal input"; return; }
+            fi
+        else
+            fail "terminal key row has no Watch action"
+            return
+        fi
+    fi
+
+    # A composition that finishes after focus release must reach neither the
+    # terminal nor the document.
+    _ime_action compose 迟到
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput phase release' \
+        || { fail "Back did not release terminal focus"; return; }
+    D logcat -c >/dev/null 2>&1 || true
+    _ime_action finish
+    sleep 0.8
+    if grep -q 'terminalInput text 迟到' "$log"; then
+        fail "late composition reached the terminal after release"
+        return
+    fi
+    pass "Back released focus and a late commit was rejected"
+
+    D shell ime disable "$test_ime" >/dev/null 2>&1
+    _restore_secure_setting enabled_input_methods "$enabled_was"
+    if [ -n "$default_was" ] && [ "$default_was" != null ]; then
+        D shell ime set "$default_was" >/dev/null 2>&1 || true
+    else
+        _restore_secure_setting default_input_method "$default_was"
+    fi
+
+    cmd_screencap "$OUTDIR/terminal-scene.png" >/dev/null \
+        && say "    captured $OUTDIR/terminal-scene.png"
+}
+
+# T12 fixture: real gateway frames over adb reverse, not an in-process flag.
+LEASE_PORT=47654
+LEASE_ADMIN_PORT=47655
+LEASE_PID=""
+LEASE_DIR=""
+
+start_lease_fixture() {
+    command -v python3 >/dev/null 2>&1 || {
+        fail "python3 is required for the gateway lease fixture"
+        return 1
+    }
+    LEASE_DIR=$(mktemp -d /tmp/emthin-lease.XXXXXX) || return 1
+    python3 "$SCRIPT_DIR/../fixtures/herdr-gateway-v1/lease_fixture.py" \
+        --listen "127.0.0.1:$LEASE_PORT" \
+        --admin "127.0.0.1:$LEASE_ADMIN_PORT" \
+        >"$LEASE_DIR/server.log" 2>&1 &
+    LEASE_PID=$!
+    local tries=0
+    while [ "$tries" -lt 30 ]; do
+        if grep -q 'lease fixture listening' "$LEASE_DIR/server.log" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$LEASE_PID" 2>/dev/null; then
+            say "    lease fixture exited: $(cat "$LEASE_DIR/server.log" 2>/dev/null)"
+            return 1
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    if ! grep -q 'lease fixture listening' "$LEASE_DIR/server.log" 2>/dev/null; then
+        fail "gateway lease fixture did not start"
+        return 1
+    fi
+    if ! D reverse "tcp:$LEASE_PORT" "tcp:$LEASE_PORT" >/dev/null 2>&1; then
+        fail "adb reverse for the gateway lease fixture"
+        return 1
+    fi
+    return 0
+}
+
+stop_lease_fixture() {
+    D reverse --remove "tcp:$LEASE_PORT" >/dev/null 2>&1 || true
+    if [ -n "$LEASE_PID" ]; then
+        kill "$LEASE_PID" >/dev/null 2>&1 || true
+        wait "$LEASE_PID" 2>/dev/null || true
+    fi
+    LEASE_PID=""
+    if [ -n "$LEASE_DIR" ] && [ -f "$LEASE_DIR/server.log" ]; then
+        cp "$LEASE_DIR/server.log" "$OUTDIR/terminal-lease-server.txt" 2>/dev/null || true
+    fi
+    rm -rf "$LEASE_DIR"
+    LEASE_DIR=""
+}
+
+lease_admin() {
+    (exec 3<>/dev/tcp/127.0.0.1/$LEASE_ADMIN_PORT
+     printf '%s\n' "$1" >&3
+     cat <&3) 2>/dev/null
+}
+
+terminal_lease_check() {
+    local log="$1" fixture="$2" placed x y w h cx cy status
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureVtScene true \
+            --es emthin.fixtureGateway "127.0.0.1:$LEASE_PORT" \
+            --es emthin.fixtureGatewayGeneration 'g-fixture-1' \
+            --ef emthin.fixtureViewZoom 1.0 \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        pass "launched the disposable gateway-lease fixture"
+    else
+        fail "launch the gateway-lease fixture"
+        return
+    fi
+    wait_for_log "$log" 'vtScene phase ready' \
+        || { fail "lease fixture scene did not start"; return; }
+    wait_for_log "$log" 'gatewayLease phase ready mode watch' \
+        || { fail "gateway watch attach did not become ready"; return; }
+    pass "watch attach became a gateway lease"
+    wait_for_log "$log" 'gatewayLease resize cols 80 rows 24' \
+        || { fail "gateway did not publish its authoritative grid"; return; }
+    wait_for_log "$log" 'gatewayLease data .*gateway lease' \
+        || { fail "gateway DATA did not reach the native scene"; return; }
+    pass "gateway DATA reached the scene"
+
+    wait_for_log "$log" 'vtScene phase placed' \
+        || { fail "lease scene did not publish its placed rect"; return; }
+    placed=$(sed -n 's/.*vtScene phase placed x \([-0-9]*\) y \([-0-9]*\) w \([0-9]*\) h \([0-9]*\).*/\1 \2 \3 \4/p' "$log" | tail -1)
+    read -r x y w h <<EOF
+$placed
+EOF
+    if [ -z "$x" ] || [ -z "$y" ] || [ -z "$w" ] || [ -z "$h" ]; then
+        fail "could not parse the lease scene rect from $log"
+        return
+    fi
+    cx=$((x + w / 2))
+    cy=$((y + h / 2))
+    D shell input tap "$cx" "$cy" >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput phase focus' \
+        || { fail "tapping the lease scene did not focus it"; return; }
+
+    if ! cmd_uidump >/dev/null 2>&1 || ! b=$(node_bounds 'text="Take"'); then
+        fail "lease fixture has no Take action"
+        return
+    fi
+    tap_center "$b"
+    wait_for_log "$log" 'gatewayLease phase request control' \
+        || { fail "Take did not request a control attach"; return; }
+    wait_for_log "$log" 'gatewayLease phase ready mode control' \
+        || { fail "control attach did not become ready"; return; }
+    pass "Take acquired a gateway controller lease"
+
+    D shell input text 'gatewayinput' >/dev/null 2>&1
+    wait_for_log "$log" 'gatewayLease input bytes' \
+        || { fail "controller input did not cross the gateway DATA channel"; return; }
+    wait_for_log "$log" 'gatewayLease data .*echo:' \
+        || { fail "gateway did not echo the controller input"; return; }
+    status=$(lease_admin status)
+    if ! printf '%s' "$status" | grep -q 'gatewayinput'; then
+        fail "gateway did not receive the complete controller input"
+        return
+    fi
+    pass "controller input crossed the gateway and returned as DATA"
+
+    lease_admin revoke >/dev/null 2>&1
+    wait_for_log "$log" 'gatewayLease closed reason .*revoked' \
+        || { fail "operator revoke did not close the viewer generation"; return; }
+    pass "operator revoke closed the viewer generation"
+
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input text 'after-revoke' >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput blocked conflict' \
+        || { fail "revoked controller still accepted input"; return; }
+    status=$(lease_admin status)
+    if printf '%s' "$status" | grep -q 'after-revoke'; then
+        fail "revoked input reached the gateway"
+        return
+    fi
+    pass "revoked lease rejected input before the transport"
+
+    # A revoked viewer may explicitly Take again; that is a new attach and a
+    # new lease, not a reuse of the old generation.
+    D logcat -c >/dev/null 2>&1 || true
+    if ! cmd_uidump >/dev/null 2>&1 || ! b=$(node_bounds 'text="Take"'); then
+        fail "lease fixture has no Take action after revocation"
+        return
+    fi
+    tap_center "$b"
+    wait_for_log "$log" 'gatewayLease phase ready mode control' \
+        || { fail "a second Take did not acquire a fresh lease"; return; }
+    D shell input text 'retakeinput' >/dev/null 2>&1
+    wait_for_log "$log" 'gatewayLease data .*echo:' \
+        || { fail "fresh lease did not carry input"; return; }
+    status=$(lease_admin status)
+    if ! printf '%s' "$status" | grep -q 'retakeinput'; then
+        fail "fresh lease did not reach the gateway"
+        return
+    fi
+    pass "second Take acquired a fresh working lease"
+
+    # Leave terminal focus so the IME closes; the gateway lane's screenshot
+    # should show the scene, not the keyboard overlay.
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput phase release' \
+        || { fail "Back did not release terminal focus"; return; }
+    sleep 0.8
+    cmd_screencap "$OUTDIR/terminal-lease.png" >/dev/null \
+        && say "    captured $OUTDIR/terminal-lease.png"
+}
+
+cmd_terminal_lease() {
+    local log="$OUTDIR/terminal-lease-logcat.txt"
+    local fixture
+    say "==> terminal lease: watch -> take -> gateway input -> revoke -> retake"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' \
+        '#1 Build log #2 \app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")')
+    if ! start_lease_fixture; then
+        stop_lease_fixture
+        return
+    fi
+    terminal_lease_check "$log" "$fixture"
+    stop_lease_fixture
+}
+
+# T08: view zoom rebuilds the page stack without dropping the stream.
+cmd_terminal_reflow() {
+    local log="$OUTDIR/terminal-reflow-logcat.txt"
+    local fixture zoom reflow
+
+    say "==> terminal reflow: stream -> zoom -> rebuild -> reflow -> pan"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' \
+        '#1 Build log #2 \app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")')
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureVtScene true \
+            --ez emthin.fixtureVtZoom true \
+            --ez emthin.fixtureVtA11y true \
+            --ef emthin.fixtureViewZoom 1.0 \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        pass "launched the disposable VT-zoom fixture"
+    else
+        fail "launch the VT-zoom fixture"
+        return
+    fi
+    wait_for_log "$log" 'vtScene phase ready' \
+        || { fail "native scene did not start"; return; }
+    wait_for_log "$log" 'vtScene phase placed' \
+        || { fail "scene did not publish its placed rect"; return; }
+    wait_for_log "$log" 'vtScene phase zoom cols' \
+        || { fail "fixture did not request view zoom"; return; }
+    pass "view zoom started while the scene was streaming"
+    wait_for_log "$log" 'terminalTransfer attach' \
+        || { fail "page rebuild dropped the scene instead of transferring it"; return; }
+    pass "page rebuild transferred the live scene"
+    wait_for_log "$log" 'vtScene phase reflow' \
+        || { fail "transferred scene did not reflow its grid"; return; }
+
+    zoom=$(sed -n 's/.*vtScene phase zoom cols \([0-9]*\) rows \([0-9]*\).*/\1 \2/p' "$log" | tail -1)
+    reflow=$(sed -n 's/.*vtScene phase reflow .*cols \([0-9]*\) rows \([0-9]*\).*/\1 \2/p' "$log" | tail -1)
+    if [ -z "$zoom" ] || [ -z "$reflow" ] || [ "$zoom" = "$reflow" ]; then
+        fail "grid did not change after zoom (before '$zoom', after '$reflow')"
+        return
+    fi
+    pass "grid reflowed from $zoom to $reflow cells"
+
+    wait_for_log "$log" 'vtA11y phase complete' \
+        || { fail "terminal accessibility actions did not complete"; return; }
+    wait_for_log "$log" 'terminalInput text a11y-paste' \
+        || { fail "accessibility paste did not reach the terminal"; return; }
+    wait_for_log "$log" 'terminalInput blocked conflict' \
+        || { fail "a conflicting lease did not block terminal input"; return; }
+    pass "terminal accessibility Focus/Copy/Paste and conflict gate ran"
+
+    local before_lines tries=0
+    before_lines=$(D logcat -d -s emthin-pad:D 2>/dev/null | wc -l)
+    D shell input swipe 1200 1000 1200 940 300 >/dev/null 2>&1
+    while [ "$tries" -lt 50 ]; do
+        D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"
+        if tail -n +$((before_lines + 1)) "$log" | grep -q 'vtScene phase frame'; then
+            pass "scene kept streaming after a pan"
+            break
+        fi
+        if ! D shell pidof "$PKG" >/dev/null 2>&1; then
+            D logcat -d >"$OUTDIR/terminal-reflow-crash.txt" 2>/dev/null || true
+            fail "app died while panning the streaming scene (log: $OUTDIR/terminal-reflow-crash.txt)"
+            return
+        fi
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    if [ "$tries" -ge 50 ]; then
+        fail "scene stopped streaming after a pan"
+        return
+    fi
+
+    cmd_screencap "$OUTDIR/terminal-reflow.png" >/dev/null \
+        && say "    captured $OUTDIR/terminal-reflow.png"
+}
+
+# T08: leave a streaming scene's page, return, and keep the same parser.
+cmd_terminal_pages() {
+    local log="$OUTDIR/terminal-pages-logcat.txt"
+    local fixture ready_page cycle_page away back
+
+    say "==> terminal pages: stream -> leave page -> return -> still streaming"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(
+        printf '#1 Cover #2 \\\n'
+        i=1
+        while [ "$i" -le 80 ]; do
+            printf 'cover line %s\n\n' "$i"
+            i=$((i + 1))
+        done
+        printf '#1 Build log #2 \\app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")\n'
+    )
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureVtScene true \
+            --ez emthin.fixtureVtPages true \
+            --ef emthin.fixtureViewZoom 1.0 \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        pass "launched the multi-page VT fixture"
+    else
+        fail "launch the multi-page VT fixture"
+        return
+    fi
+    wait_for_log "$log" 'vtScene phase ready page' \
+        || { fail "multi-page fixture never started its terminal scene"; return; }
+    ready_page=$(sed -n 's/.*vtScene phase ready page \([0-9]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$ready_page" ]; then
+        fail "could not parse the terminal scene page"
+        return
+    fi
+    pass "terminal scene started on page $((ready_page + 1))"
+
+    wait_for_log "$log" 'vtScene phase paging away' \
+        || { fail "fixture did not leave the streaming page"; return; }
+    wait_for_log "$log" 'pageRaster page 1' \
+        || { fail "the next page never loaded during the switch"; return; }
+    pass "switched to another page while the scene was streaming"
+    wait_for_log "$log" 'vtScene phase paging back' \
+        || { fail "fixture did not return to the streaming page"; return; }
+    wait_for_log "$log" 'vtScene phase page-cycle' \
+        || { fail "scene did not survive the page switch"; return; }
+    wait_for_log "$log" 'vtScene gl repaint page .* reason page-cycle' \
+        || { fail "scene surface did not repaint after returning"; return; }
+    away=$(sed -n 's/.*vtScene phase paging away .*scroll \([0-9]*\).*/\1/p' "$log" | tail -1)
+    back=$(sed -n 's/.*vtScene phase paging back .*scroll \([0-9]*\).*/\1/p' "$log" | tail -1)
+    cycle_page=$(sed -n 's/.*vtScene phase page-cycle page \([0-9]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$away" ] || [ -z "$back" ] || [ "$back" -ge "$away" ]; then
+        fail "page switch did not move away and back (away '$away', back '$back')"
+        return
+    fi
+    if [ "$cycle_page" != "$ready_page" ]; then
+        fail "scene moved from page $ready_page to page $cycle_page"
+        return
+    fi
+    pass "scene survived leaving page $((ready_page + 1)) and returning"
+    wait_for_log "$log" 'vtScene phase frame 25' \
+        || { fail "scene stopped streaming after the page cycle"; return; }
+    pass "same parser kept streaming after the page cycle"
+
+    cmd_screencap "$OUTDIR/terminal-pages.png" >/dev/null \
+        && say "    captured $OUTDIR/terminal-pages.png"
+}
+
+# T05: query and activate a terminal figure through the accessibility provider.
+cmd_figure_a11y() {
+    local log="$OUTDIR/figure-a11y-logcat.txt"
+    local fixture
+
+    say "==> figure accessibility: node state + Go/Rebind/Detach/Sessions"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' \
+        '#1 Build log #2 \app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")')
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureFigureA11y true \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        pass "launched the disposable figure-accessibility fixture"
+    else
+        fail "launch the disposable figure-accessibility fixture"
+        return
+    fi
+    wait_for_log "$log" 'figureA11y phase nodes .*Watching on studio' \
+        || { fail "figure node did not expose its watched state"; return; }
+    pass "figure node exposed the watched state and all four actions"
+    wait_for_log "$log" 'figureA11y phase focus .*Watching on studio' \
+        || { fail "accessibility focus did not resolve to the figure node"; return; }
+    pass "accessibility focus resolved to the figure node"
+    wait_for_log "$log" 'figureA11y phase go' \
+        || { fail "Go to figure action did not run"; return; }
+    pass "Go to figure action ran"
+    wait_for_log "$log" 'figureA11y phase detach .*Live on studio' \
+        || { fail "Detach did not transition the figure to live"; return; }
+    pass "Detach transitioned the figure to live"
+    wait_for_log "$log" 'figureA11y phase sessions' \
+        || { fail "Sessions action did not run"; return; }
+    pass "Sessions action ran"
+    wait_for_log "$log" 'figureA11y phase complete' \
+        || { fail "figure-accessibility fixture did not complete"; return; }
+    pass "figure-accessibility fixture completed"
 }
 
 cmd_e2e() {
@@ -1819,6 +2482,12 @@ cmd_e2e() {
     cmd_focus_stack
     cmd_composing_ime
     cmd_modifier_inspector
+    cmd_session_pin
+    cmd_figure_a11y
+    cmd_terminal_scene
+    cmd_terminal_reflow
+    cmd_terminal_pages
+    cmd_terminal_lease
 
     # Byte-identity of the installed APK, the launch proof's companion.
     cmd_pull
@@ -1855,6 +2524,12 @@ case "$cmd" in
     focus-stack) cmd_focus_stack ;;
     composing-ime) cmd_composing_ime ;;
     modifier-inspector) cmd_modifier_inspector ;;
+    session-pin) cmd_session_pin ;;
+    figure-a11y) cmd_figure_a11y ;;
+    terminal-scene) cmd_terminal_scene ;;
+    terminal-reflow) cmd_terminal_reflow ;;
+    terminal-pages) cmd_terminal_pages ;;
+    terminal-lease) cmd_terminal_lease ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;
 esac

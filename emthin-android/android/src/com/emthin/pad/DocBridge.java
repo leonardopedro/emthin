@@ -109,6 +109,24 @@ public final class DocBridge {
     /** Pushes {@code text} into the model (one undo step) and moves the caret. */
     public static native String sync(long handle, String text, int caretUtf16);
 
+    /**
+     * Appends one terminal figure as an undoable edit. Fails closed when the
+     * document no longer matches {@code expectedText}, or when the reference
+     * is not a canonical public terminal reference.
+     */
+    public static native String appendTerminalFigure(long handle, String expectedText,
+            String reference, String caption);
+
+    /** Public terminal figures in source order, with caption and binding. */
+    public static native String terminalFigures(String docText);
+
+    /**
+     * Replaces only the selected figure's terminal reference. The document
+     * must still match {@code expectedText}; the edit is one undo step.
+     */
+    public static native String rebindTerminalFigure(long handle, String expectedText,
+            String figureKey, String reference);
+
     /** Returns mathed's generated marker for a typed #, or empty if escaped. */
     public static native String typedMarker(String text, int offsetUtf16);
 
@@ -136,6 +154,33 @@ public final class DocBridge {
     public static native String undo(long handle);
 
     public static native String redo(long handle);
+
+    // ----- native document sharing (K6) --------------------------------
+
+    /** Start a transport worker from a snapshot; returns 0 on invalid data. */
+    public static native long shareOpen(byte[] snapshot, String peer, String name);
+
+    /** Stop and free a sharing worker. Call exactly once. */
+    public static native void shareClose(long handle);
+
+    /** Join a peer at a hex Loro frontier; returns {ok,error}. */
+    public static native String shareJoin(long handle, String peer, String version);
+
+    /** Publish one hex local delta; returns {ok,error}. */
+    public static native String sharePublish(long handle, String delta);
+
+    /** Accept one inbound frame; scope -1 means legacy/unscoped. */
+    public static native String shareReceive(long handle, String peer, long seq,
+                                             String delta, long scope);
+
+    /** Leave the share; returns {ok,error}. */
+    public static native String shareLeave(long handle);
+
+    /** Drain worker events as {share_id,events:[…]}. */
+    public static native String sharePoll(long handle);
+
+    /** Apply an accepted hex delta to the live model as one grouped edit. */
+    public static native String shareApply(long handle, String delta);
 
     /**
      * Renders a chunk of a mathed document's pages to pixels, returning

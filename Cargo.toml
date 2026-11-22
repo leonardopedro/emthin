@@ -6,6 +6,9 @@ members = [
     "crates/emthin-collab",
     "crates/emthin-core-client",
     "crates/emthin-dbus",
+    "crates/emthin-vt",
+    "crates/ghostty-vt",
+    "crates/herdr-gateway-fixtures",
 ]
 # Guard against rust-analyzer's scratch target directory (which it may create
 # under crates/target/rust-analyzer/) being picked up as a workspace member.

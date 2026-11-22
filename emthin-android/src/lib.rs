@@ -20,6 +20,12 @@
 //! All calls happen on the Android UI thread, so the raw handle needs
 //! no synchronisation.
 
+#[path = "../../crates/emthin/src/docui/change.rs"]
+pub mod change;
+
+#[path = "../../crates/emthin/src/docui/inspect.rs"]
+pub mod inspect;
+
 #[path = "../../crates/emthin/src/docui/model.rs"]
 pub mod model;
 
@@ -27,15 +33,17 @@ pub mod diagnostics;
 pub mod jit;
 pub mod layout;
 pub mod modifiers;
+pub mod scene;
 pub mod semantics;
+pub mod sharing;
 
 #[path = "../../crates/emthin/src/docui/citations.rs"]
 pub mod citations;
 
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyte, jfloat, jint, jlong};
-use jni::{EnvUnowned, errors};
-use serde_json::{Value, json};
+use jni::{errors, EnvUnowned};
+use serde_json::{json, Value};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::DocModel;
@@ -97,11 +105,18 @@ fn state_json(m: &DocModel) -> String {
             "resolved": link.resolved,
         })
     }).collect();
-    let markers: Vec<Value> = m.scan().markers.iter().map(|marker| json!({
-        "id": marker.id,
-        "start": byte_to_utf16(m.text(), marker.range.start),
-        "end": byte_to_utf16(m.text(), marker.range.end),
-    })).collect();
+    let markers: Vec<Value> = m
+        .scan()
+        .markers
+        .iter()
+        .map(|marker| {
+            json!({
+                "id": marker.id,
+                "start": byte_to_utf16(m.text(), marker.range.start),
+                "end": byte_to_utf16(m.text(), marker.range.end),
+            })
+        })
+        .collect();
 
     json!({
         "text": m.text(),
@@ -118,19 +133,29 @@ fn state_json(m: &DocModel) -> String {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_setMarkerTargets<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, handle: jlong,
-    start_id: JString<'local>, end_id: JString<'local>, targets: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    start_id: JString<'local>,
+    end_id: JString<'local>,
+    targets: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        // SAFETY: the handle is confined to the UI thread.
-        let model = unsafe { model_mut(handle) };
-        let result = match modifiers::set_marker_targets(model, &start_id.to_string(),
-                &end_id.to_string(), &targets.to_string()) {
-            Ok(()) => state_json(model),
-            Err(message) => json!({"error": message}).to_string(),
-        };
-        JString::from_str(env, result)
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: the handle is confined to the UI thread.
+            let model = unsafe { model_mut(handle) };
+            let result = match modifiers::set_marker_targets(
+                model,
+                &start_id.to_string(),
+                &end_id.to_string(),
+                &targets.to_string(),
+            ) {
+                Ok(()) => state_json(model),
+                Err(message) => json!({"error": message}).to_string(),
+            };
+            JString::from_str(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -144,16 +169,27 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_setModifier<'local>(
     end_utf16: jint,
     enabled: jint,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        // SAFETY: the handle is confined to the UI thread.
-        let model = unsafe { model_mut(handle) };
-        let start = utf16_to_byte(model.text(), start_utf16.max(0) as usize);
-        let end = utf16_to_byte(model.text(), end_utf16.max(0) as usize);
-        let ok = modifiers::set_link(model, &start_id.to_string(), &end_id.to_string(),
-                                     start.min(end)..start.max(end), enabled != 0);
-        let result = if ok { state_json(model) } else { json!({"error": "Invalid modifier or selection"}).to_string() };
-        JString::from_str(env, result)
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: the handle is confined to the UI thread.
+            let model = unsafe { model_mut(handle) };
+            let start = utf16_to_byte(model.text(), start_utf16.max(0) as usize);
+            let end = utf16_to_byte(model.text(), end_utf16.max(0) as usize);
+            let ok = modifiers::set_link(
+                model,
+                &start_id.to_string(),
+                &end_id.to_string(),
+                start.min(end)..start.max(end),
+                enabled != 0,
+            );
+            let result = if ok {
+                state_json(model)
+            } else {
+                json!({"error": "Invalid modifier or selection"}).to_string()
+            };
+            JString::from_str(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 // ----- text-coordinate conversion ------------------------------------
@@ -247,13 +283,21 @@ fn grapheme_boundary_utf16(text: &str, offset: usize, direction: i32) -> usize {
     let boundary = match direction {
         d if d < 0 => {
             let start = grapheme_start(text, byte);
-            if start == byte { previous_grapheme_start(text, byte) } else { start }
+            if start == byte {
+                previous_grapheme_start(text, byte)
+            } else {
+                start
+            }
         }
         0 => grapheme_start(text, byte),
         1 => grapheme_end(text, byte),
         _ => {
             let end = grapheme_end(text, byte);
-            if end == byte { next_grapheme_end(text, byte) } else { end }
+            if end == byte {
+                next_grapheme_end(text, byte)
+            } else {
+                end
+            }
         }
     };
     byte_to_utf16(text, boundary)
@@ -337,6 +381,132 @@ fn utf16_to_grapheme_byte(text: &str, utf16: usize) -> usize {
     grapheme_start(text, utf16_to_byte(text, utf16))
 }
 
+/// Escape a catalogue caption for the document body. A caption is ordinary
+/// text, but `#` would start a marker and a newline could open a statement.
+fn escape_caption(caption: &str) -> String {
+    caption
+        .replace('\\', "\\\\")
+        .replace('#', "\\#")
+        .replace(['\n', '\r'], " ")
+}
+
+/// Escape a terminal reference for a quoted `\app` argument.
+fn escape_arg(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], " ")
+}
+
+/// The `terminal:` literal argument of one segment, if it has one.
+fn terminal_argument(segment: &mathed_core::markers::Segment) -> Option<&mathed_core::markers::Arg> {
+    segment.extra_args.iter().find(|arg| match arg {
+        mathed_core::markers::Arg::Literal { text, .. } => text
+            .split_once(':')
+            .is_some_and(|(name, _)| name.trim() == "terminal"),
+        mathed_core::markers::Arg::MarkerRef { .. } => false,
+    })
+}
+
+/// Public terminal figures a Rebind picker can target. Only source metadata is
+/// returned; captions and references are safe to show and persist.
+fn terminal_figure_options(text: &str) -> String {
+    let scan = mathed_core::markers::scan(text);
+    let figures: Vec<Value> = mathed_core::markers::resolve_segments(&scan)
+        .iter()
+        .filter_map(|segment| {
+            let terminal = terminal_argument(segment)?;
+            let figure = mathed_core::figures::resolve_figure(segment)?;
+            let caption = segment
+                .span
+                .as_ref()
+                .map(|span| text[span.clone()].trim())
+                .unwrap_or("Figure");
+            Some(json!({
+                "key": figure.key,
+                "caption": caption,
+                "reference": figure.spec.terminal.as_ref().map(|r| r.canonical()),
+                "bindingError": figure.spec.binding_error,
+                "argument": match terminal {
+                    mathed_core::markers::Arg::Literal { text, .. } => text,
+                    mathed_core::markers::Arg::MarkerRef { .. } => "",
+                },
+            }))
+        })
+        .collect();
+    json!(figures).to_string()
+}
+
+/// Rewrite only a figure's `terminal:` argument. Everything else in the
+/// statement-and the document-stays byte-identical, and the edit is one undo
+/// step through the normal `DocModel` transaction.
+fn rebind_terminal_figure(
+    model: &mut DocModel,
+    expected_text: &str,
+    key: &str,
+    reference: &str,
+) -> Result<(), String> {
+    if model.text() != expected_text {
+        return Err("Document changed before the session was rebound".to_string());
+    }
+    let reference = mathed_core::figures::TerminalRef::parse(reference)?;
+    let scan = mathed_core::markers::scan(model.text());
+    let segments = mathed_core::markers::resolve_segments(&scan);
+    let segment = segments
+        .iter()
+        .find(|segment| mathed_core::figures::figure_key(segment.stmt) == key)
+        .ok_or_else(|| "That figure no longer exists".to_string())?;
+    let argument = terminal_argument(segment)
+        .ok_or_else(|| "That figure has no terminal binding to replace".to_string())?;
+    let range = match argument {
+        mathed_core::markers::Arg::Literal { range, .. } => range.clone(),
+        mathed_core::markers::Arg::MarkerRef { .. } => {
+            return Err("That figure has no terminal binding to replace".to_string());
+        }
+    };
+    let canonical = reference.canonical();
+    if model.text()[range.clone()] == format!("terminal: \"{canonical}\"") {
+        return Ok(());
+    }
+    model.replace(range, &format!("terminal: \"{}\"", escape_arg(&canonical)));
+    Ok(())
+}
+
+/// Append a terminal figure as one undo step. The caller's expected text makes
+/// a stale Sessions tap fail closed instead of editing a replaced document.
+fn append_terminal_figure(
+    model: &mut DocModel,
+    expected_text: &str,
+    reference: &str,
+    caption: &str,
+) -> Result<(), String> {
+    if model.text() != expected_text {
+        return Err("Document changed before the session was pinned".to_string());
+    }
+    let reference = mathed_core::figures::TerminalRef::parse(reference)?;
+    let ids = {
+        let scan = model.scan();
+        mathed_core::markers::lowest_free_marker_numbers(scan, 2)
+    };
+    let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
+        return Err("Could not allocate figure markers".to_string());
+    };
+    let start = format!("#{}", mathed_core::markers::auto_marker_id(a));
+    let end = format!("#{}", mathed_core::markers::auto_marker_id(b));
+    let caption = escape_caption(caption.trim());
+    let caption = if caption.is_empty() { "Terminal" } else { caption.as_str() };
+    let terminal = escape_arg(&reference.canonical());
+    let mut statement = format!(
+        "{start} {caption} {end} \\app({start}, {end}, 640, 400, terminal: \"{terminal}\")\n"
+    );
+    let at = model.text().len();
+    if at > 0 && !model.text().ends_with('\n') {
+        statement.insert(0, '\n');
+    }
+    model.insert(at, &statement);
+    Ok(())
+}
+
 // ----- JNI entry points -----------------------------------------------
 //
 // Names follow the JNI spec: `Java_com_emthin_pad_DocBridge_<method>`.
@@ -382,7 +552,9 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_create<'local>(
 /// Restore only a snapshot that corresponds to the separately saved text.
 fn model_from_snapshot(encoded: &str, expected: &str) -> Option<DocModel> {
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     let model = DocModel::from_snapshot(&bytes).ok()?;
     (model.text() == expected).then_some(model)
 }
@@ -401,7 +573,9 @@ fn canonical_content(snapshot: &[u8]) -> Option<Vec<u8>> {
     let deltas = value.as_array()?;
     let mut runs: Vec<(String, serde_json::Map<String, Value>)> = Vec::new();
     for delta in deltas {
-        let Some(map) = delta.as_object() else { continue };
+        let Some(map) = delta.as_object() else {
+            continue;
+        };
         let insert = map.get("insert").and_then(Value::as_str).unwrap_or("");
         let mut attrs = serde_json::Map::new();
         if let Some(original) = map.get("attributes").and_then(Value::as_object) {
@@ -439,20 +613,30 @@ fn logical_fingerprint(snapshot: &[u8]) -> Option<String> {
 }
 
 fn search_ranges(text: &str, query: &str) -> Value {
-    json!(mathed_core::search::find_matches(text, query).into_iter()
-        .map(|range| [byte_to_utf16(text, range.start), byte_to_utf16(text, range.end)])
+    json!(mathed_core::search::find_matches(text, query)
+        .into_iter()
+        .map(|range| [
+            byte_to_utf16(text, range.start),
+            byte_to_utf16(text, range.end)
+        ])
         .collect::<Vec<_>>())
 }
 
 fn protected_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     let scan = mathed_core::markers::scan(text);
-    let mut ranges: Vec<_> = scan.markers.iter().map(|marker| marker.range.clone()).collect();
+    let mut ranges: Vec<_> = scan
+        .markers
+        .iter()
+        .map(|marker| marker.range.clone())
+        .collect();
     ranges.extend(scan.stmts.iter().map(|stmt| stmt.range.clone()));
     ranges
 }
 
 fn intersects(ranges: &[std::ops::Range<usize>], range: &std::ops::Range<usize>) -> bool {
-    ranges.iter().any(|protected| protected.start < range.end && range.start < protected.end)
+    ranges
+        .iter()
+        .any(|protected| protected.start < range.end && range.start < protected.end)
 }
 
 /// A bounded search page. Text scope omits structure; Source and Selection
@@ -483,7 +667,10 @@ fn search_scoped(
         .filter(|range| !text_scope || !intersects(&protected, range))
         .collect();
     let anchor_byte = utf16_to_byte(text, anchor);
-    let first = all.iter().position(|range| range.start >= anchor_byte).unwrap_or(0);
+    let first = all
+        .iter()
+        .position(|range| range.start >= anchor_byte)
+        .unwrap_or(0);
     let page_size = page_size.max(1).min(10_000);
     let page_start = if include_all {
         0
@@ -492,12 +679,21 @@ fn search_scoped(
     } else {
         (first / page_size) * page_size
     };
-    let end = if include_all { all.len().min(10_000) } else { (page_start + page_size).min(all.len()) };
-    let matches: Vec<Value> = all[page_start..end].iter().map(|range| json!({
-        "start": byte_to_utf16(text, range.start),
-        "end": byte_to_utf16(text, range.end),
-        "protected": intersects(&protected, range),
-    })).collect();
+    let end = if include_all {
+        all.len().min(10_000)
+    } else {
+        (page_start + page_size).min(all.len())
+    };
+    let matches: Vec<Value> = all[page_start..end]
+        .iter()
+        .map(|range| {
+            json!({
+                "start": byte_to_utf16(text, range.start),
+                "end": byte_to_utf16(text, range.end),
+                "protected": intersects(&protected, range),
+            })
+        })
+        .collect();
     json!({
         "total": all.len(),
         "replaceable": all.iter().filter(|range| !intersects(&protected, range)).count(),
@@ -510,17 +706,34 @@ fn search_scoped(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_searchScoped<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, query: JString<'local>, scope: JString<'local>,
-    selection_start: jint, selection_end: jint, anchor: jint,
-    page_start: jint, page_size: jint, include_all: jint,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    query: JString<'local>,
+    scope: JString<'local>,
+    selection_start: jint,
+    selection_end: jint,
+    anchor: jint,
+    page_start: jint,
+    page_size: jint,
+    include_all: jint,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let result = search_scoped(&text.to_string(), &query.to_string(), &scope.to_string(),
-            selection_start.max(0) as usize, selection_end.max(0) as usize,
-            anchor.max(0) as usize, page_start, page_size.max(1) as usize, include_all != 0);
-        JString::from_str(env, result.to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let result = search_scoped(
+                &text.to_string(),
+                &query.to_string(),
+                &scope.to_string(),
+                selection_start.max(0) as usize,
+                selection_end.max(0) as usize,
+                anchor.max(0) as usize,
+                page_start,
+                page_size.max(1) as usize,
+                include_all != 0,
+            );
+            JString::from_str(env, result.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 /// Apply a checked batch of literal replacements. `expected` must still be
@@ -530,19 +743,33 @@ fn replace_many_json(model: &mut DocModel, expected: &str, ops: &Value) -> Resul
     if model.text() != expected {
         return Err("The document changed; refresh the replacement preview".into());
     }
-    let entries = ops.as_array().ok_or_else(|| "replacement plan is not an array".to_string())?;
+    let entries = ops
+        .as_array()
+        .ok_or_else(|| "replacement plan is not an array".to_string())?;
     if entries.len() > 10_000 {
         return Err("replacement plan exceeds 10,000 operations".into());
     }
     let protected = protected_ranges(expected);
     let mut replacements = Vec::with_capacity(entries.len());
     for entry in entries {
-        let start = entry.get("start").and_then(Value::as_u64).ok_or("missing start")? as usize;
-        let end = entry.get("end").and_then(Value::as_u64).ok_or("missing end")? as usize;
-        let with = entry.get("text").and_then(Value::as_str).ok_or("missing text")?;
+        let start = entry
+            .get("start")
+            .and_then(Value::as_u64)
+            .ok_or("missing start")? as usize;
+        let end = entry
+            .get("end")
+            .and_then(Value::as_u64)
+            .ok_or("missing end")? as usize;
+        let with = entry
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or("missing text")?;
         let range = utf16_to_byte(expected, start)..utf16_to_byte(expected, end);
-        if range.start >= range.end || range.end > expected.len()
-            || !expected.is_char_boundary(range.start) || !expected.is_char_boundary(range.end) {
+        if range.start >= range.end
+            || range.end > expected.len()
+            || !expected.is_char_boundary(range.start)
+            || !expected.is_char_boundary(range.end)
+        {
             return Err("replacement range is invalid".into());
         }
         if intersects(&protected, &range) {
@@ -556,9 +783,14 @@ fn replace_many_json(model: &mut DocModel, expected: &str, ops: &Value) -> Resul
             return Err("replacement ranges overlap".into());
         }
     }
-    let first = replacements.first().map(|(range, with)| (range.start, with.len())).unwrap_or((0, 0));
-    let ops: Vec<mathed_core::doc::ReplaceOp> = replacements.into_iter()
-        .map(|(range, with)| mathed_core::doc::ReplaceOp { range, with }).collect();
+    let first = replacements
+        .first()
+        .map(|(range, with)| (range.start, with.len()))
+        .unwrap_or((0, 0));
+    let ops: Vec<mathed_core::doc::ReplaceOp> = replacements
+        .into_iter()
+        .map(|(range, with)| mathed_core::doc::ReplaceOp { range, with })
+        .collect();
     model.replace_many(ops);
     let caret = byte_to_utf16(model.text(), first.0.saturating_add(first.1));
     model.set_caret(utf16_to_grapheme_byte(model.text(), caret));
@@ -567,33 +799,50 @@ fn replace_many_json(model: &mut DocModel, expected: &str, ops: &Value) -> Resul
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_replaceMany<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, handle: jlong,
-    expected: JString<'local>, ops: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    expected: JString<'local>,
+    ops: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let expected = expected.to_string();
-        let parsed: Value = match serde_json::from_str(&ops.to_string()) {
-            Ok(value) => value,
-            Err(error) => return Ok(JString::from_str(env, json!({"error": format!("invalid replacement plan: {error}")}).to_string())?),
-        };
-        // SAFETY: the handle is confined to the UI thread.
-        let model = unsafe { model_mut(handle) };
-        let result = match replace_many_json(model, &expected, &parsed) {
-            Ok(state) => state,
-            Err(message) => json!({"error": message}).to_string(),
-        };
-        JString::from_str(env, result)
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let expected = expected.to_string();
+            let parsed: Value = match serde_json::from_str(&ops.to_string()) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(JString::from_str(
+                        env,
+                        json!({"error": format!("invalid replacement plan: {error}")}).to_string(),
+                    )?)
+                }
+            };
+            // SAFETY: the handle is confined to the UI thread.
+            let model = unsafe { model_mut(handle) };
+            let result = match replace_many_json(model, &expected, &parsed) {
+                Ok(state) => state,
+                Err(message) => json!({"error": message}).to_string(),
+            };
+            JString::from_str(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_search<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, query: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    query: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        JString::from_str(env, search_ranges(&text.to_string(), &query.to_string()).to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            JString::from_str(
+                env,
+                search_ranges(&text.to_string(), &query.to_string()).to_string(),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 fn word_boundary_utf16(text: &str, caret: usize, direction: i32) -> usize {
@@ -618,21 +867,35 @@ fn math_completion(text: &str, caret: usize) -> Value {
     }
 }
 
-fn citation_source(text: &str, scan: &mathed_core::markers::MarkerScan, stmt_idx: usize) -> (String, usize, usize) {
+fn citation_source(
+    text: &str,
+    scan: &mathed_core::markers::MarkerScan,
+    stmt_idx: usize,
+) -> (String, usize, usize) {
     let span = &scan.stmts[stmt_idx].range;
-    let mut snippet = text.get(span.clone()).unwrap_or("")
-        .split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snippet = text
+        .get(span.clone())
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if snippet.chars().count() > 180 {
         snippet = snippet.chars().take(180).collect::<String>() + "…";
     }
-    (snippet, byte_to_utf16(text, span.start), byte_to_utf16(text, span.end))
+    (
+        snippet,
+        byte_to_utf16(text, span.start),
+        byte_to_utf16(text, span.end),
+    )
 }
 
 fn citation_keys(reference: &mathed_core::markers::ReferenceEntry) -> Vec<String> {
     use mathed_core::markers::ReferenceKind;
     match &reference.kind {
-        ReferenceKind::Bibliography { keys } => keys.iter()
-            .map(|key| key.trim().trim_matches('"').to_string()).collect(),
+        ReferenceKind::Bibliography { keys } => keys
+            .iter()
+            .map(|key| key.trim().trim_matches('"').to_string())
+            .collect(),
         ReferenceKind::DocumentRef { .. } => Vec::new(),
     }
 }
@@ -657,7 +920,10 @@ fn citation_index(text: &str, resolve_status: bool) -> Value {
                 ReferenceKind::Bibliography { .. } => {
                     if let Some(number) = reference.numbers.first() {
                         if let Err(error) = citations::bibliography_detail(
-                            text, *number, None, citations::DEFAULT_CITATION_LOCALE,
+                            text,
+                            *number,
+                            None,
+                            citations::DEFAULT_CITATION_LOCALE,
                         ) {
                             resolved = false;
                             status_error = error;
@@ -666,9 +932,14 @@ fn citation_index(text: &str, resolve_status: bool) -> Value {
                 }
                 ReferenceKind::DocumentRef { body, .. } => {
                     let has_body = body.is_some();
-                    let popup = upstream.iter().find(|r| r.stmt_idx == reference.stmt_idx)
-                        .and_then(|r| r.numbers.first()).copied()
-                        .and_then(|number| mathed_mini::cite_popup::resolve_popup_body(text, number));
+                    let popup = upstream
+                        .iter()
+                        .find(|r| r.stmt_idx == reference.stmt_idx)
+                        .and_then(|r| r.numbers.first())
+                        .copied()
+                        .and_then(|number| {
+                            mathed_mini::cite_popup::resolve_popup_body(text, number)
+                        });
                     if !has_body || popup.is_none() {
                         resolved = false;
                         status_error = "Citation has no referenced text".to_string();
@@ -686,26 +957,40 @@ fn citation_index(text: &str, resolve_status: bool) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_citationIndex<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, resolve_status: jboolean,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    resolve_status: jboolean,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        JString::from_str(env, citation_index(&text.to_string(), resolve_status).to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            JString::from_str(
+                env,
+                citation_index(&text.to_string(), resolve_status).to_string(),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_citationChoices<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        JString::from_str(env, json!({
-            "styles": citations::CITATION_STYLES,
-            "locales": citations::CITATION_LOCALES,
-            "defaultStyle": mathed_biblio::DEFAULT_STYLE,
-            "defaultLocale": citations::DEFAULT_CITATION_LOCALE,
-        }).to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            JString::from_str(
+                env,
+                json!({
+                    "styles": citations::CITATION_STYLES,
+                    "locales": citations::CITATION_LOCALES,
+                    "defaultStyle": mathed_biblio::DEFAULT_STYLE,
+                    "defaultLocale": citations::DEFAULT_CITATION_LOCALE,
+                })
+                .to_string(),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 fn citation_detail(
@@ -729,13 +1014,21 @@ fn citation_detail(
     let metadata = json!({"number": number, "label": label, "keys": keys,
         "source": source, "sourceStart": source_start, "sourceEnd": source_end});
     let upstream = mathed_core::markers::scan_references(&scan);
-    let upstream_number = upstream.iter().find(|r| r.stmt_idx == reference.stmt_idx)
-        .and_then(|r| r.numbers.first()).copied().unwrap_or(number);
+    let upstream_number = upstream
+        .iter()
+        .find(|r| r.stmt_idx == reference.stmt_idx)
+        .and_then(|r| r.numbers.first())
+        .copied()
+        .unwrap_or(number);
     let Some(body) = resolve_popup_body(text, upstream_number) else {
         return json!({"error": "Citation no longer exists", "source": source,
             "sourceStart": source_start, "sourceEnd": source_end});
     };
-    let locale = if locale.trim().is_empty() { citations::DEFAULT_CITATION_LOCALE } else { locale };
+    let locale = if locale.trim().is_empty() {
+        citations::DEFAULT_CITATION_LOCALE
+    } else {
+        locale
+    };
     let style = style.map(str::trim).filter(|name| !name.is_empty());
     match body {
         PopupBody::Bibliography { keys, .. } => {
@@ -743,25 +1036,42 @@ fn citation_detail(
                 Ok((citation, entries)) => json!({"kind":"bibliography", "text":citation,
                     "entries":entries, "resolved":true, "style": style.unwrap_or(mathed_biblio::DEFAULT_STYLE),
                     "locale": locale, "metadata": metadata}),
-                Err(error) => json!({"kind":"bibliography", "text":format!("[{}]", keys.join(", ")),
+                Err(error) => {
+                    json!({"kind":"bibliography", "text":format!("[{}]", keys.join(", ")),
                     "resolved":false, "errorDetail":error, "style": style.unwrap_or(mathed_biblio::DEFAULT_STYLE),
-                    "locale": locale, "metadata": metadata}),
+                    "locale": locale, "metadata": metadata})
+                }
             }
         }
-        PopupBody::DocumentRef { body_text, body_markup } => {
-            let body_markup = if body_text.is_empty() { body_markup } else {
+        PopupBody::DocumentRef {
+            body_text,
+            body_markup,
+        } => {
+            let body_markup = if body_text.is_empty() {
+                body_markup
+            } else {
                 let scan = mathed_core::markers::scan(&body_text);
                 let segments = mathed_core::markers::resolve_segments(&scan);
                 let options = mathed_core::transform::TransformOptions {
-                    references: model::citation_references(&scan), ..Default::default()
+                    references: model::citation_references(&scan),
+                    ..Default::default()
                 };
                 mathed_core::transform::to_render_text(&body_text, &scan, &segments, &options).text
             };
             let world = mathed_mini::MiniWorld::new(format!("{DOCUMENT_THEME}{body_markup}"));
-            let image = world.eval_main().and_then(|content| {
-                use typst::layout::{Abs, Axes, Region, Size};
-                world.layout(&content, Region::new(Size::new(Abs::pt(width), Abs::pt(2048.0)), Axes::splat(false)))
-            }).and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
+            let image = world
+                .eval_main()
+                .and_then(|content| {
+                    use typst::layout::{Abs, Axes, Region, Size};
+                    world.layout(
+                        &content,
+                        Region::new(
+                            Size::new(Abs::pt(width), Abs::pt(2048.0)),
+                            Axes::splat(false),
+                        ),
+                    )
+                })
+                .and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
             match image {
                 Some(image) => match png_page(image.width, image.height, &image.data) {
                     Ok(png) => json!({"kind":"document", "text":body_text, "scope":body_text,
@@ -779,97 +1089,183 @@ fn citation_detail(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_citationDetail<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
-    number: jint, width: jfloat, scale: jfloat, style: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    number: jint,
+    width: jfloat,
+    scale: jfloat,
+    style: JString<'local>,
     locale: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let width = if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 };
-        let scale = if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 };
-        let style = style.to_string();
-        let locale = locale.to_string();
-        JString::from_str(env, citation_detail(&text.to_string(), number.max(0) as u64,
-            width, scale, (!style.is_empty()).then_some(style.as_str()), &locale).to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let width = if width.is_finite() {
+                (width as f64).clamp(60.0, 1200.0)
+            } else {
+                250.0
+            };
+            let scale = if scale.is_finite() {
+                scale.clamp(1.0, 3.0)
+            } else {
+                1.0
+            };
+            let style = style.to_string();
+            let locale = locale.to_string();
+            JString::from_str(
+                env,
+                citation_detail(
+                    &text.to_string(),
+                    number.max(0) as u64,
+                    width,
+                    scale,
+                    (!style.is_empty()).then_some(style.as_str()),
+                    &locale,
+                )
+                .to_string(),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_semanticIndex<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, text: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        JString::from_str(env, semantics::semantic_json(&text.to_string()).to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            JString::from_str(env, semantics::semantic_json(&text.to_string()).to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_renamePreview<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, def_index: jint, new_name: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    def_index: jint,
+    new_name: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let result = semantics::rename_preview_json(&text.to_string(),
-            def_index.max(0) as usize, &new_name.to_string());
-        JString::from_str(env, result.to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let result = semantics::rename_preview_json(
+                &text.to_string(),
+                def_index.max(0) as usize,
+                &new_name.to_string(),
+            );
+            JString::from_str(env, result.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_renameDefinition<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, handle: jlong,
-    expected: JString<'local>, def_index: jint, new_name: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    expected: JString<'local>,
+    def_index: jint,
+    new_name: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        // SAFETY: the handle is confined to the UI thread.
-        let model = unsafe { model_mut(handle) };
-        let result = match semantics::rename_definition_json(model, &expected.to_string(),
-            def_index.max(0) as usize, &new_name.to_string()) {
-            Ok(state) => state,
-            Err(message) => json!({"error": message}).to_string(),
-        };
-        JString::from_str(env, result)
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: the handle is confined to the UI thread.
+            let model = unsafe { model_mut(handle) };
+            let result = match semantics::rename_definition_json(
+                model,
+                &expected.to_string(),
+                def_index.max(0) as usize,
+                &new_name.to_string(),
+            ) {
+                Ok(state) => state,
+                Err(message) => json!({"error": message}).to_string(),
+            };
+            JString::from_str(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_mathCompletion<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, caret: jint,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    caret: jint,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        JString::from_str(env, math_completion(&text.to_string(), caret.max(0) as usize).to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            JString::from_str(
+                env,
+                math_completion(&text.to_string(), caret.max(0) as usize).to_string(),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_graphemeBoundary<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, offset: jint, direction: jint,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    offset: jint,
+    direction: jint,
 ) -> jint {
-    unowned_env.with_env(|_env| -> errors::Result<jint> {
-        Ok(grapheme_boundary_utf16(&text.to_string(), offset.max(0) as usize, direction) as jint)
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|_env| -> errors::Result<jint> {
+            Ok(
+                grapheme_boundary_utf16(&text.to_string(), offset.max(0) as usize, direction)
+                    as jint,
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_wordBoundary<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, caret: jint, direction: jint,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    caret: jint,
+    direction: jint,
 ) -> jint {
-    unowned_env.with_env(|_env| -> errors::Result<jint> {
-        Ok(word_boundary_utf16(&text.to_string(), caret.max(0) as usize, direction) as jint)
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|_env| -> errors::Result<jint> {
+            Ok(word_boundary_utf16(&text.to_string(), caret.max(0) as usize, direction) as jint)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 const DOCUMENT_THEME: &str = "#set text(fill: white, size: 17pt, font: \"DejaVu Sans Mono\", kerning: false, bottom-edge: \"descender\", ligatures: false)\n";
 
-fn modifier_fragment(model: &DocModel, range: std::ops::Range<usize>, excluded: Option<(&str, &str)>, width: f64, scale: f32) -> Value {
+fn modifier_fragment(
+    model: &DocModel,
+    range: std::ops::Range<usize>,
+    excluded: Option<(&str, &str)>,
+    width: f64,
+    scale: f32,
+) -> Value {
     use base64::Engine as _;
     use unicode_segmentation::UnicodeSegmentation;
-    let mut boundaries: Vec<usize> = model.text().grapheme_indices(true).map(|(i, _)| i).collect();
+    let mut boundaries: Vec<usize> = model
+        .text()
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .collect();
     boundaries.push(model.len());
-    let start = boundaries.iter().copied().take_while(|i| *i <= range.start).last().unwrap_or(0);
-    let end = boundaries.iter().copied().find(|i| *i >= range.end).unwrap_or(model.len());
+    let start = boundaries
+        .iter()
+        .copied()
+        .take_while(|i| *i <= range.start)
+        .last()
+        .unwrap_or(0);
+    let end = boundaries
+        .iter()
+        .copied()
+        .find(|i| *i >= range.end)
+        .unwrap_or(model.len());
     let range = start..end;
     let scan = mathed_core::markers::scan(model.text());
     let segments = mathed_core::markers::resolve_segments(&scan);
@@ -878,16 +1274,28 @@ fn modifier_fragment(model: &DocModel, range: std::ops::Range<usize>, excluded: 
         block_splices: modifiers::typst_splices_in(model, range.clone(), excluded),
         ..Default::default()
     };
-    let fragment = mathed_core::transform::to_render_text_range(model.text(), &scan, &segments, range, &options);
+    let fragment = mathed_core::transform::to_render_text_range(
+        model.text(),
+        &scan,
+        &segments,
+        range,
+        &options,
+    );
     // Match mathed_mini's document theme and rasterize at device density;
     // enlarging a 1 px/pt snippet makes its glyphs visibly pixelated.
     let markup = format!("{DOCUMENT_THEME}{}", fragment.text);
     let world = mathed_mini::MiniWorld::new(markup);
-    let image = world.eval_main().and_then(|content| {
-        use typst::layout::{Abs, Axes, Region, Size};
-        let region = Region::new(Size::new(Abs::pt(width), Abs::pt(2048.0)), Axes::splat(false));
-        world.layout(&content, region)
-    }).and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
+    let image = world
+        .eval_main()
+        .and_then(|content| {
+            use typst::layout::{Abs, Axes, Region, Size};
+            let region = Region::new(
+                Size::new(Abs::pt(width), Abs::pt(2048.0)),
+                Axes::splat(false),
+            );
+            world.layout(&content, region)
+        })
+        .and_then(|frame| mathed_mini::rasterize_at(&frame, scale).ok());
     match image {
         Some(image) => json!({"width": image.width, "height": image.height,
             "rgba": base64::engine::general_purpose::STANDARD.encode(&image.data)}),
@@ -895,17 +1303,26 @@ fn modifier_fragment(model: &DocModel, range: std::ops::Range<usize>, excluded: 
     }
 }
 
-fn modifier_comparisons(model: &DocModel, start_id: &str, end_id: &str, width: f64, scale: f32) -> Value {
+fn modifier_comparisons(
+    model: &DocModel,
+    start_id: &str,
+    end_id: &str,
+    width: f64,
+    scale: f32,
+) -> Value {
     let Some(source) = modifiers::source_range(model, start_id, end_id) else {
         return json!({"error": "Modifier markers no longer exist"});
     };
     let mut incoming = Vec::new();
     let mut outgoing = Vec::new();
     for link in modifiers::links(model) {
-        if !link.resolved { continue; }
+        if !link.resolved {
+            continue;
+        }
         let source_start = modifiers::source_range(model, &link.start_id, &link.end_id);
         if link.target.start < source.end && source.start < link.target.end {
-            let label = source_start.as_ref()
+            let label = source_start
+                .as_ref()
                 .map(|r| model.text()[r.clone()].trim().to_owned())
                 .unwrap_or_else(|| "Missing modifier".to_string());
             incoming.push(json!({"label": label,
@@ -945,7 +1362,8 @@ fn modifier_relationships(model: &DocModel, start_id: &str, end_id: &str) -> Val
     for link in modifiers::links(model) {
         let source_start = modifiers::source_range(model, &link.start_id, &link.end_id);
         if link.target.start < source.end && source.start < link.target.end {
-            let label = source_start.as_ref()
+            let label = source_start
+                .as_ref()
                 .map(|r| model.text()[r.clone()].trim().to_owned())
                 .unwrap_or_else(|| "Missing modifier".to_string());
             incoming.push(json!({"label": label,
@@ -980,23 +1398,34 @@ fn modifier_relationships(model: &DocModel, start_id: &str, end_id: &str) -> Val
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_modifierRelationships<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, snapshot: JString<'local>,
-    start_id: JString<'local>, end_id: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    snapshot: JString<'local>,
+    start_id: JString<'local>,
+    end_id: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let text = text.to_string();
-        let value = match model_from_snapshot(&snapshot.to_string(), &text) {
-            Some(model) => modifier_relationships(&model, &start_id.to_string(), &end_id.to_string()),
-            None => json!({"error": "Could not restore document"}),
-        };
-        JString::from_str(env, value.to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = text.to_string();
+            let value = match model_from_snapshot(&snapshot.to_string(), &text) {
+                Some(model) => {
+                    modifier_relationships(&model, &start_id.to_string(), &end_id.to_string())
+                }
+                None => json!({"error": "Could not restore document"}),
+            };
+            JString::from_str(env, value.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 fn snippet_utf16(text: &str, range: std::ops::Range<usize>) -> String {
-    let mut value = text.get(range).unwrap_or("")
-        .split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut value = text
+        .get(range)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if value.chars().count() > 80 {
         value = value.chars().take(80).collect::<String>() + "…";
     }
@@ -1017,8 +1446,11 @@ fn modifier_comparison_row(
     let text = model.text();
     let start = utf16_to_byte(text, target_start.max(0) as usize);
     let end = utf16_to_byte(text, target_end.max(0) as usize);
-    if start >= end || end > text.len()
-        || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+    if start >= end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
         return json!({"error": "This relationship has no visible text"});
     }
     let excluded = (!exclude_start.is_empty() && !exclude_end.is_empty())
@@ -1031,41 +1463,80 @@ fn modifier_comparison_row(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_modifierComparisonRow<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, snapshot: JString<'local>,
-    target_start: jint, target_end: jint,
-    exclude_start: JString<'local>, exclude_end: JString<'local>,
-    width: jfloat, scale: jfloat,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    snapshot: JString<'local>,
+    target_start: jint,
+    target_end: jint,
+    exclude_start: JString<'local>,
+    exclude_end: JString<'local>,
+    width: jfloat,
+    scale: jfloat,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let text = text.to_string();
-        let value = match model_from_snapshot(&snapshot.to_string(), &text) {
-            Some(model) => modifier_comparison_row(&model, target_start, target_end,
-                &exclude_start.to_string(), &exclude_end.to_string(),
-                if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 },
-                if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 }),
-            None => json!({"error": "Could not restore document"}),
-        };
-        JString::from_str(env, value.to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = text.to_string();
+            let value = match model_from_snapshot(&snapshot.to_string(), &text) {
+                Some(model) => modifier_comparison_row(
+                    &model,
+                    target_start,
+                    target_end,
+                    &exclude_start.to_string(),
+                    &exclude_end.to_string(),
+                    if width.is_finite() {
+                        (width as f64).clamp(60.0, 1200.0)
+                    } else {
+                        250.0
+                    },
+                    if scale.is_finite() {
+                        scale.clamp(1.0, 3.0)
+                    } else {
+                        1.0
+                    },
+                ),
+                None => json!({"error": "Could not restore document"}),
+            };
+            JString::from_str(env, value.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_modifierComparisons<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>,
-    text: JString<'local>, snapshot: JString<'local>,
-    start_id: JString<'local>, end_id: JString<'local>, width: jfloat, scale: jfloat,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    snapshot: JString<'local>,
+    start_id: JString<'local>,
+    end_id: JString<'local>,
+    width: jfloat,
+    scale: jfloat,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let text = text.to_string();
-        let value = match model_from_snapshot(&snapshot.to_string(), &text) {
-            Some(model) => modifier_comparisons(&model, &start_id.to_string(), &end_id.to_string(),
-                if width.is_finite() { (width as f64).clamp(60.0, 1200.0) } else { 250.0 },
-                if scale.is_finite() { scale.clamp(1.0, 3.0) } else { 1.0 }),
-            None => json!({"error": "Could not restore document"}),
-        };
-        JString::from_str(env, value.to_string())
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = text.to_string();
+            let value = match model_from_snapshot(&snapshot.to_string(), &text) {
+                Some(model) => modifier_comparisons(
+                    &model,
+                    &start_id.to_string(),
+                    &end_id.to_string(),
+                    if width.is_finite() {
+                        (width as f64).clamp(60.0, 1200.0)
+                    } else {
+                        250.0
+                    },
+                    if scale.is_finite() {
+                        scale.clamp(1.0, 3.0)
+                    } else {
+                        1.0
+                    },
+                ),
+                None => json!({"error": "Could not restore document"}),
+            };
+            JString::from_str(env, value.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -1077,22 +1548,30 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_createFromSnapshot<'local>(
 ) -> jlong {
     unowned_env
         .with_env(|_env| -> errors::Result<jlong> {
-            Ok(model_from_snapshot(&snapshot.to_string(), &expected.to_string())
-                .map_or(0, |m| Box::into_raw(Box::new(m)) as jlong))
+            Ok(
+                model_from_snapshot(&snapshot.to_string(), &expected.to_string())
+                    .map_or(0, |m| Box::into_raw(Box::new(m)) as jlong),
+            )
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_openSnapshot<'local>(
-    mut unowned_env: EnvUnowned<'local>, _class: JClass<'local>, snapshot: JString<'local>,
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: JString<'local>,
 ) -> jlong {
     use base64::Engine as _;
-    unowned_env.with_env(|_env| -> errors::Result<jlong> {
-        let model = base64::engine::general_purpose::STANDARD.decode(snapshot.to_string())
-            .ok().and_then(|bytes| DocModel::from_snapshot(&bytes).ok());
-        Ok(model.map_or(0, |m| Box::into_raw(Box::new(m)) as jlong))
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|_env| -> errors::Result<jlong> {
+            let model = base64::engine::general_purpose::STANDARD
+                .decode(snapshot.to_string())
+                .ok()
+                .and_then(|bytes| DocModel::from_snapshot(&bytes).ok());
+            Ok(model.map_or(0, |m| Box::into_raw(Box::new(m)) as jlong))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -1122,20 +1601,21 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_createAnchor<'local>(
     side: jint,
 ) -> JString<'local> {
     use base64::Engine as _;
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let model = unsafe { model_mut(handle) };
-        let byte = utf16_to_byte(model.text(), offset_utf16.max(0) as usize);
-        let value = match model.math_doc().create_anchor(byte, side) {
-            Some(anchor) => json!({
-                "encoded": base64::engine::general_purpose::STANDARD.encode(anchor.encoded),
-                "side": anchor.side,
-                "fallback": byte_to_utf16(model.text(), anchor.fallback),
-            }),
-            None => json!({"error": "Could not create a stable position"}),
-        };
-        JString::from_str(env, value.to_string())
-    })
-    .resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let model = unsafe { model_mut(handle) };
+            let byte = utf16_to_byte(model.text(), offset_utf16.max(0) as usize);
+            let value = match model.math_doc().create_anchor(byte, side) {
+                Some(anchor) => json!({
+                    "encoded": base64::engine::general_purpose::STANDARD.encode(anchor.encoded),
+                    "side": anchor.side,
+                    "fallback": byte_to_utf16(model.text(), anchor.fallback),
+                }),
+                None => json!({"error": "Could not create a stable position"}),
+            };
+            JString::from_str(env, value.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 /// Resolve a stable Loro cursor to a grapheme-snapped UTF-16 offset, or -1 for
@@ -1150,21 +1630,23 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_resolveAnchor<'local>(
     fallback_utf16: jint,
 ) -> jint {
     use base64::Engine as _;
-    unowned_env.with_env(|_env| -> errors::Result<jint> {
-        let model = unsafe { model_mut(handle) };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.to_string()) else {
-            return Ok(-1);
-        };
-        let fallback = utf16_to_byte(model.text(), fallback_utf16.max(0) as usize);
-        let resolved = model.math_doc().resolve_anchor(&bytes, fallback);
-        let boundary = if side > 0 {
-            grapheme_end(model.text(), resolved)
-        } else {
-            grapheme_start(model.text(), resolved)
-        };
-        Ok(byte_to_utf16(model.text(), boundary) as jint)
-    })
-    .resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|_env| -> errors::Result<jint> {
+            let model = unsafe { model_mut(handle) };
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.to_string())
+            else {
+                return Ok(-1);
+            };
+            let fallback = utf16_to_byte(model.text(), fallback_utf16.max(0) as usize);
+            let resolved = model.math_doc().resolve_anchor(&bytes, fallback);
+            let boundary = if side > 0 {
+                grapheme_end(model.text(), resolved)
+            } else {
+                grapheme_start(model.text(), resolved)
+            };
+            Ok(byte_to_utf16(model.text(), boundary) as jint)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 /// Capture the live document's snapshot as bytes for recovery/render work.
@@ -1179,7 +1661,15 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_snapshotBytes<'local>(
             // SAFETY: the handle is owned by the UI thread until onDestroy.
             let bytes = unsafe { model_mut(handle).math_doc().snapshot() };
             let array = JByteArray::new(env, bytes.len())?;
-            array.set_region(env, 0, bytes.iter().map(|b| *b as jbyte).collect::<Vec<_>>().as_slice())?;
+            array.set_region(
+                env,
+                0,
+                bytes
+                    .iter()
+                    .map(|b| *b as jbyte)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )?;
             Ok(array)
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
@@ -1274,6 +1764,74 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_sync<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_terminalFigures<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let json = terminal_figure_options(&text.to_string());
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_rebindTerminalFigure<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    expected: JString<'local>,
+    key: JString<'local>,
+    reference: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let expected = expected.to_string();
+            let key = key.to_string();
+            let reference = reference.to_string();
+            // SAFETY: handle invariants documented on model_mut.
+            let json = unsafe {
+                let m = model_mut(handle);
+                match rebind_terminal_figure(m, &expected, &key, &reference) {
+                    Ok(()) => state_json(m),
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_appendTerminalFigure<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    expected: JString<'local>,
+    reference: JString<'local>,
+    caption: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let expected = expected.to_string();
+            let reference = reference.to_string();
+            let caption = caption.to_string();
+            // SAFETY: handle invariants documented on model_mut.
+            let json = unsafe {
+                let m = model_mut(handle);
+                match append_terminal_figure(m, &expected, &reference, &caption) {
+                    Ok(()) => state_json(m),
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_undo<'local>(
     mut unowned_env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -1357,23 +1915,42 @@ const MAX_CHUNK_PAGES: usize = 8;
 /// resolution an A4 page can occupy tens of megabytes, so rasterizing the
 /// whole document for every chunk would exhaust memory on long documents.
 fn layout_page_chunk(
-    text: &str, opts: &mathed_core::transform::TransformOptions,
-    scale: f32, start: usize, max_pages: usize,
+    text: &str,
+    opts: &mathed_core::transform::TransformOptions,
+    scale: f32,
+    start: usize,
+    max_pages: usize,
 ) -> Result<(usize, Vec<mathed_mini::PageLayout>), mathed_mini::RenderError> {
     let render = mathed_mini::doc_to_render_with(text, opts);
     let world = mathed_mini::MiniWorld::new(format!("{DOCUMENT_THEME}{}", render.text));
     let document = typst::compile::<typst_layout::PagedDocument>(&world)
-        .output.map_err(|_| mathed_mini::RenderError::Eval)?;
+        .output
+        .map_err(|_| mathed_mini::RenderError::Eval)?;
     let total = document.pages().len();
-    let pages = document.pages().iter().skip(start).take(max_pages.clamp(1, MAX_CHUNK_PAGES))
+    let pages = document
+        .pages()
+        .iter()
+        .skip(start)
+        .take(max_pages.clamp(1, MAX_CHUNK_PAGES))
         .map(|page| {
             let glyphs = mathed_core::glyphs::build_glyph_index(
-                &page.frame, world.main_source(), &render.map, DOCUMENT_THEME.len());
+                &page.frame,
+                world.main_source(),
+                &render.map,
+                DOCUMENT_THEME.len(),
+            );
             let figures = mathed_core::figures::figures_in_frame(&page.frame);
             let image = mathed_mini::rasterize_at(&page.frame, scale)?;
             let (width, height) = (image.width, image.height);
-            Ok(mathed_mini::PageLayout { image, glyphs, figures, width, height })
-        }).collect::<Result<Vec<_>, _>>()?;
+            Ok(mathed_mini::PageLayout {
+                image,
+                glyphs,
+                figures,
+                width,
+                height,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((total, pages))
 }
 
@@ -1394,7 +1971,9 @@ fn png_page(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>, String> {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer.write_image_data(&straight).map_err(|e| e.to_string())?;
+        writer
+            .write_image_data(&straight)
+            .map_err(|e| e.to_string())?;
     }
     Ok(encoded)
 }
@@ -1417,12 +1996,32 @@ fn render_pages_with_model(
     caret_utf16: usize,
     model: Option<&DocModel>,
 ) -> Result<String, String> {
-    render_pages_with_options(doc_text, start, max_pages, scale, caret_utf16, model, false, false)
+    render_pages_with_options(
+        doc_text,
+        start,
+        max_pages,
+        scale,
+        caret_utf16,
+        model,
+        false,
+        false,
+    )
 }
 
-fn marker_reveal_ranges(scan: &mathed_core::markers::MarkerScan, caret: usize, show: bool) -> Vec<std::ops::Range<usize>> {
-    let on_marker = scan.markers.iter().any(|m| m.range.start <= caret && caret <= m.range.end);
-    let mut reveal = if !show && on_marker { Vec::new() } else { vec![caret..caret] };
+fn marker_reveal_ranges(
+    scan: &mathed_core::markers::MarkerScan,
+    caret: usize,
+    show: bool,
+) -> Vec<std::ops::Range<usize>> {
+    let on_marker = scan
+        .markers
+        .iter()
+        .any(|m| m.range.start <= caret && caret <= m.range.end);
+    let mut reveal = if !show && on_marker {
+        Vec::new()
+    } else {
+        vec![caret..caret]
+    };
     if show {
         reveal.extend(scan.markers.iter().map(|marker| marker.range.clone()));
     }
@@ -1439,13 +2038,28 @@ fn render_pages_with_options(
     show_markers: bool,
     rendered_only: bool,
 ) -> Result<String, String> {
-    render_pages_with_options_expanded(doc_text, start, max_pages, scale, caret_utf16,
-        model, show_markers, rendered_only, &[])
+    render_pages_with_options_expanded(
+        doc_text,
+        start,
+        max_pages,
+        scale,
+        caret_utf16,
+        model,
+        show_markers,
+        rendered_only,
+        &[],
+    )
 }
 
 fn render_pages_with_options_expanded(
-    doc_text: &str, start: usize, max_pages: usize, scale: f32, caret_utf16: usize,
-    model: Option<&DocModel>, show_markers: bool, rendered_only: bool,
+    doc_text: &str,
+    start: usize,
+    max_pages: usize,
+    scale: f32,
+    caret_utf16: usize,
+    model: Option<&DocModel>,
+    show_markers: bool,
+    rendered_only: bool,
     expanded_pairs: &[(String, String)],
 ) -> Result<String, String> {
     use base64::Engine as _;
@@ -1467,17 +2081,29 @@ fn render_pages_with_options_expanded(
     let scan = mathed_core::markers::scan(doc_text);
     let segments = mathed_core::markers::resolve_segments(&scan);
     let expand = if rendered_only {
-        segments.iter().filter(|s| expanded_pairs.iter().any(|(a, b)| &s.start_id == a && &s.end_id == b))
-            .filter_map(|s| s.span.clone()).collect()
+        segments
+            .iter()
+            .filter(|s| {
+                expanded_pairs
+                    .iter()
+                    .any(|(a, b)| &s.start_id == a && &s.end_id == b)
+            })
+            .filter_map(|s| s.span.clone())
+            .collect()
     } else {
-        mathed_mini::render::reveal_span_in(&scan, &segments, caret).into_iter().collect()
+        mathed_mini::render::reveal_span_in(&scan, &segments, caret)
+            .into_iter()
+            .collect()
     };
     // A caret on a marker normally reveals that token in mathed. This
     // frontend's explicit marker toggle promises hidden markers even at
     // the caret, while still revealing other token kinds as before.
     let reveal = if rendered_only {
-        if show_markers { scan.markers.iter().map(|m| m.range.clone()).collect() }
-        else { Vec::new() }
+        if show_markers {
+            scan.markers.iter().map(|m| m.range.clone()).collect()
+        } else {
+            Vec::new()
+        }
     } else {
         marker_reveal_ranges(&scan, caret, show_markers)
     };
@@ -1513,7 +2139,9 @@ fn render_pages_with_options_expanded(
                 return Err(format!("Could not typeset the document ({original:?})"));
             };
             let pairs: std::collections::BTreeSet<(String, String)> = modifiers::links(model)
-                .into_iter().map(|link| (link.start_id, link.end_id)).collect();
+                .into_iter()
+                .map(|link| (link.start_id, link.end_id))
+                .collect();
             if pairs.is_empty() {
                 return Err(format!("Could not typeset the document ({original:?})"));
             }
@@ -1525,7 +2153,8 @@ fn render_pages_with_options_expanded(
                 .map_err(|_| format!("Could not typeset the document ({original:?})"))?;
             for pair in pairs {
                 excluded.remove(&pair);
-                opts.block_splices = modifiers::typst_splices_excluding(model, 0..model.len(), &excluded);
+                opts.block_splices =
+                    modifiers::typst_splices_excluding(model, 0..model.len(), &excluded);
                 match layout_page_chunk(doc_text, &opts, scale, start, max_pages) {
                     Ok(next) => pages = next,
                     Err(_) => {
@@ -1548,8 +2177,11 @@ fn render_pages_with_options_expanded(
     let chunk: Vec<Value> = pages
         .iter()
         .map(|p| -> Result<Value, String> {
-            let bytes = if rendered_only { png_page(p.image.width, p.image.height, &p.image.data)? }
-                else { p.image.data.clone() };
+            let bytes = if rendered_only {
+                png_page(p.image.width, p.image.height, &p.image.data)?
+            } else {
+                p.image.data.clone()
+            };
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             // With a known caption span, a page before the caption must
             // report `null` rather than its own prose, or the pad would
@@ -1569,16 +2201,47 @@ fn render_pages_with_options_expanded(
                     .and_then(|e| p.glyphs.bands.get(e.band as usize)),
             }
             .map(|band| band.top);
-            let hits: Vec<Value> = p.glyphs.entries.iter().filter_map(|e| {
-                let band = p.glyphs.bands.get(e.band as usize)?;
-                Some(json!([e.x, band.top, e.x + e.advance, band.bottom,
-                    byte_to_utf16(doc_text, e.doc_byte)]))
-            }).collect();
+            let hits: Vec<Value> = p
+                .glyphs
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    let band = p.glyphs.bands.get(e.band as usize)?;
+                    Some(json!([
+                        e.x,
+                        band.top,
+                        e.x + e.advance,
+                        band.bottom,
+                        byte_to_utf16(doc_text, e.doc_byte)
+                    ]))
+                })
+                .collect();
+            let bindings = crate::layout::figure_bindings(doc_text);
+            let figures: Vec<Value> = p
+                .figures
+                .iter()
+                .map(|figure| {
+                    let (reference, binding_error) = bindings
+                        .get(&figure.key)
+                        .cloned()
+                        .unwrap_or((None, None));
+                    json!({
+                        "key": figure.key,
+                        "x": figure.rect.x0,
+                        "y": figure.rect.y0,
+                        "w": figure.rect.x1 - figure.rect.x0,
+                        "h": figure.rect.y1 - figure.rect.y0,
+                        "reference": reference,
+                        "bindingError": binding_error,
+                    })
+                })
+                .collect();
             let mut result = json!({
                 "width": p.image.width,
                 "height": p.image.height,
                 "textTop": text_top,
-                "hasFigures": !p.figures.is_empty(),
+                "hasFigures": !figures.is_empty(),
+                "figures": figures,
                 "hits": hits,
             });
             result[if rendered_only { "png" } else { "rgba" }] = json!(b64);
@@ -1602,16 +2265,24 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_prepareLayout<'local>(
     expanded: JString<'local>,
     text_size: jfloat,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let bytes = env.convert_byte_array(&snapshot)?;
-        let text = doc_text.to_string();
-        let expanded: Vec<(String, String)> =
-            serde_json::from_str(&expanded.to_string()).unwrap_or_default();
-        let result = layout::prepare(&bytes, &text, &layout_id.to_string(), show_markers != 0, &expanded, text_size as f32)
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let bytes = env.convert_byte_array(&snapshot)?;
+            let text = doc_text.to_string();
+            let expanded: Vec<(String, String)> =
+                serde_json::from_str(&expanded.to_string()).unwrap_or_default();
+            let result = layout::prepare(
+                &bytes,
+                &text,
+                &layout_id.to_string(),
+                show_markers != 0,
+                &expanded,
+                text_size as f32,
+            )
             .unwrap_or_else(|error| error);
-        JString::from_str(env, result.to_string())
-    })
-    .resolve::<errors::ThrowRuntimeExAndDefault>()
+            JString::from_str(env, result.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 /// Rasterize one page from the retained layout at the requested density.
@@ -1627,20 +2298,21 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderLayoutPage<'local>(
     retain_from: jint,
     retain_to: jint,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let result = layout::render_page(
-            &layout_id.to_string(),
-            &doc_text.to_string(),
-            page.max(0) as usize,
-            scale as f32,
-            pixel_limit.max(1) as u64,
-            retain_from.max(0) as usize,
-            retain_to.max(0) as usize,
-        )
-        .unwrap_or_else(|error| json!({"error": error}));
-        JString::from_str(env, result.to_string())
-    })
-    .resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let result = layout::render_page(
+                &layout_id.to_string(),
+                &doc_text.to_string(),
+                page.max(0) as usize,
+                scale as f32,
+                pixel_limit.max(1) as u64,
+                retain_from.max(0) as usize,
+                retain_to.max(0) as usize,
+            )
+            .unwrap_or_else(|error| json!({"error": error}));
+            JString::from_str(env, result.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 /// Locate a UTF-16 source range in the retained layout without rasterizing.
@@ -1653,17 +2325,18 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_locateLayoutRange<'local>(
     start_utf16: jint,
     end_utf16: jint,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let result = layout::locate_range(
-            &layout_id.to_string(),
-            &doc_text.to_string(),
-            start_utf16.max(0) as usize,
-            end_utf16.max(0) as usize,
-        )
-        .unwrap_or_else(|error| json!({"error": error}));
-        JString::from_str(env, result.to_string())
-    })
-    .resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let result = layout::locate_range(
+                &layout_id.to_string(),
+                &doc_text.to_string(),
+                start_utf16.max(0) as usize,
+                end_utf16.max(0) as usize,
+            )
+            .unwrap_or_else(|error| json!({"error": error}));
+            JString::from_str(env, result.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -1679,17 +2352,32 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPagesWithSnapshot<'lo
     show_markers: jint,
     expanded: JString<'local>,
 ) -> JString<'local> {
-    unowned_env.with_env(|env| -> errors::Result<JString<'local>> {
-        let text = doc_text.to_string();
-        let model = model_from_snapshot(&snapshot.to_string(), &text);
-        let expanded: Vec<(String, String)> = serde_json::from_str(&expanded.to_string()).unwrap_or_default();
-        let result = match model {
-            Some(model) => render_pages_with_options_expanded(&text, start.max(0) as usize,
-                max_pages.max(0) as usize, scale as f32, caret_utf16.max(0) as usize, Some(&model), show_markers != 0, true, &expanded),
-            None => Err("Could not restore document for preview".to_string()),
-        };
-        JString::from_str(env, result.unwrap_or_else(|e| json!({"error": e}).to_string()))
-    }).resolve::<errors::ThrowRuntimeExAndDefault>()
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = doc_text.to_string();
+            let model = model_from_snapshot(&snapshot.to_string(), &text);
+            let expanded: Vec<(String, String)> =
+                serde_json::from_str(&expanded.to_string()).unwrap_or_default();
+            let result = match model {
+                Some(model) => render_pages_with_options_expanded(
+                    &text,
+                    start.max(0) as usize,
+                    max_pages.max(0) as usize,
+                    scale as f32,
+                    caret_utf16.max(0) as usize,
+                    Some(&model),
+                    show_markers != 0,
+                    true,
+                    &expanded,
+                ),
+                None => Err("Could not restore document for preview".to_string()),
+            };
+            JString::from_str(
+                env,
+                result.unwrap_or_else(|e| json!({"error": e}).to_string()),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -1723,6 +2411,460 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPages<'local>(
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
+// ----- native terminal scene -----------------------------------------
+
+/// # Safety
+/// `handle` must come from `NativeTerminal.create` and be confined to one
+/// Android thread until `close`.
+unsafe fn scene_mut<'a>(handle: jlong) -> &'a mut scene::Scene {
+    unsafe { &mut *(handle as *mut scene::Scene) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeCreate<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    cols: jint,
+    rows: jint,
+    cell_width: jint,
+    cell_height: jint,
+    baseline: jint,
+    echo: jboolean,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> errors::Result<jlong> {
+            let scene = scene::Scene::new(
+                cols.max(1) as u16,
+                rows.max(1) as u16,
+                cell_width.max(1) as u16,
+                cell_height.max(1) as u16,
+                baseline.max(0) as u16,
+                echo,
+            );
+            Ok(Box::into_raw(Box::new(scene)) as jlong)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeFeed<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    bytes: JByteArray<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let bytes = env.convert_byte_array(&bytes)?;
+            let scene = unsafe { scene_mut(handle) };
+            scene.feed(&bytes);
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeState<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            JString::from_str(env, unsafe { scene_mut(handle) }.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeRgba<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JByteArray<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JByteArray<'local>> {
+            let pixels = unsafe { scene_mut(handle) }.rgba();
+            let array = JByteArray::new(env, pixels.len())?;
+            array.set_region(
+                env,
+                0,
+                pixels.iter().map(|b| *b as jbyte).collect::<Vec<_>>().as_slice(),
+            )?;
+            Ok(array)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeResize<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    cols: jint,
+    rows: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let scene = unsafe { scene_mut(handle) };
+            scene.resize(cols.max(1) as u16, rows.max(1) as u16);
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeKey<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key: jint,
+    mods: jint,
+    text: JString<'local>,
+    unshifted: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = text.to_string();
+            let scene = unsafe { scene_mut(handle) };
+            scene.key(key, mods as u16, &text, unshifted as u32);
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeText<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    text: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let text = text.to_string();
+            let scene = unsafe { scene_mut(handle) };
+            scene.text(&text);
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeMouse<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+    button: jint,
+    press: jboolean,
+    mods: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let scene = unsafe { scene_mut(handle) };
+            scene.mouse(
+                x.max(0) as u16,
+                y.max(0) as u16,
+                button.clamp(0, 3) as u8,
+                press,
+                mods.clamp(0, 7) as u8,
+            );
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeMouseMotion<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+    button: jint,
+    mods: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let scene = unsafe { scene_mut(handle) };
+            let button = (button >= 0).then_some(button.clamp(0, 3) as u8);
+            scene.mouse_motion(
+                x.max(0) as u16,
+                y.max(0) as u16,
+                button,
+                mods.clamp(0, 7) as u8,
+            );
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeSelection<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    x0: jint,
+    y0: jint,
+    x1: jint,
+    y1: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let scene = unsafe { scene_mut(handle) };
+            let text = scene.selection(
+                x0.max(0) as u16,
+                y0.max(0) as u16,
+                x1.max(0) as u16,
+                y1.max(0) as u16,
+            );
+            JString::from_str(env, text)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeWordSelection<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let scene = unsafe { scene_mut(handle) };
+            let bounds = scene
+                .word_at(x.max(0) as u16, y.max(0) as u16)
+                .unwrap_or((0, 0, 0, 0));
+            JString::from_str(
+                env,
+                json!({
+                    "x0": bounds.0,
+                    "y0": bounds.1,
+                    "x1": bounds.2,
+                    "y1": bounds.3,
+                })
+                .to_string(),
+            )
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeRecreate<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let scene = unsafe { scene_mut(handle) };
+            scene.recreate();
+            JString::from_str(env, scene.state())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeClose(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        // SAFETY: the Java wrapper calls close exactly once.
+        drop(unsafe { Box::from_raw(handle as *mut scene::Scene) });
+    }
+}
+
+// ----- native document sharing (K6) ------------------------------------
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// Start a sharing worker from a snapshot. The worker owns its transport-side
+/// replica; the returned handle is the UI-thread command channel only.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareOpen<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: JByteArray<'local>,
+    peer: JString<'local>,
+    name: JString<'local>,
+) -> jlong {
+    unowned_env
+        .with_env(|env| -> errors::Result<jlong> {
+            let bytes = env.convert_byte_array(&snapshot)?;
+            let peer = peer.to_string();
+            let name = name.to_string();
+            let handle = match sharing::ShareHandle::start(&bytes, peer, name) {
+                Ok(handle) => handle,
+                Err(_) => return Ok(0),
+            };
+            Ok(Box::into_raw(Box::new(handle)) as jlong)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// SAFETY: the Java wrapper owns this handle and closes it exactly once.
+unsafe fn share_handle_mut<'a>(handle: jlong) -> &'a mut sharing::ShareHandle {
+    unsafe { &mut *(handle as *mut sharing::ShareHandle) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareClose(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        unsafe {
+            drop(Box::from_raw(handle as *mut sharing::ShareHandle));
+        }
+    }
+}
+
+fn share_json_result<'local>(
+    env: &mut jni::Env<'local>,
+    result: Result<(), String>,
+) -> errors::Result<JString<'local>> {
+    let json = match result {
+        Ok(()) => "{\"ok\":true}".to_string(),
+        Err(message) => serde_json::json!({"ok": false, "error": message}).to_string(),
+    };
+    JString::from_str(env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareJoin<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    peer: JString<'local>,
+    version: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let peer = peer.to_string();
+            let version = hex_decode(&version.to_string()).unwrap_or_default();
+            // SAFETY: UI-thread-owned handle.
+            let result = unsafe { share_handle_mut(handle) }.join(peer, version);
+            share_json_result(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_sharePublish<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    delta: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let delta = hex_decode(&delta.to_string()).unwrap_or_default();
+            // SAFETY: UI-thread-owned handle.
+            let result = unsafe { share_handle_mut(handle) }.publish(delta);
+            share_json_result(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareReceive<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    peer: JString<'local>,
+    seq: jlong,
+    delta: JString<'local>,
+    scope: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let peer = peer.to_string();
+            let delta = hex_decode(&delta.to_string()).unwrap_or_default();
+            let scope = (scope >= 0).then_some(scope as u64);
+            // SAFETY: UI-thread-owned handle.
+            let result = unsafe { share_handle_mut(handle) }.receive(peer, seq as u64, delta, scope);
+            share_json_result(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareLeave<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: UI-thread-owned handle.
+            let result = unsafe { share_handle_mut(handle) }.leave();
+            share_json_result(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_sharePoll<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: UI-thread-owned handle.
+            let json = unsafe { share_handle_mut(handle) }.poll_json();
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Apply an accepted remote delta to the live `DocModel` as one grouped edit
+/// on the UI thread. The transport worker never touches this handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareApply<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    delta: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let delta = hex_decode(&delta.to_string()).unwrap_or_default();
+            // SAFETY: UI-thread-owned handle.
+            let json = unsafe {
+                let m = model_mut(handle);
+                match m.math_doc_mut().import_delta(&delta) {
+                    Ok(()) => {
+                        m.rescan();
+                        state_json(m)
+                    }
+                    Err(error) => serde_json::json!({"error": error.to_string()}).to_string(),
+                }
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 // ----- tests ----------------------------------------------------------
 //
 // These run the *emthin* `DocModel` tests too (they live inside the
@@ -1731,6 +2873,55 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_renderPages<'local>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_proof_note_golden_diagnostics_match_the_desktop_contract() {
+        // The pad compiles the desktop `DocModel` and the K1 `change` module
+        // verbatim, so this fixture has the same source ranges and codes the
+        // desktop golden-set test asserts.
+        let text = "#1 claim #2 \\formal(#1,#2, \"a claim\")\n\
+                    #3 fig #4 \\app(#3,#8, 10, 20)\n\
+                    $missing$";
+        let model = DocModel::new(text);
+        let diagnostics = model.diagnostics();
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|d| d.code.as_str())
+            .collect();
+        for expected in [
+            "marker-pair",
+            "dangling-figure",
+            "missing-proof-result",
+            "unresolved-name",
+        ] {
+            assert!(codes.contains(&expected), "missing {expected}: {diagnostics:?}");
+        }
+        assert!(diagnostics.iter().all(|d| d.range.end <= text.len()));
+    }
+
+    #[test]
+    fn a_replayed_trace_settles_the_same_state_as_the_desktop_reducer() {
+        use inspect::{EventKind, SessionEvent};
+        let mut event = |kind, frontier: &str, reason: &str, count: u64| {
+            let mut e = SessionEvent::new(kind).with("run", "share", "pad");
+            e.frontier = frontier.to_string();
+            e.reason = reason.to_string();
+            e.count = count;
+            e
+        };
+        let trace = [
+            event(EventKind::Load, "", "", 0),
+            event(EventKind::Recovery, "", "late recovery", 0),
+            event(EventKind::Handshake, "v1", "", 0),
+            event(EventKind::AcceptedChanges, "v2", "", 2),
+        ];
+        let ndjson = trace.iter().map(SessionEvent::to_ndjson).collect::<Vec<_>>().join("\n");
+        let settled = inspect::replay(&ndjson).unwrap();
+        assert_eq!(settled.local, "recovered");
+        assert_eq!(settled.share, "current");
+        assert_eq!(settled.accepted, 2);
+        assert_eq!(settled.frontier, "v2");
+    }
 
     #[test]
     fn typed_markers_use_mathed_names_and_respect_escapes_and_utf16() {
@@ -1751,9 +2942,81 @@ mod tests {
         assert_eq!(typed_marker("hello", 0), None);
     }
 
+    #[test]
+    fn page_metadata_carries_the_terminal_reference_for_each_figure_key() {
+        let reference = "hc://6ab09a20fd1288983dfbbac2bb349231/t3";
+        let text = format!(
+            "#a Figure #b \\app(#a, #b, 100, 100, terminal: \"{reference}\")\n"
+        );
+        let bindings = layout::figure_bindings(&text);
+        assert_eq!(bindings.len(), 1);
+        let (terminal, error) = bindings.values().next().unwrap();
+        assert_eq!(terminal.as_deref(), Some(reference));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn terminal_figure_pin_is_one_step_and_rejects_stale_text() {
+        let mut model = DocModel::new("hello\n");
+        let reference = "hc://6ab09a20fd1288983dfbbac2bb349231/t3".to_string();
+        let before = model.text().to_string();
+        assert!(append_terminal_figure(&mut model, &before, &reference, "Build #log").is_ok());
+        let text = model.text().to_string();
+        assert!(text.contains("Build \\#log"), "{text}");
+        assert!(text.contains(&format!("terminal: \"{reference}\"")));
+        let scan = mathed_core::markers::scan(&text);
+        let figures: Vec<_> = mathed_core::markers::resolve_segments(&scan)
+            .iter()
+            .filter_map(mathed_core::figures::resolve_figure)
+            .collect();
+        assert_eq!(figures.len(), 1);
+        assert_eq!(
+            figures[0]
+                .spec
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.canonical()),
+            Some(reference.clone())
+        );
+        model.undo();
+        assert_eq!(model.text(), before);
+        assert!(append_terminal_figure(&mut model, "stale", &reference, "x").is_err());
+    }
+
+    #[test]
+    fn rebind_replaces_only_the_terminal_argument_and_undoes_as_one_step() {
+        let old = "hc://6ab09a20fd1288983dfbbac2bb349231/t3";
+        let new = "hc://6ab09a20fd1288983dfbbac2bb349231/t4";
+        let source = format!(
+            "#a Build log #b \\app(#a, #b, 640, 400, terminal: \"{old}\")\n"
+        );
+        let mut model = DocModel::new(&source);
+        let options = terminal_figure_options(model.text());
+        assert!(options.contains("Build log"), "{options}");
+        assert!(options.contains(old), "{options}");
+        let scan = mathed_core::markers::scan(model.text());
+        let key = mathed_core::markers::resolve_segments(&scan)
+            .iter()
+            .find_map(mathed_core::figures::resolve_figure)
+            .expect("figure")
+            .key;
+        let before = model.text().to_string();
+        rebind_terminal_figure(&mut model, &before, &key, new).unwrap();
+        assert!(!model.text().contains(old));
+        assert!(model.text().contains(new));
+        assert!(model.text().contains("Build log"));
+        assert!(model.text().contains("640, 400"));
+        model.undo();
+        assert_eq!(model.text(), before);
+        assert!(rebind_terminal_figure(&mut model, &before, "f99", new).is_err());
+        assert!(rebind_terminal_figure(&mut model, "stale", &key, new).is_err());
+    }
+
     fn long_fixture() -> String {
         (0..90)
-            .map(|i| format!("Paragraph {i}: retained layout keeps the source map and glyph bands.\n\n"))
+            .map(|i| {
+                format!("Paragraph {i}: retained layout keeps the source map and glyph bands.\n\n")
+            })
             .collect()
     }
 
@@ -1763,33 +3026,66 @@ mod tests {
         let model = DocModel::new(&text);
         let snapshot = model.math_doc().snapshot();
         let prepared = layout::prepare(&snapshot, &text, "retained-a", false, &[], 17.0).unwrap();
-        assert!(prepared["total"].as_u64().unwrap() > 1, "fixture must span pages");
+        assert!(
+            prepared["total"].as_u64().unwrap() > 1,
+            "fixture must span pages"
+        );
         let compiles = layout::compiles();
 
         let first = layout::render_page("retained-a", &text, 0, 1.0, 4_000_000, 0, 1).unwrap();
         let repeated = layout::render_page("retained-a", &text, 0, 1.0, 4_000_000, 0, 1).unwrap();
         let later = layout::render_page("retained-a", &text, 1, 1.0, 4_000_000, 0, 1).unwrap();
-        assert_eq!(first["png"], repeated["png"], "page rasters are deterministic");
+        assert_eq!(
+            first["png"], repeated["png"],
+            "page rasters are deterministic"
+        );
         assert!(!later["hits"].as_array().unwrap().is_empty());
-        assert_eq!(compiles, layout::compiles(), "later/repeated raster requests must not compile");
+        assert_eq!(
+            compiles,
+            layout::compiles(),
+            "later/repeated raster requests must not compile"
+        );
 
-        let independent: Value = serde_json::from_str(&render_pages_with_options_expanded(
-            &text, 0, 1, 1.0, 0, Some(&model), false, true, &[]).unwrap()).unwrap();
-        assert_eq!(first["png"], independent["pages"][0]["png"],
-            "cached and independent rasters agree");
+        let independent: Value = serde_json::from_str(
+            &render_pages_with_options_expanded(
+                &text,
+                0,
+                1,
+                1.0,
+                0,
+                Some(&model),
+                false,
+                true,
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            first["png"], independent["pages"][0]["png"],
+            "cached and independent rasters agree"
+        );
         let cached_hits = first["hits"].as_array().unwrap();
         let independent_hits = independent["pages"][0]["hits"].as_array().unwrap();
-        assert_eq!(cached_hits.len(), independent_hits.len(),
-            "cached and independent hit counts agree");
+        assert_eq!(
+            cached_hits.len(),
+            independent_hits.len(),
+            "cached and independent hit counts agree"
+        );
         for (i, (cached, standalone)) in cached_hits.iter().zip(independent_hits).enumerate() {
             let cached = cached.as_array().unwrap();
             let standalone = standalone.as_array().unwrap();
-            assert_eq!(cached[4], standalone[4], "cached/independent hit {i} source offset differs");
+            assert_eq!(
+                cached[4], standalone[4],
+                "cached/independent hit {i} source offset differs"
+            );
             for axis in 0..4 {
                 let a = cached[axis].as_f64().unwrap();
                 let b = standalone[axis].as_f64().unwrap();
-                assert!((a - b).abs() < 0.01,
-                    "cached/independent hit {i} geometry differs on axis {axis}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 0.01,
+                    "cached/independent hit {i} geometry differs on axis {axis}: {a} vs {b}"
+                );
             }
         }
     }
@@ -1798,37 +3094,98 @@ mod tests {
     fn presentation_and_mark_changes_replace_the_retained_layout() {
         let text = "#a bold #b visible text tail";
         let mut model = DocModel::new(text);
-        let hidden = layout::prepare(&model.math_doc().snapshot(), text, "retained-hidden", false, &[], 17.0).unwrap();
+        let hidden = layout::prepare(
+            &model.math_doc().snapshot(),
+            text,
+            "retained-hidden",
+            false,
+            &[],
+            17.0,
+        )
+        .unwrap();
         assert!(hidden["total"].as_u64().unwrap() >= 1);
-        let hidden_png = layout::render_page("retained-hidden", text, 0, 1.0, 4_000_000, 0, 0).unwrap()["png"].clone();
+        let hidden_png = layout::render_page("retained-hidden", text, 0, 1.0, 4_000_000, 0, 0)
+            .unwrap()["png"]
+            .clone();
 
         let before_markers = layout::compiles();
-        layout::prepare(&model.math_doc().snapshot(), text, "retained-markers", true, &[], 17.0).unwrap();
-        assert!(layout::compiles() > before_markers, "marker visibility is a layout input");
-        let shown_png = layout::render_page("retained-markers", text, 0, 1.0, 4_000_000, 0, 0).unwrap()["png"].clone();
+        layout::prepare(
+            &model.math_doc().snapshot(),
+            text,
+            "retained-markers",
+            true,
+            &[],
+            17.0,
+        )
+        .unwrap();
+        assert!(
+            layout::compiles() > before_markers,
+            "marker visibility is a layout input"
+        );
+        let shown_png = layout::render_page("retained-markers", text, 0, 1.0, 4_000_000, 0, 0)
+            .unwrap()["png"]
+            .clone();
         assert_ne!(hidden_png, shown_png);
 
         let visible = text.find("visible").unwrap();
-        assert!(modifiers::set_link(&mut model, "a", "b", visible..visible + "visible".len(), true));
+        assert!(modifiers::set_link(
+            &mut model,
+            "a",
+            "b",
+            visible..visible + "visible".len(),
+            true
+        ));
         let before_mark = layout::compiles();
-        layout::prepare(&model.math_doc().snapshot(), text, "retained-marks", false, &[], 17.0).unwrap();
-        assert!(layout::compiles() > before_mark, "a marks-only capture recompiles");
-        let marked_png = layout::render_page("retained-marks", text, 0, 1.0, 4_000_000, 0, 0).unwrap()["png"].clone();
-        assert_ne!(hidden_png, marked_png, "a modifier-only change changes its output");
+        layout::prepare(
+            &model.math_doc().snapshot(),
+            text,
+            "retained-marks",
+            false,
+            &[],
+            17.0,
+        )
+        .unwrap();
+        assert!(
+            layout::compiles() > before_mark,
+            "a marks-only capture recompiles"
+        );
+        let marked_png = layout::render_page("retained-marks", text, 0, 1.0, 4_000_000, 0, 0)
+            .unwrap()["png"]
+            .clone();
+        assert_ne!(
+            hidden_png, marked_png,
+            "a modifier-only change changes its output"
+        );
     }
 
     #[test]
     fn retained_layout_locates_a_late_range_without_rasterizing() {
         let text = long_fixture();
         let model = DocModel::new(&text);
-        layout::prepare(&model.math_doc().snapshot(), &text, "retained-locate", false, &[], 17.0).unwrap();
+        layout::prepare(
+            &model.math_doc().snapshot(),
+            &text,
+            "retained-locate",
+            false,
+            &[],
+            17.0,
+        )
+        .unwrap();
         let target = text.rfind("Paragraph 89").unwrap();
         let start = byte_to_utf16(&text, target);
         let located = layout::locate_range("retained-locate", &text, start, start + 2).unwrap();
-        assert_eq!(located["found"], true, "late source range must be locatable: {located}");
-        assert!(located["page"].as_u64().unwrap() > 0, "target belongs on a later page");
+        assert_eq!(
+            located["found"], true,
+            "late source range must be locatable: {located}"
+        );
+        assert!(
+            located["page"].as_u64().unwrap() > 0,
+            "target belongs on a later page"
+        );
         let page = located["page"].as_u64().unwrap() as usize;
-        let raster = layout::render_page("retained-locate", &text, page, 1.0, 4_000_000, page, page).unwrap();
+        let raster =
+            layout::render_page("retained-locate", &text, page, 1.0, 4_000_000, page, page)
+                .unwrap();
         assert!(!raster["hits"].as_array().unwrap().is_empty());
     }
 
@@ -1839,9 +3196,13 @@ mod tests {
         let target_utf16 = byte_to_utf16(model.text(), target);
         let anchor = model.math_doc().create_anchor(target, -1).unwrap();
         model.insert(0, "new 👋 prefix\n");
-        let resolved = model.math_doc().resolve_anchor(&anchor.encoded, anchor.fallback);
-        assert_eq!(byte_to_utf16(model.text(), resolved),
-                target_utf16 + "new 👋 prefix\n".encode_utf16().count());
+        let resolved = model
+            .math_doc()
+            .resolve_anchor(&anchor.encoded, anchor.fallback);
+        assert_eq!(
+            byte_to_utf16(model.text(), resolved),
+            target_utf16 + "new 👋 prefix\n".encode_utf16().count()
+        );
         assert!(model.text().is_char_boundary(resolved));
     }
 
@@ -1851,13 +3212,21 @@ mod tests {
         let json = render_pages(doc, 0, 1, 1.0, 0).unwrap();
         let value: Value = serde_json::from_str(&json).unwrap();
         let hits = value["pages"][0]["hits"].as_array().unwrap();
-        assert!(hits.iter().any(|h| h[4] == 3), "h begins at UTF-16 offset 3");
-        assert!(hits.iter().all(|h| h[1].as_f64().unwrap() < h[3].as_f64().unwrap()));
+        assert!(
+            hits.iter().any(|h| h[4] == 3),
+            "h begins at UTF-16 offset 3"
+        );
+        assert!(hits
+            .iter()
+            .all(|h| h[1].as_f64().unwrap() < h[3].as_f64().unwrap()));
     }
 
     #[test]
     fn search_uses_mathed_case_rules_and_android_utf16_offsets() {
-        assert_eq!(search_ranges("👋 Alpha α ALPHA", "alpha"), json!([[3, 8], [11, 16]]));
+        assert_eq!(
+            search_ranges("👋 Alpha α ALPHA", "alpha"),
+            json!([[3, 8], [11, 16]])
+        );
         assert_eq!(search_ranges("👋 Alpha α ALPHA", "Alpha"), json!([[3, 8]]));
         assert_eq!(search_ranges("👋 Alpha α ALPHA", "α"), json!([[9, 10]]));
     }
@@ -1866,28 +3235,60 @@ mod tests {
     fn scoped_search_protects_structure_and_honours_selection_pages() {
         let text = "#a bold #b visible alpha";
         let protected = search_scoped(text, "#a", "text", 0, 0, 0, -1, 200, false);
-        assert_eq!(protected["total"], 0, "Text scope omits marker tokens: {protected}");
+        assert_eq!(
+            protected["total"], 0,
+            "Text scope omits marker tokens: {protected}"
+        );
         let source = search_scoped(text, "#a", "source", 0, 0, 0, -1, 200, false);
         assert_eq!(source["total"], 1);
         assert_eq!(source["matches"][0]["protected"], true);
         let statement = "#a body #b \\cite(#a, #b)";
         let statement_text = search_scoped(statement, "cite", "text", 0, 0, 0, -1, 200, false);
-        assert_eq!(statement_text["total"], 0, "Text scope omits property statements");
+        assert_eq!(
+            statement_text["total"], 0,
+            "Text scope omits property statements"
+        );
         let statement_source = search_scoped(statement, "cite", "source", 0, 0, 0, -1, 200, false);
         assert_eq!(statement_source["total"], 1);
         assert_eq!(statement_source["matches"][0]["protected"], true);
 
         let visible = text.find("visible").unwrap();
         let start = byte_to_utf16(text, visible);
-        let frozen = search_scoped(text, "visible", "selection", start, start + 7, 0, -1, 200, false);
+        let frozen = search_scoped(
+            text,
+            "visible",
+            "selection",
+            start,
+            start + 7,
+            0,
+            -1,
+            200,
+            false,
+        );
         assert_eq!(frozen["total"], 1);
-        let outside = search_scoped(text, "alpha", "selection", start, start + 7, 0, -1, 200, false);
-        assert_eq!(outside["total"], 0, "Selection scope never crosses its frozen endpoints");
+        let outside = search_scoped(
+            text,
+            "alpha",
+            "selection",
+            start,
+            start + 7,
+            0,
+            -1,
+            200,
+            false,
+        );
+        assert_eq!(
+            outside["total"], 0,
+            "Selection scope never crosses its frozen endpoints"
+        );
 
-        let starter = "#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n"
-            .to_string() + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
+        let starter = "#1 terminal #2 \\app(#1, #2, 600, 300, \"term\")\n".to_string()
+            + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
         let prose = search_scoped(&starter, "editor", "text", 0, 0, 0, -1, 200, false);
-        assert_eq!(prose["total"], 1, "marker bodies remain searchable text: {prose}");
+        assert_eq!(
+            prose["total"], 1,
+            "marker bodies remain searchable text: {prose}"
+        );
 
         let many = "x ".repeat(250);
         let first = search_scoped(&many, "x", "text", 0, 0, 0, -1, 200, false);
@@ -1910,12 +3311,18 @@ mod tests {
         replace_many_json(&mut model, text, &ops).unwrap();
         assert_eq!(model.text(), "#a bold #b 1 two 1");
         model.undo();
-        assert_eq!(model.text(), text, "one Undo restores the whole replacement batch");
+        assert_eq!(
+            model.text(),
+            text,
+            "one Undo restores the whole replacement batch"
+        );
 
         assert!(replace_many_json(&mut model, "stale", &ops).is_err());
         let bad = json!([{"start": 0, "end": 3, "text": "x"}]);
-        assert!(replace_many_json(&mut model, text, &bad).is_err(),
-            "markers/property statements cannot be replaced");
+        assert!(
+            replace_many_json(&mut model, text, &bad).is_err(),
+            "markers/property statements cannot be replaced"
+        );
     }
 
     #[test]
@@ -1942,8 +3349,14 @@ mod tests {
         assert_eq!(detail["kind"], "bibliography");
         assert_eq!(detail["resolved"], true);
         assert!(detail["text"].as_str().unwrap().contains("Kwan"));
-        assert!(detail["text"].as_str().unwrap().contains("2014"), "citation year missing: {detail}");
-        assert!(detail["entries"][0].as_str().unwrap().contains("Crazy Rich Asians"));
+        assert!(
+            detail["text"].as_str().unwrap().contains("2014"),
+            "citation year missing: {detail}"
+        );
+        assert!(detail["entries"][0]
+            .as_str()
+            .unwrap()
+            .contains("Crazy Rich Asians"));
         let bare = "#1 crazy-rich:\n    type: Book\n    title: Crazy Rich Asians\n    author: Kwan, Kevin\n    date: 2014\n#2 \\bibliography(#1,#2, refs)\n\\cite(\"crazy-rich\", bib: \"refs\") \\cite(#1,#2)";
         let index = citation_index(bare, true);
         assert_eq!(index[0]["numbers"], json!([1]));
@@ -1951,7 +3364,17 @@ mod tests {
         assert_eq!(index[0]["keys"], json!(["crazy-rich"]));
         assert!(index[0]["source"].as_str().unwrap().contains("\\cite("));
         assert_eq!(index[0]["resolved"], true);
-        assert_eq!(citation_detail(bare, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE)["resolved"], true);
+        assert_eq!(
+            citation_detail(
+                bare,
+                1,
+                300.0,
+                1.0,
+                None,
+                citations::DEFAULT_CITATION_LOCALE
+            )["resolved"],
+            true
+        );
         let vancouver = citation_detail(bare, 1, 300.0, 1.0, Some("vancouver"), "de-DE");
         assert_eq!(vancouver["resolved"], true);
         assert_eq!(vancouver["style"], "vancouver");
@@ -1961,25 +3384,60 @@ mod tests {
         assert_eq!(citations::CITATION_STYLES[0], "apa");
         assert!(citations::CITATION_LOCALES.contains(&citations::DEFAULT_CITATION_LOCALE));
         let misspelled = bare.replace("\"crazy-rich\", bib", "\"Kwn14\", bib");
-        let detail = citation_detail(&misspelled, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE);
+        let detail = citation_detail(
+            &misspelled,
+            1,
+            300.0,
+            1.0,
+            None,
+            citations::DEFAULT_CITATION_LOCALE,
+        );
         assert_eq!(detail["resolved"], false);
-        assert!(detail["errorDetail"].as_str().unwrap().contains("crazy-rich"));
+        assert!(detail["errorDetail"]
+            .as_str()
+            .unwrap()
+            .contains("crazy-rich"));
         let unresolved_index = citation_index(&misspelled, true);
         assert_eq!(unresolved_index[0]["resolved"], false);
-        assert!(unresolved_index[0]["statusError"].as_str().unwrap().contains("crazy-rich"));
+        assert!(unresolved_index[0]["statusError"]
+            .as_str()
+            .unwrap()
+            .contains("crazy-rich"));
         let bibtex = "#a @book{kwan:2014, title={Crazy Rich Asians}, author={Kwan, Kevin}, year={2014}} #b \\bibliography(#a,#b, refs, format: \"bibtex\") \\cite(\"kwan:2014\", bib: \"refs\")";
-        let bibtex_detail = citation_detail(bibtex, 1, 300.0, 1.0, None, citations::DEFAULT_CITATION_LOCALE);
+        let bibtex_detail = citation_detail(
+            bibtex,
+            1,
+            300.0,
+            1.0,
+            None,
+            citations::DEFAULT_CITATION_LOCALE,
+        );
         assert_eq!(bibtex_detail["resolved"], true, "{bibtex_detail}");
         assert!(bibtex_detail["text"].as_str().unwrap().contains("2014"));
         let reference = "#a Hello $x^2$ #b \\cite(#a,#b)";
         let index = citation_index(reference, true);
         assert_eq!(index[0]["numbers"], json!([1]));
-        let page: Value = serde_json::from_str(&render_pages_with_options(
-            reference, 0, 1, 1.0, 0, None, false, true).unwrap()).unwrap();
+        let page: Value = serde_json::from_str(
+            &render_pages_with_options(reference, 0, 1, 1.0, 0, None, false, true).unwrap(),
+        )
+        .unwrap();
         let cite_start = index[0]["start"].as_u64().unwrap();
-        assert!(page["pages"][0]["hits"].as_array().unwrap().iter()
-            .any(|hit| hit[4].as_u64() == Some(cite_start)), "citation label must be tappable");
-        let detail = citation_detail(reference, 1, 300.0, 2.0, None, citations::DEFAULT_CITATION_LOCALE);
+        assert!(
+            page["pages"][0]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit[4].as_u64() == Some(cite_start)),
+            "citation label must be tappable"
+        );
+        let detail = citation_detail(
+            reference,
+            1,
+            300.0,
+            2.0,
+            None,
+            citations::DEFAULT_CITATION_LOCALE,
+        );
         assert_eq!(detail["kind"], "document");
         assert!(detail["png"].is_string());
     }
@@ -1987,10 +3445,26 @@ mod tests {
     #[test]
     fn explicit_fold_expands_only_the_selected_translator() {
         let text = "before #3 #let translate(b) = { \"[]\" } #4 \\translator(#3,#4, name: \"ho\")";
-        let collapsed: Value = serde_json::from_str(&render_pages_with_options_expanded(
-            text, 0, 1, 1.0, 0, None, false, true, &[]).unwrap()).unwrap();
-        let expanded: Value = serde_json::from_str(&render_pages_with_options_expanded(
-            text, 0, 1, 1.0, 0, None, false, true, &[("3".into(), "4".into())]).unwrap()).unwrap();
+        let collapsed: Value = serde_json::from_str(
+            &render_pages_with_options_expanded(text, 0, 1, 1.0, 0, None, false, true, &[])
+                .unwrap(),
+        )
+        .unwrap();
+        let expanded: Value = serde_json::from_str(
+            &render_pages_with_options_expanded(
+                text,
+                0,
+                1,
+                1.0,
+                0,
+                None,
+                false,
+                true,
+                &[("3".into(), "4".into())],
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_ne!(collapsed["pages"][0]["png"], expanded["pages"][0]["png"]);
         let hits = collapsed["pages"][0]["hits"].as_array().unwrap();
         let marker = byte_to_utf16(text, text.find("#3").unwrap());
@@ -2001,20 +3475,38 @@ mod tests {
     #[test]
     fn marker_visibility_changes_the_preview_without_changing_the_document() {
         let doc = "#a alpha #b tail";
-        let hidden: Value = serde_json::from_str(&render_pages_with_options(
-            doc, 0, 1, 1.0, doc.len(), None, false, true).unwrap()).unwrap();
-        let shown: Value = serde_json::from_str(&render_pages_with_options(
-            doc, 0, 1, 1.0, doc.len(), None, true, true).unwrap()).unwrap();
+        let hidden: Value = serde_json::from_str(
+            &render_pages_with_options(doc, 0, 1, 1.0, doc.len(), None, false, true).unwrap(),
+        )
+        .unwrap();
+        let shown: Value = serde_json::from_str(
+            &render_pages_with_options(doc, 0, 1, 1.0, doc.len(), None, true, true).unwrap(),
+        )
+        .unwrap();
         assert_ne!(hidden["pages"][0]["png"], shown["pages"][0]["png"]);
     }
 
     #[test]
     fn rendered_editor_does_not_expand_source_when_caret_enters_a_figure() {
         let doc = "#a caption #b \\app(#a,#b,100,60)";
-        let open: Value = serde_json::from_str(&render_pages_with_options(
-            doc, 0, 1, 1.0, doc.find("caption").unwrap(), None, false, true).unwrap()).unwrap();
-        let elsewhere: Value = serde_json::from_str(&render_pages_with_options(
-            doc, 0, 1, 1.0, doc.len(), None, false, true).unwrap()).unwrap();
+        let open: Value = serde_json::from_str(
+            &render_pages_with_options(
+                doc,
+                0,
+                1,
+                1.0,
+                doc.find("caption").unwrap(),
+                None,
+                false,
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let elsewhere: Value = serde_json::from_str(
+            &render_pages_with_options(doc, 0, 1, 1.0, doc.len(), None, false, true).unwrap(),
+        )
+        .unwrap();
         assert!(open["pages"][0]["png"].is_string());
         assert_eq!(open["pages"][0]["png"], elsewhere["pages"][0]["png"]);
     }
@@ -2022,13 +3514,22 @@ mod tests {
     #[test]
     fn rendered_editor_transports_a_decodable_full_resolution_page() {
         use base64::Engine as _;
-        let result: Value = serde_json::from_str(&render_pages_with_options(
-            "Visible text", 0, 1, 2.0, 0, None, false, true).unwrap()).unwrap();
+        let result: Value = serde_json::from_str(
+            &render_pages_with_options("Visible text", 0, 1, 2.0, 0, None, false, true).unwrap(),
+        )
+        .unwrap();
         let page = &result["pages"][0];
-        let bytes = base64::engine::general_purpose::STANDARD.decode(page["png"].as_str().unwrap()).unwrap();
-        let reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(page["png"].as_str().unwrap())
+            .unwrap();
+        let reader = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .unwrap();
         assert_eq!(reader.info().width, page["width"].as_u64().unwrap() as u32);
-        assert_eq!(reader.info().height, page["height"].as_u64().unwrap() as u32);
+        assert_eq!(
+            reader.info().height,
+            page["height"].as_u64().unwrap() as u32
+        );
     }
 
     #[test]
@@ -2051,12 +3552,16 @@ mod tests {
     fn saved_snapshot_preserves_loro_marks_and_rejects_mismatched_text() {
         use base64::Engine as _;
         let mut model = DocModel::new("a👋b");
-        model.math_doc_mut().mark_segment(1..5, "prop:bold", "example");
+        model
+            .math_doc_mut()
+            .mark_segment(1..5, "prop:bold", "example");
         model.math_doc_mut().commit();
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(model.math_doc().snapshot());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(model.math_doc().snapshot());
         let restored = model_from_snapshot(&encoded, "a👋b").unwrap();
-        assert_eq!(restored.math_doc().segment_marks(), vec![(1..5, "prop:bold".into())]);
+        assert_eq!(
+            restored.math_doc().segment_marks(),
+            vec![(1..5, "prop:bold".into())]
+        );
         assert!(model_from_snapshot(&encoded, "different").is_none());
         assert!(model_from_snapshot("not-base64", "a👋b").is_none());
     }
@@ -2067,16 +3572,27 @@ mod tests {
         let before = logical_fingerprint(&model.math_doc().snapshot()).unwrap();
         assert_eq!(before.len(), 64, "lowercase SHA-256 hex");
         let revision = model.math_doc().revision();
-        model.math_doc_mut().mark_segment(1..5, "prop:bold", "example");
+        model
+            .math_doc_mut()
+            .mark_segment(1..5, "prop:bold", "example");
         model.math_doc_mut().commit();
         let after = logical_fingerprint(&model.math_doc().snapshot()).unwrap();
-        assert_eq!(model.math_doc().revision(), revision,
-            "a mark-only change must not bump the text revision");
-        assert_ne!(before, after, "all mark attributes contribute to the fingerprint");
+        assert_eq!(
+            model.math_doc().revision(),
+            revision,
+            "a mark-only change must not bump the text revision"
+        );
+        assert_ne!(
+            before, after,
+            "all mark attributes contribute to the fingerprint"
+        );
 
         let restored = DocModel::from_snapshot(&model.math_doc().snapshot()).unwrap();
-        assert_eq!(logical_fingerprint(&restored.math_doc().snapshot()).unwrap(), after,
-            "the fingerprint survives snapshot round-trip");
+        assert_eq!(
+            logical_fingerprint(&restored.math_doc().snapshot()).unwrap(),
+            after,
+            "the fingerprint survives snapshot round-trip"
+        );
         assert_eq!(canonical_content(b"not a loro snapshot"), None);
     }
 
@@ -2085,8 +3601,12 @@ mod tests {
         let mut model = DocModel::new("#a bold #b hello");
         let at = model.text().find("hello").unwrap();
         assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
-        let plain: Value = serde_json::from_str(&render_pages(model.text(), 0, 1, 1.0, 0).unwrap()).unwrap();
-        let styled: Value = serde_json::from_str(&render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap()).unwrap();
+        let plain: Value =
+            serde_json::from_str(&render_pages(model.text(), 0, 1, 1.0, 0).unwrap()).unwrap();
+        let styled: Value = serde_json::from_str(
+            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap(),
+        )
+        .unwrap();
         assert_ne!(plain["pages"][0]["rgba"], styled["pages"][0]["rgba"]);
     }
 
@@ -2119,8 +3639,15 @@ mod tests {
         assert_eq!(incoming["endId"], "b");
         assert!(incoming["snippet"].as_str().unwrap().contains("hello"));
         assert_eq!(incoming["resolved"], true);
-        let row = modifier_comparison_row(&model, incoming["start"].as_i64().unwrap() as i32,
-            incoming["end"].as_i64().unwrap() as i32, "a", "b", 250.0, 2.0);
+        let row = modifier_comparison_row(
+            &model,
+            incoming["start"].as_i64().unwrap() as i32,
+            incoming["end"].as_i64().unwrap() as i32,
+            "a",
+            "b",
+            250.0,
+            2.0,
+        );
         assert!(row["with"]["rgba"].is_string());
         assert!(row["without"]["rgba"].is_string());
         assert_ne!(row["with"]["rgba"], row["without"]["rgba"]);
@@ -2144,7 +3671,13 @@ mod tests {
         let mut model = DocModel::new("#a bold #b #c italic #d abcdefgh");
         let at = model.text().find("abcdefgh").unwrap();
         assert!(modifiers::set_link(&mut model, "a", "b", at..at + 5, true));
-        assert!(modifiers::set_link(&mut model, "c", "d", at + 3..at + 8, true));
+        assert!(modifiers::set_link(
+            &mut model,
+            "c",
+            "d",
+            at + 3..at + 8,
+            true
+        ));
         assert!(render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).is_ok());
     }
 
@@ -2153,17 +3686,35 @@ mod tests {
         let mut model = DocModel::new("\n#ad bold #am\n#i fgh #o\n \n    ");
         let bold = model.text().find("bold").unwrap();
         let target = model.text().find("fgh").unwrap();
-        assert!(modifiers::set_link(&mut model, "ad", "am", target..target + 3, true));
+        assert!(modifiers::set_link(
+            &mut model,
+            "ad",
+            "am",
+            target..target + 3,
+            true
+        ));
         let expected: Value = serde_json::from_str(
-            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap()
-        ).unwrap();
-        assert!(modifiers::set_link(&mut model, "i", "o", bold..bold + 4, true));
+            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap(),
+        )
+        .unwrap();
+        assert!(modifiers::set_link(
+            &mut model,
+            "i",
+            "o",
+            bold..bold + 4,
+            true
+        ));
         let actual: Value = serde_json::from_str(
-            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap()
-        ).unwrap();
+            &render_pages_with_model(model.text(), 0, 1, 1.0, 0, Some(&model)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(actual["pages"][0]["rgba"], expected["pages"][0]["rgba"]);
         assert!(actual["warnings"][0].as_str().unwrap().contains("fgh"));
-        assert_eq!(modifiers::links(&model).len(), 2, "rendering must not remove links");
+        assert_eq!(
+            modifiers::links(&model).len(),
+            2,
+            "rendering must not remove links"
+        );
     }
 
     #[test]
@@ -2178,7 +3729,10 @@ mod tests {
         assert_eq!(missing["severity"], "error");
         assert_eq!(missing["provenance"], "exact");
         assert_eq!(missing["markerPair"], json!(["1", "9"]));
-        assert!(missing["start"].as_u64().is_some(), "statement range is exact source");
+        assert!(
+            missing["start"].as_u64().is_some(),
+            "statement range is exact source"
+        );
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic["code"] == "execution-unavailable"
                 && diagnostic["message"]
@@ -2197,7 +3751,12 @@ mod tests {
         let mut model = DocModel::new(text);
         assert!(modifiers::set_marker_targets(&mut model, "3", "4", "1 2").is_ok());
         let prepared = layout::prepare(
-            &model.math_doc().snapshot(), text, "diag-owner", false, &[], 17.0,
+            &model.math_doc().snapshot(),
+            text,
+            "diag-owner",
+            false,
+            &[],
+            17.0,
         )
         .expect("the invalid modifier is isolated and the document still renders");
         let diagnostics = prepared["diagnostics"].as_array().unwrap();
@@ -2207,7 +3766,10 @@ mod tests {
             .expect("the failing modifier is a diagnostic, not a discarded Eval");
         assert_eq!(owner["provenance"], "owner");
         assert_eq!(owner["markerPair"], json!(["3", "4"]));
-        assert_eq!(owner["start"], json!(byte_to_utf16(text, text.find("nope").unwrap() - 1)));
+        assert_eq!(
+            owner["start"],
+            json!(byte_to_utf16(text, text.find("nope").unwrap() - 1))
+        );
         assert!(owner["end"].as_u64().unwrap() > owner["start"].as_u64().unwrap());
     }
 
@@ -2310,9 +3872,18 @@ mod tests {
         let family = "x👨‍👩‍👧y";
         let family_start = 1;
         let family_end = byte_to_utf16(family, family.find('y').unwrap());
-        assert_eq!(grapheme_boundary_utf16(family, family_start + 2, 1), family_end);
-        assert_eq!(grapheme_boundary_utf16(family, family_end, -1), family_start);
-        assert_eq!(grapheme_boundary_utf16(family, family_end, 2), family_end + 1);
+        assert_eq!(
+            grapheme_boundary_utf16(family, family_start + 2, 1),
+            family_end
+        );
+        assert_eq!(
+            grapheme_boundary_utf16(family, family_end, -1),
+            family_start
+        );
+        assert_eq!(
+            grapheme_boundary_utf16(family, family_end, 2),
+            family_end + 1
+        );
         let accented = "e\u{301}x";
         assert_eq!(grapheme_boundary_utf16(accented, 1, -1), 0);
         assert_eq!(grapheme_boundary_utf16(accented, 1, 1), 2);
@@ -2326,7 +3897,11 @@ mod tests {
         let family = "👨‍👩‍👧";
         let mut m = DocModel::new(family);
         let without_mother = "👨‍👧";
-        sync_text(&mut m, without_mother, without_mother.encode_utf16().count());
+        sync_text(
+            &mut m,
+            without_mother,
+            without_mother.encode_utf16().count(),
+        );
         assert_eq!(m.text(), without_mother);
         assert!(m.undo());
         assert_eq!(m.text(), family, "one undo restores the whole old cluster");
@@ -2384,7 +3959,11 @@ mod tests {
         let total = v["total"].as_u64().unwrap();
         assert!(total >= 1, "the starter document has pages: {v}");
         let pages = v["pages"].as_array().unwrap();
-        assert_eq!(pages.len() as u64, total.min(8), "one entry per page in range");
+        assert_eq!(
+            pages.len() as u64,
+            total.min(8),
+            "one entry per page in range"
+        );
         for p in pages {
             let (w, h) = (p["width"].as_u64().unwrap(), p["height"].as_u64().unwrap());
             assert!(w > 0 && h > 0, "empty raster {w}x{h}");
@@ -2410,10 +3989,14 @@ mod tests {
             + "#3 editor #4 \\app(#3, #4, 400, 300, \"vim\")\n";
         for (caret, scale) in [(0usize, 1.0f32), (9, 1.0), (30, 1.0), (9, 2.5), (0, 2.5)] {
             let v: Value = serde_json::from_str(
-                &render_pages(&starter, 0, 3, scale, caret).expect("the starter document must render"),
+                &render_pages(&starter, 0, 3, scale, caret)
+                    .expect("the starter document must render"),
             )
             .unwrap();
-            assert!(v.get("error").is_none(), "caret {caret}: unexpected render error: {v}");
+            assert!(
+                v.get("error").is_none(),
+                "caret {caret}: unexpected render error: {v}"
+            );
             let pages = v["pages"].as_array().unwrap();
             assert!(!pages.is_empty(), "caret {caret}: no page: {v}");
             let p = &pages[0];
@@ -2468,7 +4051,9 @@ mod tests {
         let mut doc = String::new();
         for i in 0..40u32 {
             let m = 1000 + i;
-            doc.push_str(&format!(r#"#{i} block{i} #{m} \app(#{i}, #{m}, 300, 100, "w{i}")"#));
+            doc.push_str(&format!(
+                r#"#{i} block{i} #{m} \app(#{i}, #{m}, 300, 100, "w{i}")"#
+            ));
             doc.push('\n');
         }
 
@@ -2482,7 +4067,11 @@ mod tests {
         assert_eq!(first["pages"].as_array().unwrap().len(), 2);
 
         let second = chunk(2, 2);
-        assert_eq!(second["total"].as_u64().unwrap(), total, "total is document-wide");
+        assert_eq!(
+            second["total"].as_u64().unwrap(),
+            total,
+            "total is document-wide"
+        );
         assert_eq!(second["start"], json!(2));
         assert_eq!(second["pages"].as_array().unwrap().len(), 2);
 
@@ -2490,7 +4079,10 @@ mod tests {
         // signal the Java side keys its scroll streaming on.
         let tail = chunk(total as usize + 1, 2);
         assert_eq!(tail["total"].as_u64().unwrap(), total);
-        assert!(tail["pages"].as_array().unwrap().is_empty(), "past the end: no pages");
+        assert!(
+            tail["pages"].as_array().unwrap().is_empty(),
+            "past the end: no pages"
+        );
     }
 
     /// Bad inputs fall back instead of failing: a non-positive or
@@ -2503,7 +4095,10 @@ mod tests {
     fn render_pages_falls_back_on_bad_scale_and_clamps_the_chunk() {
         let doc = "hello mathed";
         let one = render_pages(doc, 0, 1, 1.0, 0).expect("1.0 renders");
-        assert!(one.contains("\"total\":1"), "a short note is one page: {one}");
+        assert!(
+            one.contains("\"total\":1"),
+            "a short note is one page: {one}"
+        );
         assert_eq!(
             render_pages(doc, 0, 1, 0.0, 0).expect("scale 0 falls back"),
             one,
@@ -2610,8 +4205,8 @@ mod tests {
         // collapsed view this test pins).
         let cited = "#1 alpha claim #2 \\cite(#1,#2)\n\nprose tail";
         let literal = "#1 alpha claim #2 [1]\n\nprose tail";
-        let a = render_pages(cited, 0, 8, 1.0, cited.find("prose").unwrap())
-            .expect("cited renders");
+        let a =
+            render_pages(cited, 0, 8, 1.0, cited.find("prose").unwrap()).expect("cited renders");
         let b = render_pages(literal, 0, 8, 1.0, literal.find("prose").unwrap())
             .expect("literal renders");
         let a: Value = serde_json::from_str(&a).unwrap();
@@ -2739,29 +4334,42 @@ mod tests {
             "/android/src/com/emthin/pad/MainActivity.java"
         ))
         .expect("MainActivity.java must be readable");
-        assert!(java.contains("DocBridge.prepareLayout(")
+        assert!(
+            java.contains("DocBridge.prepareLayout(")
                 && java.contains("DocBridge.renderLayoutPage(")
                 && java.contains("renderAndDecodeChunk("),
-            "the app must prepare one layout and raster pages from it on the worker");
-        assert!(java.contains("BitmapFactory.decodeByteArray(png, 0, png.length);")
+            "the app must prepare one layout and raster pages from it on the worker"
+        );
+        assert!(
+            java.contains("BitmapFactory.decodeByteArray(png, 0, png.length);")
                 && java.contains("decodeMs += (System.nanoTime() - decodeStart)"),
-            "PNG decode and pixel sampling must be counted in worker work");
-        assert!(!java.contains("DocBridge.renderPagesWithSnapshot(text, snapshot"),
-            "the app must use captured snapshot bytes, not the superseded string path");
-        assert!(java.contains("renderPresentationKey()")
+            "PNG decode and pixel sampling must be counted in worker work"
+        );
+        assert!(
+            !java.contains("DocBridge.renderPagesWithSnapshot(text, snapshot"),
+            "the app must use captured snapshot bytes, not the superseded string path"
+        );
+        assert!(
+            java.contains("renderPresentationKey()")
                 && !java.contains("renderPresentationKey(caret)"),
-            "the layout key must exclude the caret");
+            "the layout key must exclude the caret"
+        );
         let caret_start = java.find("private final class CaretEditText").unwrap();
         let caret_end = java.find("private final class SourceEditText").unwrap();
-        assert!(!java[caret_start..caret_end].contains("scheduleRender()"),
-            "caret movement must repaint overlays without a layout request");
-        assert!(java.contains("pagesStale = true;")
+        assert!(
+            !java[caret_start..caret_end].contains("scheduleRender()"),
+            "caret movement must repaint overlays without a layout request"
+        );
+        assert!(
+            java.contains("pagesStale = true;")
                 && java.contains("if (pagesStale) return true;")
                 && java.contains("pagesStale = false;"),
-            "old pages must remain visible but reject stale hit positions");
-        assert!(java.contains("if (session.isLatest(owner))")
-                && java.contains("applyChunk(chunk);"),
-            "a superseded worker chunk must not erase the newer frame");
+            "old pages must remain visible but reject stale hit positions"
+        );
+        assert!(
+            java.contains("if (session.isLatest(owner))") && java.contains("applyChunk(chunk);"),
+            "a superseded worker chunk must not erase the newer frame"
+        );
     }
 
     /// A8 wiring guard: long-press selection shares the rendered selection
@@ -2774,19 +4382,23 @@ mod tests {
             "/android/src/com/emthin/pad/MainActivity.java"
         ))
         .expect("MainActivity.java must be readable");
-        assert!(java.contains("touchLongPress")
+        assert!(
+            java.contains("touchLongPress")
                 && java.contains("selectWordAt(")
                 && java.contains("showSelectionBar();")
                 && java.contains("copyRenderedSelection();")
                 && java.contains("deleteRenderedSelection();")
                 && java.contains("pasteRenderedClipboard();"),
-            "touch selection must use the existing rendered selection and clipboard path");
-        assert!(java.contains("getAccessibilityNodeProvider()")
+            "touch selection must use the existing rendered selection and clipboard path"
+        );
+        assert!(
+            java.contains("getAccessibilityNodeProvider()")
                 && java.contains("accessibleBlocks(")
                 && java.contains("visibleSource(")
                 && java.contains("AccessibilityAction.ACTION_CLICK")
                 && java.contains("requestPage(index, \"accessible\")"),
-            "rendered pages must expose source-backed virtual text and load on accessibility focus");
+            "rendered pages must expose source-backed virtual text and load on accessibility focus"
+        );
     }
 
     /// A11 wiring guard: Find has scoped bounded pages, a separable
@@ -2803,20 +4415,26 @@ mod tests {
             "/android/src/com/emthin/pad/FindController.java"
         ))
         .expect("FindController.java must be readable");
-        assert!(java.contains("new FindController(")
+        assert!(
+            java.contains("new FindController(")
                 && java.contains("DocBridge.searchScoped(")
                 && java.contains("DocBridge.replaceMany(")
                 && java.contains("occurrences")
                 && java.contains("Structural matches are not replaced"),
-            "the UI must use the scoped search and checked replacement boundary");
-        assert!(find.contains("public static final int PAGE_SIZE = 200;")
+            "the UI must use the scoped search and checked replacement boundary"
+        );
+        assert!(
+            find.contains("public static final int PAGE_SIZE = 200;")
                 && find.contains("if (token != requestToken) return;")
                 && find.contains("public void searchFrom("),
-            "Find must retain one bounded page and reject stale scans");
-        assert!(java.contains("closeSearch(true)")
+            "Find must retain one bounded page and reject stale scans"
+        );
+        assert!(
+            java.contains("closeSearch(true)")
                 && java.contains("restoreSearchOrigin()")
                 && java.contains("expandedSegments.putAll(origin.folds)"),
-            "Cancel must restore the captured viewport/folds/selection");
+            "Cancel must restore the captured viewport/folds/selection"
+        );
     }
 
     /// A5 wiring guard: candidates stay in the native field until commit,
@@ -2829,16 +4447,24 @@ mod tests {
             "/android/src/com/emthin/pad/MainActivity.java"
         ))
         .expect("MainActivity.java must be readable");
-        assert!(java.contains("DocBridge.graphemeBoundary"),
-            "rendered editing must use mathed's native grapheme rules");
-        assert!(java.contains("boolean isComposing()")
+        assert!(
+            java.contains("DocBridge.graphemeBoundary"),
+            "rendered editing must use mathed's native grapheme rules"
+        );
+        assert!(
+            java.contains("boolean isComposing()")
                 && java.contains("finishActiveComposition();")
                 && java.contains("isComposing(editor)"),
-            "composition must be observable and flushed before Save/New/Open");
-        assert!(java.contains("replaceRenderedRange"),
-            "selection replacement must combine removal and insertion");
-        assert!(!java.contains("Character.charCount(Character.codePointAt"),
-            "rendered movement must not use a second code-point boundary rule");
+            "composition must be observable and flushed before Save/New/Open"
+        );
+        assert!(
+            java.contains("replaceRenderedRange"),
+            "selection replacement must combine removal and insertion"
+        );
+        assert!(
+            !java.contains("Character.charCount(Character.codePointAt"),
+            "rendered movement must not use a second code-point boundary rule"
+        );
     }
 
     /// A cold launch rebuilds DocModel from its initial text. Without the
@@ -2864,8 +4490,7 @@ mod tests {
             "cold launch must prefer a valid recovery slot and migrate a matching legacy snapshot"
         );
         assert!(
-            !java.contains(".putString(PREF_SNAPSHOT,")
-                && !java.contains(".putString(PREF_DOC,"),
+            !java.contains(".putString(PREF_SNAPSHOT,") && !java.contains(".putString(PREF_DOC,"),
             "document-sized state must not be written back to SharedPreferences"
         );
         assert!(

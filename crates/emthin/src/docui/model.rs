@@ -14,6 +14,11 @@ use std::ops::Range;
 use mathed_core::doc::MathDoc;
 use mathed_core::markers::{resolve_segments, scan, MarkerScan, Segment};
 use mathed_core::transform::TransformOptions;
+use sha2::{Digest as _, Sha256};
+
+use super::change::{
+    source_diagnostics, validate_import, ChangeOrigin, ChangeScope, Diagnostic, DocChange,
+};
 
 /// Number actual citation keys, excluding named options such as `bib:`.
 /// Mathed's scanner retains literal arguments, including named options, in
@@ -26,8 +31,10 @@ pub fn citation_references(scan: &MarkerScan) -> Vec<mathed_core::markers::Refer
         let count = match &mut reference.kind {
             ReferenceKind::DocumentRef { .. } => 1,
             ReferenceKind::Bibliography { keys } => {
-                keys.retain(|key| !key.split_once(':').is_some_and(|(name, _)|
-                    matches!(name.trim(), "bib" | "style")));
+                keys.retain(|key| {
+                    !key.split_once(':')
+                        .is_some_and(|(name, _)| matches!(name.trim(), "bib" | "style"))
+                });
                 keys.len().max(1)
             }
         };
@@ -55,6 +62,21 @@ pub struct DocModel {
     /// Bumped by every content mutation and forced layout invalidation. The
     /// caret/selection does not bump it.
     content_generation: u64,
+    /// The origin attributed to the next committed change. Non-local edit
+    /// paths (peer delta, undo, redo, restore) set this before mutating; the
+    /// default is local.
+    change_origin: ChangeOrigin,
+    /// The last durable content a change was published for: `(source digest,
+    /// content digest)`. A marks-only edit keeps the source digest but changes
+    /// the content digest, so it still produces a change. Presentation-only
+    /// work (caret, pan, a reading-size reflow) changes neither and produces
+    /// nothing.
+    last_change_state: Option<(String, String)>,
+    /// The content generation last checked by `take_changes`. A fast gate so
+    /// an idle tick does not hash the whole document.
+    last_checked_generation: u64,
+    /// Monotonic sequence assigned to published changes.
+    change_seq: u64,
 }
 
 /// The part of caret/selection state that can change rendered source. Empty
@@ -76,7 +98,7 @@ impl DocModel {
         let doc = MathDoc::with_text(text);
         let scan = scan(doc.text());
         let segments = resolve_segments(&scan);
-        Self {
+        let mut model = Self {
             doc,
             scan,
             segments,
@@ -84,15 +106,27 @@ impl DocModel {
             anchor: None,
             dirty: true,
             content_generation: 1,
-        }
+            change_origin: ChangeOrigin::Local,
+            last_change_state: None,
+            last_checked_generation: 1,
+            change_seq: 0,
+        };
+        model.last_change_state = Some(model.change_state());
+        model
     }
 
     /// Rebuild a model from a Loro snapshot (session restore).
+    ///
+    /// The outer envelope — bounds and non-emptiness — is validated before the
+    /// Loro decoder runs. A rejection leaves no partially applied state because
+    /// no model has been constructed yet.
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, mathed_core::doc::DocError> {
+        validate_import(bytes, None)
+            .map_err(|error| mathed_core::doc::DocError::BadSnapshot(error.to_string()))?;
         let doc = MathDoc::from_snapshot(bytes)?;
         let scan = scan(doc.text());
         let segments = resolve_segments(&scan);
-        Ok(Self {
+        let mut model = Self {
             doc,
             scan,
             segments,
@@ -100,7 +134,13 @@ impl DocModel {
             anchor: None,
             dirty: true,
             content_generation: 1,
-        })
+            change_origin: ChangeOrigin::Restore,
+            last_change_state: None,
+            last_checked_generation: 1,
+            change_seq: 0,
+        };
+        model.last_change_state = Some(model.change_state());
+        Ok(model)
     }
 
     /// The document's raw source text (with its hidden markers and
@@ -177,6 +217,26 @@ impl DocModel {
             self.anchor = Some(end);
             self.caret = start;
         }
+    }
+
+    /// The fixed and active ends of a non-empty selection. Unlike
+    /// [`DocModel::selection`] this keeps the direction, so a backward drag
+    /// restores with the same active end.
+    pub fn selection_ends(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        (anchor != self.caret).then_some((anchor, self.caret))
+    }
+
+    /// Restore explicit fixed/active selection ends without normalising them.
+    pub fn set_selection_ends(&mut self, anchor: usize, caret: usize) {
+        let anchor = anchor.min(self.len());
+        let caret = caret.min(self.len());
+        if anchor == caret {
+            self.anchor = None;
+        } else {
+            self.anchor = Some(anchor);
+        }
+        self.caret = caret;
     }
 
     pub fn clear_selection(&mut self) {
@@ -309,6 +369,7 @@ impl DocModel {
         if self.doc.revision() == revision {
             return false;
         }
+        self.change_origin = ChangeOrigin::Undo;
         self.caret = self.caret.min(self.doc.len());
         self.anchor = None;
         self.rescan();
@@ -321,6 +382,7 @@ impl DocModel {
         if self.doc.revision() == revision {
             return false;
         }
+        self.change_origin = ChangeOrigin::Redo;
         self.caret = self.caret.min(self.doc.len());
         self.anchor = None;
         self.rescan();
@@ -378,7 +440,8 @@ impl DocModel {
             .into_iter()
             .filter(|range| range.start < range.end)
             .collect();
-        if let Some(span) = mathed_mini::render::reveal_span_in(&self.scan, &self.segments, self.caret)
+        if let Some(span) =
+            mathed_mini::render::reveal_span_in(&self.scan, &self.segments, self.caret)
         {
             spans.push(span);
         }
@@ -427,6 +490,101 @@ impl DocModel {
     pub fn snapshot(&self) -> Vec<u8> {
         self.doc.snapshot()
     }
+
+    /// SHA-256 of the source representation. A source export omits marks, so
+    /// this deliberately covers only the text.
+    pub fn source_digest(&self) -> String {
+        sha256_hex(self.doc.text().as_bytes())
+    }
+
+    /// SHA-256 of the logical rich-text content a snapshot file represents:
+    /// text plus segment marks, independent of snapshot encoding details.
+    pub fn content_digest(&self) -> String {
+        let mut hash = Sha256::new();
+        let text = self.doc.text();
+        hash.update((text.len() as u64).to_le_bytes());
+        hash.update(text.as_bytes());
+        let mut marks = self.doc.segment_marks();
+        marks.sort_by(|a, b| (a.0.start, a.0.end, &a.1).cmp(&(b.0.start, b.0.end, &b.1)));
+        hash.update((marks.len() as u64).to_le_bytes());
+        for (range, mark) in marks {
+            hash.update((range.start as u64).to_le_bytes());
+            hash.update((range.end as u64).to_le_bytes());
+            hash.update((mark.len() as u64).to_le_bytes());
+            hash.update(mark.as_bytes());
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    // ----- typed committed changes (K1) --------------------------------
+
+    /// Attribute the next committed change to `origin`. Callers on a non-local
+    /// edit path (a peer delta, undo/redo, a restore) set this before mutating;
+    /// ordinary editing leaves it at [`ChangeOrigin::Local`].
+    pub fn set_change_origin(&mut self, origin: ChangeOrigin) {
+        self.change_origin = origin;
+    }
+
+    fn change_state(&self) -> (String, String) {
+        (self.source_digest(), self.content_digest())
+    }
+
+    /// Drain the committed changes since the last call, coalescing every edit
+    /// in the interval into one summary per origin. The document instance is
+    /// supplied by the owner (`DocUi`) because the model does not know which
+    /// open document it belongs to.
+    ///
+    /// A presentation-only change — a caret move, a pan, a status update —
+    /// leaves all three state components untouched and produces no change, so
+    /// it can never advance a derived durable version.
+    pub fn take_changes(&mut self, document: u64) -> Vec<DocChange> {
+        if self.last_checked_generation == self.content_generation {
+            return Vec::new();
+        }
+        self.last_checked_generation = self.content_generation;
+        let current = self.change_state();
+        if self.last_change_state.as_ref() == Some(&current) {
+            return Vec::new();
+        }
+        self.last_change_state = Some(current.clone());
+        let origin = self.change_origin;
+        // The next mutation on this model is local unless a caller says
+        // otherwise. Consuming the origin here prevents a one-shot peer/undo
+        // tag from leaking onto a later local keystroke.
+        self.change_origin = ChangeOrigin::Local;
+        self.change_seq = self.change_seq.wrapping_add(1);
+        let seq = self.change_seq;
+        let version = hex_encode(&self.doc.version_vector());
+        vec![DocChange {
+            seq,
+            document,
+            content_generation: self.content_generation,
+            version,
+            origin,
+            scope: ChangeScope::Content,
+            ranges: Vec::new(),
+            source_digest: current.0,
+            content_digest: current.1,
+        }]
+    }
+
+    /// The golden set of source diagnostics for the current text, derived from
+    /// the shared scanner and semantic index. Compiled verbatim by the pad.
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        source_diagnostics(self.text(), &self.scan, &self.segments)
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Byte offset of the grapheme boundary before `pos`.
@@ -468,6 +626,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 mod tests {
+    use super::super::change::MAX_IMPORT_BYTES;
     use super::*;
 
     #[test]
@@ -476,7 +635,10 @@ mod tests {
         doc.set_caret(doc.len());
         let options = doc.transform_options();
         assert_eq!(options.references.len(), 1);
-        assert_eq!(mathed_core::markers::cite_label_text(&options.references[0]), "[1]");
+        assert_eq!(
+            mathed_core::markers::cite_label_text(&options.references[0]),
+            "[1]"
+        );
     }
 
     #[test]
@@ -548,10 +710,7 @@ mod tests {
     fn a_stable_anchor_tracks_an_edit_above_it() {
         let mut model = DocModel::new("alpha target");
         let target = model.text().find("target").expect("target");
-        let anchor = model
-            .math_doc()
-            .create_anchor(target, -1)
-            .expect("anchor");
+        let anchor = model.math_doc().create_anchor(target, -1).expect("anchor");
         model.insert(0, "prefix ");
         let resolved = model
             .math_doc()
@@ -645,6 +804,21 @@ mod tests {
     }
 
     #[test]
+    fn a_source_digest_ignores_marks_but_the_snapshot_content_digest_does_not() {
+        let mut m = DocModel::new("hello");
+        let source = m.source_digest();
+        let content = m.content_digest();
+        m.math_doc_mut().mark_segment(0..5, "prop:bold", "test");
+        m.math_doc_mut().commit();
+        assert_eq!(m.source_digest(), source, "a source export omits marks");
+        assert_ne!(
+            m.content_digest(),
+            content,
+            "a snapshot represents the mark change"
+        );
+    }
+
+    #[test]
     fn undo_and_redo_invalidate_after_mark_only_changes() {
         let mut m = DocModel::new("hello");
         m.math_doc_mut().mark_segment(0..5, "prop:bold", "test");
@@ -654,7 +828,10 @@ mod tests {
         assert!(m.math_doc().segment_marks().is_empty());
         assert!(m.take_dirty());
         assert!(m.redo());
-        assert_eq!(m.math_doc().segment_marks(), vec![(0..5, "prop:bold".into())]);
+        assert_eq!(
+            m.math_doc().segment_marks(),
+            vec![(0..5, "prop:bold".into())]
+        );
         assert!(m.take_dirty());
     }
 
@@ -687,6 +864,104 @@ mod tests {
         assert!(
             spans.iter().any(|s| s.start == 0),
             "the caret is always a reveal span: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn one_grouped_edit_publishes_one_change_and_one_undo_step() {
+        let mut m = DocModel::new("");
+        assert!(
+            m.take_changes(7).is_empty(),
+            "a fresh model is not a change"
+        );
+        m.insert_at_caret("hello world");
+        let changes = m.take_changes(7);
+        assert_eq!(changes.len(), 1, "one grouped edit produces one change");
+        let change = &changes[0];
+        assert_eq!(change.document, 7);
+        assert_eq!(change.seq, 1);
+        assert_eq!(change.origin, ChangeOrigin::Local);
+        assert_eq!(change.scope, ChangeScope::Content);
+        assert!(!change.version.is_empty(), "the version token is captured");
+        assert!(m.take_changes(7).is_empty(), "draining is idempotent");
+        assert!(m.can_undo(), "the same edit is one undo step");
+        assert!(m.undo());
+        assert_eq!(m.text(), "");
+    }
+
+    #[test]
+    fn a_marks_only_edit_publishes_a_change_with_an_identical_source_digest() {
+        let mut m = DocModel::new("hello");
+        m.take_changes(1);
+        m.math_doc_mut().mark_segment(0..5, "prop:bold", "test");
+        m.math_doc_mut().commit();
+        let changes = m.take_changes(1);
+        assert_eq!(changes.len(), 1, "a marks-only edit is still a change");
+        let change = &changes[0];
+        assert_eq!(change.source_digest, sha256_hex(b"hello"));
+        assert_ne!(
+            change.content_digest, change.source_digest,
+            "the content digest covers marks"
+        );
+        assert_eq!(change.origin, ChangeOrigin::Local);
+    }
+
+    #[test]
+    fn caret_and_view_changes_publish_no_change() {
+        let mut m = DocModel::new("some prose #a hidden #b");
+        m.take_changes(1);
+        m.set_caret(3);
+        m.set_selection(2..8);
+        m.clear_selection();
+        m.set_caret(m.len());
+        m.mark_dirty();
+        assert!(
+            m.take_changes(1).is_empty(),
+            "presentation-only activity never produces a durable change"
+        );
+        assert_eq!(m.change_origin, ChangeOrigin::Local);
+    }
+
+    #[test]
+    fn undo_and_redo_are_attributed_to_their_origin() {
+        let mut m = DocModel::new("");
+        m.take_changes(1);
+        m.insert_at_caret("x");
+        m.take_changes(1);
+        assert!(m.undo());
+        let undo = m.take_changes(1);
+        assert_eq!(undo.len(), 1);
+        assert_eq!(undo[0].origin, ChangeOrigin::Undo);
+        assert!(m.redo());
+        let redo = m.take_changes(1);
+        assert_eq!(redo.len(), 1);
+        assert_eq!(redo[0].origin, ChangeOrigin::Redo);
+        assert_eq!(redo[0].seq, undo[0].seq + 1);
+    }
+
+    #[test]
+    fn an_invalid_snapshot_leaves_no_partial_document() {
+        assert!(DocModel::from_snapshot(&[]).is_err());
+        assert!(DocModel::from_snapshot(b"not a loro snapshot").is_err());
+        let huge = vec![0u8; MAX_IMPORT_BYTES + 1];
+        assert!(
+            DocModel::from_snapshot(&huge).is_err(),
+            "an over-bound envelope is rejected before the decoder runs"
+        );
+    }
+
+    #[test]
+    fn a_peer_origin_is_consumed_by_one_change() {
+        let mut m = DocModel::new("");
+        m.take_changes(1);
+        m.set_change_origin(ChangeOrigin::Peer);
+        m.insert_at_caret("remote");
+        assert_eq!(m.take_changes(1)[0].origin, ChangeOrigin::Peer);
+        m.insert_at_caret(" local");
+        assert_eq!(
+            m.take_changes(1)[0].origin,
+            ChangeOrigin::Local,
+            "the peer tag does not leak onto the next local keystroke"
         );
     }
 }

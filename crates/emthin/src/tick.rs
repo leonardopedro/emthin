@@ -17,6 +17,13 @@ pub fn event_loop_tick(state: &mut EmthinState) {
     // embedded clients share the seat's keymap.
     state.sync_host_keymap();
 
+    // --- Wake a live Core retry when its backoff is due ---
+    // `ensure_live` runs in the render pass, so an idle compositor needs one
+    // frame requested here to make progress after a failed attach.
+    if state.core_sessions.retry_due() {
+        state.needs_redraw = true;
+    }
+
     // --- Voice: finish turns whose harness run has completed ---
     //
     // Before the relayout below so a reply spliced this tick is
@@ -92,11 +99,11 @@ pub fn event_loop_tick(state: &mut EmthinState) {
 
     // --- Forward local document changes to collaboration peers ---
     //
-    // The document revision is the trigger, so this covers keyboard edits,
-    // IPC-driven edits, and splices from the voice/formals workers without
-    // every edit site having to remember the session. A remote import sets
-    // `collab_revision` to the post-import revision, so it is not echoed
-    // back as a local edit on the next tick.
+    // The committed Loro version vector is the trigger, so this covers
+    // keyboard edits, mark-only edits, IPC-driven edits, and splices from the
+    // voice/formals workers without every edit site remembering the session.
+    // A remote import sets `collab_version` to the post-import vector, so it
+    // is not echoed back as a local edit on the next tick.
     match state.collab_local_edit() {
         Ok(outbound) => {
             for out in outbound {
@@ -104,6 +111,7 @@ pub fn event_loop_tick(state: &mut EmthinState) {
                     peer: out.peer,
                     seq: out.seq,
                     delta: crate::ipc::hex::encode(&out.delta),
+                    scope: out.scope,
                 });
             }
         }
@@ -117,6 +125,8 @@ pub fn event_loop_tick(state: &mut EmthinState) {
     // document, and expired peers are pruned here.
     state.collab_prune_presence();
     state.collab_publish_presence(false);
+    // A share with no recent acknowledgement is offline, not merely behind.
+    state.doc.refresh_share_timeout();
 
     // --- Dispatch incoming IPC messages from the control client ---
     if let Some(msgs) = state.ipc.recv_all() {
@@ -124,6 +134,35 @@ pub fn event_loop_tick(state: &mut EmthinState) {
             crate::ipc::dispatch::handle_ipc_message(state, msg);
         }
         state.needs_redraw = true;
+    }
+
+    // --- Typed committed changes (K1) ---
+    // One notification per grouped content edit, drained once per tick after
+    // every edit path (keyboard, voice/formals splice, IPC, peer delta) has
+    // run. Presentation-only activity produces nothing here, so a client that
+    // applies these summaries can keep its derived version in step with the
+    // durable document without ever advancing it for a pan or a status tick.
+    let changes = state.doc.take_changes();
+    if !changes.is_empty() {
+        // Retain a read-only snapshot of each committed generation with its
+        // explicit share and owner (K5). The live model and its undo stack are
+        // untouched.
+        let share_id = *state.collab.share_id();
+        let owner = state.collab.local_peer().to_string();
+        state.doc.retain_history(share_id, &owner);
+    }
+    for change in changes {
+        state.ipc.send(crate::ipc::OutgoingMessage::DocChanged {
+            seq: change.seq,
+            document: change.document,
+            content_generation: change.content_generation,
+            version: change.version,
+            origin: change.origin.as_str().to_owned(),
+            scope: change.scope.as_str().to_owned(),
+            ranges: change.ranges.iter().map(|r| [r.start, r.end]).collect(),
+            source_digest: change.source_digest,
+            content_digest: change.content_digest,
+        });
     }
 
     state.ipc.flush();

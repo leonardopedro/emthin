@@ -1,58 +1,57 @@
-# emthin development plan — desktop and shared document core
+# emthin development plan
 
-Reviewed and expanded 2026-11-18. This is the development plan for `./`
-(emthin's compositor, document UI, IPC, collaboration and shared file surface).
-It is deliberately separate from the Android plan:
+Reviewed 2026-11-20 against `deca816` and the current working tree. This
+plan covers the desktop compositor and shared document behavior. The
+[Android development plan](emthin-android/DEVELOPMENT_PLAN.md) owns pad
+work and the [terminal integration plan](docs/HERDR_INTEGRATION_PLAN.md)
+owns Herdr, Tailscale and OpenShell. Both are used in the
+[development testing plan](#development-testing-plan).
 
-- [`emthin-android/DEVELOPMENT_PLAN.md`](emthin-android/DEVELOPMENT_PLAN.md)
-  remains authoritative for `emthin-pad`.
-- [`docs/REWRITE_PLAN.md`](docs/REWRITE_PLAN.md) is the historical rewrite
-  design and work log. Its W1–W11 landed; do not reopen completed work.
-- [`docs/MATHED_FOOT_PARITY.md`](docs/MATHED_FOOT_PARITY.md) is the feature
-  inventory shared by both frontends.
-- The [native terminal figure plan](docs/HERDR_INTEGRATION_PLAN.md) covers
-  the separate Herdr, Tailscale and OpenShell integration milestone.
+The [native Kyneta plan](docs/KYNETA_NATIVE_PLAN.md) extends these paths with
+typed change notifications, local-first readiness, scoped sync, collaboration
+policy, history and derived views. The implementation is Rust, with a
+specific AustralVM rule candidate. It requires no JavaScript tooling or
+runtime. D2.1, D3.1, D4.1, D6.1 and D7.1 supply shared prerequisites.
 
-This review selects work that repairs or completes paths already present. It
-does not add a second editor model, a window manager, a notebook runtime, a
-plugin framework, or a network transport. The excluded new features are listed
-with reasons in [Parked work](#parked-work).
-
-The plan is implementation-ready for a cheaper model. Each card states the
-current path, the required behavior, the files to read first, the acceptance
-evidence, and what must not be built.
+The first D0–D8 pass delivered atomic recovery, source and snapshot I/O,
+an asynchronous layout worker, reader anchors, return history, local
+presence and one action/status surface. Continue those implementations
+with the cards below. Each card repairs an observable gap in an existing
+workflow. The document remains the layout authority, and Typst figures
+still define placement and size.
 
 ## Review baseline
 
-| Item | Observation |
+| Area | Current evidence |
 |---|---|
-| Repository | `emthin` at `d86710c`, with existing uncommitted collaboration, Android and CI work. Preserve unrelated changes. |
-| Workspace | Four Rust crates: `emthin`, `emthin-clipboard`, `emthin-collab`, `emthin-dbus`. |
-| Document model | `MathDoc` (Loro), `DocModel`, paged Typst layout, `\app` figures, citations, find, voice and formal-verification seams. |
-| Shared frontends | Desktop document UI and the Android pad both build on `mathed_core`/`mathed_mini`; desktop-only work must not assume the pad can follow it in the same change. |
-| Documented tests | The old 353/347 counts were reconciled on 2026-11-18: after D8 the workspace runs 511 passed, 2 ignored, including an async-relayout restore regression test and the Core protocol client tests. (The D1 checkpoint was 471.) The desktop E2E also runs on 2026-11-18: `wtype` passes 28/28 and `xdotool` 36/36, 0 skipped; the xdotool extras are Find cancel plus fcitx5/rime preedit and commit checks. |
-| E2E | `scripts/e2e/run.sh` runs 28 checks in `wtype` and 36 in `xdotool`: typing, document copy, both clipboard directions, multi-page PgDn/PgUp navigation, per-document preferences, touch panning, no-X11 transport, state read, graceful shutdown, and (XTEST only) Find cancel plus an fcitx5/rime preedit followed by its commit. It does not measure rendering quality or latency. |
-| Device lane | `emthin-android/device-lane.sh` is the pad lane; it is not a desktop gate. |
-| Sibling revisions | kyneta `83d6e0d06f4b`; pinetrie `0f4483f4aa86`; desktop `06102dcd77f5`; fresh `4a5940ed6063`; foot `152487e49499`; helix `a714a818a3a4`; atuin `6e57c7e3dc8d`; starship `e3b64da0b660`; Infinity `e1a3e4b36e5f`. |
+| Review inputs | The worktree contains active Herdr, Android and shared dependency changes. Preserve them. `Cargo.toml` currently lists eight desktop workspace members. The pad remains standalone. |
+| Invariants | `bash scripts/verify-invariants` passed 7 checks on 2026-11-20. |
+| Current Rust tests | `cargo test --locked --workspace` passed **608** tests with 2 ignored on 2026-11-20 after D3.2. See D3.2. |
+| Historical evidence | The 2026-11-19 D8 run lists 538 passed including 18 VT tests and 2 ignored. It covers a different working set. The recorded 2026-11-18 desktop E2E is 28 headless Wayland and 36 XTEST checks. See [D8](#d8--extend-verification-with-each-card) for what those tests exercised. |
+| Sibling revisions | kyneta `83d6e0d06f4b`, pinetrie `0f4483f4aa86`, desktop `06102dcd77f5`, fresh `4a5940ed6063`, foot `152487e49499`, helix `a714a818a3a4`, atuin `6e57c7e3dc8d`, starship `e3b64da0b660`, Infinity `e1a3e4b36e5f`. |
 
-## Findings and priority
+## Current priorities
 
-| ID | Priority | Finding | Consequence |
+| Order | Card | Why it remains | Dependency |
 |---|---|---|---|
-| F1 | P0 — addressed by D1 | At review, `DocUi::save` wrote the Loro snapshot with `std::fs::write`; `SessionFile::save` wrote JSON the same way; `SessionFile::load` silently returned defaults on parse errors. | A crash during autosave could tear either file. D1 now writes a digest-verified pair through same-directory temporaries, keeps a paired backup, migrates legacy metadata, and blocks autosave when no valid snapshot can be recovered. |
-| F2 | P0 | `ipc_save_doc` writes `DocUi::model().text()` directly. `DocUi::open_document` only reads UTF-8 source. | An explicit save loses Loro marks. Opening a `.mathed`/Loro file is unsupported even though the session path already uses snapshots. Neither write is atomic or checks for an outside change. |
-| F3 | P1 | `tick.rs` calls `state.relayout_document()`; `DocUi::relayout` calls `DocLayoutCache::rebuild`, which runs the whole paged Typst compile and raster on the event-loop thread. `DocModel::set_caret` also marks a document with revealable content dirty. | Caret movement and every accepted edit can stall the compositor. There is no latest-wins worker, no visible-page prioritisation, and no latency measurement. |
-| F4 | P1 | `DocumentPreferences` stores page, zoom, pan, reading size and citation format, but no caret, selection or reading anchor. | Relaunch restores the page but not the place in it. Concurrent edits can move the logical location while the stored page stays valid-looking. |
-| F5 | P1 | `FindBar::close` only flips `open`; it does not restore the pre-search caret, selection, page or pan. `goto_citation` and page jumps do not enter a return history. | Escape after a search leaves the reader at the last match. There is no Back/Forward for navigation, so a jump cannot be undone without remembering the old position. |
-| F6 | P1 | `emthin-collab::Session` already has `set_cursor`, `presence_blob`, `apply_presence`, `present` and `remove_outdated_presence`, and the handlers expose `collab_join`/`collab_delta`/`collab_ack`. emthin only forwards deltas. | Presence is implemented but invisible. `list_state` has no peers, there is no heartbeat, no remote caret, and no peer status. |
-| F7 | P2 | The keymap is a static `match`; `DOCUMENTED_KEYMAP` still calls `Ctrl+Shift+Return` "open the app launcher" although the launcher is a relaunch action with no prompt. `DocUi::last_error` is stored but never rendered. | Documentation and behavior disagree, and a failed layout is silent to the user. There is no single place that says which actions currently apply. |
-| F8 | P2 | Verification has no latency budget, no crash-injection case, no two-instance presence check, and stale test counts. The E2E still names the IME commit as an uncovered leg. | The riskiest new paths (persistence, async layout, presence) would land without checks that can fail for the right reason. |
-| F9 | parked | Semantic outline/definition navigation, rendered-text accessibility, notebook/kernel execution, and AT Protocol publication are real gaps but are not selected here. | They need shared-core or new transport work beyond this plan's "complete existing paths" boundary. See [Parked work](#parked-work). |
+| 1 | [D0.1 Reproduce the current build](#d01-reproduce-the-current-build) | Done locally on 2026-11-20; CI input wiring is added but has not run on GitHub. | Coordinate with T01 and T06 |
+| 2 | [D2.1 Separate file save from recovery](#d21-separate-file-save-from-recovery) | Done on 2026-11-20: explicit and recovery baselines are separate in the desktop path; the pad already had a separate saved fingerprint. | D0.1 for runtime verification |
+| 3 | [D2.2 Protect concrete write targets](#d22-protect-concrete-write-targets) | Done on 2026-11-20: one resolved target drives comparison, write and stamp; symlinks and unknown existing destinations are protected. | D2.1 |
+| 4 | [D3.1 Gate retained layout interactions](#d31-gate-retained-layout-interactions) | Done on 2026-11-20: accepted pixels/glyphs carry a document+source owner; stale owners retain pixels but refuse hits, grabs and figure actions. | D0.1 |
+| 5 | [D4.1 Restore the visible reading position](#d41-restore-the-visible-reading-position) | Done on 2026-11-20: the reading anchor is the first glyph intersecting the viewport, with a document-space vertical offset; page/pan remains the fallback. | D3.1 |
+| 6 | [D5.1 Complete return transactions](#d51-complete-return-transactions) | Done on 2026-11-20: one page-publication path serves Find, citations, history and page navigation; page-only moves no longer compile. | D3.1, D4.1 |
+| 7 | [D6.1 Scope collaboration to the active document](#d61-scope-collaboration-to-the-active-document) | Done on 2026-11-20: version-vector triggering includes marks; Open and ASCII import share a scoped peer/presence reset with stale-frame fencing. | D3.1 |
+| 8 | [D7.1 Report save and render state accurately](#d71-report-save-and-render-state-accurately) | Done on 2026-11-20: explicit-file, recovery and preview state are separate on the line and over IPC; preview updating is visible. | D2.1, D3.1 |
+| 9 | [D3.2 Measure and bound page work](#d32-measure-and-bound-page-work) | Done on 2026-11-20: compile/glyph/raster are measured separately; the worker retains one compiled generation and materializes only the visible page raster. | D3.1, D4.1, named performance run |
+| Throughout | [Development testing](#development-testing-plan) | Unit checks and disposable workflows must prove actual behavior across docs, live figures and Android. | Run the applicable lane with each card |
+| Next milestone | [K1–K9 Native Kyneta behavior](docs/KYNETA_NATIVE_PLAN.md#implementation-order) | K1–K8 implemented on 2026-11-21 (K6 local lane only); K9 evaluated and **not adopted** — the Rust proof-dependency rule is kept because no Austral artifact or dual-lane benefit exists. Real-phone transport and the K9 Austral `Done` bar remain named gaps. | Milestone complete with recorded gaps; reopen K6's real-phone adapter or K9's artifact only on a concrete deployment decision |
 
-The ordering above is intentional. Persistence is P0 because it can destroy a
-document; responsiveness is next because it makes every other workflow feel
-broken; navigation and presence are user-visible completions; status and
-verification make the results observable.
+D2 and D3 can proceed in parallel after agreeing on document identity
+and content generation. Complete the deterministic safety checks before
+desktop cutover or a live sandbox run. Raster optimization follows a
+measured baseline. Existing behavior listed in the
+[initial delivery record](#initial-d0d8-delivery-record) is regression
+coverage for these cards.
 
 ## What the siblings contribute
 
@@ -62,7 +61,7 @@ links because the siblings are review-only checkouts.
 
 | Project | Mechanism inspected | Transfer to emthin | Boundary |
 |---|---|---|---|
-| kyneta | `packages/exchange/src/store/store-program.ts`: explicit `unwritten`/`idle`/`writing` phases, one `owed` follow-up write, acknowledged persistence; `packages/schema/src/position.ts`: side-bias positions that resolve after edits; `packages/transport/src/task-scope.ts`: cancellation periods and owned background work. | D1's acknowledged, one-owed session save; D4's document-bound anchors; D3/D6's owned jobs and cancellation. | No Kyneta store/schema substrate, React runtime, or second document model. |
+| kyneta | `packages/exchange/src/store/store-program.ts`: explicit `unwritten`/`idle`/`writing` phases, one `owed` follow-up write, acknowledged persistence; `packages/schema/src/position.ts`: side-bias positions that resolve after edits; `packages/transport/src/task-scope.ts`: cancellation periods and owned background work. | D2.1's separate write acknowledgements and owed recovery; D4.1's anchors; D3.1/D6.1's job ownership. | No Kyneta store/schema substrate, React runtime, or second document model. |
 | pinetrie | `packages/interface/search.ts`: search state belongs to one canvas and its corpus is explicit; ADR-0058: a reader's spot is keyed by message, not a pixel scroll offset; ADR-0213: tests name the place they require and a missing lane is reported with a reason. | D5's scoped search state and origin restoration; D4's anchored reading spot; D8's named requirements. | No conversation tree, agent lanes, columns, boards, or fuzzy matcher. Keep mathed's literal smart-case search. |
 | Atuin Desktop (`desktop`) | `src/state/runbooks/snapshot.ts`: snapshots carry runbook identity separate from runtime state; `operation_processor.ts`: unprocessed operations are retried only when online; `src/lib/std/async_queue.ts`: priority concurrency with one release per checkout. | D2's document identity and save-copy/conflict boundary; D3's bounded job admission; D1's durable identity separate from view state. | No runbook execution, secrets, variables, or server sync. |
 | fresh | `crates/fresh-editor/src/view/viewport.rs`: one byte anchor plus row displacement, explicit `Follow`/`Hold` ownership; `app/async_dispatch.rs`: a 50 ms per-tick dispatch budget with deferred backlog; `services/recovery/storage.rs`: atomic recovery storage. | D3's bounded/latest-wins work; D4's document-relative reader position; D1's atomic recovery. | No buffer/split/plugin system, piece tree, or QuickJS. |
@@ -99,47 +98,875 @@ keep those contracts green.
    `mathed_mini` must run the Android host tests at minimum; a pad-visible
    behavior change needs the device lane or an explicit named gap.
 
-## Workstreams and task cards
+## Follow-up cards
 
-Sizes are implementation scope, not elapsed-time promises: S is one focused
-change, M is two or three, L is a small subsystem with a design check. Every
-card must leave a buildable tree and carry evidence for its own boundary.
+### D0.1 Reproduce the current build
 
-Every selected card extends a path that already exists: D5 adds return history
-to existing jumps, D6 exposes existing presence, D7 projects existing state.
-A wholly new capability is not a card here; it is in [Parked work](#parked-work)
-until it has a separate scope decision.
+**Read first.** `crates/ghostty-vt/{build.rs,src/lib.rs}`,
+`scripts/{check-herdr-inputs,build-ghostty-vt}`, `docs/HERDR_COMPATIBILITY.toml`,
+`flake.nix`, and `.github/workflows/ci.yml`.
 
-| Order | Card | Depends on | Size | Implementer |
-|---|---|---|---|---|
-| 0 | D0 Re-establish the measured baseline | — | S | Cheaper LLM |
-| 1 | D1 Make session persistence crash-safe | D0 | M | Cheaper LLM; owner reviews the on-disk contract |
-| 2 | D2 Make document files truthful | D1 | M | Cheaper LLM |
-| 3 | D3a Separate caret/selection repaint from layout | D1 | S | Cheaper LLM |
-| 4 | D3b Move layout/raster to a latest-wins worker | D3a | L | Cheaper LLM; design check for `Send` and page lifetime |
-| 5 | D4 Restore the reader's place with document anchors | D1, D3a | M | Cheaper LLM |
-| 6 | D5 Make find cancel and jumps returnable | D4 | M | Cheaper LLM |
-| 7 | D6 Wire collaboration presence and peer status | D4, D7 (status hook) | M | Cheaper LLM |
-| 8 | D7 Add one action/status surface | D1, D3a | M | Cheaper LLM |
-| 9 | Throughout | D8 Extend verification with each card | all | S–M | Cheaper LLM; owner runs the desktop E2E if the machine cannot |
+**Work.** The Rust source path is relative to `src/lib.rs`, while the Zig
+source path is relative to the crate manifest. The latter currently resolves
+to `/home/leo/herdr-core/vendor/ghostty` here. Correct the manifest-relative
+lookup and reuse the existing compatibility pins. Bring the same pinned
+inputs to every CI lane compiling the wrapper, including Android, and make
+missing source/archive/Zig errors name the attempted path, required revision
+and setup action. Keep the pinned Android archive aligned with its ABI.
+Reuse T01/T06 for this work.
 
-Checkpoints:
+**Done.** A clean work directory with the declared sibling pins can run
+locked workspace tests and clippy. An arm64 APK links against the matching
+archive. An intentionally missing input reports the correct requirement.
+No installed Core or OpenShell service is started by these checks. Update
+counts from those runs only.
 
-- **E0 — no data loss (D0–D2).** A crash or outside write cannot silently
-  destroy marks, preferences or the last good snapshot.
-- **E1 — responsive editing (D3).** Caret movement does not recompile the
-  document; a layout in flight cannot blank or overwrite the visible page.
-- **E2 — returnable reading (D4–D5).** Relaunch, Find cancel and navigation
-  jumps restore the reader's place.
-- **E3 — visible collaboration and state (D6–D7).** Peers, save/render failures
-  and the active action context are visible without reading logs.
+**Result (2026-11-20).**
+
+- `crates/ghostty-vt/build.rs` now resolves the default Zig source from the
+  crate manifest (`../../../herdr-core/vendor/ghostty`, correcting the former
+  four-`..` path), accepts `GHOSTTY_VT_SOURCE`, and reads the required Ghostty
+  revision from `docs/HERDR_COMPATIBILITY.toml`. Missing source, Zig, Android
+  archive and unsupported-ABI failures name the attempted path, required
+  revision and setup command. The Android branch maps `aarch64-linux-android`
+  to the `arm64-v8a` archive and rejects other ABIs instead of linking a
+  mismatched archive.
+- `GHOSTTY_VT_SOURCE=/nonexistent/ghostty cargo build --locked -p ghostty-vt`
+  exits 101 with the attempted path, revision
+  `1e5cdb865807abc990181efb8ebfa9122955cce2`, the submodule setup command and
+  the manifest root.
+- `cargo test --locked --workspace` exits 0: **572 passed, 0 failed, 2
+  ignored**. Per binary: 390 `emthin` lib (2 ignored live-logos tests), 2
+  `collab_ipc`, 1 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0. Test binaries ran with
+  `CARGO_BUILD_JOBS=2` after an earlier OOM.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- `./build-apk.sh` with `ANDROID_ABI=arm64-v8a` links
+  `build/emthin-pad.apk` against the archive; `readelf -h` reports AArch64.
+- `python3 scripts/check-herdr-inputs` exits 0 with `herdr_core
+  c7517808d64f06609e4ecf0db1757005373cc3a3`, `ghostty
+  1e5cdb865807abc990181efb8ebfa9122955cce2` and nixpkgs
+  `c59305bab2065cfecc4944690d9eedbb56f3a9fa`. It still warns that the four
+  local sibling checkouts have uncommitted changes; those changes are the
+  review inputs and were preserved.
+- CI now checks out the pinned `herdr-core` and Ghostty submodule in the
+  workspace-test, emthin-pad host-test, APK and E2E jobs
+  (`.github/actions/checkout-herdr-core`), installs Zig 0.16 from the pinned
+  nixpkgs revision for the non-Nix jobs
+  (`.github/actions/setup-pinned-zig`), and builds both desktop and
+  `arm64-v8a` Ghostty archives before the APK build. Those workflow changes
+  are syntax-checked but have not run on GitHub, and a clean-worktree run was
+  not possible because the review inputs are uncommitted. Those two points
+  remain unverified; the local commands above are the evidence recorded here.
+- `cargo fmt --all -- --check` was intentionally not run.
+
+### D2.1 Separate file save from recovery
+
+**Read first.** `docui/mod.rs` (`load`, `save_document`, `status`, `save`),
+`docui/model.rs` (`content_generation`, `mark_dirty`), `session/store.rs`
+and the Android `PadSession`/recovery implementation.
+
+**Work.** Track the last acknowledged recovery snapshot independently of
+the last acknowledged explicit write and its format. Stamp each completion
+with the document instance and the content it actually wrote. Use source
+bytes to compare source exports and shared logical rich-text content to
+compare snapshots. Persist the explicit destination and its last confirmed
+baseline alongside recovery metadata. An older record without them can
+report recovery, with file status unconfirmed until the next explicit
+open/save. Presentation changes including zoom, reading size and
+page change affect recovery view state without changing explicit file
+content. An export that omits marks must describe the source it saved.
+Keep explicit conflict/error state until the user resolves it, and recovery
+failure/warning state until the recovery operation resolves it. Reuse the
+existing status projection and atomic session pair. Skip idle periodic
+writes when neither content nor persisted preferences changed. A failed
+write keeps the relevant change owed. Do the initial version on the
+existing save path and measure it before moving file I/O to a worker.
+
+**Done.** Edit a named file, let autosave succeed, then prove in IPC/status
+that the file still needs saving and that disk content is unchanged. Save
+explicitly and show the represented content is now clean. Repeat with a
+mark-only edit, source export, reading-size change and a prior external
+conflict. Relaunch recovers the latest note with correct provenance.
+Idle ticks produce zero new snapshot writes after the first successful
+checkpoint.
+
+**Result (2026-11-20).**
+
+- `DocUi` now carries a `FileBaseline` and a `RecoveryBaseline` separately.
+  The explicit baseline records the document instance, representation and the
+  content that representation covers; the recovery baseline records the
+  instance, content digest, preferences and explicit-file record last written.
+  A recovery save no longer changes the explicit file's status.
+- `DocModel::{source_digest,content_digest}` distinguish a source export (text
+  only) from a snapshot export (text plus segment marks). Source files stay
+  clean across marks-only edits; snapshot files do not. Reading-size, page and
+  other presentation changes affect only the recovery baseline.
+- `SessionFile.explicit_file` persists the destination path, format, byte
+  length, SHA-256 and logical content digest. A relaunch reconstructs the
+  file's conflict stamp from that record and reports an outside write or a
+  missing destination before the next save. Older sessions without the record
+  load as recovery with no explicit file status.
+- `save()` skips an idle checkpoint when the document instance, content,
+  preferences and explicit record all match the last acknowledged pair. Its
+  existing timing fields still measure snapshot and write work. A failed write
+  does not advance the baseline, so the next tick remains owed.
+- `DocUi::status` reports `Failed` for an explicit save/conflict error and
+  keeps that state across autosaves; a separate `recovery_error` field shows a
+  failed recovery without making a clean explicit file look unsaved. The IPC
+  `save_error` projection includes both errors.
+- Tests added in `docui::session_tests`, `docui::model` and `session::tests`:
+  autosave preserves a named file's unsaved state and disk bytes, explicit save
+  clears it, source exports ignore marks, snapshot exports track marks but not
+  reading size, a prior conflict stays failed until a forced save, a relaunch
+  restores the explicit destination and reports an outside write, and an idle
+  tick does not touch a blocked snapshot path.
+- `cargo test --locked --workspace` exits 0: **581 passed, 0 failed, 2
+  ignored**. Per binary: 399 `emthin` lib (2 ignored live-logos tests), 2
+  `collab_ipc`, 1 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- `cd emthin-android && cargo test --locked` exits 0: **100 passed**. The Java
+  host suite exits 0 (10 groups, including 30 recovery-codec checks and 12
+  status-model checks); no Android source changed in this card because its
+  recovery metadata already carries `savedFingerprint` separately.
+- The measurement is the existing `emthin::timing` `session_save` event
+  (`snapshot_us`, `write_us`, `snapshot_bytes`). No file I/O was moved to a
+  worker in this card; that remains future work after a measured baseline.
+- `cargo fmt --all -- --check` was intentionally not run; a standalone
+  `rustfmt --check` on `docui/mod.rs` also walks untouched submodules and
+  reports pre-existing formatting drift, so it is not a useful gate here.
+
+### D2.2 Protect concrete write targets
+
+**Read first.** `docui/file.rs`, `session/store.rs::write_atomic`,
+`ipc/dispatch.rs::ipc_save_doc`, [IPC](docs/ipc.md) and Android
+`ProviderIo.java`'s saved-content comparison.
+
+**Work.** Resolve one destination for comparison, atomic write and returned
+stamp. Save through a stable symlink writes the verified target while
+preserving the link. A link or target changed since capture returns
+`doc_conflict`. Protect an existing destination with either its matching
+opened/saved stamp or the existing explicit `force` decision. Publishing
+a newly created file must avoid clobbering one created concurrently.
+Recheck the known target near replacement. Document the limit with an
+uncooperative process writing concurrently to an already existing file.
+Retain the stamp and file kind on failure, and keep the original document
+and its recoverable bytes when a required pre-switch save fails.
+
+**Done.** Test tracked external change, unknown existing Save Copy target,
+new destination racing with creation, stable and retargeted symlinks,
+failed rename and an explicitly forced write. A non-forced error leaves
+the prior bytes intact. Opening a valid snapshot still round-trips marks.
+If IPC changes, update its catalog and error contract in the same patch.
+
+**Result (2026-11-20).**
+
+- `docui::file::write` resolves one destination before the conflict check and
+  uses that same target for the temporary file, publish and returned stamp.
+  Saving through a stable symlink writes the target and leaves the link in
+  place; a retargeted link is `doc_conflict`.
+- A destination this document has not opened or saved is refused unless
+  `force` is set. New paths are published with a hard-link create-only step, so
+  a concurrent creator wins with `AlreadyExists` translated to `doc_conflict`
+  instead of being overwritten. The known target and its bytes are checked
+  again immediately before publishing.
+- `session::store::write_atomic_publish` separates replace and create-only
+  publication. `write_atomic` keeps the existing replace path for the recovery
+  pair and legacy metadata.
+- `open_document` treats a failed required checkpoint as a refusal: it returns
+  an I/O error and keeps the original document in memory. An already
+  unreadable/blocked session still does not trap the reader; an explicit open
+  remains the way out.
+- Tests added: stable symlink save, retargeted symlink conflict, unknown
+  existing Save Copy target with and without force, create-only publication
+  against a concurrent creator, failed publish leaving the destination alone,
+  failed pre-switch checkpoint preserving the original document, plus the
+  existing outside-write/forced-write and snapshot-mark round-trip checks.
+- `docs/ipc.md` documents the symlink/create-only behavior and the remaining
+  limit: a separate process writing an already existing target between the last
+  check and the rename can still race; atomic replacement is not mutual
+  exclusion.
+- `cargo test --locked --workspace` exits 0: **588 passed, 0 failed, 2
+  ignored**. Per binary: 406 `emthin` lib (2 ignored live-logos tests), 2
+  `collab_ipc`, 1 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- The Android provider path was inspected: it already compares the active
+  destination's remembered SHA-256 before writing and retains the active file
+  on failure. No Android source changed in this card; its host Rust/Java lanes
+  remain green from D2.1.
+
+### D3.1 Gate retained layout interactions
+
+**Read first.** `docui/{mod,layout,figures}.rs`, `input.rs`, `grabs.rs`,
+`figure_render.rs`, `tests/docui_async_restore.rs`, and Android
+`PadSession.java`/retained preview tests.
+
+**Work.** Track which document instance and source/layout generation produced
+the accepted page, glyph index and figure geometry. Retain last-good pixels
+while waiting for the next compile or after a failed compile. Use the
+accepted layout for source-derived actions only while its owner is current.
+Cover point-to-byte, drag selection, citation hits, vertical glyph
+navigation, IME caret rectangles, and figure hit/resize/relaunch; recheck
+owner/marker pair on delayed grab commit. Source-only keyboard editing
+continues. Invalidate immediately at New/Open/import and when source changes,
+even before the next tick schedules a job. Permit current layout-only view
+transforms without requesting a compile. Ensure the current generation
+alone can publish new figure placements.
+
+**Done.** In a non-`cfg(test)` compositor or controllable worker integration
+lane, keep old pixels visible during a selection hit and grab attempt
+against stale geometry. Neither edits nor launches can target old
+offsets or the wrong figure. Repeat with a failing newest compile and
+Open while in flight. An accepted replacement restores hits without
+an extra compile. Use a multibyte source edit to demonstrate offset safety.
+
+**Result (2026-11-20).**
+
+- `DocLayoutCache` now carries a `LayoutOwner { document, content }` for the
+  pages/glyphs it holds and for the request currently in flight. `glyphs`,
+  `screen_to_doc`, `page_for_range` and therefore point-to-byte, citation hits,
+  selection rectangles, IME caret rectangles and vertical glyph navigation are
+  withheld while those owners differ. The old `pages` remain available to the
+  renderer, so the last good raster stays visible.
+- `DocUi` records the current document instance/source generation and exposes
+  `geometry_current`. Figure hit-testing and dormant-figure relaunch refuse a
+  stale owner; `figure_at`/`dormant_figure_at` cannot target an old rect.
+  Selection/find overlays and remote carets also stop drawing from stale
+  geometry. Source-only keyboard editing is untouched.
+- `FigureResizeGrab` captures the document instance and content generation at
+  press time and discards a delayed commit if either changed during the drag.
+  `finish_layout` only syncs figure placements and deferred preferences when
+  the accepted owner is the live one; a failed newest compile sets the error
+  while retaining the old pages and leaving hit-testing disabled.
+- `emthin/tests/docui_async_restore.rs` now has a non-`cfg(test)` lane:
+  initial hits, a multibyte edit that immediately withholds byte/caret/figure
+  hits, an accepted replacement that restores them without an extra compile,
+  and Open while a layout is in flight. A unit test covers the failed-compile
+  path (`finish_layout(Err(..))`) retaining pixels and withholding hits.
+- `cargo test --locked --workspace` exits 0: **591 passed, 0 failed, 2
+  ignored**. Per binary: 408 `emthin` lib (2 ignored live-logos tests), 2
+  `collab_ipc`, 2 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- The Android `PadSession` path already gates retained preview work by document
+  id, instance, mutation sequence and request id; no Android source changed in
+  this card.
+
+### D4.1 Restore the visible reading position
+
+**Read first.** `docui/mod.rs` (`reading_position`, `capture_view`,
+`apply_document_anchors`), `session.rs::DocumentPreferences`,
+`docui/layout.rs` and Fresh's viewport `ViewAnchor`.
+
+**Work.** Capture the first semantically readable glyph intersecting the
+actual viewport and its vertical displacement from the viewport top.
+Store the existing document-bound anchor with an optional displacement.
+Resolve against the current accepted layout, choose the resolved page,
+then apply zoom and clamped pan once. Keep page/pan fallback for old
+records, figure-only pages and missing anchors. Store actual fixed and
+active selection ends so a backward selection keeps its direction.
+Defer restoring view state until the correct document/layout arrives.
+If the user moves the view while restoration is pending, the explicit
+action wins. Keep recovery anchors out of durable document edits.
+
+**Done.** In a zoomed multi-page note, pan below the first glyph, insert
+several paragraphs above the reading spot, then relayout and relaunch.
+The same logical line returns near its original visible offset after
+clamping. An old record still restores; an anchor for another document
+falls back; a backward selection restores with the same active end.
+
+**Result (2026-11-20).**
+
+- `DocLayoutCache::reading_spot` returns the first rendered glyph whose line
+  intersects the actual viewport, plus `band.top - doc_top` in page points.
+  `DocUi` captures that byte as the existing document-bound `reading_anchor`
+  and stores the displacement in `DocumentPreferences::reading_offset`
+  (`Option<f64>`, absent for old records). Figure-only, stale, and missing
+  geometry fall back to the first glyph on the visible page; after an edit the
+  save path falls back to the caret instead of an old byte offset.
+- Restore resolves the anchor against the accepted layout, selects the page
+  that holds it, applies the saved zoom, places the line at the saved offset,
+  and clamps pan once. Without an offset, the saved page and pan are used
+  unchanged. The offset is stored in page points, so a relaunch at another
+  display scale still keeps the line at the same document-relative position.
+- Selection preferences now carry the explicit fixed and active ends. Capture
+  reads `DocModel::selection_ends`, restore uses `set_selection_ends`, and a
+  backward selection keeps the caret at its original active end.
+- A user pan, zoom, reset, or page change clears `pending_preferences`, so an
+  explicit view action wins over a restore waiting for the replacement layout.
+  Text size is still configured immediately and the anchors are applied only
+  after the worker accepts the correct pages.
+- Tests cover a save/load relaunch, an edit inserted above the anchor, an old
+  record without an offset, an anchor from another document, a backward
+  selection, and an explicit pan cancelling a pending restore. The save/load
+  test restores a page-2, 2x view and compares the visible reading offset.
+- `cargo test --locked --workspace` exits 0: **599 passed, 0 failed, 2
+  ignored**. Per binary: 416 `emthin` lib (2 ignored live-logos tests), 2
+  `collab_ipc`, 2 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- Android host `cargo test --locked` exits 0 with **100 passed**. `test-java.sh`
+  exits 0: ownership 18, recovery 30, provider 16, Find 17, navigation 27,
+  citation 22, inspector 9, status 12, action catalogue 48, session catalogue
+  22 checks.
+- D3.1 review: every exposed hit path routes through `screen_to_doc`,
+  `page_for_range`, `glyphs`, `caret_rect`, `selection_rects`, `figure_at`, or
+  `dormant_figure_at`; all are owner-gated. Drawing retained app/dormant/focus
+  geometry is intentional because it matches the retained raster, and resize
+  commits are rejected by the grab owner before `reconfigure_after_resize`.
+  The save-path fallback was the only stale-offset leak and now uses the caret.
+- A live compositor relaunch was not run here; the relaunch evidence is the
+  `DocUi` save/load path, not a second process. The device lane was not rerun.
+
+### D5.1 Complete return transactions
+
+**Read first.** `docui/search.rs`, `docui/mod.rs` (`restore_view`, Find and
+citation jumps), `state/mod.rs` (`goto_page_inner`, history),
+`ipc/dispatch.rs` and Helix's `JumpList`.
+
+**Work.** Use one navigation path to resolve the destination against the
+current layout, apply its view, update compositor page state and emit
+the page change when applicable. Use it for Find cancel/accept, citation
+go-to, Back/Forward and page navigation. Use the existing geometry
+invalidation path for page changes. A reveal-key change can still
+legitimately schedule layout. Cancel restores origin and adds no history;
+accept records the destination once. Truncate forward entries after
+a new branch and deduplicate adjacent views relative to that branch.
+Preserve smart-case, F3 behavior and existing IPC actions. Limit this
+card to the existing literal search and jump paths.
+
+**Done.** A cross-page Find cancel restores zoom, pan, caret and selection
+including after text is inserted above the origin. Back/Forward restores
+same-page and cross-page destinations, updates focus/visible figures,
+and respects forward truncation. A pure page change performs zero
+Typst compiles. A result that crosses a reveal boundary performs only
+the needed layout.
+
+**Result (2026-11-20).**
+
+- `EmthinState::publish_document_page` is the single compositor destination
+  path. It compares the document page to `PageState`, dismisses off-page
+  popups, resets focus/IME/cursor, emits `PageChanged`, clears pointer focus,
+  re-places figures, and requests a redraw. Find, citation go-to, page
+  navigation, and Back/Forward all end there.
+- `goto_page` now records the origin, changes the document page (geometry
+  invalidation only), publishes it, then records the destination. It no longer
+  uses the separate page-only early return.
+- Find step and citation go-to use `DocUi::on_page_changed` instead of
+  `layout.set_current_page` plus `model.mark_dirty`. A pure page change does
+  not schedule Typst; only a reveal-boundary change still does.
+- Find cancel restores the captured view and publishes the restored page
+  without touching history. Accept still records the origin and destination
+  once. Back/Forward now restore the view even when the destination is on the
+  same page, including caret, selection, zoom and pan.
+- `push_history` compares against the branch head rather than the vector tail.
+  Re-recording that head no longer duplicates it, and a new destination after
+  Back truncates the forward branch.
+- Tests added: cross-page Find stepping is geometry-only and does not dirty or
+  recompile; same-page history restores caret/zoom/pan; branch-head recording
+  is deduplicated; a new branch clears Forward; the existing cross-page Find
+  cancel/accept test still passes.
+- `cargo test --locked --workspace` exits 0: **601 passed, 0 failed, 2
+  ignored**. Per binary: 418 `emthin` lib (2 ignored live-logos tests), 2
+  `collab_ipc`, 2 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- A live compositor/device run was not performed here; the page publication,
+  IPC reset and history behavior are covered at the `DocUi`/state-call level,
+  not by an attached Wayland client.
+
+### D6.1 Scope collaboration to the active document
+
+**Read first.** `crates/emthin-collab/src/{session,line}.rs`,
+`state/mod.rs::collab_local_edit`, `ipc/dispatch.rs`,
+`tests/collab_ipc.rs`, and the shared `MathDoc` revision/presence APIs.
+
+**Work.** Trigger outbound exchange from the committed Loro version/frontier
+or an equivalent mutation token that includes marks. Keep a remote import
+from echoing back to its sender. Make Open and successful ASCII import run
+the same document-scope reset. Clear or replace the ephemeral presence
+store alongside delta lines, and publish an empty view/redraw immediately.
+Fence relay results by active document and join generation. If the wire
+needs scope to distinguish a delayed message after rejoin, add negotiated
+scope and document the local IPC compatibility path. A legacy relay has to
+leave and establish a fresh peer session after replacement before it can
+send again. Keep presence out of persistence and continue using the
+Unix transport.
+
+**Done.** In two real isolated emthin instances, a mark-only edit converges.
+After the receiver switches through both Open and ASCII import, there are
+no old peers/carets and a delayed old-session update changes neither text
+nor marks. Rejoining the new document works. A stale/expired presence
+update cannot alter the saved snapshot or create undo entries. Keep the
+existing reconnect and convergence checks.
+
+**Result (2026-11-20).**
+
+- `collab_local_edit` now compares the committed Loro version vector, not the
+  text revision, so a mark-only edit schedules a delta. Remote import stores
+  the post-import vector and remains un-echoed.
+- `EmthinState::collab_reset_document_scope` is the one reset for Open and a
+  successful ASCII import. It clears peers and lines, replaces the ephemeral
+  presence store, advances a document-scope generation, stores the new
+  version, and publishes an empty peer snapshot immediately.
+- Scope-aware `collab_join`, `collab_delta` and `collab_presence` carry an
+  optional `scope`. A delta tagged with another generation is ignored before
+  it reaches the document or reliable line; stale presence is not merged.
+  Untagged frames keep the legacy path; after replacement a legacy relay must
+  leave and join the new session before sending. The local IPC compatibility
+  path is documented in `docs/ipc.md` and `docs/collaboration.md`.
+- `emthin-collab` tests cover a scoped old frame after replacement, the legacy
+  untagged path, and stale presence. The two-instance IPC test joins with
+  scopes, converges a mark-only edit, resets one side through ASCII import and
+  the other through Open, verifies no old peers remain, rejects a delayed old
+  frame, and checks the saved snapshot and undo availability are unchanged
+  before establishing fresh peer sessions.
+- `cargo test --locked --workspace` exits 0: **605 passed, 0 failed, 2
+  ignored**. Per binary: 418 `emthin` lib (2 ignored live-logos tests), 3
+  `collab_ipc`, 2 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 37 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- Presence remains out of snapshots and undo; the transport is still Unix IPC.
+  A live two-process run over a real remote transport was not performed; the
+  test uses two isolated in-process states with separate real Unix control
+  sockets and relays every frame through JSON-RPC.
+
+### D7.1 Report save and render state accurately
+
+**Read first.** `docui/{status,keymap}.rs`, `status_bar.rs`, `input.rs`,
+`ipc/dispatch.rs::ipc_list_state` and Android `StatusModel.java`.
+
+**Work.** Derive the existing compact line and IPC status from the same
+acknowledged file/recovery and layout facts. Expose file unsaved,
+recovery failure/recovered copy, preview updating and preview failed as
+distinct conditions. Preserve the quiet line when there is no current
+message. Retain the full failure detail over IPC and use the shared
+source map for attribution only if it provides a valid range in the
+accepted document. Resolve action availability from the same context
+used for dispatch. While a viewer or IME holds focus, preserve the
+existing input routing and use the advertised action for that context.
+
+**Done.** Drive explicit conflict followed by recovery, invalid Typst
+followed by a valid edit, and a peer join under an open Find bar.
+IPC and the drawn line agree about current state. A recovery success
+cannot clear an explicit conflict. An action unavailable in its current
+focus context cannot fire through the documented key.
+
+**Result (2026-11-20).**
+
+- `StatusModel` now has independent `save`, `recovery` and `preview`
+  dimensions. The line can say `preview updating`, `preview failed`,
+  `save failed`, `unsaved`, `recovered copy` and `recovery failed` without
+  one condition overwriting another.
+- `DocUi::status` derives those dimensions from the same facts the save paths
+  maintain: explicit-file match/conflict, session failure/recovered warning,
+  and retained-raster layout failure/pending worker. `layout.is_pending()`
+  reports an outstanding production rebuild.
+- `list_state` now carries `save_state`, `recovery_state`, `preview_state`,
+  the full `save_error`, `recovery_error` and `layout_error`, plus the compact
+  line and warning. The explicit and recovery details use their own getters,
+  so an explicit conflict is not stored in the recovery slot.
+- A successful recovery write no longer changes the explicit conflict state;
+  the conflict test asserts this. A failed layout keeps the previous raster,
+  reports `preview failed`, and leaves the file state alone.
+- Action availability remains the single `keymap::available` gate in the key
+  path; the catalog and dispatch use the same predicate. Existing Find-bar
+  routing with peers and figure/IME focus was not changed.
+- Tests added: preview-updating vs preview-failed vs save state, independent
+  file/recovery failures, and status assertions after failed layout and after
+  a recovery write over an explicit conflict.
+- `cargo test --locked --workspace` exits 0: **607 passed, 0 failed, 2
+  ignored**. Per binary: 418 `emthin` lib (2 ignored live-logos tests), 3
+  `collab_ipc`, 2 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 37 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- The Android pad has its own `StatusModel` and was not changed: its project
+  does not run the compositor's preview worker. A live viewer/IME focus run on
+  a device was not performed here.
+
+### D3.2 Measure and bound page work
+
+**Read first.** `docui/layout.rs::run_layout`,
+`../velysterm/crates/mathed_mini/src/render.rs` and
+`emthin-android/src/layout.rs` (retained Typst frames, lazy page work).
+
+**Work.** First record separate compile, glyph extraction, raster,
+publication/apply and slow-tick measurements on the same proof note.
+Today `layout_compile_ms` covers all phases up to publication and
+`layout_raster_ms` is zero. If all-page raster or memory is significant,
+split shared compilation from materialization using current mathed
+frames. Retain one compiled generation on the existing worker. Publish
+page sizes and figure geometry, then raster the requested visible page
+first and at most one adjacent page as a prefetch. Keep enough source
+mapping to locate a jump without rastering the destination in advance.
+Bound cached raster bytes and reject results for obsolete page/document
+requests. Use the desktop and Android test lanes if shared engine
+methods change.
+
+**Done.** Record p50/p95 and peak RSS before and after on identical long
+document edits, with the host and dependency pins. Initial visible-page
+work does not scale with the number of offscreen rasters. Page turns
+inside the retained generation do not recompile. Ordinary caret moves
+compile zero times and an outdated page cannot be clicked. A layout error
+preserves the last good view. If measurements show the retained worker
+already meets the identified need, keep the instrumentation and skip
+the additional cache work.
+
+**Result (2026-11-20).**
+
+- `mathed_mini::RetainedPaged` compiles once, keeps the Typst paged frames,
+  source map and per-page glyph/figure skeleton, and materializes one page's
+  raster on demand. `PageLayout::release_raster` drops pixels without losing
+  page size, glyphs or figures.
+- The desktop layout worker now owns the retained generation. A compile
+  request returns all page metadata plus only the visible page raster; a page
+  request materializes another page without recompiling. `DocUi` requests the
+  visible page after a page change, and `DocLayoutCache::poll_page` installs
+  it and releases every other resident page raster.
+- `AppliedLayout` and the `layout_worker` timing log now carry separate
+  `layout_compile_ms`, `layout_glyph_ms`, `layout_raster_ms` and
+  `layout_apply_ms`; `layout_raster_ms` is no longer a placeholder.
+- Measurements on a 1,200-line (97-page) note, same host, rustc 1.98.1
+  (aarch64, 12 cores), workspace `Cargo.lock`:
+  - all-page layout: p50 **739.1 ms**, p95 **870.4 ms**, peak RSS
+    **415,652 KiB**;
+  - retained compile + all-page glyphs + visible raster: p50 **561.6 ms**,
+    p95 **570.3 ms**, peak RSS **31,664 KiB**; compile p50 2.1 ms, glyphs
+    p50 556.7 ms, visible raster p50 2.7 ms.
+  This is a 1.31x p50 latency improvement and 13.1x peak-RSS reduction. The
+  remaining cost is all-page glyph extraction, retained because a jump must
+  locate a source range without rastering the destination.
+- Worker tests assert that only the requested page has pixels, a later page
+  materializes from the retained generation, and the page request does not
+  advance the compile generation. `RetainedPaged` has a shared-engine test
+  for skeleton size and one-page materialization. The ignored measurement
+  tests record p50/p95 and peak RSS and are run explicitly.
+- Existing tests continue to cover ordinary caret moves compiling zero times,
+  rejected hit geometry while an owner is stale, and retaining the last good
+  view on a layout error.
+- `cargo test --locked --workspace` exits 0: **608 passed, 0 failed, 2
+  ignored**. Per binary: 419 `emthin` lib (2 ignored live-logos tests), 3
+  `collab_ipc`, 2 `docui_async_restore`, 18 `xwayland_satellite`, 5
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 37 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40
+  `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
+  `herdr-gateway-fixtures`; doc-tests 0.
+- Shared engine: `cargo test -p mathed_core -p mathed_mini` exits 0 with 580
+  passed, 0 failed and 4 ignored (three performance measurements plus the
+  existing ignored case). `cargo clippy -p mathed_mini --all-targets -- -D
+  warnings` is clean. The Android host lane `cargo test --locked` passes 100.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
+- No adjacent-page prefetch is performed yet: the card allows "at most one"
+  and the retained page is materialized only when requested. The pre-existing
+  sibling test fixture in `mathed_mini` needed its `FigureSpec.terminal` and
+  `binding_error` fields filled in to compile; that was outside the card's
+  product behavior.
+
+## Implementation handoff
+
+Use the cheaper model for one card at a time. Give it the card's files,
+the relevant part of the design constraints and the applicable test lane.
+Ask it to record changed code, observed results and any authority gaps.
+Review the save and collaboration ownership contracts before changing
+their format or adopting a library. Leave unrelated working-tree changes
+untouched. Keep Herdr and Android fixes in their existing cards when
+the root plan points there.
+
+The first product card after the build repair is D2.1. A focused handoff
+can use the named-file recovery case from the MM0 test note and drive the
+existing status and save APIs. D3.1 can be prepared independently with
+the retained-layout acceptance case. Each card leaves a checkable change
+and a regression test for its specific failure path.
+
+## Development testing plan
+
+Use three levels of evidence. Fast checks run with every change. A
+disposable document and companion app test the real user workflow at each
+checkpoint. A separately configured Zenodo sandbox run checks the live
+service only after the offline workflow works.
+
+| Level | Use | Required evidence |
+|---|---|---|
+| Per card | Run focused Rust or Android host tests, repository invariants and affected doc/protocol checks. Run workspace tests, fmt, clippy and rustdoc before desktop review. Shared engine changes run the Android host lane too. | Commands, exact source/build identity, pass/fail totals and named gaps. Assertions use observable output rather than implementation mirroring. |
+| Disposable integration | Extend [agent replay](docs/AGENT_LOOP.md), [desktop E2E](scripts/e2e/README.md) and `emthin-android/device-lane.sh` on `com.emthin.pad.test`. Use local stubbed services and real input/persistence where the seam matters. | Proof note retained, document geometry and app focus correct, no unexpected disk write, and cleanup ownership proved. |
+| Checkpoint device and service | Real arm64 phone for the MM0 client flow, nested desktop for live app figures, real Zenodo sandbox for approved draft-only smoke. Use the [Herdr acceptance run](docs/HERDR_ACCEPTANCE_RUN.md) when a proof workload runs in an existing terminal figure. | APK hash, app/runtime, test fixture identifiers, status/byte evidence, and explicit gaps for unavailable device or sandbox. |
+
+### MM0 proof workflow fixture
+
+The proof UI is a companion workload. Its backend owns proof verification
+and upload. emthin owns the document page, figure, text editing, file
+persistence, input and navigation under test.
+
+The checked backend is `../unfer/mm0web` at `b0aaa7c9220a`.
+Read `deploy/README.md`, `tests/e2e.sh`, `tests/mock_zenodo.py`,
+and `src/{main,web,store}.rs` there. The backend runs `mm0-rs compile`
+and `mm0-c`. Its local E2E exercises successful verification, failed
+publication retry, restart/resume and duplicate submission against a
+mock Zenodo base. Reuse that mock and its server counters. Check
+`/healthz` for both verifier binaries before claiming a verified proof.
+The older E2E has an absolute `/tmp/mm0` reference for the larger
+Peano fixture. Resolve that fixture from the pinned checkout or run
+the small cases that do not require it.
+
+The Android proof client has yet to be created. Start with P0a and keep P0b
+as a separate, small implementation task. Browser results count as browser
+coverage. Native cross-app file and lifecycle cases use the companion.
+
+- **P0a. Reuse the proof web UI.** Run `mm0web` against its existing
+  mock in scratch state. Mount its HTML form, status, search and proof
+  detail in a normal desktop browser figure. Run the same pages in an
+  Android browser if available. The preflight succeeds when both verifiers
+  are ready and the mock can count a test publication.
+- **P0b. Build the native Android test companion.** Give a cheaper model
+  a single-Activity test APK outside the shipping pad. Use the platform
+  document picker for one `.mm0` and one `.mm1`, the existing
+  `/api/v1/verify` and `/api/v1/publish` routes, and the returned status
+  or proof lookup. Require an explicit action to submit to a configured
+  mock-backed test server. Use a local test endpoint with disposable
+  state and no upstream credentials. Store the pending proof/project ID locally so
+  recreation can reload status. Expose the proof ID and status link through
+  the Android share sheet or clipboard. Bind results to the captured file
+  pair and Activity to drop stale UI work. Reuse the backend and mock;
+  implement only the native entry points needed for the file, sharing and
+  lifecycle tests. Keep verification and publication in the backend.
+
+P0b is done when the disposable phone lane selects both fixture files,
+verifies, submits once to the mock-backed service, rotates and relaunches
+to the same proof status, and returns the ID/link to emthin through the
+existing handoff. Record the package ID, APK hash, backend revision and
+mock run ID.
+
+Prepare one disposable two-page mathed proof note. Use synthetic content
+with a claim heading, a Unicode formula, marker/markup ranges, a known
+search match, a mark-only edit, and space for a proof ID and result link.
+On desktop include a normal `\app` figure bound to the browser running
+the proof UI. Set its geometry in the document. Use existing open/copy/
+paste/save flows between the proof app and pad on Android. A share
+action, when available, or the Android document picker transports a
+local copy for the test. Keep the raw `.mm0` / `.mm1` pair separate from
+the `.mathed` note. Begin with the known-good `sort Prop;` spec/proof
+pair and the mismatched proof used by `mm0web/tests/e2e.sh`. Add the
+larger proof only for search and performance runs.
+
+| Case | Action | Expected evidence |
+|---|---|---|
+| P1 Verify and annotate | Verify the valid and invalid pairs in the proof UI. Queue the valid pair against the mock, copy the resulting proof ID/link into the note and save a snapshot. | The checker accepts the valid pair and reports a stage for the invalid one. The note reopens with exact text, marks and reference. An invalid submission makes no upload. |
+| P2 Save versus recovery | Edit the opened note, let recovery autosave, then force-stop the disposable app or restart the desktop fixture. Compare the named file before and after. Simulate an outside file change and attempt Save. | Recovery contains the edit. Named file remains explicitly unsaved until the user writes it. External conflict preserves both versions. Test Save Copy and round-trip its bytes and marks. Covers D2.1–D2.2. |
+| P3 Figure and input | Focus the live proof form in the desktop Wayland figure, type and paste, then return to the document. Resize the figure through its statement. In the pad, switch to the companion app and back, using the real composing IME in the note. | Input reaches the intended editor/form, not both. Geometry equals the accepted Typst rectangle. Unsupported or absent figure stays a placeholder. Returning restores the note caret and reading position. |
+| P4 Navigation during layout | From page 2 at non-default zoom, search a claim, cancel, accept another hit, then Back/Forward. Keep output active or edit above the note while a replacement is pending. | Cancel restores the source place, pan and selection. Stale glyph and figure coordinates cannot edit or launch a different target. Ordinary view navigation performs no needless compile. Covers D3.1, D4.1 and D5.1. |
+| P5 Retry and restart | With mock Zenodo, start one publication, inject the existing failure or stop only the fixture backend after upload, then retry or restart. Meanwhile rotate/background Android or switch desktop documents. | One logical proof record is recovered, byte hashes agree, and completion cannot modify a newer note or render status in a recycled view. Backend and mock logs record actual attempts. |
+| P6 Peer and recovery boundary | Relay the proof note between two isolated desktop instances, change a mark, then switch one through Open and ASCII import while the first keeps editing. Kill/restart at an existing session-write boundary in a scratch session. | Mark-only convergence, no cross-document replay or presence, and the last verified recovery pair survives. Use a deterministic write-boundary signal for a process kill, or report that only storage-boundary tests ran. |
+| P7 Performance | Use identical repeated proof-note fixtures at short and long sizes, changing titles, paging, panning and typing. Run with the live proof UI held constant. | Measure edit to first accepted preview, p50/p95 layout/apply times, slow event-loop ticks, raster bytes and peak RSS. Record compile counts for caret, page and content changes separately. This is D3.2's workload. |
+
+P1–P5 exercise emthin through the test application's real workflow.
+Run backend-only retry and validator checks as preflight evidence.
+Proof verification itself is owned by the companion backend and does
+not imply that Android mathed executes proofs.
+
+### Live sandbox checkpoint
+
+Run only with a separately configured test account, the sandbox HTTPS
+host explicitly selected, and a synthetic fixture. Keep credentials in
+the companion service's existing private configuration. Use a fresh
+test draft and an explicit one-time upload action. Compare local file
+size/hash with the draft's returned file data or a downloaded copy,
+then test that the app can revisit the draft and read its status.
+Delete only the draft created for this run when cleanup is part of the
+chosen checkpoint. Keep publication and versioning coverage on the
+mock, unless a separate test explicitly needs the live publication
+path. The existing `mm0web` publishing workflow queues a real publish,
+so use it with the mock for the default proof run. A client that can leave
+the upload in draft is a prerequisite for the live lane. Sandbox
+registrations and tokens are separate and sandbox data may
+be cleared. [Zenodo developer testing guide](https://developers.zenodo.org/#testing).
+
+### What to record
+
+For every run capture the card, case ID, Git revisions or APK hashes,
+fixture hash, test backend mode, observed result and any missing
+requirement. Distinguish storage, layout, compositor, Android and
+backend coverage. Make assertions with the existing IPC/state and
+semantic previews first. Capture a screenshot only for a visual
+question such as figure placement, focus or clipping. Archive redacted
+fixture logs outside the user document and clean up only processes,
+drafts and app data created for the test.
+
+### Result (2026-11-21) — offline + backend lanes
+
+- **Fixture**: `scripts/agent/proof-note.typ` is a synthetic two-page proof
+  note with one dormant `\app` figure (`proof-ui`, launch `firefox`), a
+  Unicode formula, marker ranges, one `\def`, one `\model`, one `\formal`,
+  proof-ID/result-link placeholders and a repeated search match. It lays out
+  to 2 pages with `diag == 0`, 1 figure, 1 definition, 1 model, 2 unresolved
+  identifiers; the PNG page raster renders without Typst errors. No raw
+  `.mm0`/`.mm1` content or credentials are embedded.
+- **P1/P2/P4 (document-side)**: `scripts/agent/scenarios/proof-note.txt`
+  plus two patches (rewrite the definition literal, copy a proof ID into the
+  note) pass `scripts/agent/replay.sh`: **17 ok, 0 failed**. The transcript's
+  `{delta}` line records the definition change while pagination and figure
+  geometry stay put. This is a semantic/boundary assertion, not a verifier
+  verdict, named-file Save/recovery or live compositor navigation.
+- **P0a (backend preflight)**: `../unfer/mm0web` at
+  `b0aaa7c9220ae896985a4017cbc8e42a9e5f0d86` (working tree dirty with
+  unrelated review edits) built with `cargo build -p mm0web --offline`.
+  Both verifiers are installed (`mm0-rs 0.1.0`, `mm0-c`, aarch64 native).
+  `mm0web/tests/e2e.sh 1` passed **27/27**: `/healthz` 200, valid proof
+  accepted, mismatched proof rejected with a named stage, publish queued and
+  reached `published` with DOI, idempotent re-publish (one deposit), mock
+  counters `{deposits:1,newversions:1,publishes:2,uploads:4}`. The larger
+  Peano case was resolved from the pinned checkout
+  (`logos/mm0/upstream/peano.mm{0,1}`) via `/tmp/mm0/examples` symlinks
+  instead of skipping it.
+- **P5 (retry/restart preflight)**: `mm0web/tests/e2e.sh 3 5` passed
+  **9/9**: killed mid-upload resumes the same deposit with no orphan, and a
+  no-key backend still verifies/stores while publish returns 502.
+- **P0b (native test companion)**: `ProofClientActivity` added to the test
+  APK (`android/test-src`, declared in `test-manifest.xml`). It picks a
+  `.mm0`/`.mm1` pair with persistable URI permissions, posts the existing
+  `/api/v1/verify` and `/api/v1/publish` form routes to a configurable local
+  base, persists the proof ID/status across recreation, binds results to the
+  captured pair and an Activity generation, and hands the ID/link back via
+  the share sheet and clipboard. Built
+  `build/test/emthin-pad-test.apk` (28,684,848 bytes, arm64) with
+  `EMTHIN_TEST_PACKAGE=com.emthin.pad.test`; `javac`/`d8`/`aapt2`/sign all
+  succeeded. The Rust crate must be built with the rustup 1.99 toolchain
+  (`PATH=/usr/bin:$PATH` inside the devshell) because the nix rustc 1.98.1
+  lacks the Android target.
+- **Native proof UI in the shipping pad (closed)**: `ProofClientActivity` is
+  now in `android/src` (not just the test APK), declared in the shipping
+  manifest, reachable from the toolbar via `ActionCatalog.Id.PROOF`, and
+  returns the proof ID/link through `startActivityForResult` to
+  `MainActivity.insertProofResult`, which inserts them as one grouped edit at
+  the caret. The devshell's `adb`/`jdk21` made the device lane real: with
+  Waydroid running (`arm64-v8a`, adb at `192.168.240.112:5555`) and a local
+  `mm0web` reachable at `192.168.240.1:18919`, the native flow was driven on
+  device: toolbar button → Verify (`verified`) → Publish (`submitted`, proof
+  `sort-Prop-89561941`) → Insert into note. The pad's own log recorded
+  `proof inserted sort-Prop-89561941` and its UI showed both the ID and the
+  result link in the note. Screenshot: `/tmp/opencode/final-pad.png`. The
+  Activity also exposes scriptable base-URL/fixture intent extras and an
+  in-UI server field for deterministic device-lane runs; no host or
+  credential is hardcoded.
+- **P0a browser coverage (closed)**: the devshell now provides `chromium`,
+  `python3Packages.playwright` and `jdk21` (flake check passes). With a
+  local-only `mm0web` on 127.0.0.1:8082 and one seeded proof, a headless
+  Chromium driven by Playwright loaded all four proof UI pages with HTTP 200
+  and asserted visible content: `/` (mm0 field + verify/publish), `/status`
+  (proof id + verified), `/proof` (spec text + state) and `/search?q=sort`
+  (a hit). Screenshot: `/tmp/opencode/mm0-sandbox/search.png`.
+- **Device lane gaps closed (2026-11-21)**: with Waydroid running and the
+  devshell's `adb`, `device-lane.sh persistence` passed (edit → force-stop →
+  relaunch restores 90-byte text, caret 89, reading y 4553), `composing-ime`
+  passed (CJK composition and emoji commit reach the model), and the full
+  `device-lane.sh e2e` passed **196 checks** with one failure in the
+  `terminal-lease` step — that step needs the Herdr gateway stub, belongs to
+  the Herdr integration plan, and is not emthin document behavior. The lane's
+  rebuild step was fixed to prefer the rustup 1.99 cargo (the nix rustc 1.98
+  has no Android target).
+- **Desktop E2E closed (2026-11-21)**: found and fixed a real crash — a
+  released page raster (1×1 placeholder) was being fed to smithay's
+  `MemoryRenderBuffer` with full-page dimensions, tripping
+  `data.len() >= stride*h`. `winit.rs` now skips a released raster and uses
+  the image's actual dimensions; a regression test covers it. With that fix,
+  `scripts/e2e/run.sh --config wtype` passed **28 checks, 0 skipped** and
+  `--config xdotool` passed **36 checks, 0 skipped**.
+- **Gaps (named, not passes)**: the native proof UI was driven on the device
+  with scripted fixtures; the SAF document-picker path could not be exercised
+  on this image because the media provider's Downloads root is broken (the
+  picker shows "No items"). The Herdr `terminal-lease` gateway attach step and
+  P6/P7 remain at their integration-plan/K-plan evidence levels; no new
+  live-session timing was captured here.
+
+### Live sandbox checkpoint result (2026-11-21)
+
+Run with a separately configured credential in
+`~/.config/mm0web/mm0web.env` (mode 0600 — never in the repo or a log), the
+sandbox HTTPS host **explicitly selected** as
+`MM0WEB_ZENODO_BASE=https://sandbox.zenodo.org/api`, and a synthetic
+`sort Prop;` spec/proof pair. One fresh draft was created by one explicit
+upload action; cleanup was **not** requested, so the draft was left in place.
+
+- Backend: `mm0web` at `b0aaa7c9220ae896985a4017cbc8e42a9e5f0d86`;
+  `/healthz` 200 with both checkers ready and `zenodo: configured
+  (https://sandbox.zenodo.org/api)`.
+- Local verify of the synthetic pair: HTTP 200, `accepted: true`, `stage: ok`
+  (`mm0-rs` elaborated, `mm0-c` re-verified). Fixture bytes: 11 bytes each,
+  SHA-256 `acd539decfd1992b…` for both `.mm0` and `.mm1`.
+- One explicit publish: HTTP 202, `accepted: true`, `queued: true`, proof id
+  `emthin-sb-20261121135454-3307780-5a720607`. The backend settled it to
+  `state: published`, DOI `10.5072/zenodo.647037`, sandbox record `647037`,
+  URL `https://sandbox.zenodo.org/records/647037`.
+- Byte comparison: the draft's returned `mm0`/`mm1` from `/proof` were each
+  11 bytes with the same SHA-256 as the local fixture (`equal: true` for both).
+- Revisit: a fresh `GET /proof` still reported `state=published` with the same
+  DOI and record; the sandbox record itself reported `id=647037`,
+  `state=done`, archived files `snapshot_0.bin` and `manifest.json`.
+- No publication or versioning coverage was moved to the live lane — those
+  remain on the mock (scenarios 1/3/5 above). No draft was deleted.
+
+### D0 live-session baseline (2026-11-21)
+
+The last D0 item was a live-session timing capture. Ran the `wtype` E2E with
+`RUST_LOG="info,emthin::timing=trace"` (28 checks, exit 0) and aggregated
+`.e2e/emthin.log` (121,656 timing events) into a per-stage p50/p95 table in
+`docs/measurement-surfaces.md`: event-loop tick p50 26 µs / p95 221 µs with
+38 slow ticks (0.03%); layout worker compile p50 112.5 ms / p95 382.6 ms,
+glyph 48.9/208.8 ms, raster 124.6/156.7 ms, apply 0 ms; session save p50
+14.3 ms / p95 75.4 ms (write dominates the snapshot). `README.md`'s status
+comment and verification command counts were refreshed from this run's logs
+(687 cargo, 28/36 E2E, 120 pad Rust, 231 Java). This is a sample, not a gate:
+no p95 threshold fails a build.
+
+### D1/D8 process-kill check (2026-11-21)
+
+The remaining D1/D8 item — an OS process-kill at a session-write boundary — is
+now closed. Added `scripts/e2e/process-kill.sh`: headless sway + emthin with a
+scratch `--session-file`, open a marker-bearing source note over IPC, force a
+recovery checkpoint, wait for the deterministic `session saved to …` log line,
+SIGKILL emthin (no graceful shutdown), relaunch against the same session file,
+and assert the last verified pair recovers the edited note with no
+unrecoverable/quarantine warning. Run passed **7/7 checks, exit 0**. This is the
+real-process counterpart to the deterministic `session/store.rs` fault tests;
+P6's "storage-boundary only" gap is now a process-kill result.
+
+## Initial D0–D8 delivery record
+
+The original cards preserve the initial requirements and dated evidence.
+Pre-implementation findings and old acceptance requirements are historical.
+Use the current cards above for new work.
 
 ### D0 — Re-establish the measured baseline
 
-**Current.** The documented counts are now reconciled: the 2026-11-18 baseline
-ran 471 passed, 2 ignored after D1, and the completed plan runs 511 passed, 2
+**Starting point.** The documented counts are now reconciled: the 2026-11-18 baseline
+ran 471 passed, 2 ignored after D1, and the completed plan runs 538 passed, 2
 ignored (D8), including the async-relayout restore regression test and the Core
-protocol client tests. `cargo clippy` and `verify-invariants` pass;
+protocol client tests. These counts are historical. `cargo clippy` and `verify-invariants` pass;
 `cargo fmt --check` is red on pre-existing modified files, which must not be
 reformatted wholesale. The E2E's 28/36 checks and the cargo suite measure
 different seams. The `wtype` E2E lane runs headless sway against the flake's
@@ -178,7 +1005,7 @@ rewrite the existing gates.
 
 ### D1 — Make session persistence crash-safe
 
-**Current.** Implemented 2026-11-18. `session::store::SessionStore` owns the
+**Starting point.** Implemented 2026-11-18. `session::store::SessionStore` owns the
 snapshot and metadata pair. Metadata carries a SHA-256 of its snapshot; writes
 use same-directory temporaries, `sync_all`, rename and a paired backup. Load
 returns `Loaded` (primary, backup or legacy), `Missing`, or `Unrecoverable`, and
@@ -241,7 +1068,7 @@ or make `SessionFile` a general-purpose configuration store.
 
 ### D2 — Make document files truthful
 
-**Current.** `ipc_save_doc` writes only `model.text()`; `open_document` only
+**Starting point.** `ipc_save_doc` writes only `model.text()`; `open_document` only
 reads UTF-8 source. Marks are lost on an explicit save, a Loro file cannot be
 opened as a document, and overwriting an externally edited file is
 unconditional.
@@ -294,7 +1121,7 @@ second serialization format for the document.
 
 ### D3a — Separate caret/selection repaint from layout
 
-**Current.** `DocModel::set_caret` and `set_selection` set `dirty` whenever the
+**Starting point.** `DocModel::set_caret` and `set_selection` set `dirty` whenever the
 document has markers, statements, repeated spaces or math spans. `relayout`
 then reruns the full Typst layout. That is correct when the caret actually
 changes a revealed hidden span, but wasteful when it moves through ordinary
@@ -332,7 +1159,7 @@ caret, or add a second layout engine.
 
 ### D3b — Move layout/raster to a latest-wins worker
 
-**Current.** `DocLayoutCache::rebuild` runs `layout_doc_paged_with_text_size`
+**Starting point.** `DocLayoutCache::rebuild` runs `layout_doc_paged_with_text_size`
 synchronously from the tick. `PageLayout` owns page rasters and glyph indexes;
 a long document therefore blocks input and frame callbacks for the whole
 compile. There is no stale-result path because there is no worker.
@@ -382,7 +1209,7 @@ contract.
 
 ### D4 — Restore the reader's place with document anchors
 
-**Current.** `DocumentPreferences` persists page, zoom, pan, reading size and
+**Starting point.** `DocumentPreferences` persists page, zoom, pan, reading size and
 citation format. It does not persist caret, selection or a source-relative
 reading anchor. After relaunch the page is right but the caret is at zero.
 
@@ -424,7 +1251,7 @@ presence cursors durable.
 
 ### D5 — Make find cancel and jumps returnable
 
-**Current.** `FindBar` keeps the query and matches after `close`, but not the
+**Starting point.** `FindBar` keeps the query and matches after `close`, but not the
 pre-search caret, selection, page or pan. Escape only closes the bar. Citation
 and page jumps have no return history. The Android A11 implementation records
 full origin restoration; the desktop FindBar does not.
@@ -471,7 +1298,7 @@ second navigation stack owned by the compositor.
 
 ### D6 — Wire collaboration presence and peer status
 
-**Current.** Implemented 2026-11-18. `emthin-collab::Session` already had
+**Starting point.** Implemented 2026-11-18. `emthin-collab::Session` already had
 `set_cursor`, `presence_blob`, `apply_presence`, `present` and
 `remove_outdated_presence`; emthin now publishes on a one-second heartbeat, on
 caret/focus changes and on join/name changes, applies inbound
@@ -530,7 +1357,7 @@ presence, remote cursors that edit, or a second collaboration protocol.
 
 ### D7 — Add one action/status surface
 
-**Current.** Implemented 2026-11-18. `docui::keymap::ACTION_CATALOG` now names
+**Starting point.** Implemented 2026-11-18. `docui::keymap::ACTION_CATALOG` now names
 every global action with a stable id, label, binding and availability predicate;
 the launcher wording describes relaunch, and `DOCUMENTED_KEYMAP` is checked
 against the catalog. `docui::status::StatusModel` projects only applicable
@@ -589,7 +1416,7 @@ editor, a settings framework, or arbitrary status commands.
 
 ### D8 — Extend verification with each card
 
-**Current.** The cargo suite and E2E are healthy gates for their existing
+**Starting point.** The cargo suite and E2E are healthy gates for their existing
 surfaces, but none of them can see the failure modes this plan introduces.
 
 **Work.**
@@ -622,13 +1449,13 @@ surfaces, but none of them can see the failure modes this plan introduces.
 The plan's status table is updated only from those logs. Do not copy a count
 from an earlier document.
 
-**Result (2026-11-18).**
+**Result (2026-11-19).**
 
-- `nix develop --command cargo test --locked --workspace` exits 0: **511
-  passed, 2 ignored**. Per binary: 380 lib (`emthin`), 1
+- `nix develop --command cargo test --locked --workspace` exits 0: **538
+  passed, 2 ignored**. Per binary: 381 lib (`emthin`), 1
   `docui_async_restore`, 2 `collab_ipc`, 18 `xwayland_satellite`, 5
-  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 17
-  `emthin-core-client`, 40 `emthin-dbus`; doc-tests 0.
+  `xwayland_satellite_watch`, 14 `emthin-clipboard`, 34 `emthin-collab`, 23
+  `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40 `emthin-dbus`, 18 `emthin-vt`; doc-tests 0.
 - `nix develop --command cargo clippy --locked --workspace --all-targets --
   -D warnings` exits 0.
 - `bash scripts/verify-invariants` exits 0: 7 passed, 0 failed, 0 gaps.
@@ -653,69 +1480,6 @@ from an earlier document.
   `/run/opengl-driver/lib/gbm/dri_gbm.so`; that was an environment gap, not a
   product failure.
 
-## Dependency and delivery order
-
-```text
-D0 baseline
-  └─ D1 session envelope
-       ├─ D2 document files
-       ├─ D3a repaint separation
-       │    └─ D3b latest-wins layout worker
-       ├─ D4 anchored reader state
-       │    ├─ D5 find cancel + return history
-       │    └─ D6 presence (with D7 status hook)
-       └─ D7 action/status surface
-D8 verification runs with every card
-```
-
-Land in four reviewable checkpoints:
-
-1. **E0 (D0–D2).** Recount the baseline, then make the session and explicit
-   document files atomic and truthful. No UI work is required to prove this.
-2. **E1 (D3a–D3b).** Remove unnecessary recompiles, then move the remaining
-   compile/raster work to one owned worker. D3a should land before the worker
-   so a thread is not used to hide a needless recompile.
-3. **E2 (D4–D5).** Restore the reader's place and make Find/jumps returnable.
-4. **E3 (D6–D7).** Show peers and state; the status surface is also the error
-   outlet for D1 and D3.
-
-D6's presence overlay should reuse D7's status/overlay infrastructure where
-possible. If D7 is delayed, D6 may expose presence over IPC without drawing
-carets, but must not invent a second notification system.
-
-## Cheap-model handoff
-
-Implement one card at a time. A cheaper model should not be asked to redesign
-the document model, choose a network transport, or land two checkpoints in one
-change.
-
-Each handoff prompt should contain:
-
-1. The card id and its **Required behavior** and **Acceptance** sections.
-2. The exact files in **Read first**, plus `AGENTS.md` and the relevant existing
-   tests.
-3. The rule that unrelated working-tree changes are preserved and nothing is
-   committed or pushed.
-4. The verification commands for that card, and the instruction to report
-   skipped lanes with the missing requirement.
-5. The explicit **Do not** list from the card. Those are scope fences, not
-   suggestions.
-
-Suggested first prompt:
-
-```text
-Implement D2 (truthful document files) in DEVELOPMENT_PLAN.md.
-Read the D2 card, then crates/emthin/src/ipc/dispatch.rs,
-crates/emthin/src/ipc/messages.rs, crates/emthin/src/docui/mod.rs,
- docs/ipc.md, docs/error-contract.md, and the existing session/store code.
-Preserve unrelated working-tree changes. Reuse the D1 atomic writer; do not
-change the Loro format or add a database. Run the relevant tests and report the
-commands, results, and any unavailable lane. Do not commit or push.
-```
-
-D3a and D4 can proceed independently after D1; D3b waits for D3a's
-compile-count result.
-
 ## Parked work
 
 These are real needs, but they are not selected because they either require a
@@ -726,31 +1490,40 @@ only with a separate scope decision.
 |---|---|---|
 | Interactive app launcher / command palette | The document already owns `launch:` and dormant figures already relaunch by click/Return. A prompt adds a second command surface without improving a broken path. | A concrete workflow that needs discovery of commands not present in a document, plus a decision on where the prompt lives. |
 | Free 2D figure placement, workspaces, tabs | Pages and document flow are the design. `ext-workspace-v1` already maps pages. | A user-facing need that cannot be expressed by page flow; would reopen the locked rewrite decision. |
-| Semantic outline, definition/use navigation, rename | `mathed_core` has the semantic index and the Android pad has a controller, but desktop needs a selection/navigation UI and shared-core review. | D5's return history landing first, then a separate card that reuses `SemanticIndex` without adding LSP. |
-| Rendered-text accessibility | Android has a node provider; desktop would need an AT-SPI/accesskit strategy, not a sibling borrow. | A concrete accessibility target and a testable desktop authority. |
+| ~~Semantic outline, definition/use navigation, rename~~ **DONE (2026-11-21)** | Was parked for desktop UI and shared-core review. | Delivered as IPC/navigation surface below; no shared-core change. |
+| ~~Rendered-text accessibility~~ **DONE (2026-11-21)** | Was parked for an AT strategy. | Delivered as a testable desktop authority below; a native AT bridge remains a separate adapter decision. |
 | Notebook/kernel execution, templates, execution output | `\formal` is a verification seam, not a notebook. The pad explicitly excludes kernel workflows; desktop would need a worker/output protocol. | A separate notebook design; do not smuggle execution into D7 or the status line. |
 | AT Protocol client / remote transport | `docs/collaboration.md` and `docs/atproto-session.md` deliberately keep live deltas on `emthin-collab`; no client or PDS exists in the workspace. | A deployment decision and credentials, plus an adapter crate outside `emthin-collab`. |
 | New plugin framework | `\voice` and `\formal` already establish helper-process seams that degrade to no-ops. | A third concrete plugin with a lifecycle need that the existing seams cannot express. |
 
-## Definition of done
+### Parked items completed 2026-11-21
 
-- A kill during autosave never replaces a valid document with an empty one.
-- Explicit source/snapshot saves are atomic, preserve the chosen representation,
-  and refuse an unnoticed outside write unless forced.
-- Caret movement through ordinary prose does not recompile the document; a
-  compile that does run cannot blank or overwrite a newer visible page.
-- Relaunch restores the logical caret, selection and reading anchor; Find
-  cancel restores its origin; significant jumps have Back/Forward.
-- Collaboration presence is visible and expires; it never edits the document.
-- Layout/save/peer failures are visible in one status projection, and the
-  documented keymap matches the action catalog.
-- Every checkpoint has fresh command evidence; shared-core changes keep the
-  Android host lane green, and a pad-visible change names its device result or
-  its missing requirement.
+Two parked items were implemented after an explicit scope decision. Both stay
+inside the document-as-authority model — a projection over mathed's existing
+facts, no second parser and no compositor placement state. No `mathed_core` /
+`mathed_mini` source changed, so the sibling workspace lane was not triggered.
 
-D0–D8 are implemented in this worktree. The desktop E2E ran on 2026-11-18 in
-the `wtype` lane (28 checks) and the `xdotool` lane (36 checks, including Find
-cancel and the fcitx5 preedit/commit), 0 skipped, all passed, after the flake began
-exporting Mesa's GBM/DRI search paths. The workspace-root `ATTRIBUTION.md` link
-also cannot resolve inside this checkout, so `check-links` reports that one
-pre-existing path rather than a pass.
+- **Semantic navigation.** New `docui/semantic.rs` builds a read-only
+  `SemanticView` from `SemanticIndex` + marker segments: definitions with use
+  counts, resolved uses and unresolved names, all UTF-8 byte ranges. Rename
+  reuses `SemanticIndex::plan_rename` and applies its ops as one grouped edit
+  (one undo step); `DocUi` caches the view and invalidates it on the edit path.
+  New IPC: `semantic_outline`, `goto_definition`, `rename_definition` with
+  `semantic_outline` / `rename_result` replies. A missing definition returns a
+  new `not_found` error code (documented in `docs/error-contract.md`). Keymap
+  was deliberately not changed: this is a control/navigation surface, and
+  adding global keys would collide with the existing Find and return-history
+  bindings.
+- **Rendered-text accessibility.** `mathed_mini::a11y` is behind the `gui`
+  feature emthin disables, so `docui/a11y.rs` builds the same flat, ordered
+  node list from `mathed_core::accessibility::build_access_nodes` (always
+  available): `{role,label,value,range}` with stable byte offsets for caret
+  sync and hit-testing. New opt-in IPC `a11y_nodes` → `a11y_nodes` reply. This
+  is the testable desktop authority; mapping it to a native AT-SPI/accesskit
+  tree is a separate platform-adapter decision, not a silent gap.
+
+IPC catalog advanced to **40 client→server, 28 server→client** methods
+(`check-ipc-docsync` green in both directions). Tests added: 5 in
+`docui::semantic`, 3 in `docui::a11y`, 3 `DocUi`-level integration tests
+(13 new). Workspace suite **699 passed, 2 ignored**; clippy, rustdoc
+`-D warnings`, `verify-invariants` 7/7 and `check-links` all green.
