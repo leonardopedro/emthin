@@ -56,6 +56,23 @@ Generated from conventional commits via git-cliff.
 - Figure page raster added to the GPU in `doc_render.rs`, re-imported
   only when `(page, doc revision)` changes.
 
+## [0.3.13] - 2026-10-12
+
+Merged from upstream `emskin/main`. The Emacs child-frame fix (#79) and its
+Elisp/IPC surface are not applied: this fork removed the Emacs shell.
+
+### Bug Fixes
+- Keep Emacs child frames above embedded apps (#79)
+- Inherit host DISPLAY when satellite is unavailable
+- Spawn parked child even when satellite is missing
+
+### Documentation
+- Cargo-install fallback for xwayland-satellite on non-Arch distros
+
+### Features
+- --dbus-isolated mode with private dbus-daemon (#70)
+- Floating-dialog routing for embedded toplevels (#69)
+
 ## [0.3.12] - 2026-04-27
 
 ### Bug Fixes
