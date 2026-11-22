@@ -29,6 +29,7 @@ pub mod inspect;
 #[path = "../../crates/emthin/src/docui/model.rs"]
 pub mod model;
 
+pub mod austral_rule;
 pub mod diagnostics;
 pub mod jit;
 pub mod layout;
@@ -399,7 +400,9 @@ fn escape_arg(value: &str) -> String {
 }
 
 /// The `terminal:` literal argument of one segment, if it has one.
-fn terminal_argument(segment: &mathed_core::markers::Segment) -> Option<&mathed_core::markers::Arg> {
+fn terminal_argument(
+    segment: &mathed_core::markers::Segment,
+) -> Option<&mathed_core::markers::Arg> {
     segment.extra_args.iter().find(|arg| match arg {
         mathed_core::markers::Arg::Literal { text, .. } => text
             .split_once(':')
@@ -494,7 +497,11 @@ fn append_terminal_figure(
     let start = format!("#{}", mathed_core::markers::auto_marker_id(a));
     let end = format!("#{}", mathed_core::markers::auto_marker_id(b));
     let caption = escape_caption(caption.trim());
-    let caption = if caption.is_empty() { "Terminal" } else { caption.as_str() };
+    let caption = if caption.is_empty() {
+        "Terminal"
+    } else {
+        caption.as_str()
+    };
     let terminal = escape_arg(&reference.canonical());
     let mut statement = format!(
         "{start} {caption} {end} \\app({start}, {end}, 640, 400, terminal: \"{terminal}\")\n"
@@ -531,6 +538,47 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_jitRoundtrip<'local>(
                 Err(e) => json!({ "error": e }).to_string(),
             };
             JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// K9 native rule artifact: run the embedded Austral module on a worker
+/// thread (never on the Android UI thread) and return
+/// `{"result": "complete"|"incomplete"|"malformed", ...}` or `{"error": …}`.
+/// The artifact is fingerprint-checked and capability-free before it loads.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_australRule<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    facts_json: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let json = (|| -> Result<serde_json::Value, String> {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&facts_json.to_string()).map_err(|e| e.to_string())?;
+                let facts: Vec<austral_rule::LinkFact> = serde_json::from_value(
+                    parsed
+                        .get("facts")
+                        .cloned()
+                        .unwrap_or(serde_json::json!([])),
+                )
+                .map_err(|e| e.to_string())?;
+                match austral_rule::evaluate_off_ui_thread(facts)? {
+                    austral_rule::RuleResult::Complete { facts } => {
+                        Ok(json!({ "result": "complete", "facts": facts }))
+                    }
+                    austral_rule::RuleResult::Incomplete { missing } => {
+                        Ok(json!({ "result": "incomplete", "missing": missing }))
+                    }
+                    austral_rule::RuleResult::Malformed => Ok(json!({ "result": "malformed" })),
+                }
+            })();
+            let value = match json {
+                Ok(value) => value,
+                Err(error) => json!({ "error": error }),
+            };
+            JString::from_str(env, value.to_string())
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
@@ -2221,10 +2269,8 @@ fn render_pages_with_options_expanded(
                 .figures
                 .iter()
                 .map(|figure| {
-                    let (reference, binding_error) = bindings
-                        .get(&figure.key)
-                        .cloned()
-                        .unwrap_or((None, None));
+                    let (reference, binding_error) =
+                        bindings.get(&figure.key).cloned().unwrap_or((None, None));
                     json!({
                         "key": figure.key,
                         "x": figure.rect.x0,
@@ -2489,7 +2535,11 @@ pub extern "system" fn Java_com_emthin_pad_NativeTerminal_nativeRgba<'local>(
             array.set_region(
                 env,
                 0,
-                pixels.iter().map(|b| *b as jbyte).collect::<Vec<_>>().as_slice(),
+                pixels
+                    .iter()
+                    .map(|b| *b as jbyte)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
             )?;
             Ok(array)
         })
@@ -2801,7 +2851,8 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_shareReceive<'local>(
             let delta = hex_decode(&delta.to_string()).unwrap_or_default();
             let scope = (scope >= 0).then_some(scope as u64);
             // SAFETY: UI-thread-owned handle.
-            let result = unsafe { share_handle_mut(handle) }.receive(peer, seq as u64, delta, scope);
+            let result =
+                unsafe { share_handle_mut(handle) }.receive(peer, seq as u64, delta, scope);
             share_json_result(env, result)
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
@@ -2884,17 +2935,17 @@ mod tests {
                     $missing$";
         let model = DocModel::new(text);
         let diagnostics = model.diagnostics();
-        let codes: Vec<_> = diagnostics
-            .iter()
-            .map(|d| d.code.as_str())
-            .collect();
+        let codes: Vec<_> = diagnostics.iter().map(|d| d.code.as_str()).collect();
         for expected in [
             "marker-pair",
             "dangling-figure",
             "missing-proof-result",
             "unresolved-name",
         ] {
-            assert!(codes.contains(&expected), "missing {expected}: {diagnostics:?}");
+            assert!(
+                codes.contains(&expected),
+                "missing {expected}: {diagnostics:?}"
+            );
         }
         assert!(diagnostics.iter().all(|d| d.range.end <= text.len()));
     }
@@ -2915,7 +2966,11 @@ mod tests {
             event(EventKind::Handshake, "v1", "", 0),
             event(EventKind::AcceptedChanges, "v2", "", 2),
         ];
-        let ndjson = trace.iter().map(SessionEvent::to_ndjson).collect::<Vec<_>>().join("\n");
+        let ndjson = trace
+            .iter()
+            .map(SessionEvent::to_ndjson)
+            .collect::<Vec<_>>()
+            .join("\n");
         let settled = inspect::replay(&ndjson).unwrap();
         assert_eq!(settled.local, "recovered");
         assert_eq!(settled.share, "current");
@@ -2945,9 +3000,7 @@ mod tests {
     #[test]
     fn page_metadata_carries_the_terminal_reference_for_each_figure_key() {
         let reference = "hc://6ab09a20fd1288983dfbbac2bb349231/t3";
-        let text = format!(
-            "#a Figure #b \\app(#a, #b, 100, 100, terminal: \"{reference}\")\n"
-        );
+        let text = format!("#a Figure #b \\app(#a, #b, 100, 100, terminal: \"{reference}\")\n");
         let bindings = layout::figure_bindings(&text);
         assert_eq!(bindings.len(), 1);
         let (terminal, error) = bindings.values().next().unwrap();
@@ -2987,9 +3040,7 @@ mod tests {
     fn rebind_replaces_only_the_terminal_argument_and_undoes_as_one_step() {
         let old = "hc://6ab09a20fd1288983dfbbac2bb349231/t3";
         let new = "hc://6ab09a20fd1288983dfbbac2bb349231/t4";
-        let source = format!(
-            "#a Build log #b \\app(#a, #b, 640, 400, terminal: \"{old}\")\n"
-        );
+        let source = format!("#a Build log #b \\app(#a, #b, 640, 400, terminal: \"{old}\")\n");
         let mut model = DocModel::new(&source);
         let options = terminal_figure_options(model.text());
         assert!(options.contains("Build log"), "{options}");

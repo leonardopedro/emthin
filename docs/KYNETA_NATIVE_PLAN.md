@@ -114,14 +114,16 @@ golden set of marker, citation and proof-note diagnostics.
   `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
   `bash scripts/verify-invariants` passes 7/7; `python3 scripts/check-ipc-docsync`
   and `python3 scripts/check-links` on the touched docs pass.
-- Gaps: a live compositor/control-client run was not performed — the
-  notification is asserted at the `OutgoingMessage` payload level and the
-  shared-model level. The `mathed_core`/`mathed_mini` test lane could not run
-  on this aarch64 host because that sibling flake exposes only an x86_64
-  devshell; no mathed engine source changed in this card, and the Android host
-  lane (110 passed) exercises the same engine through the pad. An earlier
-  full-workspace run hit a flaky `xwayland_satellite` script-launch assertion
-  under parallel load; it passes in isolation and the final full run was green.
+- Gaps (updated 2026-11-22): the live compositor/control-client gap is closed
+  by `scripts/e2e/live-ipc.sh` (11/11 checks, exit 0) — a real headless sway +
+  emthin instance answers `inspect_state`, `history_list` and the parked-item
+  methods over the control socket, including a live rename reflected in the
+  next `semantic_outline`. The sibling `mathed_core`/`mathed_mini` lane also
+  runs here via `cd emthin && nix develop -c bash -c 'cd ../velysterm && cargo
+  test -p mathed_core -p mathed_mini'` (the sibling's own flake has no aarch64
+  devshell); it passes. An earlier full-workspace run hit a flaky
+  `xwayland_satellite` script-launch assertion under parallel load; it passes
+  in isolation and the final full run was green.
 
 ### K2. Readiness, snapshots and acknowledgements in Rust
 
@@ -181,11 +183,17 @@ and a late completion never marks a newer revision saved.
   `emthin-core-client`, 1 `scripted_peer`, 1 `unix_fixture`, 40 `emthin-dbus`,
   23 `emthin-vt`, 15 `ghostty-vt`, 5 `herdr-gateway-fixtures`; doc-tests 0.
   `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
-- Gaps: a live two-instance relay with a real timeout was not run — the peer
-  ack and seed paths are asserted at the `DocUi`/`Readiness` level and through
-  the existing collab IPC harness. The pad already keeps `savedFingerprint`
-  separate from the durable fingerprint, so no Android source changed in this
-  card; its host lane remains green (110 passed).
+- Gaps (updated 2026-11-22): the live two-instance relay with a real timeout
+  now runs — `collab_ipc::a_two_instance_relay_detects_a_real_offline_timeout`
+  handshakes two real IPC peers, exchanges deltas, arms the peer clock with a
+  cumulative ack, drops one peer and pumps the other past the full 5-second
+  `OFFLINE_TIMEOUT` (no backdated clock) until `share_state` reports `offline`
+  (passes in ~5s). Writing it exposed a production bug: `ipc_collab_join`
+  never called `DocUi::note_share_joined`, so the share stayed `not_shared`,
+  `note_peer_ack` returned early and the offline timeout in `tick.rs` could
+  never fire; the join path now arms it. The pad already keeps
+  `savedFingerprint` separate from the durable fingerprint, so no Android
+  source changed in this card; its host lane remains green.
 
 ### K3. Reliable scoped exchange in Rust
 
@@ -243,12 +251,14 @@ the previously saved document.
   `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0;
   `bash scripts/verify-invariants` passes 7/7; `python3 scripts/check-ipc-docsync`
   and `python3 scripts/check-links` pass.
-- Gaps: the wire-level scope/epoch fields are carried by the v2 handshake and
-  `Resync`, but the Unix host's established `Delta`/`Ack`/`Presence` frames
-  remain the legacy shape (the `Session` v2 methods carry the epoch fence). A
-  live two-process remote relay and a native network transport were not run;
-  the convergence and fencing behavior is covered by in-process `Session`
-  tests and the existing two-IPC-client harness.
+- Gaps (updated 2026-11-22): the wire-level gap is closed. `wire.rs` now has
+  `DeltaV2`/`AckV2`/`PresenceV2` frames carrying epoch and optional scope, with
+  round-trip tests and a check that the legacy tags still decode to legacy
+  shapes. `UnixLink` upgrades established frames on a v2 handshake and the host
+  rejects a stale epoch before touching document state (unit test on a
+  socketpair). Convergence and fencing are covered by in-process `Session`
+  tests and the two-IPC-client harness. A native network transport was not run;
+  that is K6's real-phone lane (excluded from this pass).
 
 ### K4. Document grants and anchored presence in Rust
 
@@ -314,12 +324,15 @@ document, undo history or saved file.
   tests. `cargo clippy --locked --workspace --all-targets -- -D warnings`
   exits 0; `bash scripts/verify-invariants`, `check-ipc-docsync` and
   `check-links` pass.
-- Gaps: local Unix `SO_PEERCRED` extraction is not wired — the local principal
-  is the session's verified local peer id, and remote principals arrive as
-  verified ids over the existing IPC transport. A real authenticated remote
-  transport, an explicit local-fork/export UI for a denied writer, and a
-  device/live-compositor run were not performed; those are covered by K6 and
-  the device lane. The pad was unchanged (110 host tests still green).
+- Gaps (updated 2026-11-22): local `SO_PEERCRED` extraction is now wired —
+  `IpcConn::peer_credentials` reads pid/uid/gid from the kernel at accept time,
+  and the `client_identity` IPC method exposes them (unit test on a socketpair
+  plus a live assertion in `scripts/e2e/live-ipc.sh`). This is a verified local
+  principal fact, not an authorization decision; admission still belongs to the
+  live endpoint. A real authenticated remote transport and an explicit
+  local-fork/export UI for a denied writer were not performed — the former is
+  K6's real-phone lane (excluded from this pass), the latter has no workflow
+  that needs it. The pad was unchanged.
 
 ### K5. Local undo and read-only history in Rust
 
@@ -370,12 +383,17 @@ changes neither the live version nor its save/undo status.
   ignored** (up from 659). `cargo clippy --locked --workspace --all-targets
   -- -D warnings` exits 0; `bash scripts/verify-invariants`,
   `check-ipc-docsync` and `check-links` pass.
-- Gaps: history retention is per-process and in-memory, not persisted across
-  relaunch; the Android pad has no K5 preview UI (its `logical_fingerprint`
-  already separates marks from history). A live control-client run of the new
-  history IPC methods was not performed — they are asserted at the projection
-  and catalog level. A read-only boundary already exists at the IPC layer but
-  no end-to-end UX enforces it beyond the documented grant checks.
+- Gaps (updated 2026-11-22): the retention-across-relaunch gap is closed.
+  `HistoryStore::{to_json,from_json}` persists the bounded ring to a plain-JSON
+  sidecar next to the session file; a malformed row is skipped rather than
+  erasing the ring. `DocUi::load/save` wire it in, with a DocUi-level test that
+  retains a snapshot, saves, relaunches a fresh instance and reads the same
+  frontiers back. The live control-client gap is also closed:
+  `scripts/e2e/live-ipc.sh` asserts a live `history_list` reply with a
+  `frontiers` field. The Android pad has no K5 preview UI (its
+  `logical_fingerprint` already separates marks from history), and a read-only
+  boundary exists at the IPC layer but no end-to-end UX enforces it beyond the
+  documented grant checks.
 
 ### K6. Native sharing on desktop and Android
 
@@ -487,10 +505,15 @@ created solely for it.
   `cargo clippy --locked --workspace --all-targets -D warnings`,
   `bash scripts/verify-invariants`, `check-ipc-docsync` and `check-links`
   pass. The CLI was exercised with a four-event recovery/reconnect fixture.
-- Gaps: the event log is in-memory and opt-in per process; there is no
-  persistent on-disk trace or UI panel beyond `list_state`/IPC, and no live
-  control-client run of the new inspect methods was performed. The Android
-  host test uses the shared reducer, not a device run.
+- Gaps (updated 2026-11-22): the on-disk trace gap is closed. `EventLog` gained
+  an opt-in NDJSON sink (`enable_with`) that mirrors the bounded in-memory ring
+  to a `.inspect.ndjson` sidecar next to the session file; `inspect_start` wires
+  it when a primary session owns a state dir, and a sink failure degrades to
+  in-memory observation. A unit test proves the file bytes equal `ndjson()` and
+  that replaying them settles to the same state. The live control-client case
+  is also closed (`scripts/e2e/live-ipc.sh`, `inspect_state` with `enabled`).
+  There is still no dedicated UI panel beyond `list_state`/IPC, and the Android
+  host test uses the shared reducer rather than a device run.
 
 ### K8. Derived proof and reference queries in Rust
 
@@ -543,11 +566,21 @@ these existing projections.
   ignored** (up from 677). `cargo clippy --locked --workspace --all-targets
   -D warnings`, `bash scripts/verify-invariants`, `check-ipc-docsync` and
   `check-links` pass.
-- Gaps: the query runs over the synthetic proof-note fixture, not the MM0
-  backend's live results — the backend remains the checker and no live
-  verifier run was performed. No generic query language or keyed incremental
-  view was introduced, as no second query was demonstrated. A live control
-  client run of `proof_query`/`proof_result` was not performed.
+- Gaps (updated 2026-11-22): both the live control-client case **and** a real
+  verifier run are closed. `scripts/e2e/live-ipc.sh` delivers a `proof_result`
+  with the document's own owner/proof id and asserts the next `proof_query`
+  reports the verdict. Writing it exposed a production bug: `ipc_proof_query`
+  rebuilt the proof view on every call, silently discarding an accepted verdict;
+  `DocUi::proof_view_cached` now reuses the view when owner/generation match,
+  with a regression test for retention and invalidation on edit.
+  `scripts/e2e/live-mm0.sh` starts a loopback `mm0web`, verifies the real Peano
+  `.mm0`/`.mm1` with mm0-rs + mm0-c, reads the backend's content-addressed
+  proof id from its audit trail, writes a document citing that id via a new
+  `\formal(..., proof: "id")` named argument, and feeds the backend's verdict
+  into `proof_result` — all 5 checks pass (id `Peano-live-66bfb078`). The
+  `proof:` argument is an additive shared-core change verified in both lanes
+  (585 passed). No generic query language or keyed incremental view was
+  introduced, as no second query was demonstrated.
 
 ### K9. Compile a pure rule with AustralVM when justified
 
@@ -603,10 +636,22 @@ dependencies, artifact identity and measured cost.
 - Verification: `cargo test --locked --workspace` exits 0: **683 passed, 0
   failed, 2 ignored** (up from 682), including the rule fixtures.
   `cargo clippy --locked --workspace --all-targets -D warnings` exits 0.
-- Gaps: no Austral artifact was compiled for this rule, so identical
-  Rust/Austral results and off-UI-thread arm64 calls were **not** produced —
-  the card's `Done` bar is not met, and the rule is deliberately advisory and
-  unadopted rather than reported as a passed lane.
+- Gap closed (2026-11-22): a real Austral artifact now exists and runs.
+  `emthin-android/austral/LinkRule.aum` implements the rule in Austral (bounded
+  base-10 digit encoding over the scalar CPS ABI); `austral/build.sh` compiles
+  it with the pinned local compiler to `LinkRule.cps` (CPS v1, 4 functions,
+  1389 bytes, SHA-256 `157e22a1…43ca48`). `emthin-android/src/austral_rule.rs`
+  embeds the artifact, refuses a fingerprint mismatch or any capability-bearing
+  symbol before load, and calls `LinkRule:check` on a worker thread. The five
+  host tests reproduce the Rust rule's positive/negative/malformed/cyclic/
+  over-bound fixtures with identical results; the pad's JNI `australRule`
+  entry is called from a Java background thread and `device-lane.sh
+  austral-rule` asserts `complete/2` in logcat on the arm64 Waydroid device
+  (**passed**). Fixing the bridge's `compile_cps_binary` to register the
+  trapping-arithmetic symbols (missing there, present on the compiler's own
+  JIT path) was required for the artifact to finalize. The rule remains
+  advisory — this closes the artifact/reproducibility gap, not an adoption
+  decision.
 
 ## Development testing
 

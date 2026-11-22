@@ -2,6 +2,22 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
+/// Kernel-verified credentials of the process on the other end of the control
+/// socket. Unlike a self-asserted peer id, these cannot be spoofed by a local
+/// client: `SO_PEERCRED` is filled in by the kernel at `accept` time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl std::fmt::Display for PeerCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid:{} uid:{} gid:{}", self.pid, self.uid, self.gid)
+    }
+}
+
 /// Maximum allowed IPC message payload size (1 MiB).
 const MAX_MSG_SIZE: usize = 1024 * 1024;
 
@@ -72,6 +88,35 @@ pub struct IpcConn {
 }
 
 impl IpcConn {
+    /// The kernel-verified local peer, or `None` when the platform has no
+    /// `SO_PEERCRED` support. Captured from the connected stream, never from a
+    /// message field, so a client cannot claim another process's identity.
+    pub fn peer_credentials(&self) -> io::Result<Option<PeerCredentials>> {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            let mut cred: libc::ucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let rc = libc::getsockopt(
+                self.stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            );
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (len as usize) < std::mem::size_of::<libc::ucred>() {
+                return Ok(None);
+            }
+            Ok(Some(PeerCredentials {
+                pid: cred.pid as u32,
+                uid: cred.uid,
+                gid: cred.gid,
+            }))
+        }
+    }
+
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Self {
@@ -219,6 +264,17 @@ mod tests {
     fn make_pair() -> (IpcConn, UnixStream) {
         let (a, b) = UnixStream::pair().unwrap();
         (IpcConn::new(a).unwrap(), b)
+    }
+
+    #[test]
+    fn a_socketpair_reports_the_kernel_verified_peer() {
+        let (conn, _peer) = make_pair();
+        let cred = conn
+            .peer_credentials()
+            .expect("getsockopt works on Linux")
+            .expect("SO_PEERCRED is available");
+        assert_eq!(cred.pid, std::process::id() as u32);
+        assert!(cred.to_string().contains("pid:"));
     }
 
     fn write_content_length(stream: &mut UnixStream, payload: &[u8]) {

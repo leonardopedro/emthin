@@ -48,6 +48,18 @@ pub fn event_loop_tick(state: &mut EmthinState) {
         state.ipc.send(msg);
     }
 
+    // --- Kernel: collect worker output into derived splices ---
+    //
+    // Same shape as voice: a worker thread runs the external kernel and this
+    // is the only collection point. Output is derived state spliced into the
+    // render text, never written into the document.
+    if !state.doc.poll_kernel().is_empty() {
+        state.needs_redraw = true;
+    }
+    if state.doc.poll_diagnostics() {
+        state.needs_redraw = true;
+    }
+
     // --- Re-layout a document an edit left dirty ---
     //
     // Keystrokes mark the model dirty and return; this is where the typeset

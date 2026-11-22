@@ -29,6 +29,7 @@
 #   build        build the APK for the connected device's ABI
 #   install      adb install -r the built APK (implies connect)
 #   launch       am start -W the pad activity
+#   austral-rule  native Austral rule artifact on a worker thread (K9 arm64)
 #   pull         pull the installed base.apk, md5-compare to the built APK
 #   screencap F  capture the screen to file F (prefix-stripped PNG)
 #   logcat F     dump the pad's logcat to F
@@ -2493,6 +2494,32 @@ cmd_e2e() {
     cmd_pull
 }
 
+cmd_austral_rule() {
+    # K9: run the embedded Austral rule artifact on a worker thread (the JNI
+    # entry spawns one, and MainActivity calls it from a Java background
+    # thread). Assert the real native result reaches logcat on this arm64
+    # device; a fingerprint/artifact mismatch or a capability violation
+    # would surface as `austral rule failed` instead.
+    local log="$OUTDIR/austral-rule-logcat.txt"
+    say "==> austral rule: native artifact off the UI thread"
+    mkdir -p "$OUTDIR"
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" --ez emthin.australRuleSmoke true \
+            >/dev/null 2>&1; then
+        pass "launched the austral-rule smoke"
+    else
+        fail "launch the austral-rule smoke"
+        return
+    fi
+    wait_for_log "$log" 'austral rule: .*"result":"complete".*"facts":2' \
+        || { fail "native Austral rule did not return complete/2 on device"; return; }
+    if grep -q 'austral rule failed' "$log"; then
+        fail "native Austral rule reported a failure on device"
+        return
+    fi
+    pass "native Austral rule returned complete/2 off the UI thread on arm64"
+}
+
 # ---- dispatch ---------------------------------------------------------
 
 cmd="${1:-e2e}"
@@ -2530,6 +2557,7 @@ case "$cmd" in
     terminal-reflow) cmd_terminal_reflow ;;
     terminal-pages) cmd_terminal_pages ;;
     terminal-lease) cmd_terminal_lease ;;
+    austral-rule) cmd_austral_rule ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;
 esac

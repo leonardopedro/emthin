@@ -549,6 +549,21 @@ public class MainActivity extends Activity {
         if (getIntent().getBooleanExtra("emthin.jitSmoke", false)) {
             Log.i("emthin-pad", "cranelift roundtrip: " + DocBridge.jitRoundtrip(42));
         }
+
+        // K9 native rule artifact: the Rust entry runs the Austral module on
+        // its own worker thread; call it from a Java background thread too so
+        // the device proof covers both sides of the off-UI-thread boundary.
+        if (getIntent().getBooleanExtra("emthin.australRuleSmoke", false)) {
+            new Thread(() -> {
+                try {
+                    String facts = "{\"facts\":[{\"from\":\"a\",\"to\":\"b\"},"
+                            + "{\"from\":\"b\",\"to\":\"a\"}]}";
+                    Log.i("emthin-pad", "austral rule: " + DocBridge.australRule(facts));
+                } catch (Throwable t) {
+                    Log.e("emthin-pad", "austral rule failed: " + t, t);
+                }
+            }, "emthin-austral-rule").start();
+        }
     }
 
     private void installEditorWatcher() {

@@ -52,7 +52,14 @@ trap 'stop_emthin; stop_compositor 2>/dev/null || true; cleanup 2>/dev/null || t
 # open_doc IPC (a real file edit), not by writing the snapshot directly.
 MARKER="PKILL-$$-$(date +%s)"
 FIXTURE="$E2E_RUN/process-kill.typ"
-printf 'process kill fixture\n%s\n' "$MARKER" > "$FIXTURE"
+{
+  printf 'process kill fixture\n%s\n\n' "$MARKER"
+  # Enough filler to paginate, so a reading position off page 0 is meaningful.
+  for _ in $(seq 1 12); do
+    printf 'Filler paragraph for pagination in the process-kill fixture. '
+    printf 'The reading anchor must survive an OS process kill and relaunch.\n\n'
+  done
+} > "$FIXTURE"
 
 # open_doc has no content arg; it reads a named file. Use export_ascii's
 # companion: write a fresh source doc and open it, then edit through IPC.
@@ -65,17 +72,55 @@ if [[ "$doc_before" != *"$MARKER"* ]]; then
 fi
 ok "opened the scratch proof note through IPC"
 
+# Read one scalar field out of the `state` notification.
+read_field() {
+  python3 -c '
+import sys, json
+dec = json.JSONDecoder(); text = sys.stdin.read(); i = 0
+while i < len(text):
+    while i < len(text) and text[i] != "{": i += 1
+    if i >= len(text): break
+    try: obj, i = dec.raw_decode(text, i)
+    except ValueError: break
+    if obj.get("method") == "state":
+        value = obj["params"].get(sys.argv[1])
+        print("" if value is None else value); break
+' "$1"
+}
+
+# Choose a reading position off page 0 so its restoration is observable.
+page_count=$(ipc list_state | read_field page_count)
+if [ "${page_count:-1}" -gt 1 ]; then
+  ipc goto_page '{"page": 1}' >/dev/null
+  sleep 0.3
+  page_before=$(ipc list_state | read_field page)
+  if [ "$page_before" != "1" ]; then
+    fail "goto_page did not move to page 1 (got ${page_before:-none})"
+    exit 1
+  fi
+  ok "reading position moved to page 1 before the kill"
+else
+  page_before="0"
+  warn "fixture did not paginate; reading position check is weak"
+fi
+
 # Force a content change so autosave has something to checkpoint, then wait for
 # the deterministic write-boundary signal in the log ("session saved to ...").
 # The marker is already in the opened source, so touch the text via the voice
 # seam is unnecessary: a text_size change marks recovery state dirty and the
 # 5s autosave writes the pair.
-ipc set_text_size '{"pt": 17}' >/dev/null
+# Count saves already logged: a save from before the page change does not
+# checkpoint the reading position we are about to assert.
+saves_before=$(grep -ac "session saved to" "$E2E_ROOT/emthin.log" 2>/dev/null || echo 0)
+current_size=$(ipc list_state | read_field text_size)
+new_size=$(python3 -c "print(int(float('${current_size:-12}')) + 1)")
+ipc set_text_size "{\"pt\": $new_size}" >/dev/null
 
 deadline=$(( SECONDS + 20 ))
 boundary=0
 while [ "$SECONDS" -lt "$deadline" ]; do
-  if grep -aq "session saved to" "$E2E_ROOT/emthin.log"; then
+  saves_now=$(grep -ac "session saved to" "$E2E_ROOT/emthin.log" 2>/dev/null || echo 0)
+  if [ "$saves_now" -gt "$saves_before" ]; then
     boundary=1
     break
   fi
@@ -123,6 +168,14 @@ if [[ "$doc_after" != *"$MARKER"* ]]; then
   exit 1
 fi
 ok "relaunch recovered the last verified pair with the edited note"
+
+sleep 0.3
+page_after=$(ipc list_state | read_field page)
+if [ "$page_after" != "$page_before" ]; then
+  fail "relaunch lost the reading position (before $page_before, after ${page_after:-none})"
+  exit 1
+fi
+ok "relaunch restored the reading position (page $page_after)"
 
 if grep -aq "unrecoverable\|Unrecoverable\|quarantin" "$E2E_ROOT/emthin.log"; then
   fail "relaunch reported an unrecoverable session"

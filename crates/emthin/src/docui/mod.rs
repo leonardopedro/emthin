@@ -19,13 +19,17 @@ pub mod a11y;
 pub mod ascii_interchange;
 pub mod change;
 pub mod citations;
+pub mod diagnostics;
 pub mod edit;
 pub mod figures;
 pub mod file;
 pub mod formals;
+pub mod helpers;
 pub mod history;
 pub mod inspect;
+pub mod kernel;
 pub mod keymap;
+pub mod launcher;
 pub mod layout;
 pub mod model;
 pub mod proof_index;
@@ -100,6 +104,11 @@ pub struct DocUi {
     /// the document, so a relayout caused by an unrelated edit does not re-run
     /// the subprocess.
     formals: FormalVerifier,
+    /// The notebook/kernel worker bridge. Output is derived state, never
+    /// written into the Loro document.
+    kernel: kernel::KernelBridge,
+    /// The `\lint` diagnostics plugin (third helper-process plugin).
+    diagnostics: diagnostics::DiagnosticsBridge,
     /// The `\voice` dialogue seam: the `voice.sh` helper resolved from
     /// `${EMTHIN_VOICE_BIN}` or `$PATH`, plus the one turn in flight.
     /// Replies land in the transcript through [`DocUi::poll_voice`].
@@ -109,6 +118,9 @@ pub struct DocUi {
     /// `mathed_core::search` finds. The compositor draws its query and the
     /// match highlights — see [`search::FindBar`] and `crate::find_bar`.
     find: search::FindBar,
+    /// The app launcher palette: a filtered list of dormant `launch:` figures.
+    /// Holds no command registry — entries come from the document's figures.
+    launcher: launcher::LauncherBar,
     /// The view to return to when the find bar is cancelled. `None` while the
     /// bar is closed. Accepting a match clears it and records one history
     /// entry instead, so the accepted jump is returnable but Escape is not.
@@ -198,9 +210,12 @@ impl DocUi {
             layout: DocLayoutCache::new(),
             figures: FigureManager::new(),
             formals: FormalVerifier::new(),
+            kernel: kernel::KernelBridge::new(),
+            diagnostics: diagnostics::DiagnosticsBridge::new(),
             voice: VoiceBridge::new(),
             citation_popup: citations::CitationPopup::default(),
             find: search::FindBar::new(),
+            launcher: launcher::LauncherBar::new(),
             find_origin: None,
             history: Vec::new(),
             history_index: 0,
@@ -392,11 +407,47 @@ impl DocUi {
         view
     }
 
+    /// Return the cached proof view when it still describes this owner and
+    /// generation, rebuilding only on a change. A rebuild is a new fact: it
+    /// must not silently discard a verdict the owner already accepted.
+    pub fn proof_view_cached(
+        &mut self,
+        share_id: &emthin_collab::wire::ShareId,
+        document_key: &str,
+    ) -> proof_index::ProofView {
+        let revision = format!(
+            "{}:{}",
+            self.document_instance,
+            self.model.content_generation()
+        );
+        if let Some(view) = &self.proof_view {
+            if view.owner.share_id == crate::ipc::hex::encode(share_id)
+                && view.owner.document_key == document_key
+                && view.revision == revision
+            {
+                return view.clone();
+            }
+        }
+        self.proof_view(share_id, document_key)
+    }
+
     /// Apply an independently fetched proof result only to the current view.
     pub fn apply_proof_result(&mut self, result: proof_index::ProofResult) -> bool {
         self.proof_view
             .as_mut()
             .is_some_and(|view| view.apply_result(result))
+    }
+
+    /// The second query over the current proof view: bounded name search.
+    pub fn proof_search(&self, query: &str, limit: usize) -> proof_index::ProofMatches {
+        self.proof_view
+            .as_ref()
+            .map(|view| view.search(query, limit))
+            .unwrap_or(proof_index::ProofMatches {
+                definitions: Vec::new(),
+                references: Vec::new(),
+                missing: Vec::new(),
+            })
     }
 
     pub fn proof_dependencies(&self, name: &str, limit: usize) -> Vec<String> {
@@ -438,7 +489,99 @@ impl DocUi {
         Some(count)
     }
 
+    // ----- notebook / kernel execution (parked item) ------------------
+
+    pub fn kernel(&self) -> &kernel::KernelBridge {
+        &self.kernel
+    }
+
+    /// Queue one kernel run for the block ending at `block_end`.
+    pub fn kernel_run(
+        &mut self,
+        block_end: usize,
+        code: &str,
+        lang: Option<&str>,
+    ) -> Result<u64, String> {
+        self.kernel.submit(block_end, code, lang)
+    }
+
+    pub fn diagnostics(&self) -> &diagnostics::DiagnosticsBridge {
+        &self.diagnostics
+    }
+
+    /// Queue one `\lint` pass. A missing helper is a silent no-op.
+    pub fn lint_document(&mut self) -> Result<u64, String> {
+        let text = self.model.text().to_string();
+        self.diagnostics.submit(&text)
+    }
+
+    /// Drain lint replies; marks the page dirty when diagnostics changed.
+    pub fn poll_diagnostics(&mut self) -> bool {
+        let changed = self.diagnostics.poll();
+        if changed {
+            self.geometry_dirty = true;
+        }
+        changed
+    }
+
+    /// Drain kernel replies and mark the page dirty when output moved. The
+    /// last-good page stays visible until the rebuild completes.
+    pub fn poll_kernel(&mut self) -> Vec<usize> {
+        let changed = self.kernel.poll();
+        if !changed.is_empty() {
+            self.geometry_dirty = true;
+        }
+        changed
+    }
+
     // ----- read-only document history (K5) ----------------------------
+
+    /// On-disk sink for the opt-in inspect trace, next to the session file.
+    /// `None` for a nested session with no `--session-file`.
+    pub fn inspect_sink_path(&self) -> Option<std::path::PathBuf> {
+        let file = self.session_file.as_ref()?;
+        let mut name = file.as_os_str().to_os_string();
+        name.push(".inspect.ndjson");
+        Some(std::path::PathBuf::from(name))
+    }
+
+    /// Sidecar path for the retained history ring, next to the session file.
+    /// A nested session with no `--session-file` keeps nothing, matching the
+    /// existing save-path rule.
+    fn history_path(session_file: &std::path::Path) -> std::path::PathBuf {
+        let mut name = session_file.as_os_str().to_os_string();
+        name.push(".history");
+        std::path::PathBuf::from(name)
+    }
+
+    /// Restore history from the sidecar. A missing or malformed sidecar leaves
+    /// an empty ring; it never blocks opening the document.
+    fn restore_history_beside(&mut self, session_file: Option<&std::path::Path>) {
+        let Some(file) = session_file else { return };
+        match std::fs::read_to_string(Self::history_path(file)) {
+            Ok(text) => match history::HistoryStore::from_json(&text) {
+                Ok(store) => self.doc_history = store,
+                Err(error) => tracing::warn!("history sidecar unreadable: {error}"),
+            },
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("history sidecar could not be read: {error}");
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Persist the retained ring next to the session file. History is advisory
+    /// so a write failure is a warning, never a reason to fail the save.
+    fn save_history_beside(&self, session_file: &std::path::Path) {
+        match self.doc_history.to_json() {
+            Ok(text) => {
+                if let Err(error) = std::fs::write(Self::history_path(session_file), text) {
+                    tracing::warn!("history sidecar could not be written: {error}");
+                }
+            }
+            Err(error) => tracing::warn!("history sidecar could not be encoded: {error}"),
+        }
+    }
 
     /// Retain a snapshot of the committed document with explicit ownership.
     pub fn retain_history(&mut self, share_id: emthin_collab::wire::ShareId, owner: &str) {
@@ -559,6 +702,48 @@ impl DocUi {
             self.restore_view(&origin);
         }
         was_open
+    }
+
+    // ----- app launcher palette (parked item) --------------------------
+
+    /// The launcher palette, for the overlay renderer's query and status.
+    pub fn launcher(&self) -> &launcher::LauncherBar {
+        &self.launcher
+    }
+
+    /// Open the palette from the document's current figures. No command is
+    /// stored here; accepting an entry calls `relaunch_dormant`, which re-reads
+    /// the `launch:` argument from the document at that moment.
+    pub fn open_launcher(&mut self) {
+        self.launcher.open(&self.figures);
+        self.completion.cancel();
+    }
+
+    pub fn close_launcher(&mut self) -> bool {
+        self.launcher.close()
+    }
+
+    /// Refresh the palette after a re-layout changed the figure set.
+    pub fn refresh_launcher(&mut self) {
+        self.launcher.refresh(&self.figures);
+    }
+
+    /// The figure key Return would launch, or `None` when closed/empty. The
+    /// caller must go through `relaunch_dormant` to actually spawn it.
+    pub fn launcher_accept(&self) -> Option<String> {
+        self.launcher.accept().map(|entry| entry.key.clone())
+    }
+
+    pub fn launcher_push(&mut self, ch: char) {
+        self.launcher.push(ch);
+    }
+
+    pub fn launcher_backspace(&mut self) {
+        self.launcher.backspace();
+    }
+
+    pub fn launcher_step(&mut self, forward: bool) {
+        self.launcher.step(forward);
     }
 
     /// Accept the selected match: keep it, discard the cancel origin, and make
@@ -909,6 +1094,7 @@ impl DocUi {
                     self.note_existing_document();
                     self.relayout();
                     self.restore_preferences_beside(session_file);
+                    self.restore_history_beside(session_file);
                     self.relayout();
                     return;
                 }
@@ -946,6 +1132,7 @@ impl DocUi {
                                 ));
                             }
                             self.relayout();
+                            self.restore_history_beside(Some(file));
                             self.apply_document_preferences(preferences);
                             return;
                         }
@@ -1146,6 +1333,7 @@ impl DocUi {
             peers,
             voice: self.voice.in_flight(),
             formal: self.formals.calls() > 0,
+            diagnostics: self.diagnostics.in_flight(),
         }
     }
 
@@ -1475,6 +1663,10 @@ impl DocUi {
         if self.model.is_dirty() {
             self.semantic_view = None;
             self.proof_view = None;
+            // A content edit makes cached kernel regions stale. Drop them
+            // rather than splicing last-good output under the wrong block.
+            self.kernel.invalidate_from(0);
+            self.diagnostics.invalidate_from(0);
         }
         self.citation_popup.clear_if_stale(self.model.revision());
         // An IPC edit can change the document while the bar is open; refresh
@@ -1498,6 +1690,12 @@ impl DocUi {
             // verdicts ride along with the rest of the annotations.
             let mut options = self.model.transform_options();
             self.formals.apply(self.model.text(), &mut options);
+            // Kernel output and `\lint` diagnostics are derived state: splice
+            // the last-good regions without ever editing the document text.
+            options.block_splices = self.kernel.outputs().clone();
+            for (offset, markup) in self.diagnostics.annotations() {
+                options.block_splices.entry(offset).or_insert(markup);
+            }
             self.model.take_dirty();
             self.last_content_generation = Some(generation);
             self.last_reveal_key = Some(reveal_key);
@@ -1791,13 +1989,7 @@ impl DocUi {
         if fig.is_inert() {
             return Some("Invalid terminal reference — edit the figure".to_owned());
         }
-        let name = fig
-            .spec
-            .launch
-            .as_deref()
-            .and_then(|cmd| crate::cli::split_command(cmd).first().cloned())
-            .or_else(|| fig.spec.id.clone())
-            .unwrap_or_else(|| key.to_owned());
+        let name = launcher::dormant_name(&fig.spec, key);
         Some(format!("{name} — click or Return to launch"))
     }
 
@@ -1909,6 +2101,10 @@ impl DocUi {
             // dir it could own unconditionally.
             return;
         };
+        // Persist the advisory history ring alongside the session. This is
+        // deliberately before the content/preferences early return: a new
+        // frontier with an unchanged digest still changes history.
+        self.save_history_beside(&path);
         if self.persistence_blocked {
             tracing::debug!(
                 "session save suppressed for {}: unreadable files are preserved",
@@ -1945,7 +2141,15 @@ impl DocUi {
             reading_anchor: reading.and_then(|(byte, _)| self.capture_anchor(byte, -1)),
             reading_offset: reading.map(|(_, offset)| offset),
         };
-        session.set_preferences(key, preferences.clone());
+        session.set_preferences(key.clone(), preferences.clone());
+        // A relaunch with only `--session-file` has no opened document path to
+        // derive the key from, so it looks preferences up by the session file
+        // key. Mirror them there as well; otherwise page/zoom/text-size all
+        // snap back to defaults on restart even though they were saved.
+        let session_key = stable_document_key(&path);
+        if session_key != key {
+            session.set_preferences(session_key, preferences.clone());
+        }
         session.explicit_file = self.explicit_record().map(Box::new);
         let content = self.model.content_digest();
         if self.recovery_baseline.as_ref().is_some_and(|baseline| {
@@ -2596,6 +2800,47 @@ mod ascii_interchange_tests {
 }
 
 #[cfg(test)]
+mod proof_cache_tests {
+    use super::*;
+    use crate::docui::proof_index::{ProofResult, ViewOwner};
+
+    #[test]
+    fn a_query_after_an_accepted_result_keeps_the_verdict() {
+        let mut ui = DocUi::new();
+        ui.model_mut()
+            .replace(0..0, "#g claim #h \\formal(#g, #h, \"sort Prop\")");
+        let share = [7u8; 16];
+        let key = "proof.typ";
+        let view = ui.proof_view(&share, key);
+        let proof_id = view
+            .proof_id()
+            .expect("a formal statement's proof id")
+            .to_string();
+        let owner = ViewOwner::new(crate::ipc::hex::encode(&share), key.to_string());
+        assert!(ui.apply_proof_result(ProofResult {
+            owner,
+            proof_id,
+            verdict: "verified".into(),
+        }));
+
+        // A second query must reuse the same view: rebuilding would silently
+        // drop the verdict the owner already accepted (the live IPC bug).
+        let after = ui.proof_view_cached(&share, key);
+        assert_eq!(after.proof.map(|p| p.verdict).as_deref(), Some("verified"));
+
+        // But a content change is a new generation: the cache is invalidated
+        // and the verdict must not survive it.
+        ui.model_mut().replace(0..0, "new text");
+        ui.relayout();
+        let rebuilt = ui.proof_view_cached(&share, key);
+        assert!(
+            rebuilt.proof.is_none(),
+            "a stale verdict must not survive an edit"
+        );
+    }
+}
+
+#[cfg(test)]
 mod semantic_tests {
     use super::*;
 
@@ -2658,6 +2903,31 @@ mod session_tests {
     use super::*;
     use crate::session::SessionFile;
     use smithay::utils::Size;
+
+    #[test]
+    fn retained_history_survives_a_session_reload() {
+        let tmp = TmpDir::new("history-persist");
+        let session = tmp.snapshot();
+        let mut first = DocUi::new();
+        first.load(None, Some(&session));
+        first.retain_history([3u8; 16], "owner");
+        let frontiers = first.history_frontiers();
+        assert!(!frontiers.is_empty());
+        first.save();
+        assert!(
+            DocUi::history_path(&session).exists(),
+            "history sidecar written"
+        );
+
+        // A fresh UI is a relaunch: nothing carried over in memory.
+        let mut second = DocUi::new();
+        second.load(None, Some(&session));
+        assert_eq!(
+            second.history_frontiers(),
+            frontiers,
+            "the retained ring came back from the sidecar"
+        );
+    }
 
     /// A temp dir unique to one test, removed on drop.
     struct TmpDir(std::path::PathBuf);
@@ -2724,6 +2994,31 @@ mod session_tests {
         assert_eq!(second.view_pan(), Point::from((10.0, 20.0)));
         assert_eq!(second.citation_popup.style(), "vancouver");
         assert_eq!(second.citation_popup.locale(), "de-DE");
+    }
+
+    #[test]
+    fn a_page_chosen_after_opening_a_document_survives_a_session_only_relaunch() {
+        let tmp = TmpDir::new("open-then-relaunch");
+        let snapshot = tmp.snapshot();
+        let source = tmp.0.join("note.typ");
+        std::fs::write(&source, paged_doc()).expect("source");
+        let mut first = DocUi::new();
+        first.set_viewport(Size::from((1200, 900)));
+        first.load(None, Some(&snapshot));
+        // `open_document` makes document_key the .typ path, which differs from
+        // the session-file key a relaunch can derive (the real E2E bug).
+        first.open_document(&source).expect("open");
+        assert!(first.page_count() > 1, "fixture must paginate");
+        first.layout.set_current_page(1);
+        first.save();
+
+        let mut second = DocUi::new();
+        second.load(None, Some(&snapshot));
+        assert_eq!(
+            second.current_page(),
+            1,
+            "preferences mirrored under the session key must restore the page"
+        );
     }
 
     /// Without `--session-file` nothing is written at all — §5.10's nested rule.

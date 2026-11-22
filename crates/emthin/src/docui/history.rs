@@ -10,6 +10,19 @@
 use std::collections::VecDeque;
 
 use emthin_collab::wire::ShareId;
+use serde::{Deserialize, Serialize};
+
+/// A serializable row. Byte fields are hex strings so the sidecar stays plain
+/// JSON that can be inspected and compared without a binary decoder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryRow {
+    share_id: String,
+    frontier: String,
+    owner: String,
+    seq: u64,
+    snapshot: String,
+    content_digest: String,
+}
 
 /// How many snapshots are retained. Old entries fall off the front so a long
 /// session cannot grow the history without bound.
@@ -87,6 +100,54 @@ impl HistoryStore {
             entries: VecDeque::new(),
             limit: limit.max(1),
         }
+    }
+
+    /// Serialize the retained ring to a JSON sidecar. A failed encode is an
+    /// error the caller can report — history is advisory, but silently
+    /// dropping the whole ring on save would lose the evidence it exists for.
+    pub fn to_json(&self) -> Result<String, String> {
+        let rows: Vec<HistoryRow> = self
+            .entries
+            .iter()
+            .map(|entry| HistoryRow {
+                share_id: crate::ipc::hex::encode(&entry.share_id),
+                frontier: crate::ipc::hex::encode(&entry.frontier),
+                owner: entry.owner.clone(),
+                seq: entry.seq,
+                snapshot: crate::ipc::hex::encode(&entry.snapshot),
+                content_digest: entry.content_digest.clone(),
+            })
+            .collect();
+        serde_json::to_string(&rows).map_err(|error| error.to_string())
+    }
+
+    /// Restore a ring from a JSON sidecar. A malformed or truncated row is
+    /// skipped rather than discarding the rest, so one bad entry cannot erase
+    /// the whole history. The configured limit is always enforced on load.
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        let rows: Vec<HistoryRow> =
+            serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let mut store = Self::default();
+        for row in rows {
+            let share_id = crate::ipc::hex::decode(&row.share_id);
+            let frontier = crate::ipc::hex::decode(&row.frontier);
+            let snapshot = crate::ipc::hex::decode(&row.snapshot);
+            if let (Ok(share_id), Ok(frontier), Ok(snapshot)) = (share_id, frontier, snapshot) {
+                let share_id: ShareId = match share_id.try_into() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                store.retain(RetainedSnapshot {
+                    share_id,
+                    frontier,
+                    owner: row.owner,
+                    seq: row.seq,
+                    snapshot,
+                    content_digest: row.content_digest,
+                });
+            }
+        }
+        Ok(store)
     }
 
     /// Retain a snapshot. Consecutive identical frontiers are coalesced so an
@@ -179,6 +240,34 @@ mod tests {
             snapshot: doc.snapshot(),
             content_digest: doc.content_digest(),
         }
+    }
+
+    #[test]
+    fn the_ring_survives_a_json_round_trip_across_a_relaunch() {
+        let model = DocModel::new("starter");
+        let mut original = HistoryStore::new(4);
+        original.retain(entry(&model, 1, 1));
+        original.retain(entry(&model, 2, 2));
+        let json = original.to_json().expect("serialize");
+        let restored = HistoryStore::from_json(&json).expect("deserialize");
+        assert_eq!(restored.frontiers(), original.frontiers());
+        assert_eq!(
+            restored
+                .preview(&original.frontiers()[0], &[1; 16])
+                .ok()
+                .map(|preview| preview.content_digest),
+            original
+                .preview(&original.frontiers()[0], &[1; 16])
+                .ok()
+                .map(|preview| preview.content_digest)
+        );
+    }
+
+    #[test]
+    fn a_malformed_sidecar_row_is_skipped_not_fatal() {
+        let json = r#"[{"share_id":"zz","frontier":"","owner":"bad","seq":1,"snapshot":"","content_digest":""},{"share_id":"01010101010101010101010101010101","frontier":"00","owner":"ok","seq":2,"snapshot":"00","content_digest":"d"}]"#;
+        let restored = HistoryStore::from_json(json).expect("one good row survives");
+        assert_eq!(restored.frontiers().len(), 1);
     }
 
     #[test]

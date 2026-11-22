@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/emthin",
+    "crates/emthin-atproto",
     "crates/emthin-clipboard",
     "crates/emthin-collab",
     "crates/emthin-core-client",

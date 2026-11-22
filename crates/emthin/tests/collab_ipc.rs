@@ -291,8 +291,7 @@ fn presence_is_visible_expires_and_reconnects_without_editing() {
         b.pump();
         relay_presence(&mut a, &mut b);
         relay_presence(&mut b, &mut a);
-        if b
-            .state
+        if b.state
             .collab_peers()
             .iter()
             .any(|peer| peer.name == "Ada" && peer.cursor == Some(2))
@@ -335,10 +334,8 @@ fn presence_is_visible_expires_and_reconnects_without_editing() {
     a.pump();
     relay_presence(&mut a, &mut b);
     b.pump();
-    a.client.send(
-        "collab_join",
-        json!({"peer": b_peer, "version": ""}),
-    );
+    a.client
+        .send("collab_join", json!({"peer": b_peer, "version": ""}));
     let _ = a.wait_collab_delta(&b_peer);
     assert_eq!(
         b.state
@@ -408,10 +405,8 @@ fn mark_edits_converge_and_a_replaced_document_rejects_old_frames() {
     // Open/ASCII import both run the same document-scope reset.
     let path = b.dir.join("replacement.typ");
     std::fs::write(&path, "replacement").expect("write replacement");
-    b.client.send(
-        "import_ascii",
-        json!({"path": path.display().to_string()}),
-    );
+    b.client
+        .send("import_ascii", json!({"path": path.display().to_string()}));
     b.pump();
     assert_eq!(b.state.doc.model().text(), "replacement");
     assert!(b.state.collab_peers().is_empty(), "old peers are gone");
@@ -420,10 +415,8 @@ fn mark_edits_converge_and_a_replaced_document_rejects_old_frames() {
     // A uses Open; both entry points must reset the same scope.
     let a_path = a.dir.join("replacement.mathed");
     std::fs::write(&a_path, "replacement").expect("write replacement");
-    a.client.send(
-        "open_doc",
-        json!({"path": a_path.display().to_string()}),
-    );
+    a.client
+        .send("open_doc", json!({"path": a_path.display().to_string()}));
     a.pump();
     assert_eq!(a.state.doc.model().text(), "replacement");
 
@@ -479,14 +472,12 @@ fn grants_gate_commits_and_discovery_over_ipc() {
     assert!(a.state.collab.has_explicit_grants());
 
     // Discovery: a granted peer is visible, a stranger is not.
-    a.client
-        .send("collab_shares", json!({"peer": b_peer}));
+    a.client.send("collab_shares", json!({"peer": b_peer}));
     let reply = a.wait_for("granted share access", |m| {
         m["method"] == "collab_share_access"
     });
     assert_eq!(reply["params"]["visible"], true);
-    a.client
-        .send("collab_shares", json!({"peer": "stranger"}));
+    a.client.send("collab_shares", json!({"peer": "stranger"}));
     let reply = a.wait_for("stranger share access", |m| {
         m["method"] == "collab_share_access"
     });
@@ -538,8 +529,7 @@ fn grants_gate_commits_and_discovery_over_ipc() {
     // Drop the earlier denial notifications so the discovery reply is read
     // without tripping the harness's no-error guard.
     let _ = a.client.drain();
-    a.client
-        .send("collab_shares", json!({"peer": b_peer}));
+    a.client.send("collab_shares", json!({"peer": b_peer}));
     let reply = a.wait_for("revoked share access", |m| {
         m["method"] == "collab_share_access"
     });
@@ -594,6 +584,65 @@ fn two_ipc_clients_join_and_exchange_deltas() {
     // Surface any error notification that was queued instead of silently
     // passing on document text that happened to match.
     for message in a.client.drain().into_iter().chain(b.client.drain()) {
+        no_error(&message);
+    }
+}
+
+#[test]
+fn a_two_instance_relay_detects_a_real_offline_timeout() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut a = Peer::new("offline-a", "base");
+    let mut b = Peer::new("offline-b", "");
+
+    // A real handshake and delta exchange, not a backdated unit-test clock.
+    a.client
+        .send("collab_join", json!({"peer": "offline-b", "version": ""}));
+    b.client
+        .send("collab_join", json!({"peer": "offline-a", "version": ""}));
+    let (a_seq, a_delta) = a.wait_collab_delta("offline-b");
+    let (b_seq, b_delta) = b.wait_collab_delta("offline-a");
+    b.send_delta("offline-a", a_seq, &a_delta);
+    a.send_delta("offline-b", b_seq, &b_delta);
+    assert_eq!(b.document(), "base");
+
+    // A cumulative ack arms the peer-response clock on B (K2).
+    b.client
+        .send("collab_ack", json!({"peer": "offline-a", "seq": b_seq}));
+    b.wait_for("the ack to be accepted", |message| {
+        message["method"] != "state"
+    });
+    let state = |peer: &mut Peer| -> String {
+        peer.client.send("list_state", json!({}));
+        let message = peer.wait_for("a state reply", |m| m["method"] == "state");
+        message["params"]["share_state"]
+            .as_str()
+            .expect("share_state")
+            .to_string()
+    };
+    assert_ne!(
+        state(&mut b),
+        "not_shared",
+        "the ack must arm the share clock"
+    );
+
+    // The peer goes away for real. Pump B past OFFLINE_TIMEOUT (5s) — no
+    // backdating — and the readiness snapshot must report it offline.
+    drop(a);
+    let deadline = std::time::Instant::now()
+        + emthin::docui::readiness::OFFLINE_TIMEOUT
+        + std::time::Duration::from_secs(2);
+    loop {
+        let share = state(&mut b);
+        if share == "offline" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "share never went offline (was {share})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for message in b.client.drain() {
         no_error(&message);
     }
 }

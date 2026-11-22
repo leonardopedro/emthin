@@ -163,6 +163,34 @@ pub enum IncomingMessage {
     RenameDefinition { def_index: usize, new_name: String },
     /// Read-only rendered-text accessibility nodes (opt-in query).
     A11yNodes,
+    /// A second query over the proof view: bounded name search.
+    ProofSearch { query: String, limit: usize },
+    /// List dormant figures with a `launch:` command (the launcher palette).
+    LauncherEntries,
+    /// Launch a dormant figure by key, through the document's own `launch:`.
+    LauncherLaunch { figure: String },
+    /// Queue one notebook block for external kernel execution.
+    KernelRun {
+        block_end: usize,
+        code: String,
+        lang: Option<String>,
+    },
+    /// Read the last-good derived kernel output regions.
+    KernelOutputs,
+    /// Publish an AT Protocol session descriptor for the current document.
+    CollabPublishDescriptor {
+        owner: String,
+        endpoint: String,
+        rkey: String,
+    },
+    /// Fetch a published session descriptor (discovery only).
+    CollabDescriptor { rkey: String },
+    /// Queue one `\lint` diagnostics pass (third plugin).
+    LintRun,
+    /// List the helper-process plugins and their availability.
+    PluginCatalog,
+    /// Read the kernel-verified local control-client credentials.
+    ClientIdentity,
     /// Enable opt-in bounded session diagnostics.
     InspectStart,
     /// Disable diagnostics and drop the event buffer.
@@ -392,6 +420,63 @@ pub enum OutgoingMessage {
     RenameResult {
         replacements: usize,
         applied: bool,
+    },
+    /// Reply to `client_identity`: the kernel-verified local peer, or null.
+    ClientIdentity {
+        pid: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    /// Reply to `lint_run`: whether a pass was accepted (a missing helper is
+    /// a normal no-op).
+    LintResult {
+        generation: u64,
+        accepted: bool,
+    },
+    /// Reply to `plugin_catalog`: `(name, available, runs)` triples for the
+    /// helper-process plugins.
+    PluginCatalog {
+        plugins: Vec<(String, bool, usize)>,
+    },
+    /// Reply to `collab_publish_descriptor`: the committed record key and the
+    /// checkpoint revision it advertised. Publication is best-effort.
+    CollabDescriptorPublished {
+        rkey: String,
+        revision: u64,
+    },
+    /// Reply to `collab_descriptor`: the descriptor JSON, or null when the PDS
+    /// has no such record. Discovery only — the live handshake still decides
+    /// the real missing delta.
+    CollabDescriptor {
+        json: Option<String>,
+    },
+    /// Reply to `proof_search`: name matches as `(name,start,end)` rows plus
+    /// unresolved names, sorted by source offset and bounded by the request.
+    ProofMatches {
+        definitions: Vec<(String, usize, usize)>,
+        references: Vec<(String, usize, usize)>,
+        missing: Vec<String>,
+    },
+    /// Reply to `kernel_run`: the generation fenced for this job, and whether
+    /// it was accepted (a second concurrent run is rejected).
+    KernelSubmitted {
+        generation: u64,
+        accepted: bool,
+    },
+    /// Reply to `kernel_outputs`: last-good derived regions as
+    /// `[block_end, markup]` pairs. Never document text.
+    KernelOutputs {
+        regions: Vec<(usize, String)>,
+    },
+    /// Reply to `launcher_entries`: `(figure key, label, page)` triples.
+    LauncherList {
+        entries: Vec<(String, String, usize)>,
+    },
+    /// Reply to `launcher_launch`: whether the document's `launch:` was found
+    /// and a spawn was attempted.
+    LauncherLaunched {
+        figure: String,
+        spawned: bool,
     },
     /// Reply to `a11y_nodes`: read-only accessible nodes, each
     /// `{role,label,value,start,end}`. `start`/`end` are null when a node has
@@ -737,6 +822,31 @@ impl IncomingMessage {
                 new_name: params_get_string(params, "new_name")?,
             },
             "a11y_nodes" => Self::A11yNodes,
+            "proof_search" => Self::ProofSearch {
+                query: params_get_string(params, "query")?,
+                limit: params_get_usize(params, "limit")?,
+            },
+            "launcher_entries" => Self::LauncherEntries,
+            "launcher_launch" => Self::LauncherLaunch {
+                figure: params_get_string(params, "figure")?,
+            },
+            "kernel_run" => Self::KernelRun {
+                block_end: params_get_usize(params, "block_end")?,
+                code: params_get_string(params, "code")?,
+                lang: params_get_optional_string(params, "lang")?,
+            },
+            "kernel_outputs" => Self::KernelOutputs,
+            "collab_publish_descriptor" => Self::CollabPublishDescriptor {
+                owner: params_get_string(params, "owner")?,
+                endpoint: params_get_string(params, "endpoint")?,
+                rkey: params_get_string(params, "rkey")?,
+            },
+            "collab_descriptor" => Self::CollabDescriptor {
+                rkey: params_get_string(params, "rkey")?,
+            },
+            "lint_run" => Self::LintRun,
+            "plugin_catalog" => Self::PluginCatalog,
+            "client_identity" => Self::ClientIdentity,
             "inspect_start" => Self::InspectStart,
             "inspect_stop" => Self::InspectStop,
             "inspect_state" => Self::InspectState,
@@ -878,6 +988,16 @@ impl OutgoingMessage {
             Self::SemanticOutline { .. } => "semantic_outline",
             Self::RenameResult { .. } => "rename_result",
             Self::A11yNodes { .. } => "a11y_nodes",
+            Self::LauncherList { .. } => "launcher_list",
+            Self::LauncherLaunched { .. } => "launcher_launched",
+            Self::KernelSubmitted { .. } => "kernel_submitted",
+            Self::KernelOutputs { .. } => "kernel_outputs",
+            Self::CollabDescriptorPublished { .. } => "collab_descriptor_published",
+            Self::CollabDescriptor { .. } => "collab_descriptor",
+            Self::LintResult { .. } => "lint_result",
+            Self::PluginCatalog { .. } => "plugin_catalog",
+            Self::ClientIdentity { .. } => "client_identity",
+            Self::ProofMatches { .. } => "proof_matches",
             Self::ProofView { .. } => "proof_view",
             Self::InspectState { .. } => "inspect_state",
             Self::History { .. } => "history",
@@ -1076,6 +1196,40 @@ impl OutgoingMessage {
                 "applied": applied,
             }),
             Self::A11yNodes { nodes } => serde_json::json!({ "nodes": nodes }),
+            Self::ProofMatches {
+                definitions,
+                references,
+                missing,
+            } => serde_json::json!({
+                "definitions": definitions,
+                "references": references,
+                "missing": missing,
+            }),
+            Self::KernelSubmitted {
+                generation,
+                accepted,
+            } => {
+                serde_json::json!({ "generation": generation, "accepted": accepted })
+            }
+            Self::KernelOutputs { regions } => serde_json::json!({ "regions": regions }),
+            Self::CollabDescriptorPublished { rkey, revision } => {
+                serde_json::json!({ "rkey": rkey, "revision": revision })
+            }
+            Self::CollabDescriptor { json } => serde_json::json!({ "json": json }),
+            Self::LintResult {
+                generation,
+                accepted,
+            } => {
+                serde_json::json!({ "generation": generation, "accepted": accepted })
+            }
+            Self::PluginCatalog { plugins } => serde_json::json!({ "plugins": plugins }),
+            Self::ClientIdentity { pid, uid, gid } => {
+                serde_json::json!({ "pid": pid, "uid": uid, "gid": gid })
+            }
+            Self::LauncherList { entries } => serde_json::json!({ "entries": entries }),
+            Self::LauncherLaunched { figure, spawned } => {
+                serde_json::json!({ "figure": figure, "spawned": spawned })
+            }
             Self::ProofView {
                 share_id,
                 document_key,

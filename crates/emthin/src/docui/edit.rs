@@ -305,6 +305,8 @@ pub fn spec_of(w: i32, h: i32) -> FigureSpec {
         h,
         id: None,
         launch: None,
+        dx: None,
+        dy: None,
         terminal: None,
         binding_error: None,
     }

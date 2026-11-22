@@ -319,6 +319,86 @@ the number of ranges changed; one undo step reverses it.
 {"jsonrpc":"2.0","method":"rename_definition","params":{"def_index":0,"new_name":"kind"}}
 ```
 
+### `client_identity`
+
+Read the kernel-verified local control-client credentials (K4). `SO_PEERCRED`
+is captured by the kernel when the Unix socket connection is accepted, so a
+client cannot claim another process's pid/uid/gid in a message field. The reply
+is `client_identity` with `pid`, `uid` and `gid` (all null when the platform
+cannot report them). This is the local-principal fact the admission layer can
+use; it is **not** by itself an authorization decision — the live endpoint still
+verifies remote certificates and capabilities independently.
+
+```json
+{"jsonrpc":"2.0","method":"client_identity","params":{}}
+```
+
+### `lint_run` / `plugin_catalog`
+
+The helper-process plugin framework (parked item). `lint_run` queues one
+`\lint` diagnostics pass through the generic one-in-flight helper primitive;
+a missing helper is a normal no-op. Diagnostics are derived annotation state
+spliced into the render text, never written into the Loro document.
+`plugin_catalog` lists the three plugins (`formal`, `voice`, `diagnostics`)
+with their availability and run counts, making the framework observable
+without a separate registry.
+
+```json
+{"jsonrpc":"2.0","method":"lint_run","params":{}}
+{"jsonrpc":"2.0","method":"plugin_catalog","params":{}}
+```
+
+### `collab_publish_descriptor` / `collab_descriptor`
+
+Optional AT Protocol session-descriptor publication (parked item).
+`collab_publish_descriptor` builds a signed discovery record from the current
+document revision and an owner DID / joinable endpoint, and publishes it to the
+local PDS adapter, answering with `collab_descriptor_published`. The record
+carries **no deltas, snapshots, raw version tokens, document text or presence**
+— it says only which document is shared, who owns it, and where the live
+`emthin-collab` endpoint is. Publication is best-effort: a PDS outage is
+reported but never touches the edit or save path. `collab_descriptor` fetches
+a record for discovery only; the live `Hello` handshake still decides the real
+missing delta, and the live endpoint — not the descriptor — authorizes joins.
+
+```json
+{"jsonrpc":"2.0","method":"collab_publish_descriptor","params":{"owner":"did:web:notes.example.org","endpoint":"wss://notes.example.org/emthin/session/7Q2","rkey":"3KQ"}}
+{"jsonrpc":"2.0","method":"collab_descriptor","params":{"rkey":"3KQ"}}
+```
+
+### `kernel_run` / `kernel_outputs`
+
+Notebook/kernel execution (parked item). `kernel_run` queues one block for an
+external kernel binary (pinned by `EMTHIN_KERNEL_BIN`) on a worker thread,
+answering with `kernel_submitted` and a generation fence. A second run while
+one is in flight is rejected — one owner per async job. Output is **derived
+state**: it is spliced into the render text through Typst block splices and
+never written into the Loro document, so a failed or stale run cannot lose
+data. `kernel_outputs` reads the last-good regions as `[block_end, markup]`
+pairs; a failure keeps the previous output for that block, and a document edit
+invalidates regions at or after the change.
+
+```json
+{"jsonrpc":"2.0","method":"kernel_run","params":{"block_end":412,"code":"1+1","lang":"python"}}
+{"jsonrpc":"2.0","method":"kernel_outputs","params":{}}
+```
+
+### `launcher_entries` / `launcher_launch`
+
+The app launcher palette (parked item). `launcher_entries` answers with
+`launcher_list`: the dormant figures whose `\app` statement carries a `launch:`
+command, as `(figure key, label, page)` triples. It keeps **no command
+registry** — every row comes from the document. `launcher_launch` runs one by
+key through the same `relaunch_dormant` path a click/Return uses, answering with
+`launcher_launched` and whether a spawn was attempted. A figure whose `launch:`
+changed between listing and launching is interpreted from the document at
+launch time, never from a cached command string.
+
+```json
+{"jsonrpc":"2.0","method":"launcher_entries","params":{}}
+{"jsonrpc":"2.0","method":"launcher_launch","params":{"figure":"f0"}}
+```
+
 ### `a11y_nodes`
 
 Read-only rendered-text accessibility nodes (parked item). Because the
@@ -335,7 +415,11 @@ no platform API.
 
 ### `proof_query` / `proof_result`
 
-Read-only proof/reference queries (K8). `proof_query` answers with `proof_view`:
+Read-only proof/reference queries (K8). A `\formal` statement may cite an
+external verifier record with a named `proof: "id"` argument; that id, rather
+than the layout-addressed `g<stmt>` key, becomes the `proof_id` a matching
+`proof_result` must carry (see `scripts/e2e/live-mm0.sh` for a real mm0web run).
+`proof_query` answers with `proof_view`:
 definitions and references from mathed's existing semantic index, missing
 targets, and the last accepted proof result with explicit ownership. `proof_result`
 delivers an independently fetched verdict with its `share_id`, `document_key`
@@ -425,6 +509,15 @@ protocol).
 | `collab_share_access` | reply to `collab_shares` | `peer`, `visible` |
 | `semantic_outline` | reply to `semantic_outline` | `definitions` (`[index,name,uses,start,end]`), `uses` (`[name,start,end,definition]`), `unresolved` (`[name,start,end]`) |
 | `rename_result` | reply to `rename_definition` | `replacements`, `applied` |
+| `client_identity` | reply to `client_identity` | `pid`, `uid`, `gid` (kernel-verified, nullable) |
+| `lint_result` | reply to `lint_run` | `generation`, `accepted` |
+| `plugin_catalog` | reply to `plugin_catalog` | `plugins` (`[name,available,runs]`) |
+| `collab_descriptor_published` | reply to `collab_publish_descriptor` | `rkey`, `revision` |
+| `collab_descriptor` | reply to `collab_descriptor` | `json` (null when absent) |
+| `kernel_submitted` | reply to `kernel_run` | `generation`, `accepted` |
+| `kernel_outputs` | reply to `kernel_outputs` | `regions` (`[block_end,markup]`) |
+| `launcher_list` | reply to `launcher_entries` | `entries` (`[figure,label,page]`) |
+| `launcher_launched` | reply to `launcher_launch` | `figure`, `spawned` |
 | `a11y_nodes` | reply to `a11y_nodes` | `nodes` (`[role,label,value,start,end]`) |
 | `proof_view` | reply to `proof_query` | `share_id`, `document_key`, `revision`, `definitions` (`[name,start,end,uses]`), `references` (`[name,start,end,target]`), `missing`, `proof_id`, `verdict` |
 | `inspect_state` | reply to `inspect_state` | `enabled`, `local`, `share`, `frontier`, `accepted`, `peers`, `reason` |

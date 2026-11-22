@@ -7,6 +7,7 @@ pub mod messages;
 use std::os::unix::net::UnixListener;
 
 use connection::IpcConn;
+pub use connection::PeerCredentials;
 pub use messages::{
     IncomingMessage, IpcErrorCode, IpcRect, OutgoingMessage, StateFigure, StatePeer, TouchPhase,
 };
@@ -178,6 +179,14 @@ impl IpcServer {
 
     pub fn is_connected(&self) -> bool {
         self.connection.is_some()
+    }
+
+    /// The kernel-verified credentials of the connected control client.
+    /// `None` when no client is connected or the platform cannot report them.
+    pub fn client_credentials(&self) -> Option<PeerCredentials> {
+        self.connection
+            .as_ref()
+            .and_then(|conn| conn.peer_credentials().ok().flatten())
     }
 
     /// Raw fd of the listener socket (for calloop registration).

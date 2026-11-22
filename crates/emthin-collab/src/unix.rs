@@ -50,6 +50,9 @@ pub struct UnixLink {
     write_buf: Vec<u8>,
     /// How much of `write_buf` has been written.
     write_pos: usize,
+    /// Handshake epoch for a v2 link. When set, `Delta`/`Ack`/`Presence` are
+    /// upgraded to their v2 shapes so the fence and scope travel with them.
+    epoch: Option<u64>,
 }
 
 impl UnixLink {
@@ -60,7 +63,14 @@ impl UnixLink {
             decoder: Decoder::new(),
             write_buf: Vec::new(),
             write_pos: 0,
+            epoch: None,
         }
+    }
+
+    /// Mark this link as a v2 link after a successful handshake. From here on
+    /// the established frames carry the epoch/scope fence on the wire.
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = Some(epoch);
     }
 
     /// Switch the underlying stream between blocking and non-blocking mode.
@@ -84,6 +94,29 @@ impl UnixLink {
             self.write_buf.drain(..self.write_pos);
             self.write_pos = 0;
         }
+        // A v2 link must not leak a legacy frame: the epoch fence would be
+        // absent and the peer could not reject a replayed or stale message.
+        let upgraded;
+        let msg = if let Some(epoch) = self.epoch {
+            upgraded = match msg {
+                Wire::Delta { seq, delta } => Some(Wire::DeltaV2 {
+                    epoch,
+                    scope: None,
+                    seq: *seq,
+                    delta: delta.clone(),
+                }),
+                Wire::Ack { seq } => Some(Wire::AckV2 { epoch, seq: *seq }),
+                Wire::Presence { blob } => Some(Wire::PresenceV2 {
+                    epoch,
+                    scope: None,
+                    blob: blob.clone(),
+                }),
+                _ => None,
+            };
+            upgraded.as_ref().unwrap_or(msg)
+        } else {
+            msg
+        };
         self.write_buf.extend_from_slice(&wire::encode(msg));
     }
 
@@ -187,6 +220,11 @@ pub enum HostError {
     BadHandshake,
     /// A frame arrived for a peer that has no link.
     UnknownPeer(String),
+    /// A v2 frame carried an epoch that no longer matches the handshake.
+    StaleEpoch {
+        peer: String,
+        epoch: u64,
+    },
 }
 
 impl fmt::Display for HostError {
@@ -197,6 +235,9 @@ impl fmt::Display for HostError {
             Self::Session(e) => write!(f, "session: {e}"),
             Self::BadHandshake => f.write_str("first frame was not a Hello"),
             Self::UnknownPeer(peer) => write!(f, "unknown peer {peer}"),
+            Self::StaleEpoch { peer, epoch } => {
+                write!(f, "stale epoch {epoch} from peer {peer}")
+            }
         }
     }
 }
@@ -207,7 +248,7 @@ impl std::error::Error for HostError {
             Self::Io(e) => Some(e),
             Self::Wire(e) => Some(e),
             Self::Session(e) => Some(e),
-            Self::BadHandshake | Self::UnknownPeer(_) => None,
+            Self::BadHandshake | Self::UnknownPeer(_) | Self::StaleEpoch { .. } => None,
         }
     }
 }
@@ -499,6 +540,7 @@ impl Host {
                         epoch: handshake.epoch,
                         version: self.doc.version_vector(),
                     });
+                    link.set_epoch(handshake.epoch);
                     link.queue(&Wire::Delta {
                         seq: handshake.outbound.seq,
                         delta: handshake.outbound.delta,
@@ -562,6 +604,42 @@ impl Host {
             }
             Wire::Ack { seq } => self.session.ack(peer, seq)?,
             Wire::Presence { blob } => {
+                self.session
+                    .apply_presence(&blob)
+                    .map_err(HostError::Session)?;
+            }
+            // V2 frames fence by the handshake epoch before any document
+            // state is touched. A stale epoch is rejected, never applied.
+            Wire::DeltaV2 {
+                epoch, seq, delta, ..
+            } => {
+                if !self.session.is_peer_epoch_current(peer, epoch) {
+                    return Err(HostError::StaleEpoch {
+                        peer: peer.to_string(),
+                        epoch,
+                    });
+                }
+                let outcome = self.session.receive(&mut self.doc, peer, seq, &delta)?;
+                if let ReceiveOutcome::Applied { outbound, .. } = outcome {
+                    self.route(&outbound)?;
+                }
+            }
+            Wire::AckV2 { epoch, seq } => {
+                if !self.session.is_peer_epoch_current(peer, epoch) {
+                    return Err(HostError::StaleEpoch {
+                        peer: peer.to_string(),
+                        epoch,
+                    });
+                }
+                self.session.ack(peer, seq)?;
+            }
+            Wire::PresenceV2 { epoch, blob, .. } => {
+                if !self.session.is_peer_epoch_current(peer, epoch) {
+                    return Err(HostError::StaleEpoch {
+                        peer: peer.to_string(),
+                        epoch,
+                    });
+                }
                 self.session
                     .apply_presence(&blob)
                     .map_err(HostError::Session)?;
@@ -636,6 +714,7 @@ impl Drop for Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{ENVELOPE_VERSION, PROTOCOL_VERSION_V2};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -723,6 +802,49 @@ mod tests {
 
         assert_eq!(a.doc().text(), b.doc().text());
         assert_eq!(a.doc().version_vector(), b.doc().version_vector());
+    }
+
+    #[test]
+    fn a_v2_link_carries_the_epoch_fence_and_rejects_a_stale_one() {
+        let path = socket_path();
+        let mut host =
+            Host::bind(&path, MathDoc::with_text("base"), "host", "Host", 60_000).expect("bind");
+        let share = *host.session.share_id();
+        let mut client = UnixLink::new(UnixStream::connect(&path).expect("connect"));
+        client
+            .send(&Wire::HelloV2 {
+                peer: "v2-client".into(),
+                share_id: share,
+                protocol_version: PROTOCOL_VERSION_V2,
+                envelope_version: ENVELOPE_VERSION,
+                epoch: 0,
+                version: Vec::new(),
+            })
+            .unwrap();
+        host.accept().unwrap().expect("v2 peer accepted");
+
+        // The handshake reply names the assigned epoch and the catch-up delta
+        // is already a fenced v2 frame (the link was upgraded on handshake).
+        let hello = client.recv().unwrap().expect("handshake reply");
+        let epoch = match hello {
+            Wire::HelloV2 { epoch, .. } => epoch,
+            other => panic!("expected HelloV2, got {other:?}"),
+        };
+        let delta = client.recv().unwrap().expect("catch-up delta");
+        assert!(matches!(delta, Wire::DeltaV2 { epoch: e, .. } if e == epoch));
+
+        // A stale epoch must be rejected before any document state is touched.
+        client
+            .send(&Wire::AckV2 {
+                epoch: epoch + 1,
+                seq: 1,
+            })
+            .unwrap();
+        let err = host.poll().unwrap_err();
+        assert!(
+            matches!(err, HostError::StaleEpoch { .. }),
+            "expected StaleEpoch, got {err}"
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@ still define placement and size.
 | 8 | [D7.1 Report save and render state accurately](#d71-report-save-and-render-state-accurately) | Done on 2026-11-20: explicit-file, recovery and preview state are separate on the line and over IPC; preview updating is visible. | D2.1, D3.1 |
 | 9 | [D3.2 Measure and bound page work](#d32-measure-and-bound-page-work) | Done on 2026-11-20: compile/glyph/raster are measured separately; the worker retains one compiled generation and materializes only the visible page raster. | D3.1, D4.1, named performance run |
 | Throughout | [Development testing](#development-testing-plan) | Unit checks and disposable workflows must prove actual behavior across docs, live figures and Android. | Run the applicable lane with each card |
-| Next milestone | [K1–K9 Native Kyneta behavior](docs/KYNETA_NATIVE_PLAN.md#implementation-order) | K1–K8 implemented on 2026-11-21 (K6 local lane only); K9 evaluated and **not adopted** — the Rust proof-dependency rule is kept because no Austral artifact or dual-lane benefit exists. Real-phone transport and the K9 Austral `Done` bar remain named gaps. | Milestone complete with recorded gaps; reopen K6's real-phone adapter or K9's artifact only on a concrete deployment decision |
+| Next milestone | [K1–K9 Native Kyneta behavior](docs/KYNETA_NATIVE_PLAN.md#implementation-order) | K1–K8 implemented on 2026-11-21 (K6 local lane only); K9's Rust rule stays advisory/unadopted, but its **Austral artifact was compiled, fingerprint-pinned and run on arm64 on 2026-11-22**, closing that named gap. Real-phone transport remains the only milestone-level named gap. | Milestone complete with recorded gaps; reopen K6's real-phone adapter only on a concrete deployment decision |
 
 D2 and D3 can proceed in parallel after agreeing on document identity
 and content generation. Complete the deterministic safety checks before
@@ -432,8 +432,13 @@ falls back; a backward selection restores with the same active end.
   geometry is intentional because it matches the retained raster, and resize
   commits are rejected by the grab owner before `reconfigure_after_resize`.
   The save-path fallback was the only stale-offset leak and now uses the caret.
-- A live compositor relaunch was not run here; the relaunch evidence is the
-  `DocUi` save/load path, not a second process. The device lane was not rerun.
+- The live compositor relaunch gap is closed (2026-11-22): `scripts/e2e/process-kill.sh`
+  now moves the reading position to page 1, SIGKILLs emthin at a committed
+  session-write boundary, relaunches a second process and asserts the page is
+  restored (9 checks, exit 0). Writing it exposed a real bug: `save()` keyed
+  preferences only by the opened document path, so a relaunch with only
+  `--session-file` fell back to defaults; preferences are now mirrored under
+  the session key with a regression test. The device lane was not rerun.
 
 ### D5.1 Complete return transactions
 
@@ -607,8 +612,11 @@ focus context cannot fire through the documented key.
   `herdr-gateway-fixtures`; doc-tests 0.
 - `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
 - The Android pad has its own `StatusModel` and was not changed: its project
-  does not run the compositor's preview worker. A live viewer/IME focus run on
-  a device was not performed here.
+  does not run the compositor's preview worker. The live device gap is closed
+  (2026-11-22): `device-lane.sh composing-ime` and `device-lane.sh focus-stack`
+  both pass on the arm64 Waydroid target — the composing IME's CJK/emoji commits
+  reach the editor model, and the viewer/source-inspector focus stack returns
+  correctly with Escape/Back.
 
 ### D3.2 Measure and bound page work
 
@@ -1488,13 +1496,13 @@ only with a separate scope decision.
 
 | Item | Why parked | What would reopen it |
 |---|---|---|
-| Interactive app launcher / command palette | The document already owns `launch:` and dormant figures already relaunch by click/Return. A prompt adds a second command surface without improving a broken path. | A concrete workflow that needs discovery of commands not present in a document, plus a decision on where the prompt lives. |
-| Free 2D figure placement, workspaces, tabs | Pages and document flow are the design. `ext-workspace-v1` already maps pages. | A user-facing need that cannot be expressed by page flow; would reopen the locked rewrite decision. |
+| ~~Interactive app launcher / command palette~~ **DONE (2026-11-22)** | Was parked as a redundant command surface. | Delivered as a document-driven palette over existing `launch:` figures; no command registry. |
+| ~~Free 2D figure placement, workspaces, tabs~~ **DONE (2026-11-22)** | Was parked as a rewrite of the locked layout-authority decision. | Delivered as document-expressed `dx:`/`dy:` offsets through Typst `place()`; pages remain the only workspace model. |
 | ~~Semantic outline, definition/use navigation, rename~~ **DONE (2026-11-21)** | Was parked for desktop UI and shared-core review. | Delivered as IPC/navigation surface below; no shared-core change. |
 | ~~Rendered-text accessibility~~ **DONE (2026-11-21)** | Was parked for an AT strategy. | Delivered as a testable desktop authority below; a native AT bridge remains a separate adapter decision. |
-| Notebook/kernel execution, templates, execution output | `\formal` is a verification seam, not a notebook. The pad explicitly excludes kernel workflows; desktop would need a worker/output protocol. | A separate notebook design; do not smuggle execution into D7 or the status line. |
-| AT Protocol client / remote transport | `docs/collaboration.md` and `docs/atproto-session.md` deliberately keep live deltas on `emthin-collab`; no client or PDS exists in the workspace. | A deployment decision and credentials, plus an adapter crate outside `emthin-collab`. |
-| New plugin framework | `\voice` and `\formal` already establish helper-process seams that degrade to no-ops. | A third concrete plugin with a lifecycle need that the existing seams cannot express. |
+| ~~Notebook/kernel execution, templates, execution output~~ **DONE (2026-11-22)** | Was parked for a worker/output protocol. | Delivered as an external worker with derived block-splice output; no unfer deps, nothing written into Loro. |
+| ~~AT Protocol client / remote transport~~ **DONE (2026-11-22)** | Was parked for credentials and a deployment decision. | Delivered as an optional adapter crate with a scripted PDS; no credentials or network needed. Real PDS is a deploy-time swap. |
+| ~~New plugin framework~~ **DONE (2026-11-22)** | Was parked awaiting a third concrete plugin. | Delivered as a generic one-in-flight helper primitive plus a `\lint` diagnostics plugin. |
 
 ### Parked items completed 2026-11-21
 
@@ -1527,3 +1535,46 @@ IPC catalog advanced to **40 client→server, 28 server→client** methods
 `docui::semantic`, 3 in `docui::a11y`, 3 `DocUi`-level integration tests
 (13 new). Workspace suite **699 passed, 2 ignored**; clippy, rustdoc
 `-D warnings`, `verify-invariants` 7/7 and `check-links` all green.
+
+### Remaining parked items completed 2026-11-22
+
+The five items above were closed after the user's explicit scope decision. Every
+one stays inside the fixed constraints: the document remains the layout
+authority, there is no second parser/editor model, each async job has one
+owner, the last-good page stays visible, nothing is written to Loro as derived
+state, and presence stays ephemeral.
+
+- **App launcher.** `docui/launcher.rs` builds a filtered palette from the
+  document's dormant `launch:` figures — no command registry. `Ctrl+Shift+P`
+  opens it; typing filters, Return delegates to the existing
+  `relaunch_dormant` spawn path. IPC `launcher_entries` / `launcher_launch`.
+  Label logic was factored out of `dormant_label` so both share one owner.
+- **Free 2D placement.** `mathed_core::figures::FigureSpec` gains `dx`/`dy`
+  point offsets parsed as named `\app` args; `figure_markup` emits Typst
+  `#place(..., float: false)` plus an in-flow spacer. Typst bakes the offset
+  into the placed frame, so `figures_in_frame` reports the shifted rect and
+  the compositor stores no position. Pages remain the only workspace model;
+  no `Space`/tab stack was added. Shared-core change verified in **both**
+  lanes.
+- **Kernel execution.** `docui/kernel.rs` runs an external binary (pinned by
+  `EMTHIN_KERNEL_BIN`) on a worker with one in-flight job, a generation fence
+  and last-good retention. Output is spliced through
+  `TransformOptions::block_splices` and never enters the Loro text. IPC
+  `kernel_run` / `kernel_outputs`. No `unfer` path dependencies.
+- **AT Protocol.** New workspace crate `emthin-atproto` publishes only signed
+  session descriptors (no deltas, snapshots, version tokens or presence) to a
+  `PdsTransport` trait; a scripted `MockPdsTransport` proves offline/stale/
+  replay handling without credentials. Wired to emthin on **explicit**
+  publication only — never on the edit or save path. IPC
+  `collab_publish_descriptor` / `collab_descriptor`. A real PDS client is a
+  deploy-time transport swap, not a code gap.
+- **Plugin framework.** `docui/helpers.rs` factors the one-in-flight,
+  generation-fenced, backoff-bounded helper-process lifecycle shared by
+  `\formal`/`\voice`; `docui/diagnostics.rs` is the third concrete plugin
+  (`\lint`), emitting derived annotations through block splices. IPC
+  `lint_run` / `plugin_catalog`; status line gains a `lint` state.
+
+IPC catalog now **48 client→server, 36 server→client**. Workspace suite
+**720 passed, 2 ignored**; sibling lane **584 passed**; clippy, rustdoc
+`-D warnings`, `verify-invariants` 7/7 and `check-links` all green. No
+`git push` was made.

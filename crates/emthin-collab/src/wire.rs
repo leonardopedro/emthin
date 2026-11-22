@@ -19,6 +19,12 @@ const TAG_ACK: u8 = 3;
 const TAG_PRESENCE: u8 = 4;
 const TAG_HELLO_V2: u8 = 5;
 const TAG_RESYNC: u8 = 6;
+// V2 shapes for the established frames. The legacy tags stay untouched so an
+// old peer sees exactly the old bytes; a v2 link upgrades Delta/Ack/Presence to
+// these forms so the epoch fence and document scope travel with every frame.
+const TAG_DELTA_V2: u8 = 7;
+const TAG_ACK_V2: u8 = 8;
+const TAG_PRESENCE_V2: u8 = 9;
 
 /// Length of a stable share id. It is random and independent of paths, display
 /// names and Loro peer ids, none of which identify a share (K3).
@@ -64,6 +70,21 @@ pub enum Wire {
         epoch: u64,
         frontier: Vec<u8>,
         reason: String,
+    },
+    /// A reliable delta fenced by the handshake epoch and document scope.
+    DeltaV2 {
+        epoch: u64,
+        scope: Option<u64>,
+        seq: Seq,
+        delta: Vec<u8>,
+    },
+    /// A cumulative ack fenced by the handshake epoch.
+    AckV2 { epoch: u64, seq: Seq },
+    /// An ephemeral presence payload fenced by the handshake epoch/scope.
+    PresenceV2 {
+        epoch: u64,
+        scope: Option<u64>,
+        blob: Vec<u8>,
     },
 }
 
@@ -129,6 +150,31 @@ impl std::error::Error for WireError {}
 /// The peer-id cap. It is a protocol label, not a document payload; real ids
 /// are short and anything larger is a malformed handshake.
 pub const MAX_PEER: usize = 256;
+
+/// Encode an optional document scope as a 1-byte presence flag plus a u64.
+fn put_scope(out: &mut Vec<u8>, scope: Option<u64>) {
+    match scope {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            put_u64(out, value);
+        }
+    }
+}
+
+fn get_scope(body: &[u8], at: usize) -> Result<(Option<u64>, usize), WireError> {
+    let flag = *body.get(at).ok_or(WireError::TrailingBytes { len: 0 })?;
+    match flag {
+        0 => Ok((None, at + 1)),
+        1 => {
+            if body.len() < at + 9 {
+                return Err(WireError::TrailingBytes { len: body.len() });
+            }
+            Ok((Some(get_u64(body, at + 1)), at + 9))
+        }
+        _ => Err(WireError::TrailingBytes { len: flag as usize }),
+    }
+}
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
@@ -212,6 +258,32 @@ pub fn encode(msg: &Wire) -> Vec<u8> {
             put_u16(&mut body, reason.len() as u16);
             body.extend_from_slice(reason.as_bytes());
             (TAG_RESYNC, body)
+        }
+        Wire::DeltaV2 {
+            epoch,
+            scope,
+            seq,
+            delta,
+        } => {
+            let mut body = Vec::with_capacity(8 + 1 + 8 + 8 + delta.len());
+            put_u64(&mut body, *epoch);
+            put_scope(&mut body, *scope);
+            put_u64(&mut body, *seq);
+            body.extend_from_slice(delta);
+            (TAG_DELTA_V2, body)
+        }
+        Wire::AckV2 { epoch, seq } => {
+            let mut body = Vec::with_capacity(16);
+            put_u64(&mut body, *epoch);
+            put_u64(&mut body, *seq);
+            (TAG_ACK_V2, body)
+        }
+        Wire::PresenceV2 { epoch, scope, blob } => {
+            let mut body = Vec::with_capacity(8 + 1 + 8 + blob.len());
+            put_u64(&mut body, *epoch);
+            put_scope(&mut body, *scope);
+            body.extend_from_slice(blob);
+            (TAG_PRESENCE_V2, body)
         }
     };
     let len = body.len() + 1;
@@ -349,6 +421,45 @@ pub fn decode(tag: u8, body: &[u8]) -> Result<Wire, WireError> {
                 epoch,
                 frontier,
                 reason,
+            })
+        }
+        TAG_DELTA_V2 => {
+            if body.len() < 17 {
+                return Err(WireError::ShortDelta { len: body.len() });
+            }
+            let epoch = get_u64(body, 0);
+            let (scope, at) = get_scope(body, 8)?;
+            if body.len() < at + 8 {
+                return Err(WireError::ShortDelta { len: body.len() });
+            }
+            Ok(Wire::DeltaV2 {
+                epoch,
+                scope,
+                seq: get_u64(body, at),
+                delta: body[at + 8..].to_vec(),
+            })
+        }
+        TAG_ACK_V2 => {
+            if body.len() != 16 {
+                return Err(WireError::TrailingBytes {
+                    len: body.len().saturating_sub(16),
+                });
+            }
+            Ok(Wire::AckV2 {
+                epoch: get_u64(body, 0),
+                seq: get_u64(body, 8),
+            })
+        }
+        TAG_PRESENCE_V2 => {
+            if body.len() < 9 {
+                return Err(WireError::TrailingBytes { len: body.len() });
+            }
+            let epoch = get_u64(body, 0);
+            let (scope, at) = get_scope(body, 8)?;
+            Ok(Wire::PresenceV2 {
+                epoch,
+                scope,
+                blob: body[at..].to_vec(),
             })
         }
         tag => Err(WireError::UnknownTag(tag)),
@@ -541,6 +652,36 @@ mod tests {
             decode(TAG_HELLO_V2, &[0u8; 3]),
             Err(WireError::TrailingBytes { .. })
         ));
+    }
+
+    #[test]
+    fn v2_established_frames_carry_epoch_and_scope() {
+        let frames = [
+            Wire::DeltaV2 {
+                epoch: 7,
+                scope: Some(3),
+                seq: 42,
+                delta: vec![1, 2, 3],
+            },
+            Wire::AckV2 { epoch: 7, seq: 42 },
+            Wire::PresenceV2 {
+                epoch: 7,
+                scope: None,
+                blob: vec![9, 9],
+            },
+        ];
+        for frame in frames {
+            let bytes = encode(&frame);
+            let mut decoder = Decoder::new();
+            decoder.push(&bytes);
+            assert_eq!(decoder.next_frame().unwrap(), Some(frame.clone()));
+        }
+        // The legacy tags still decode to the legacy shapes: a v1 peer is
+        // unaffected by the additive v2 frames.
+        let legacy = encode(&Wire::Ack { seq: 42 });
+        let mut decoder = Decoder::new();
+        decoder.push(&legacy);
+        assert_eq!(decoder.next_frame().unwrap(), Some(Wire::Ack { seq: 42 }));
     }
 
     #[test]

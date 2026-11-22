@@ -10,8 +10,8 @@
 use crate::byte_to_utf16;
 use crate::model::DocModel;
 use mathed_core::semantics::{DocumentContext, SemanticIndex};
-use mathed_core::transform::{TransformOptions, to_render_text};
-use serde_json::{Value, json};
+use mathed_core::transform::{to_render_text, TransformOptions};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -51,7 +51,10 @@ fn uses_of(index: &SemanticIndex, def_idx: usize) -> usize {
 }
 
 fn range_json(text: &str, range: &Range<usize>) -> Value {
-    json!([byte_to_utf16(text, range.start), byte_to_utf16(text, range.end)])
+    json!([
+        byte_to_utf16(text, range.start),
+        byte_to_utf16(text, range.end)
+    ])
 }
 
 /// The semantic facts the Navigate panel consumes. UTF-16 offsets match the
@@ -164,7 +167,8 @@ fn apply_ops(text: &str, ops: &[mathed_core::doc::ReplaceOp]) -> Result<String, 
     let mut out = String::with_capacity(text.len());
     let mut end = 0;
     for op in sorted {
-        if op.range.start < end || op.range.end > text.len()
+        if op.range.start < end
+            || op.range.end > text.len()
             || !text.is_char_boundary(op.range.start)
             || !text.is_char_boundary(op.range.end)
         {
@@ -296,7 +300,10 @@ mod tests {
         let simulated = apply_ops(SHADOWED, &plan.ops).unwrap();
         assert_eq!(simulated.matches("\\def(").count(), 2);
         assert!(simulated.contains(", magnitude)"));
-        assert!(simulated.contains(", norm)"), "the later same-spelling definition stays");
+        assert!(
+            simulated.contains(", norm)"),
+            "the later same-spelling definition stays"
+        );
     }
 
     #[test]

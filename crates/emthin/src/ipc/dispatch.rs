@@ -86,7 +86,18 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
         IncomingMessage::HistoryPreview { frontier } => ipc_history_preview(state, &frontier),
         IncomingMessage::HistoryExport { frontier } => ipc_history_export(state, &frontier),
         IncomingMessage::InspectStart => {
-            state.inspect.enable();
+            // When a primary session owns a state dir, observation also writes
+            // an NDJSON trace beside it; a nested session still observes in
+            // memory only. A sink failure leaves the in-memory log usable.
+            match state.doc.inspect_sink_path() {
+                Some(path) => {
+                    if let Err(error) = state.inspect.enable_with(path) {
+                        tracing::warn!("inspect sink unavailable: {error}");
+                        state.inspect.enable();
+                    }
+                }
+                None => state.inspect.enable(),
+            }
         }
         IncomingMessage::InspectStop => {
             state.inspect.disable();
@@ -99,6 +110,23 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
             new_name,
         } => ipc_rename_definition(state, def_index, &new_name),
         IncomingMessage::A11yNodes => ipc_a11y_nodes(state),
+        IncomingMessage::LauncherEntries => ipc_launcher_entries(state),
+        IncomingMessage::LauncherLaunch { figure } => ipc_launcher_launch(state, &figure),
+        IncomingMessage::KernelRun {
+            block_end,
+            code,
+            lang,
+        } => ipc_kernel_run(state, block_end, &code, lang.as_deref()),
+        IncomingMessage::KernelOutputs => ipc_kernel_outputs(state),
+        IncomingMessage::CollabPublishDescriptor {
+            owner,
+            endpoint,
+            rkey,
+        } => ipc_collab_publish_descriptor(state, &owner, &endpoint, &rkey),
+        IncomingMessage::CollabDescriptor { rkey } => ipc_collab_descriptor(state, &rkey),
+        IncomingMessage::LintRun => ipc_lint_run(state),
+        IncomingMessage::PluginCatalog => ipc_plugin_catalog(state),
+        IncomingMessage::ClientIdentity => ipc_client_identity(state),
         IncomingMessage::ProofQuery => ipc_proof_query(state),
         IncomingMessage::ProofResult {
             share_id,
@@ -190,6 +218,141 @@ fn ipc_rename_definition(state: &mut EmthinState, def_index: usize, new_name: &s
     state.needs_redraw = true;
 }
 
+fn ipc_client_identity(state: &mut EmthinState) {
+    let cred = state.ipc.client_credentials();
+    state.ipc.send(OutgoingMessage::ClientIdentity {
+        pid: cred.map(|c| c.pid),
+        uid: cred.map(|c| c.uid),
+        gid: cred.map(|c| c.gid),
+    });
+}
+
+fn ipc_lint_run(state: &mut EmthinState) {
+    let (generation, accepted) = match state.doc.lint_document() {
+        Ok(generation) => (generation, true),
+        Err(reason) => {
+            tracing::info!("lint run skipped: {reason}");
+            (0, false)
+        }
+    };
+    state.ipc.send(OutgoingMessage::LintResult {
+        generation,
+        accepted,
+    });
+}
+
+fn ipc_plugin_catalog(state: &mut EmthinState) {
+    let plugins = vec![
+        (
+            "formal".to_owned(),
+            state.doc.formals().is_available(),
+            state.doc.formals().calls(),
+        ),
+        // The voice bridge tracks one in-flight turn, not a lifetime count.
+        ("voice".to_owned(), state.doc.voice().is_available(), 0),
+        (
+            "diagnostics".to_owned(),
+            state.doc.diagnostics().is_available(),
+            state.doc.diagnostics().runs(),
+        ),
+    ];
+    state.ipc.send(OutgoingMessage::PluginCatalog { plugins });
+}
+
+fn ipc_collab_publish_descriptor(state: &mut EmthinState, owner: &str, endpoint: &str, rkey: &str) {
+    use emthin_atproto::{DocumentIdentity, SessionDescriptor};
+
+    let revision = state.doc.model().content_generation();
+    let document_id = format!(
+        "emthin:sha256:{:016x}",
+        revision ^ (state.doc.model().text().len() as u64)
+    );
+    let descriptor = match SessionDescriptor::builder()
+        .document(DocumentIdentity {
+            id: document_id,
+            kind: "mathed".into(),
+            title: "emthin document".into(),
+        })
+        .owner(owner)
+        .endpoint(endpoint)
+        .revision(revision)
+        // Coarse expiry: the live endpoint's lease still governs admission.
+        .validity("1970-01-01T00:00:00Z", "9999-12-31T23:59:59Z")
+        .build()
+    {
+        Ok(descriptor) => descriptor,
+        Err(reason) => {
+            return error(
+                state,
+                IpcErrorCode::CollabFailed,
+                format!("invalid descriptor: {reason}"),
+            )
+        }
+    };
+    match emthin_atproto::publish(&mut state.atproto_pds, rkey, &descriptor) {
+        Ok(commit) => state.ipc.send(OutgoingMessage::CollabDescriptorPublished {
+            rkey: commit.rkey,
+            revision: commit.revision,
+        }),
+        Err(reason) => {
+            // Publication is best-effort: never on the save or edit path.
+            tracing::info!("descriptor publication skipped: {reason}");
+            error(state, IpcErrorCode::CollabFailed, reason.to_string());
+        }
+    }
+}
+
+fn ipc_collab_descriptor(state: &mut EmthinState, rkey: &str) {
+    match emthin_atproto::fetch(&mut state.atproto_pds, rkey) {
+        Ok(descriptor) => state.ipc.send(OutgoingMessage::CollabDescriptor {
+            json: descriptor.map(|d| d.to_json()),
+        }),
+        Err(reason) => error(state, IpcErrorCode::CollabFailed, reason.to_string()),
+    }
+}
+
+fn ipc_kernel_run(state: &mut EmthinState, block_end: usize, code: &str, lang: Option<&str>) {
+    let accepted = state.doc.kernel_run(block_end, code, lang);
+    let (generation, ok) = match accepted {
+        Ok(generation) => (generation, true),
+        Err(reason) => {
+            tracing::info!("kernel_run rejected: {reason}");
+            (0, false)
+        }
+    };
+    state.ipc.send(OutgoingMessage::KernelSubmitted {
+        generation,
+        accepted: ok,
+    });
+}
+
+fn ipc_kernel_outputs(state: &mut EmthinState) {
+    let regions = state
+        .doc
+        .kernel()
+        .outputs()
+        .iter()
+        .map(|(end, markup)| (*end, markup.clone()))
+        .collect();
+    state.ipc.send(OutgoingMessage::KernelOutputs { regions });
+}
+
+fn ipc_launcher_entries(state: &mut EmthinState) {
+    let entries = crate::docui::launcher::entries(state.doc.figures())
+        .into_iter()
+        .map(|entry| (entry.key, entry.label, entry.page))
+        .collect();
+    state.ipc.send(OutgoingMessage::LauncherList { entries });
+}
+
+fn ipc_launcher_launch(state: &mut EmthinState, figure: &str) {
+    let spawned = state.relaunch_dormant(figure);
+    state.ipc.send(OutgoingMessage::LauncherLaunched {
+        figure: figure.to_owned(),
+        spawned,
+    });
+}
+
 fn ipc_a11y_nodes(state: &mut EmthinState) {
     let model = state.doc.model();
     let index = crate::docui::a11y::A11yIndex::build(model.text(), model.scan(), model.segments());
@@ -212,7 +375,7 @@ fn ipc_a11y_nodes(state: &mut EmthinState) {
 fn ipc_proof_query(state: &mut EmthinState) {
     let share = crate::ipc::hex::encode(state.collab.share_id());
     let key = state.doc.document_key().unwrap_or("untitled").to_string();
-    let view = state.doc.proof_view(state.collab.share_id(), &key);
+    let view = state.doc.proof_view_cached(state.collab.share_id(), &key);
     let proof_id = view.proof_id().map(str::to_string);
     let definitions = view
         .definitions
@@ -314,6 +477,10 @@ fn ipc_collab_join(state: &mut EmthinState, peer: &str, version: &str, scope: Op
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e.to_string()),
     };
     tracing::debug!("IPC collab_join {peer}");
+    // Arm the share readiness clock on the handshake. Without this the share
+    // stays `not_shared`, `note_peer_ack` returns early and the offline timeout
+    // in tick.rs can never fire — a peer that vanishes is never reported.
+    state.doc.note_share_joined();
     state.inspect_event(crate::docui::inspect::EventKind::Handshake, peer, "", 0, "");
     state.ipc.send(OutgoingMessage::CollabDelta {
         peer: out.peer,

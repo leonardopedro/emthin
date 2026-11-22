@@ -245,4 +245,15 @@ public final class DocBridge {
      * calls, so nothing here relaxes policy to make the smoke pass.
      */
     public static native String jitRoundtrip(long value);
+
+    /**
+     * K9 native rule artifact. Runs the embedded Austral module on a worker
+     * thread so the UI thread never blocks on JIT compilation. The artifact is
+     * fingerprint-checked and carries no capability grants.
+     *
+     * @param factsJson {@code {"facts":[{"from":"a","to":"b"},…]}}
+     * @return {@code {"result":"complete"|"incomplete"|"malformed",…}} or
+     *         {@code {"error":"…"}}
+     */
+    public static native String australRule(String factsJson);
 }

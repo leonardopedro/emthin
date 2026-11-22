@@ -13,9 +13,9 @@ use std::ops::Range;
 use mathed_core::markers::PropKind;
 use mathed_core::transform::OffsetMap;
 use mathed_mini::MiniWorld;
-use serde_json::{Value, json};
-use typst::WorldExt;
+use serde_json::{json, Value};
 use typst::diag::SourceDiagnostic;
+use typst::WorldExt;
 
 use crate::model::DocModel;
 use crate::{byte_to_utf16, modifiers};
@@ -51,7 +51,9 @@ fn diagnostic(
     })
 }
 
-fn marker_pairs(scan: &mathed_core::markers::MarkerScan) -> Vec<(String, String, Range<usize>, String)> {
+fn marker_pairs(
+    scan: &mathed_core::markers::MarkerScan,
+) -> Vec<(String, String, Range<usize>, String)> {
     let by_id: HashMap<&str, &mathed_core::markers::Marker> = scan
         .markers
         .iter()
@@ -185,8 +187,14 @@ pub fn source_diagnostics(model: &DocModel, capture: &str) -> Vec<Value> {
     // Stable order independent of the three sources above, so the UI does not
     // reshuffle equal-severity rows between identical renders.
     result.sort_by(|a, b| {
-        let a = (a["severity"].as_str().unwrap_or(""), a["start"].as_u64().unwrap_or(u64::MAX));
-        let b = (b["severity"].as_str().unwrap_or(""), b["start"].as_u64().unwrap_or(u64::MAX));
+        let a = (
+            a["severity"].as_str().unwrap_or(""),
+            a["start"].as_u64().unwrap_or(u64::MAX),
+        );
+        let b = (
+            b["severity"].as_str().unwrap_or(""),
+            b["start"].as_u64().unwrap_or(u64::MAX),
+        );
         a.cmp(&b)
     });
     result
@@ -198,12 +206,17 @@ fn copied_source(map: &OffsetMap, render: &Range<usize>) -> Option<Range<usize>>
             && span.render_start <= render.start
             && render.end <= span.render_start + span.len
     })?;
-    Some(map.render_to_doc(span.render_start + (render.start - span.render_start))
-        ..map.render_to_doc(span.render_start + (render.end - span.render_start)))
+    Some(
+        map.render_to_doc(span.render_start + (render.start - span.render_start))
+            ..map.render_to_doc(span.render_start + (render.end - span.render_start)),
+    )
 }
 
 fn owner_for(model: &DocModel, doc_pos: usize) -> Option<(String, String, Range<usize>)> {
-    for link in modifiers::links(model).into_iter().filter(|link| link.resolved) {
+    for link in modifiers::links(model)
+        .into_iter()
+        .filter(|link| link.resolved)
+    {
         let Some(source) = modifiers::source_range(model, &link.start_id, &link.end_id) else {
             continue;
         };
@@ -273,15 +286,7 @@ pub fn typst_diagnostic(
         }
     }
     diagnostic(
-        capture,
-        index,
-        severity,
-        "typst",
-        message,
-        text,
-        None,
-        None,
-        "document",
+        capture, index, severity, "typst", message, text, None, None, "document",
     )
 }
 
@@ -308,15 +313,26 @@ mod tests {
         );
         let exact = typst_diagnostic(&world, &exact, &render.map, prelude.len(), &model, "cap", 0);
         assert_eq!(exact["provenance"], "exact");
-        assert_eq!(exact["start"], json!(3), "the source range excludes hidden markers");
+        assert_eq!(
+            exact["start"],
+            json!(3),
+            "the source range excludes hidden markers"
+        );
         assert_eq!(exact["end"], json!(8));
 
         let unlocated = typst::diag::SourceDiagnostic::warning(
             typst::syntax::Span::detached(),
             "document-level warning",
         );
-        let unlocated =
-            typst_diagnostic(&world, &unlocated, &render.map, prelude.len(), &model, "cap", 1);
+        let unlocated = typst_diagnostic(
+            &world,
+            &unlocated,
+            &render.map,
+            prelude.len(),
+            &model,
+            "cap",
+            1,
+        );
         assert_eq!(unlocated["provenance"], "document");
         assert_eq!(unlocated["start"], Value::Null);
     }

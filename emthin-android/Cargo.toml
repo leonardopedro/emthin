@@ -19,6 +19,7 @@ crate-type = ["cdylib"]
 [dependencies]
 jni = "0.22"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 emthin-vt = { path = "../crates/emthin-vt" }
 emthin-core-client = { path = "../crates/emthin-core-client" }
 # std-only collaboration engine; the worker owns the transport-side replica so

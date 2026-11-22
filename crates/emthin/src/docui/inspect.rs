@@ -232,6 +232,10 @@ pub fn replay(lines: &str) -> Result<SettledState, String> {
 pub struct EventLog {
     events: Option<VecDeque<SessionEvent>>,
     limit: usize,
+    /// Optional on-disk NDJSON sink. Observation stays off by default: no
+    /// path means no file is touched. The sink mirrors the bounded in-memory
+    /// ring so a relaunch can replay the same metadata-only events.
+    sink: Option<std::path::PathBuf>,
 }
 
 impl Default for EventLog {
@@ -245,6 +249,7 @@ impl EventLog {
         Self {
             events: None,
             limit: EVENT_LIMIT,
+            sink: None,
         }
     }
 
@@ -256,7 +261,23 @@ impl EventLog {
         Self {
             events: Some(VecDeque::with_capacity(limit.max(1))),
             limit: limit.max(1),
+            sink: None,
         }
+    }
+
+    /// Enable observation with an NDJSON file sink. An existing file is
+    /// truncated: this is a session trace, not an append-to-eternity log.
+    pub fn enable_with(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
+        self.enable();
+        // Create/truncate before storing the path so a failed open leaves no
+        // sink that would silently drop every later event.
+        std::fs::write(&path, "")?;
+        self.sink = Some(path);
+        Ok(())
+    }
+
+    pub fn sink_path(&self) -> Option<&std::path::Path> {
+        self.sink.as_deref()
     }
 
     pub fn is_on(&self) -> bool {
@@ -271,6 +292,7 @@ impl EventLog {
 
     pub fn disable(&mut self) {
         self.events = None;
+        self.sink = None;
     }
 
     /// Record an event when observation is on. A no-op otherwise.
@@ -278,6 +300,21 @@ impl EventLog {
         if let Some(events) = &mut self.events {
             if events.len() == self.limit {
                 events.pop_front();
+            }
+            // Mirror to disk before queuing in memory: a failed write is
+            // logged and the event still appears in the live stream, so a
+            // full disk cannot hide what the control client can already see.
+            if let Some(path) = &self.sink {
+                if let Err(error) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| {
+                        std::io::Write::write_all(&mut file, event.to_ndjson().as_bytes())
+                            .and_then(|_| std::io::Write::write_all(&mut file, b"\n"))
+                    })
+                {
+                    eprintln!("inspect sink write failed: {error}");
+                }
             }
             events.push_back(event);
         }
@@ -312,6 +349,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static SINK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     fn event(kind: EventKind, frontier: &str, reason: &str, count: u64) -> SessionEvent {
         let mut event = SessionEvent::new(kind).with("run", "share", "peer");
@@ -364,6 +402,37 @@ mod tests {
         assert_eq!(state, replayed);
         assert_eq!(state.share, "refused");
         assert_eq!(state.reason.as_deref(), Some("read-only peer"));
+    }
+
+    #[test]
+    fn an_enabled_sink_writes_the_same_ndjson_it_keeps_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "emthin-inspect-sink-{}-{}",
+            std::process::id(),
+            SINK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("trace.ndjson");
+        let mut log = EventLog::off();
+        log.enable_with(path.clone()).expect("sink created");
+        log.push(event(EventKind::Handshake, "01", "", 0));
+        log.push(event(EventKind::Ack, "02", "", 0));
+        let on_disk = std::fs::read_to_string(&path).expect("trace on disk");
+        assert_eq!(on_disk, log.ndjson(), "sink mirrors the live ring");
+        assert_eq!(on_disk.lines().count(), 2);
+        let settled = reduce(
+            on_disk
+                .lines()
+                .map(|line| SessionEvent::from_ndjson(line).expect("parse")),
+        );
+        assert_eq!(
+            settled,
+            log.settled(),
+            "replay from disk settles like the live ring"
+        );
+        log.disable();
+        assert_eq!(log.sink_path(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

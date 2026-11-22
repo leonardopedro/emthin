@@ -1042,6 +1042,7 @@ version = "0.3.12"
 dependencies = [
  "arboard",
  "clap",
+ "emthin-atproto",
  "emthin-clipboard",
  "emthin-collab",
  "emthin-core-client",
@@ -1062,6 +1063,14 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "winit",
+]
+
+[[package]]
+name = "emthin-atproto"
+version = "0.3.12"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

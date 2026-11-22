@@ -336,7 +336,11 @@ pub(crate) fn figure_bindings(
         bindings.insert(
             figure.key,
             (
-                figure.spec.terminal.as_ref().map(|reference| reference.canonical()),
+                figure
+                    .spec
+                    .terminal
+                    .as_ref()
+                    .map(|reference| reference.canonical()),
                 figure.spec.binding_error,
             ),
         );
@@ -410,10 +414,8 @@ pub fn render_page(
         let figures: Vec<Value> = mathed_core::figures::figures_in_frame(frame)
             .into_iter()
             .map(|figure| {
-                let (reference, binding_error) = bindings
-                    .get(&figure.key)
-                    .cloned()
-                    .unwrap_or((None, None));
+                let (reference, binding_error) =
+                    bindings.get(&figure.key).cloned().unwrap_or((None, None));
                 json!({
                     "key": figure.key,
                     "x": figure.rect.x0,

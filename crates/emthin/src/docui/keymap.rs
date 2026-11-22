@@ -45,6 +45,8 @@ use smithay::input::keyboard::keysyms;
 pub enum Action {
     /// Relaunch a dormant figure from its `\app` `launch:` argument.
     OpenLauncher,
+    /// Open the app launcher palette (a filtered list of `launch:` figures).
+    LauncherPalette,
     NextPage,
     PreviousPage,
     DocumentStart,
@@ -119,6 +121,12 @@ pub const ACTION_CATALOG: &[ActionSpec] = &[
         id: "relaunch_figure",
         label: "relaunch the pointed-at (or first) dormant figure",
         binding: "Ctrl+Shift+Return",
+    },
+    ActionSpec {
+        action: Action::LauncherPalette,
+        id: "launcher_palette",
+        label: "open the app launcher palette",
+        binding: "Ctrl+Shift+P",
     },
     ActionSpec {
         action: Action::PreviousPage,
@@ -303,6 +311,7 @@ pub fn classify(sym: u32, pressed: KeyState, ctrl: bool, shift: bool, alt: bool)
     }
     match sym {
         keysyms::KEY_Return | keysyms::KEY_KP_Enter if ctrl && shift => Some(Action::OpenLauncher),
+        keysyms::KEY_p | keysyms::KEY_P if ctrl && shift => Some(Action::LauncherPalette),
         keysyms::KEY_Page_Down => Some(Action::NextPage),
         keysyms::KEY_Page_Up => Some(Action::PreviousPage),
         keysyms::KEY_Escape => Some(Action::FocusDocument),
@@ -358,6 +367,7 @@ pub const DOCUMENTED_KEYMAP: &[(&str, &str)] = &[
         "Ctrl+Shift+Return",
         "relaunch the pointed-at (or first) dormant figure",
     ),
+    ("Ctrl+Shift+P", "open the app launcher palette"),
     ("PgUp / PgDn", "previous / next document page"),
     ("Home / End", "start / end of the document"),
     ("Ctrl+Home / Ctrl+End", "start / end of the line"),
@@ -659,9 +669,12 @@ mod tests {
                 spec
             );
         }
-        assert!(!DOCUMENTED_KEYMAP
+        // The app launcher palette is now a real, documented surface (parked
+        // item completed 2026-11-22); pin that it stays reachable rather than
+        // asserting the old design where no palette existed.
+        assert!(DOCUMENTED_KEYMAP
             .iter()
-            .any(|(_, what)| what.contains("app launcher")));
+            .any(|(_, what)| what.contains("app launcher palette")));
         // The real input path feeds the *modified* keysym (shift
         // applied), so Ctrl+Shift+m arrives as uppercase `M` — pin that
         // path, not the lowercase state no shift chord can produce.

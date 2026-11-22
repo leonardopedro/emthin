@@ -97,9 +97,7 @@ impl EmthinState {
                 if keyboard.current_focus().is_none() {
                     if let Some(reference) = self.core_sessions.focused().cloned() {
                         if event.state() == KeyState::Pressed {
-                            let bytes = self
-                                .core_sessions
-                                .key_bytes(&reference, sym, ghostty_mods);
+                            let bytes = self.core_sessions.key_bytes(&reference, sym, ghostty_mods);
                             if !bytes.is_empty()
                                 && !self.core_sessions.send_input(&reference, &bytes)
                             {
@@ -201,13 +199,9 @@ impl EmthinState {
                 let new_under = self.surface_under(new_abs);
                 if new_under.is_none() {
                     if let Some((reference, rect)) = self.core_terminal_at(new_abs) {
-                        let bytes = self.core_sessions.mouse_motion(
-                            &reference,
-                            rect,
-                            new_abs,
-                            None,
-                            core_mods,
-                        );
+                        let bytes = self
+                            .core_sessions
+                            .mouse_motion(&reference, rect, new_abs, None, core_mods);
                         if !bytes.is_empty() {
                             self.core_sessions.send_input(&reference, &bytes);
                             pointer.motion(
@@ -443,9 +437,8 @@ impl EmthinState {
                 }
 
                 if let Some((reference, _)) = self.core_terminal_at(pointer_pos) {
-                    if let Some(bytes) = self
-                        .core_sessions
-                        .wheel(&reference, vertical_notches > 0.0)
+                    if let Some(bytes) =
+                        self.core_sessions.wheel(&reference, vertical_notches > 0.0)
                     {
                         if !bytes.is_empty() {
                             self.core_sessions.send_input(&reference, &bytes);
@@ -860,7 +853,7 @@ impl EmthinState {
     /// belongs to its app, but a dormant figure has no client, so nothing else
     /// can claim the click. Waiting for a double-click would be inventing a
     /// gesture out of a case where the click is already unclaimed.
-    fn relaunch_dormant(&mut self, key: &str) -> bool {
+    pub(crate) fn relaunch_dormant(&mut self, key: &str) -> bool {
         let Some((cmd, args)) = self.doc.relaunch_target(key) else {
             // Dormant with no saved command: an empty slot with nothing to open.
             // Not an error, and not worth a warning per click.
@@ -909,6 +902,8 @@ impl EmthinState {
                 // figure once none of them is open.
                 if self.doc.cancel_completion() {
                     // The completion was the innermost transient state.
+                } else if self.doc.close_launcher() {
+                    // The launcher palette closes before the find bar.
                 } else if self.doc.close_find() {
                     // Find may have moved the page while stepping matches.
                     self.publish_document_page();
@@ -993,7 +988,8 @@ impl EmthinState {
                     self.publish_document_page();
                 }
             }
-            Action::OpenLauncher => self.open_launcher(),
+            Action::OpenLauncher => self.relaunch_pointed(),
+            Action::LauncherPalette => self.doc.open_launcher(),
             Action::CloneFigure => self.clone_focused_figure(),
             Action::VoiceTurn => {
                 // Queue one turn for the `\voice` block at the caret.
@@ -1047,7 +1043,7 @@ impl EmthinState {
     /// It used to be *only* the first, which meant a document with several
     /// figures always relaunched whichever came first rather than the one
     /// under the pointer.
-    fn open_launcher(&mut self) {
+    fn relaunch_pointed(&mut self) {
         let pointer = self
             .seat
             .get_pointer()
@@ -1185,7 +1181,9 @@ impl EmthinState {
     fn edit_document_key(&mut self, keysym: u32) -> bool {
         let revision = self.doc.model().revision();
         let handled = self.edit_document_key_inner(keysym);
-        if self.doc.model().revision() != revision { self.doc.clear_citations(); }
+        if self.doc.model().revision() != revision {
+            self.doc.clear_citations();
+        }
         if handled {
             // Backspace, arrows and typing all move the caret or the run; the
             // preview must describe the new position, not the previous key's.
@@ -1199,6 +1197,11 @@ impl EmthinState {
     /// editing — the same set any editor has — so it lives in one place
     /// rather than being scattered through the input path.
     fn edit_document_key_inner(&mut self, keysym: u32) -> bool {
+        // The launcher palette is the innermost text-capturing overlay: its
+        // query must not leak into the find bar or the document behind it.
+        if self.doc.launcher().is_open() {
+            return self.edit_launcher_key(keysym);
+        }
         // An open find bar owns the keyboard: its query is being typed, so a
         // character must not land in the document behind it.
         if self.doc.find().is_open() {
@@ -1286,6 +1289,36 @@ impl EmthinState {
     /// A key while the find bar is open: text edits the query, Backspace
     /// shortens it, Return steps. Everything else falls through, so paging and
     /// the global bindings keep working over an open bar.
+    /// Keys for the app launcher palette. Return accepts (spawning through the
+    /// document's own `launch:`), arrows step, and ordinary characters filter.
+    fn edit_launcher_key(&mut self, keysym: u32) -> bool {
+        match keysym {
+            keysyms::KEY_BackSpace => {
+                self.doc.launcher_backspace();
+            }
+            keysyms::KEY_Down => self.doc.launcher_step(true),
+            keysyms::KEY_Up => self.doc.launcher_step(false),
+            keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                if let Some(key) = self.doc.launcher_accept() {
+                    if !self.relaunch_dormant(&key) {
+                        tracing::info!("launcher: {key} names no launch command");
+                    }
+                }
+                self.doc.close_launcher();
+            }
+            _ => {
+                let Some(text) = Self::char_for_keysym(keysym) else {
+                    return false;
+                };
+                for ch in text.chars() {
+                    self.doc.launcher_push(ch);
+                }
+            }
+        }
+        self.needs_redraw = true;
+        true
+    }
+
     fn edit_find_key(&mut self, keysym: u32) -> bool {
         match keysym {
             keysyms::KEY_BackSpace => {
@@ -1465,8 +1498,13 @@ impl EmthinState {
 
     fn prev_grapheme(text: &str, pos: usize) -> usize {
         let mut end = pos.min(text.len());
-        while !text.is_char_boundary(end) { end -= 1; }
-        text[..end].grapheme_indices(true).next_back().map_or(0, |(offset, _)| offset)
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(offset, _)| offset)
     }
 
     /// The character a printable keysym stands for.
@@ -1561,8 +1599,14 @@ mod tests {
     fn left_moves_one_grapheme_including_combining_and_emoji_sequences() {
         let text = "ab e\u{301} 👩‍💻";
         assert_eq!(EmthinState::prev_grapheme("abc", 3), 2);
-        assert_eq!(EmthinState::prev_grapheme(text, text.len()), text.find('👩').unwrap());
+        assert_eq!(
+            EmthinState::prev_grapheme(text, text.len()),
+            text.find('👩').unwrap()
+        );
         let end = text.find(' ').unwrap() + 1 + "e\u{301}".len();
-        assert_eq!(EmthinState::prev_grapheme(text, end), text.find('e').unwrap());
+        assert_eq!(
+            EmthinState::prev_grapheme(text, end),
+            text.find('e').unwrap()
+        );
     }
 }

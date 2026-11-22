@@ -1522,6 +1522,28 @@ mod tests {
         );
     }
 
+    /// Free 2D placement stays in the document: an `dx:`/`dy:` offset moves the
+    /// figure's placed rect without any compositor-side position state.
+    #[test]
+    fn a_doc_offset_moves_the_placed_figure_rect() {
+        let rect_of = |doc: &str| {
+            let mut cache = DocLayoutCache::new();
+            cache.set_viewport(Size::from((1280, 800)));
+            cache
+                .rebuild(doc, &mathed_core::TransformOptions::default())
+                .expect("layout");
+            cache.place_figure("f0").expect("a figure").rect
+        };
+        let flow = rect_of("#1 app #2 \\app(#1, #2, 240, 160, \"a\")");
+        let shifted = rect_of("#1 app #2 \\app(#1, #2, 240, 160, \"a\", dx: 30, dy: 20)");
+        assert_eq!(shifted.size, flow.size);
+        // The page may be downscaled to fit the viewport; the document offset
+        // is scaled with it, but must still be non-zero and in the right
+        // direction.
+        assert!(shifted.loc.x > flow.loc.x, "dx moved the figure right");
+        assert!(shifted.loc.y > flow.loc.y, "dy moved the figure down");
+    }
+
     /// A page that fits is still mapped 1:1 — the fix must not shrink a page
     /// that did not need it.
     #[test]

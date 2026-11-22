@@ -357,6 +357,10 @@ pub struct EmthinState {
     /// Collaboration peers and presence. The document stays in `doc`;
     /// the session only tracks peer streams and versions.
     pub collab: emthin_collab::Session,
+    /// Optional AT Protocol publication adapter (parked item). A local mock
+    /// PDS by default; no network client is linked and publication is never
+    /// on the edit or save path.
+    pub atproto_pds: emthin_atproto::MockPdsTransport,
     /// Document version last offered to the collaboration session, so a
     /// local edit — including a mark-only edit that does not bump the text
     /// revision — is forwarded once and a remote import is not echoed back.
@@ -425,8 +429,7 @@ impl EmthinState {
         // A process can host more than one state in tests; the id is still
         // stable for the lifetime of this state/session.
         let collab_peer = {
-            static NEXT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(1);
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             format!(
                 "emthin-{}-{}",
                 std::process::id(),
@@ -498,11 +501,8 @@ impl EmthinState {
             needs_redraw: true,
             inspect: crate::docui::inspect::EventLog::off(),
             dbus: dbus::DbusBridge::default(),
-            collab: emthin_collab::Session::new(
-                &collab_peer,
-                &collab_peer,
-                collab_timeout,
-            ),
+            collab: emthin_collab::Session::new(&collab_peer, &collab_peer, collab_timeout),
+            atproto_pds: emthin_atproto::MockPdsTransport::new(),
             collab_version: Vec::new(),
             collab_local_name: collab_peer,
             collab_presence_cursor: None,
@@ -826,7 +826,7 @@ impl EmthinState {
         self.needs_redraw = true;
     }
 
-/// Fullscreen geometry for the primary output (logical pixels).
+    /// Fullscreen geometry for the primary output (logical pixels).
     pub fn output_fullscreen_geo(&self) -> Option<Rectangle<i32, Logical>> {
         let output = self.page.active_space.outputs().next()?;
         let mode = output.current_mode()?;

@@ -13,6 +13,7 @@ description = "Render Wayland applications as figures inside a mathed document"
 [dependencies]
 emthin-clipboard = { path = "../emthin-clipboard" }
 emthin-collab = { path = "../emthin-collab" }
+emthin-atproto = { path = "../emthin-atproto" }
 emthin-core-client = { path = "../emthin-core-client" }
 emthin-vt = { path = "../emthin-vt" }
 emthin-dbus = { path = "../emthin-dbus" }

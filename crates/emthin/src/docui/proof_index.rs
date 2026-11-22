@@ -136,6 +136,53 @@ impl ProofView {
         out.sort();
         out
     }
+
+    /// A second, independent query over the same facts: case-insensitive name
+    /// search across definitions, references and unresolved names. Bounded to
+    /// `limit` per bucket and sorted by source offset, so the result is stable
+    /// and a client can key an incremental view by the returned ranges.
+    pub fn search(&self, needle: &str, limit: usize) -> ProofMatches {
+        let needle = needle.to_lowercase();
+        let matches_name = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
+        let mut definitions: Vec<ProofMatchRow> = self
+            .definitions
+            .iter()
+            .filter(|row| matches_name(&row.name))
+            .map(|row| ProofMatchRow {
+                name: row.name.clone(),
+                start: row.start,
+                end: row.end,
+            })
+            .collect();
+        definitions.sort_by_key(|row| row.start);
+        definitions.truncate(limit);
+        let mut references: Vec<ProofMatchRow> = self
+            .references
+            .iter()
+            .filter(|row| matches_name(&row.name))
+            .map(|row| ProofMatchRow {
+                name: row.name.clone(),
+                start: row.start,
+                end: row.end,
+            })
+            .collect();
+        references.sort_by_key(|row| row.start);
+        references.truncate(limit);
+        let mut missing: Vec<String> = self
+            .missing
+            .iter()
+            .filter(|name| matches_name(name))
+            .cloned()
+            .collect();
+        missing.sort();
+        missing.dedup();
+        missing.truncate(limit);
+        ProofMatches {
+            definitions,
+            references,
+            missing,
+        }
+    }
 }
 
 // ----- K9 rule candidate (evaluated, not adopted) ---------------------
@@ -150,6 +197,22 @@ pub const RULE_ABI_VERSION: u32 = 1;
 pub struct LinkFact {
     pub from: String,
     pub to: String,
+}
+
+/// One search match with its source range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofMatchRow {
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The second query over a proof view: bounded, deterministic name matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofMatches {
+    pub definitions: Vec<ProofMatchRow>,
+    pub references: Vec<ProofMatchRow>,
+    pub missing: Vec<String>,
 }
 
 /// The rule's result: either every edge resolves or the missing targets are
@@ -262,7 +325,13 @@ pub fn build_view(
     let expected_proof = segments
         .iter()
         .filter(|segment| segment.kind == mathed_core::markers::PropKind::Formal)
-        .find_map(|segment| mathed_core::formalize::resolve_formal(segment).map(|r| r.key));
+        .find_map(|segment| {
+            mathed_core::formalize::resolve_formal(segment).map(|r| {
+                // A `proof: "id"` argument names a live external record; fall
+                // back to the layout-addressed key when none was cited.
+                r.spec.proof_id.unwrap_or(r.key)
+            })
+        });
     ProofView {
         owner,
         revision,

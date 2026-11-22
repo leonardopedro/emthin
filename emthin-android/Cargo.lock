@@ -1137,6 +1137,7 @@ dependencies = [
  "mathed_core",
  "mathed_mini",
  "png",
+ "serde",
  "serde_json",
  "sha2",
  "typst",

@@ -94,7 +94,7 @@ impl Figure {
 /// The document's figures and their app bindings.
 #[derive(Debug, Default)]
 pub struct FigureManager {
-    figures: Vec<Figure>,
+    pub(crate) figures: Vec<Figure>,
 }
 
 impl FigureManager {
@@ -307,6 +307,8 @@ mod tests {
                 h,
                 id: None,
                 launch: None,
+                dx: None,
+                dy: None,
                 terminal: None,
                 binding_error: None,
             },

@@ -7,9 +7,7 @@
 //! mode feeds them back so an APK lane can prove delivery without Core.
 
 use emthin_core_client::Event;
-use emthin_vt::{
-    Color, DejaVuFont, Metrics, Pane, Renderer, Screen,
-};
+use emthin_vt::{Color, DejaVuFont, Metrics, Pane, Renderer, Screen};
 use serde_json::{json, Value};
 
 const CHANNEL: u32 = 1;
@@ -29,7 +27,14 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(cols: u16, rows: u16, cell_width: u16, cell_height: u16, baseline: u16, echo: bool) -> Self {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        baseline: u16,
+        echo: bool,
+    ) -> Self {
         let cols = cols.clamp(1, 300);
         let rows = rows.clamp(1, 120);
         let metrics = Metrics {
@@ -60,7 +65,8 @@ impl Scene {
             return;
         }
         if let Some(paint) = self.pane.handle(&event) {
-            self.renderer.update(&paint.screen, &paint.damage, &mut self.font);
+            self.renderer
+                .update(&paint.screen, &paint.damage, &mut self.font);
             self.damage = paint.damage;
             self.frame = self.frame.saturating_add(1);
         }
@@ -119,13 +125,7 @@ impl Scene {
         bytes
     }
 
-    pub fn mouse_motion(
-        &mut self,
-        x: u16,
-        y: u16,
-        button: Option<u8>,
-        mods: u8,
-    ) -> Vec<u8> {
+    pub fn mouse_motion(&mut self, x: u16, y: u16, button: Option<u8>, mods: u8) -> Vec<u8> {
         if self.closed {
             return Vec::new();
         }
@@ -151,10 +151,16 @@ impl Scene {
         let mut out = String::new();
         for y in y0..=y1 {
             let start = if y == y0 { x0.min(screen.cols - 1) } else { 0 };
-            let end = if y == y1 { x1.min(screen.cols - 1) } else { screen.cols - 1 };
+            let end = if y == y1 {
+                x1.min(screen.cols - 1)
+            } else {
+                screen.cols - 1
+            };
             let mut line = String::new();
             for x in start..=end {
-                let Some(cell) = screen.cell(x, y) else { continue };
+                let Some(cell) = screen.cell(x, y) else {
+                    continue;
+                };
                 // A wide glyph's spacer tail has no text of its own.
                 if cell.wide == 2 {
                     continue;
@@ -196,9 +202,10 @@ impl Scene {
         if !wordish(x) {
             // A long press on blank space still selects nearby text instead of
             // producing an empty clipboard entry.
-            let nearest = (0..x).rev().find(|candidate| wordish(*candidate)).or_else(|| {
-                ((x + 1)..screen.cols).find(|candidate| wordish(*candidate))
-            });
+            let nearest = (0..x)
+                .rev()
+                .find(|candidate| wordish(*candidate))
+                .or_else(|| ((x + 1)..screen.cols).find(|candidate| wordish(*candidate)));
             match nearest {
                 Some(candidate) => x = candidate,
                 None => {
@@ -216,9 +223,7 @@ impl Scene {
         while x1 + 1 < screen.cols && wordish(x1 + 1) {
             x1 += 1;
         }
-        if x1 + 1 < screen.cols
-            && screen.cell(x1 + 1, y).is_some_and(|cell| cell.wide == 2)
-        {
+        if x1 + 1 < screen.cols && screen.cell(x1 + 1, y).is_some_and(|cell| cell.wide == 2) {
             x1 += 1;
         }
         Some((x0, y, x1, y))

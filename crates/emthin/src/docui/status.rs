@@ -75,6 +75,8 @@ pub struct StatusModel {
     pub peers: usize,
     pub voice: bool,
     pub formal: bool,
+    /// A `\lint` diagnostics pass is in flight (third plugin).
+    pub diagnostics: bool,
 }
 
 impl StatusModel {
@@ -93,7 +95,8 @@ impl StatusModel {
             && self.find.is_none()
             && self.peers == 0
             && !self.voice
-            && !self.formal;
+            && !self.formal
+            && !self.diagnostics;
         if quiet {
             return None;
         }
@@ -149,6 +152,9 @@ impl StatusModel {
         if self.formal {
             parts.push("formal".to_owned());
         }
+        if self.diagnostics {
+            parts.push("lint".to_owned());
+        }
         Some(parts.join("  "))
     }
 }
@@ -180,6 +186,7 @@ mod tests {
             peers: 0,
             voice: false,
             formal: false,
+            diagnostics: false,
         }
     }
 
