@@ -1038,7 +1038,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "emthin"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "arboard",
  "clap",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "emthin-clipboard"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "libc",
  "tracing",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "emthin-dbus"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "gio",
  "glib",
