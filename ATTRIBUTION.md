@@ -2,7 +2,7 @@
 
 Borrowed patterns and components that concern *this* repo. The authoritative,
 cross-repo table — including what was deliberately **not** adopted — is
-[`../ATTRIBUTION.md`](../ATTRIBUTION.md).
+available in the [workspace attribution mirror](workspace-backup/ATTRIBUTION.md).
 
 | source | licence | what was adapted | where it landed |
 |---|---|---|---|

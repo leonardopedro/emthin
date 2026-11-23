@@ -30,10 +30,15 @@
 #   install      adb install -r the built APK (implies connect)
 #   launch       am start -W the pad activity
 #   austral-rule  native Austral rule artifact on a worker thread (K9 arm64)
+#   history-preview  read-only history snapshot preview (K5)
 #   pull         pull the installed base.apk, md5-compare to the built APK
 #   screencap F  capture the screen to file F (prefix-stripped PNG)
 #   logcat F     dump the pad's logcat to F
 #   swipe        one drag inside the preview ScrollView
+#   math-preview  rendered prose and equation agree with the on-screen hit map
+#                (requires the disposable test APK and Python Pillow)
+#   enter        Return in the preview and keypad Enter in its source editor
+#                insert newlines (requires the disposable test APK and python3)
 #   persistence  edit -> force-stop -> relaunch autosave proof (used by e2e)
 #   new-reset    New confirmation -> starter reset -> Undo restore proof
 #                (used by e2e)
@@ -422,6 +427,18 @@ EOF
     D shell input tap "$(( (x1 + x2) / 2 ))" "$(( (y1 + y2) / 2 ))" >/dev/null 2>&1
 }
 
+tap_toolbar_menu() {
+    local group="$1" action="$2" bounds
+    bounds=$(node_bounds 'content-desc="More actions"') || return 1
+    tap_center "$bounds" || return 1
+    cmd_uidump "$UI_XML" || return 1
+    bounds=$(node_bounds "text=\"$group\"") || return 1
+    tap_center "$bounds" || return 1
+    cmd_uidump "$UI_XML" || return 1
+    bounds=$(node_bounds "text=\"$action\"") || return 1
+    tap_center "$bounds"
+}
+
 # First paint focuses the rendered page at the document end. Tapping the
 # page would move the caret to the tapped glyph and may open the source field,
 # so the lane verifies the rendered surface and leaves focus where it is.
@@ -624,9 +641,8 @@ cmd_new_reset() {
     # title, and capture the dark dialog before confirming it.
     D logcat -c >/dev/null 2>&1 || true
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^N New"') \
+    tap_toolbar_menu Document New \
         || { fail "New not found in UI hierarchy"; return; }
-    tap_center "$b"
     sleep 0.8
     cmd_uidump "$ui" || return
     if ! grep -q 'text="New document"' "$ui"; then
@@ -654,7 +670,7 @@ cmd_new_reset() {
 
     # The confirmation is only useful if the reset is undoable.
     cmd_uidump "$ui" || return
-    if ! grep -q 'text="\^Z Undo"[^>]*enabled="true"' "$ui"; then
+    if ! grep -q 'text="Undo"[^>]*enabled="true"' "$ui"; then
         fail "Undo was not enabled after New"
         return
     fi
@@ -664,7 +680,7 @@ cmd_new_reset() {
     fi
 
     D logcat -c >/dev/null 2>&1 || true
-    b=$(node_bounds 'text="\^Z Undo"') \
+    b=$(node_bounds 'text="Undo"') \
         || { fail "Undo not found in UI hierarchy"; return; }
     tap_center "$b"
     wait_for_log "$log" "applyState setCaret true .*textLen $((base_len + 1))" \
@@ -762,7 +778,7 @@ cmd_scroll_anchor() {
     # match the pre-collapse two-page render.
     D logcat -c >/dev/null 2>&1 || true
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^Z Undo"') \
+    b=$(node_bounds 'text="Undo"') \
         || { fail "Undo not found in UI hierarchy"; return; }
     tap_center "$b"
     wait_for_log "$log" 'applyChunk total 2 pages [12]' \
@@ -801,7 +817,7 @@ cmd_search_replace() {
     fi
 
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^F Find"') \
+    b=$(node_bounds 'text="Find"') \
         || { fail "Find not found in UI hierarchy"; return; }
     tap_center "$b"
     sleep 0.5
@@ -837,17 +853,15 @@ cmd_search_replace() {
     fi
 
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="Alt← Back"') \
+    tap_toolbar_menu Navigation Back \
         || { fail "Back action not found in UI hierarchy"; return; }
-    tap_center "$b"
     wait_for_log "$log" 'navigate kind current' \
         || { fail "Back did not restore the pre-search location"; return; }
     pass "Back restored the pre-search destination"
 
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="Alt→ Forward"') \
+    tap_toolbar_menu Navigation Forward \
         || { fail "Forward action not found in UI hierarchy"; return; }
-    tap_center "$b"
     wait_for_log "$log" 'navigate kind search' \
         || { fail "Forward did not return to the accepted search"; return; }
     pass "Forward returned to the accepted search"
@@ -855,7 +869,7 @@ cmd_search_replace() {
     # Replace the current literal match, then one Undo restores the starter.
     # Find is reopened through the visible toolbar action.
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^F Find"') \
+    b=$(node_bounds 'text="Find"') \
         || { fail "Find not found for replacement"; return; }
     tap_center "$b"
     sleep 0.4
@@ -887,7 +901,7 @@ cmd_search_replace() {
     pass "Replace current replaced the literal match"
 
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^Z Undo"') \
+    b=$(node_bounds 'text="Undo"') \
         || { fail "Undo not found after replacement"; return; }
     tap_center "$b"
     wait_for_log "$log" "applyState setCaret true .*textLen $base_len" \
@@ -940,17 +954,17 @@ _diagnostics() {
         fail "launch the exact-diagnostic fixture"
         return
     fi
-    wait_for_log "$log" 'diagnostics .*count 2 errors 0 warnings 2' \
-        || { fail "exact fixture did not publish two warnings"; return; }
+    wait_for_log "$log" 'diagnostics .*count 1 errors 0 warnings 1 notes 1' \
+        || { fail "exact fixture did not publish a warning and a note"; return; }
     sleep 0.8
     cmd_uidump "$ui" || return
-    grep -q 'text="2 diagnostics · 2 warnings · tap for details"' "$ui" \
+    grep -q 'text="1 diagnostic · 1 warning · tap for details"' "$ui" \
         || { fail "diagnostic banner is missing"; return; }
-    grep -q 'text="Untitled · unsaved · Recovered · durable · 2 diagnostics"' "$ui" \
+    grep -q 'text="Untitled · unsaved · Recovery copy saved on this device · 1 diagnostic"' "$ui" \
         || { fail "status line does not carry the name, state and diagnostic count"; return; }
-    pass "banner and status line report two diagnostics"
+    pass "banner and status line report one actionable diagnostic"
 
-    b=$(node_bounds 'text="2 diagnostics · 2 warnings · tap for details"') \
+    b=$(node_bounds 'text="1 diagnostic · 1 warning · tap for details"') \
         || { fail "diagnostic banner is not tappable"; return; }
     tap_center "$b"
     sleep 0.6
@@ -959,7 +973,7 @@ _diagnostics() {
         || { fail "execution diagnostic is missing from the list"; return; }
     grep -q 'Open diagnostic source: unresolved-name' "$ui" \
         || { fail "unresolved-name diagnostic is missing from the list"; return; }
-    grep -q 'WARNING · unresolved-name · exact' "$ui" \
+    grep -q 'NOTE · unresolved-name · exact' "$ui" \
         || { fail "unresolved-name diagnostic is not marked exact"; return; }
     pass "list shows exact execution and unresolved-name rows"
 
@@ -974,9 +988,8 @@ _diagnostics() {
         || { fail "diagnostic navigation did not open the source inspector"; return; }
     pass "exact diagnostic opened source at the unresolved name"
 
-    b=$(node_bounds 'text="Alt← Back"') \
+    tap_toolbar_menu Navigation Back \
         || { fail "Back action is missing after diagnostic navigation"; return; }
-    tap_center "$b"
     sleep 0.8
     cmd_uidump "$ui" || return
     grep -q 'content-desc="Page 1 of 1"' "$ui" \
@@ -1027,9 +1040,8 @@ _diagnostics() {
         || { fail "owner diagnostic did not open the source inspector"; return; }
     pass "owner diagnostic opened source at the modifier pair"
 
-    b=$(node_bounds 'text="Alt← Back"') \
+    tap_toolbar_menu Navigation Back \
         || { fail "Back action is missing after owner navigation"; return; }
-    tap_center "$b"
     sleep 0.8
     cmd_uidump "$ui" || return
     grep -q 'content-desc="Target marker pairs"' "$ui" \
@@ -1092,7 +1104,7 @@ cmd_focus_stack() {
         || { fail "starter did not render for the focus test"; return; }
 
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^F Find"') \
+    b=$(node_bounds 'text="Find"') \
         || { fail "Find is missing from the toolbar"; return; }
     tap_center "$b"
     sleep 0.5
@@ -1137,9 +1149,8 @@ cmd_focus_stack() {
     pass "Escape cancelled Find and dismissed the IME"
 
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="\^N New"') \
+    tap_toolbar_menu Document New \
         || { fail "New is missing from the toolbar"; return; }
-    tap_center "$b"
     sleep 0.5
     cmd_uidump "$ui" || return
     grep -q 'text="New document"' "$ui" \
@@ -1159,11 +1170,11 @@ cmd_focus_stack() {
     D logcat -c >/dev/null 2>&1 || true
     D shell am start -W -n "$ACTIVITY" \
         --es emthin.fixtureB64 "$(printf '%s' "$exact" | base64 -w0)" >/dev/null 2>&1
-    wait_for_log "$log" 'diagnostics .*count 2 errors 0 warnings 2' \
+    wait_for_log "$log" 'diagnostics .*count 1 errors 0 warnings 1 notes 1' \
         || { fail "focus fixture did not publish diagnostics"; return; }
     sleep 0.8
     cmd_uidump "$ui" || return
-    b=$(node_bounds 'text="2 diagnostics') \
+    b=$(node_bounds 'text="1 diagnostic') \
         || { fail "diagnostic banner is missing"; return; }
     tap_center "$b"
     sleep 0.6
@@ -2475,6 +2486,7 @@ cmd_e2e() {
     # clears app data itself, so it still cold-launches the starter.
     cmd_persistence
     cmd_new_reset
+    cmd_enter
     cmd_scroll_anchor
     cmd_search_replace
     cmd_accessibility
@@ -2494,6 +2506,181 @@ cmd_e2e() {
     cmd_pull
 }
 
+cmd_enter() {
+    say "==> Enter: rendered page -> source editor"
+    if [ "$PKG" != "$TEST_PACKAGE" ]; then
+        fail "enter requires $TEST_PACKAGE"
+        return
+    fi
+    mkdir -p "$OUTDIR" || { fail "create Enter output directory"; return; }
+    local log="$OUTDIR/enter-logcat.txt" ui="$OUTDIR/enter-ui.xml"
+    cmd_clear_data || return
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixtureB64 "$(printf 'First line' | base64 -w0)" >/dev/null 2>&1; then
+        fail "launch the Enter fixture"
+        return
+    fi
+    wait_for_log "$log" 'applyChunk total 1 pages 1 start 0' \
+        || { fail "Enter fixture did not render"; return; }
+    D shell input keyevent KEYCODE_MOVE_END KEYCODE_ENTER >/dev/null 2>&1
+    wait_for_log "$log" 'applyState setCaret false .*textLen 11 ' \
+        || { fail "Return in the rendered page did not insert a newline"; return; }
+    D shell input keyevent KEYCODE_NUMPAD_ENTER >/dev/null 2>&1
+    D shell input text Next >/dev/null 2>&1
+    wait_for_log "$log" 'applyState setCaret false .*textLen 16 ' \
+        || { fail "keypad Enter and typing did not reach the source editor"; return; }
+    cmd_uidump "$ui" || return
+    if python3 - "$ui" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+for node in ET.parse(sys.argv[1]).iter("node"):
+    if (node.get("focused") == "true"
+            and node.get("content-desc") == "Editable text without modifiers"
+            and node.get("text") == "First line\n\nNext"):
+        sys.exit(0)
+sys.exit("expected the two newlines and continued typing in the focused source field")
+PY
+    then
+        pass "both Enter keys inserted newlines and typing continued in source"
+    else
+        fail "unexpected source text or focus after Enter"
+    fi
+}
+
+cmd_math_preview() {
+    say "==> math preview: verify on-screen prose and equation"
+    if [ "$PKG" != "$TEST_PACKAGE" ]; then
+        fail "math-preview requires $TEST_PACKAGE"
+        return
+    fi
+    if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+        fail "math-preview requires Python Pillow"
+        return
+    fi
+    mkdir -p "$OUTDIR" || { fail "create math preview output directory"; return; }
+    cmd_clear_data || return
+    local log="$OUTDIR/math-preview-logcat.txt" shot="$OUTDIR/math-preview.png"
+    local layout="$OUTDIR/math-preview-ui.xml" fixture
+    fixture=$(printf 'Preview ink\n\n$x^2 + y^2 = z^2$\n\nAfter equation\n' | base64 -w0)
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" --es emthin.fixtureB64 "$fixture" >/dev/null 2>&1; then
+        fail "launch the math preview fixture"
+        return
+    fi
+    wait_for_log "$log" 'applyChunk total 1 pages 1 start 0' \
+        || { fail "math preview did not apply its page"; return; }
+    wait_for_log "$log" 'diagnostics .*count 0 errors 0 warnings 0 notes [1-9]' \
+        || { fail "ordinary math variables should produce notes only"; return; }
+    cmd_uidump "$layout" || return
+    if grep -q 'tap for details' "$layout"; then
+        fail "ordinary math variables triggered a diagnostic banner"
+        return
+    fi
+    cmd_screencap "$shot" >/dev/null || return
+
+    local glyph
+    if glyph=$(python3 - "$layout" "$shot" <<'PY'
+import re
+import sys
+import xml.etree.ElementTree as ET
+from PIL import Image
+
+blocks = ET.parse(sys.argv[1]).iter("node")
+block = next((b for b in blocks if b.get("text", "").startswith("Preview ink")), None)
+if block is None:
+    sys.exit("math preview accessibility bounds are absent")
+bounds = tuple(map(int, re.findall(r"\d+", block.get("bounds", ""))))
+image = Image.open(sys.argv[2]).convert("RGB").crop(bounds)
+width, height = image.size
+# Text is white. Ignore isolated pixels and group adjacent rows so the
+# raised exponent counts with the equation below it.
+bands = []
+for y in range(height):
+    if sum(min(image.getpixel((x, y))) > 160 for x in range(width)) < 3:
+        continue
+    if not bands or y - bands[-1][-1] > max(2, height // 40):
+        bands.append([])
+    bands[-1].append(y)
+bands = [band for band in bands if len(band) >= 3]
+if len(bands) < 3:
+    sys.exit("expected three visible text bands inside the preview hit map")
+equation = bands[1]
+y = equation[2 * len(equation) // 3]
+x = next(x for x in range(width) if min(image.getpixel((x, y))) > 160)
+print(x + bounds[0], y + bounds[1])
+PY
+    )
+    then
+        pass "prose and equation are visible at the reported preview bounds"
+    else
+        fail "math preview bitmap is missing or misplaced ($shot)"
+        return
+    fi
+
+    local x y edited="$OUTDIR/math-preview-edit.xml" undone="$OUTDIR/math-preview-undo.xml"
+    read -r x y <<<"$glyph"
+    if ! D shell input tap "$x" "$y" >/dev/null 2>&1 ||
+            ! D shell input text q >/dev/null 2>&1; then
+        fail "tap and edit the displayed equation"
+        return
+    fi
+    cmd_uidump "$edited" || return
+    if ! D shell input keycombination 113 54 >/dev/null 2>&1; then
+        fail "send Ctrl+Z to undo the equation edit"
+        return
+    fi
+    cmd_uidump "$undone" || return
+    if python3 - "$edited" "$undone" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+def focused_source(path):
+    for node in ET.parse(path).iter("node"):
+        if (node.get("content-desc") == "Editable text without modifiers"
+                and node.get("focused") == "true"):
+            return node.get("text", "")
+    return ""
+
+original = "$x^2 + y^2 = z^2$"
+edited = focused_source(sys.argv[1])
+if not edited.startswith("$") or edited.count("q") != 1 or edited.replace("q", "") != original:
+    sys.exit("editing the tapped glyph did not update the focused math source")
+if focused_source(sys.argv[2]) != original:
+    sys.exit("Undo did not restore the equation and keep source focus")
+PY
+    then
+        pass "tapping the equation edits its source and Undo restores it with focus"
+    else
+        fail "equation edit or Undo lost the source text or focus"
+    fi
+}
+
+cmd_history_preview() {
+    # K5: the pad retains a snapshot of the current note and previews it
+    # read-only through the shared docui::history ring on the model owner.
+    local log="$OUTDIR/history-preview-logcat.txt"
+    say "==> history: retain -> preview a read-only snapshot"
+    mkdir -p "$OUTDIR"
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    D logcat -c >/dev/null 2>&1 || true
+    if D shell am start -W -n "$ACTIVITY" --ez emthin.historySmoke true \
+            >/dev/null 2>&1; then
+        pass "launched the history smoke"
+    else
+        fail "launch the history smoke"
+        return
+    fi
+    wait_for_log "$log" 'history smoke: .*readOnly=true' \
+        || { fail "history preview did not reach logcat"; return; }
+    if grep -q 'history smoke failed' "$log"; then
+        fail "history preview reported a failure"
+        return
+    fi
+    pass "history preview left live editor state unchanged"
+}
+
 cmd_austral_rule() {
     # K9: run the embedded Austral rule artifact on a worker thread (the JNI
     # entry spawns one, and MainActivity calls it from a Java background
@@ -2503,6 +2690,7 @@ cmd_austral_rule() {
     local log="$OUTDIR/austral-rule-logcat.txt"
     say "==> austral rule: native artifact off the UI thread"
     mkdir -p "$OUTDIR"
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
     D logcat -c >/dev/null 2>&1 || true
     if D shell am start -W -n "$ACTIVITY" --ez emthin.australRuleSmoke true \
             >/dev/null 2>&1; then
@@ -2541,6 +2729,8 @@ case "$cmd" in
     screencap) cmd_screencap "${2:-}"; echo ;;
     logcat)    cmd_logcat "${2:-}" ;;
     swipe)     cmd_swipe ;;
+    math-preview) cmd_math_preview ;;
+    enter) cmd_enter ;;
     persistence) cmd_persistence ;;
     new-reset) cmd_new_reset ;;
     scroll-anchor) cmd_scroll_anchor ;;
@@ -2558,6 +2748,7 @@ case "$cmd" in
     terminal-pages) cmd_terminal_pages ;;
     terminal-lease) cmd_terminal_lease ;;
     austral-rule) cmd_austral_rule ;;
+    history-preview) cmd_history_preview ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;
 esac

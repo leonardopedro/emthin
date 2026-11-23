@@ -23,8 +23,59 @@
 #[path = "../../crates/emthin/src/docui/change.rs"]
 pub mod change;
 
+#[path = "../../crates/emthin/src/docui/history.rs"]
+pub mod history;
+
 #[path = "../../crates/emthin/src/docui/inspect.rs"]
 pub mod inspect;
+
+/// The shared `history` module refers to `crate::ipc::hex`; the pad has no IPC
+/// crate, so provide the same path from its local hex codec.
+pub mod ipc {
+    pub use crate::hex;
+}
+
+/// The shared `history` module refers to `crate::docui::DocModel`; the pad
+/// keeps that type in `crate::model`.
+pub mod docui {
+    pub use crate::model::DocModel;
+}
+
+/// Hex codec used by the shared `history` module. Same format as the desktop
+/// IPC codec, kept local so the pad does not depend on the compositor crate.
+pub mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        const D: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(D[(b >> 4) as usize] as char);
+            out.push(D[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+    pub fn decode(text: &str) -> Result<Vec<u8>, String> {
+        if text.len() % 2 != 0 {
+            return Err("odd hex length".into());
+        }
+        let nibble = |b: u8| -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        };
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for i in (0..bytes.len()).step_by(2) {
+            out.push(
+                nibble(bytes[i]).ok_or("invalid hex")? << 4
+                    | nibble(bytes[i + 1]).ok_or("invalid hex")?,
+            );
+        }
+        Ok(out)
+    }
+}
 
 #[path = "../../crates/emthin/src/docui/model.rs"]
 pub mod model;
@@ -49,6 +100,25 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::DocModel;
 
+// ----- K5 history preview (shared docui::history, no second model) ----
+
+/// One bounded history ring per open document handle. The pad is a
+/// single-document editor, but keying by handle keeps create/destroy correct.
+static HISTORY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<jlong, history::HistoryStore>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn history_store(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<jlong, history::HistoryStore>> {
+    (*HISTORY).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn clear_history(handle: jlong) {
+    // Drop the snapshots outside the global registry lock.
+    let history = history_store().remove(&handle);
+    drop(history);
+}
+
 // ----- handle management ---------------------------------------------
 
 /// Boxes `model` and leaks it, returning the pointer as a Java `long`.
@@ -72,6 +142,7 @@ unsafe fn model_mut<'a>(handle: jlong) -> &'a mut DocModel {
 /// Same requirements as [`model_mut`], plus: the handle must not be
 /// used again afterwards.
 unsafe fn free_handle(handle: jlong) {
+    clear_history(handle);
     drop(unsafe { Box::from_raw(handle as *mut DocModel) });
 }
 
@@ -578,6 +649,113 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_australRule<'local>(
                 Ok(value) => value,
                 Err(error) => json!({ "error": error }),
             };
+            JString::from_str(env, value.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// K5: retain a read-only snapshot of the current document under `owner`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_historyRemember<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    owner: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let owner = owner.to_string();
+            let result = (|| -> Result<String, String> {
+                let model = unsafe { &*(handle as *const DocModel) };
+                let share = *state_share_id();
+                let mut stores = history_store();
+                let store = stores
+                    .entry(handle)
+                    .or_insert_with(history::HistoryStore::default);
+                store.retain(history::RetainedSnapshot {
+                    share_id: share,
+                    frontier: model.math_doc().version_vector(),
+                    owner,
+                    seq: store.frontiers().len() as u64 + 1,
+                    snapshot: model.snapshot(),
+                    content_digest: model.content_digest(),
+                });
+                Ok(store.frontiers().len().to_string())
+            })();
+            let value = match result {
+                Ok(value) => json!({ "count": value.parse::<usize>().unwrap_or(0) }),
+                Err(error) => json!({ "error": error }),
+            };
+            JString::from_str(env, value.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// A stable local share id for the advisory history ring. The pad has no
+/// collaboration session, so a fixed id namespaces its own retained facts.
+fn state_share_id() -> &'static [u8; 16] {
+    static SHARE: [u8; 16] = [
+        0x50, 0x61, 0x64, 0x4b, 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ];
+    &SHARE
+}
+
+/// K5: list the retained frontiers as hex tokens.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_historyFrontiers<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let stores = history_store();
+            let frontiers: Vec<String> = stores
+                .get(&handle)
+                .map(|store| store.frontiers().iter().map(|f| hex::encode(f)).collect())
+                .unwrap_or_default();
+            JString::from_str(env, json!({ "frontiers": frontiers }).to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_historyClear(
+    _env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+) {
+    clear_history(handle);
+}
+
+/// K5: a read-only preview of one frontier; never changes the live model.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_historyPreview<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    frontier_hex: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let token = frontier_hex.to_string();
+            let value = (|| -> Result<Value, String> {
+                let frontier = hex::decode(&token)?;
+                let stores = history_store();
+                let store = stores.get(&handle).ok_or("no retained history")?;
+                let preview = store
+                    .preview(&frontier, state_share_id())
+                    .map_err(|status| format!("{status:?}"))?;
+                let mut chars = preview.text.chars();
+                let text: String = chars.by_ref().take(1200).collect();
+                Ok(json!({
+                    "text": text,
+                    "truncated": chars.next().is_some(),
+                    "digest": preview.content_digest,
+                    "marks": preview.marks.len(),
+                }))
+            })();
+            let value = value.unwrap_or_else(|error| json!({ "error": error }));
             JString::from_str(env, value.to_string())
         })
         .resolve::<errors::ThrowRuntimeExAndDefault>()
@@ -2953,7 +3131,7 @@ mod tests {
     #[test]
     fn a_replayed_trace_settles_the_same_state_as_the_desktop_reducer() {
         use inspect::{EventKind, SessionEvent};
-        let mut event = |kind, frontier: &str, reason: &str, count: u64| {
+        let event = |kind, frontier: &str, reason: &str, count: u64| {
             let mut e = SessionEvent::new(kind).with("run", "share", "pad");
             e.frontier = frontier.to_string();
             e.reason = reason.to_string();

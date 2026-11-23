@@ -77,6 +77,8 @@ pub struct StatusModel {
     pub formal: bool,
     /// A `\lint` diagnostics pass is in flight (third plugin).
     pub diagnostics: bool,
+    /// Number of events in the opt-in inspect trace, or 0 when off (K8).
+    pub inspect_events: usize,
 }
 
 impl StatusModel {
@@ -96,7 +98,8 @@ impl StatusModel {
             && self.peers == 0
             && !self.voice
             && !self.formal
-            && !self.diagnostics;
+            && !self.diagnostics
+            && self.inspect_events == 0;
         if quiet {
             return None;
         }
@@ -155,6 +158,9 @@ impl StatusModel {
         if self.diagnostics {
             parts.push("lint".to_owned());
         }
+        if self.inspect_events > 0 {
+            parts.push(format!("inspect {}", self.inspect_events));
+        }
         Some(parts.join("  "))
     }
 }
@@ -187,7 +193,19 @@ mod tests {
             voice: false,
             formal: false,
             diagnostics: false,
+            inspect_events: 0,
         }
+    }
+
+    #[test]
+    fn the_inspect_trace_count_is_visible_and_after_background_work() {
+        let mut m = model();
+        m.inspect_events = 3;
+        m.diagnostics = true;
+        let line = m.line().expect("a line");
+        let lint = line.find("lint").expect("lint");
+        let inspect = line.find("inspect 3").expect("inspect count");
+        assert!(lint < inspect, "inspect follows background work: {line}");
     }
 
     #[test]

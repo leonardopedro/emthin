@@ -173,7 +173,10 @@ pub struct SessionFile {
     pub citation_style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citation_locale: Option<String>,
-    #[serde(default = "default_view_zoom", skip_serializing_if = "is_default_view_zoom")]
+    #[serde(
+        default = "default_view_zoom",
+        skip_serializing_if = "is_default_view_zoom"
+    )]
     pub view_zoom: f64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub view_pan_x: f64,

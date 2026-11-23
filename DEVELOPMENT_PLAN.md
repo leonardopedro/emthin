@@ -26,7 +26,7 @@ still define placement and size.
 |---|---|
 | Review inputs | The worktree contains active Herdr, Android and shared dependency changes. Preserve them. `Cargo.toml` currently lists eight desktop workspace members. The pad remains standalone. |
 | Invariants | `bash scripts/verify-invariants` passed 7 checks on 2026-11-20. |
-| Current Rust tests | `cargo test --locked --workspace` passed **608** tests with 2 ignored on 2026-11-20 after D3.2. See D3.2. |
+| Current Rust tests | `cargo test --locked --workspace -j1` passed **734** tests with 2 ignored on 2026-11-22. Formatting, Clippy and rustdoc passed in the same run. |
 | Historical evidence | The 2026-11-19 D8 run lists 538 passed including 18 VT tests and 2 ignored. It covers a different working set. The recorded 2026-11-18 desktop E2E is 28 headless Wayland and 36 XTEST checks. See [D8](#d8--extend-verification-with-each-card) for what those tests exercised. |
 | Sibling revisions | kyneta `83d6e0d06f4b`, pinetrie `0f4483f4aa86`, desktop `06102dcd77f5`, fresh `4a5940ed6063`, foot `152487e49499`, helix `a714a818a3a4`, atuin `6e57c7e3dc8d`, starship `e3b64da0b660`, Infinity `e1a3e4b36e5f`. |
 
@@ -44,7 +44,7 @@ still define placement and size.
 | 8 | [D7.1 Report save and render state accurately](#d71-report-save-and-render-state-accurately) | Done on 2026-11-20: explicit-file, recovery and preview state are separate on the line and over IPC; preview updating is visible. | D2.1, D3.1 |
 | 9 | [D3.2 Measure and bound page work](#d32-measure-and-bound-page-work) | Done on 2026-11-20: compile/glyph/raster are measured separately; the worker retains one compiled generation and materializes only the visible page raster. | D3.1, D4.1, named performance run |
 | Throughout | [Development testing](#development-testing-plan) | Unit checks and disposable workflows must prove actual behavior across docs, live figures and Android. | Run the applicable lane with each card |
-| Next milestone | [K1–K9 Native Kyneta behavior](docs/KYNETA_NATIVE_PLAN.md#implementation-order) | K1–K8 implemented on 2026-11-21 (K6 local lane only); K9's Rust rule stays advisory/unadopted, but its **Austral artifact was compiled, fingerprint-pinned and run on arm64 on 2026-11-22**, closing that named gap. Real-phone transport remains the only milestone-level named gap. | Milestone complete with recorded gaps; reopen K6's real-phone adapter only on a concrete deployment decision |
+| Next milestone | [K1–K9 Native Kyneta behavior](docs/KYNETA_NATIVE_PLAN.md#implementation-order) | K1–K9 implemented; every locally-closable gap closed on 2026-11-22 (Austral artifact + arm64 run, live MM0 verifier, v2 wire epoch fence, SO_PEERCRED, history persistence, on-disk inspect trace + status UI, real compositor relaunch, device IME/focus, proof_search, pad history preview). The Rust rule stays advisory/unadopted by design. Only the **real-phone transport** remains a milestone-level named gap. | Reopen K6's real-phone adapter only on a concrete deployment decision |
 
 D2 and D3 can proceed in parallel after agreeing on document identity
 and content generation. Complete the deterministic safety checks before
@@ -161,7 +161,9 @@ counts from those runs only.
   are syntax-checked but have not run on GitHub, and a clean-worktree run was
   not possible because the review inputs are uncommitted. Those two points
   remain unverified; the local commands above are the evidence recorded here.
-- `cargo fmt --all -- --check` was intentionally not run.
+- `cargo fmt --all -- --check` is green for all 9 workspace packages (2026-11-22);
+  the remaining `--all` diffs are in external path dependencies (unfer, velysterm)
+  with their own edition-2024 formatting.
 
 ### D2.1 Separate file save from recovery
 
@@ -239,9 +241,9 @@ checkpoint.
 - The measurement is the existing `emthin::timing` `session_save` event
   (`snapshot_us`, `write_us`, `snapshot_bytes`). No file I/O was moved to a
   worker in this card; that remains future work after a measured baseline.
-- `cargo fmt --all -- --check` was intentionally not run; a standalone
-  `rustfmt --check` on `docui/mod.rs` also walks untouched submodules and
-  reports pre-existing formatting drift, so it is not a useful gate here.
+- `cargo fmt --all -- --check` is green for every emthin workspace package
+  (verified 2026-11-22). The remaining `--all` diffs are in external path
+  dependencies with their own edition-2024 formatting, not this checkout.
 
 ### D2.2 Protect concrete write targets
 
@@ -496,9 +498,10 @@ the needed layout.
   `emthin-dbus`, 23 `emthin-vt`, 15 `ghostty-vt`, 5
   `herdr-gateway-fixtures`; doc-tests 0.
 - `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
-- A live compositor/device run was not performed here; the page publication,
-  IPC reset and history behavior are covered at the `DocUi`/state-call level,
-  not by an attached Wayland client.
+- The live compositor gap is closed (2026-11-22): `scripts/e2e/process-kill.sh`
+  runs a real headless compositor + emthin, moves the reading position, SIGKILLs
+  the process and verifies the page, IPC reset and recovered history on a second
+  process. The device lane also ran `composing-ime` and `focus-stack` on arm64.
 
 ### D6.1 Scope collaboration to the active document
 
@@ -555,9 +558,9 @@ existing reconnect and convergence checks.
   `herdr-gateway-fixtures`; doc-tests 0.
 - `cargo clippy --locked --workspace --all-targets -- -D warnings` exits 0.
 - Presence remains out of snapshots and undo; the transport is still Unix IPC.
-  A live two-process run over a real remote transport was not performed; the
-  test uses two isolated in-process states with separate real Unix control
-  sockets and relays every frame through JSON-RPC.
+  A live two-process run over real Unix control sockets is covered by
+  `collab_ipc.rs` and `scripts/e2e/live-ipc.sh`. A *remote* transport run is
+  K6's real-phone lane, excluded from this pass.
 
 ### D7.1 Report save and render state accurately
 
@@ -724,6 +727,36 @@ service only after the offline workflow works.
 | Per card | Run focused Rust or Android host tests, repository invariants and affected doc/protocol checks. Run workspace tests, fmt, clippy and rustdoc before desktop review. Shared engine changes run the Android host lane too. | Commands, exact source/build identity, pass/fail totals and named gaps. Assertions use observable output rather than implementation mirroring. |
 | Disposable integration | Extend [agent replay](docs/AGENT_LOOP.md), [desktop E2E](scripts/e2e/README.md) and `emthin-android/device-lane.sh` on `com.emthin.pad.test`. Use local stubbed services and real input/persistence where the seam matters. | Proof note retained, document geometry and app focus correct, no unexpected disk write, and cleanup ownership proved. |
 | Checkpoint device and service | Real arm64 phone for the MM0 client flow, nested desktop for live app figures, real Zenodo sandbox for approved draft-only smoke. Use the [Herdr acceptance run](docs/HERDR_ACCEPTANCE_RUN.md) when a proof workload runs in an existing terminal figure. | APK hash, app/runtime, test fixture identifiers, status/byte evidence, and explicit gaps for unavailable device or sandbox. |
+
+### Editor release checks
+
+- Run `emthin-android/device-lane.sh math-preview` with Python Pillow and the
+  disposable APK. Compare the on-screen equation and prose against their
+  accessibility bounds. Run the existing caret recovery, reading position,
+  Find/Undo, CJK composition, and terminal reflow checks on the same build.
+- On a physical arm64 phone, repeat the preview check in portrait and landscape.
+  Tap the equation, edit an exponent with the software keyboard, undo the
+  edit, and reopen the note. Confirm the same glyphs, caret and reading place.
+  Use the MM0 fixture below to repeat with an actual proof note.
+- Build the distribution APK with the release signer and test upgrade from the
+  previous signed build using a disposable note. Check that launch fixtures
+  and the test IME provider are absent from the release manifest.
+- Extend desktop input composition through `state/ime.rs` and `winit.rs`.
+  The document needs a host IME owner when the editor has focus. Use the
+  document's screen-space caret for the candidate popup. Paint preedit as
+  an overlay and commit through one checked replacement in `DocModel`.
+  Clear preedit on focus changes, document switches and cancellation. Extend
+  the fcitx E2E to commit CJK into the document, undo once, then focus an
+  embedded client and repeat to prove routing.
+- On a memory-constrained build host, run links serially with
+  `CARGO_BUILD_JOBS=1`. The 2026-11-22 kernel log recorded two system-wide
+  OOM kills of `ld.gold` during concurrent desktop links. The serialized
+  workspace run completed with the same source.
+- Repeat `device-lane.sh terminal-lease` before passing the Herdr integration
+  checkpoint. Waydroid reached the placed terminal scene on 2026-11-22, then
+  the socket timed out before the fixture's Watch attach, over both ADB reverse
+  and a direct connection to the private bridge. Local terminal input and
+  rendering passed independently.
 
 ### MM0 proof workflow fixture
 
@@ -1477,8 +1510,9 @@ from an earlier document.
   `../ATTRIBUTION.md`, which is outside this checkout and absent on this
   machine. The link is correct for the workspace root, so it was not rewritten
   or skipped to force a pass.
-- `cargo fmt --all -- --check` was not run wholesale: the worktree already has
-  pre-existing formatting drift in unrelated modified files (D0 baseline).
+- `cargo fmt --all -- --check` passes for every emthin workspace package; the
+  remaining `--all` diffs are pre-existing edition-2024 drift in external path
+  dependencies (unfer, velysterm), not in this checkout.
 - Desktop E2E ran on 2026-11-18 in both configurations: `wtype` (headless
   sway) ran 28 checks and `xdotool` (sway's X11 backend on Xvfb) ran 36, with 0
   skipped and all passed; the XTEST extras assert Find cancel, then the fcitx5

@@ -148,10 +148,11 @@ pub fn build_figure_elements(
         .collect();
     for (reference, rect) in terminals {
         let handle = state.loop_handle.clone();
-        state
+        state.core_sessions.ensure_live(&reference, rect, &handle);
+        if let Some(element) = state
             .core_sessions
-            .ensure_live(&reference, rect, &handle);
-        if let Some(element) = state.core_sessions.element(renderer, &reference, rect, scale) {
+            .element(renderer, &reference, rect, scale)
+        {
             elements.push(element);
         }
     }
@@ -450,8 +451,11 @@ pub fn build_overlay_elements(
         .filter(|figure| figure.page == Some(state.doc.current_page()))
         .filter_map(|figure| {
             let reference = figure.spec.terminal.clone()?;
-            (figure.rect.size.w > 0 && figure.rect.size.h > 0)
-                .then_some((figure.key.clone(), reference, figure.rect))
+            (figure.rect.size.w > 0 && figure.rect.size.h > 0).then_some((
+                figure.key.clone(),
+                reference,
+                figure.rect,
+            ))
         })
         .collect();
     for (key, reference, rect) in retry_terminals {
@@ -508,7 +512,8 @@ pub fn build_overlay_elements(
                         scale,
                         [0.06, 0.09, 0.12, 0.94],
                     ));
-                    if let Some(element) = crate::completion_hint::draw(renderer, image, x, y, scale)
+                    if let Some(element) =
+                        crate::completion_hint::draw(renderer, image, x, y, scale)
                     {
                         out.push(element);
                     }

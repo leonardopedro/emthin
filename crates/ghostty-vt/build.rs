@@ -44,7 +44,9 @@ impl GhosttyPin {
     }
 
     fn revision(&self) -> &str {
-        self.revision.as_deref().unwrap_or("<unknown: read docs/HERDR_COMPATIBILITY.toml>")
+        self.revision
+            .as_deref()
+            .unwrap_or("<unknown: read docs/HERDR_COMPATIBILITY.toml>")
     }
 
     fn missing_source(&self, path: &Path, manifest: &Path) -> ! {
@@ -86,7 +88,10 @@ fn revision_in_ghostty_section(text: &str) -> Option<String> {
         }
         if let Some(value) = line.strip_prefix("revision") {
             let value = value.trim_start().strip_prefix('=')?.trim();
-            return value.strip_prefix('"')?.strip_suffix('"').map(str::to_string);
+            return value
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_string);
         }
     }
     None
@@ -99,7 +104,9 @@ fn desktop_build(manifest: &Path, target: &str, pin: &GhosttyPin) {
     let src = std::env::var_os("GHOSTTY_VT_SOURCE")
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest.join("../../../herdr-core/vendor/ghostty"));
-    let src = src.canonicalize().unwrap_or_else(|_| pin.missing_source(&src, manifest));
+    let src = src
+        .canonicalize()
+        .unwrap_or_else(|_| pin.missing_source(&src, manifest));
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for path in ["src", "build.zig", "build.zig.zon", "include"] {
         println!("cargo:rerun-if-changed={}", src.join(path).display());
@@ -109,9 +116,12 @@ fn desktop_build(manifest: &Path, target: &str, pin: &GhosttyPin) {
     let host = std::env::var("HOST").unwrap();
     let zig = PathBuf::from(std::env::var("ZIG").unwrap_or_else(|_| "zig".into()));
     let mut build = Command::new(&zig);
-    build
-        .current_dir(&src)
-        .args(["build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "-Dcpu=baseline"]);
+    build.current_dir(&src).args([
+        "build",
+        "-Demit-lib-vt",
+        "-Doptimize=ReleaseFast",
+        "-Dcpu=baseline",
+    ]);
     if target != host {
         build.arg(format!("-Dtarget={}", zig_target(target)));
     }

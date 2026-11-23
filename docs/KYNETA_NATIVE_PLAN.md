@@ -115,7 +115,7 @@ golden set of marker, citation and proof-note diagnostics.
   `bash scripts/verify-invariants` passes 7/7; `python3 scripts/check-ipc-docsync`
   and `python3 scripts/check-links` on the touched docs pass.
 - Gaps (updated 2026-11-22): the live compositor/control-client gap is closed
-  by `scripts/e2e/live-ipc.sh` (11/11 checks, exit 0) — a real headless sway +
+  by `scripts/e2e/live-ipc.sh` (13/13 checks, exit 0) — a real headless sway +
   emthin instance answers `inspect_state`, `history_list` and the parked-item
   methods over the control socket, including a live rename reflected in the
   next `semantic_outline`. The sibling `mathed_core`/`mathed_mini` lane also
@@ -390,10 +390,12 @@ changes neither the live version nor its save/undo status.
   retains a snapshot, saves, relaunches a fresh instance and reads the same
   frontiers back. The live control-client gap is also closed:
   `scripts/e2e/live-ipc.sh` asserts a live `history_list` reply with a
-  `frontiers` field. The Android pad has no K5 preview UI (its
-  `logical_fingerprint` already separates marks from history), and a read-only
-  boundary exists at the IPC layer but no end-to-end UX enforces it beyond the
-  documented grant checks.
+  `frontiers` field. The Android pad now has a K5 preview UI: it path-includes
+  the same `docui::history` ring (no second model), exposes `historyRemember`,
+  `historyFrontiers` and `historyPreview` over JNI, and shows a read-only
+  snapshot list/dialog from the History toolbar action. `device-lane.sh
+  history-preview` passes on arm64 Waydroid. A read-only boundary still exists
+  at the IPC layer without an end-to-end UX beyond the documented grant checks.
 
 ### K6. Native sharing on desktop and Android
 
@@ -512,7 +514,8 @@ created solely for it.
   in-memory observation. A unit test proves the file bytes equal `ndjson()` and
   that replaying them settles to the same state. The live control-client case
   is also closed (`scripts/e2e/live-ipc.sh`, `inspect_state` with `enabled`).
-  There is still no dedicated UI panel beyond `list_state`/IPC, and the Android
+  The inspect count is now visible on the desktop status line after background
+  work, so observation has a UI surface beyond `list_state`/IPC. The Android
   host test uses the shared reducer rather than a device run.
 
 ### K8. Derived proof and reference queries in Rust
@@ -579,8 +582,12 @@ these existing projections.
   `\formal(..., proof: "id")` named argument, and feeds the backend's verdict
   into `proof_result` — all 5 checks pass (id `Peano-live-66bfb078`). The
   `proof:` argument is an additive shared-core change verified in both lanes
-  (585 passed). No generic query language or keyed incremental view was
-  introduced, as no second query was demonstrated.
+  (585 passed). A concrete second query now exists: `proof_search` filters
+  definitions/references/unresolved names by case-insensitive substring and
+  returns `(name,start,end)` rows so a client can key a bounded incremental
+  view by source range (unit test + live `proof_matches` assertion). No
+  general-purpose query language was introduced — only this second query over
+  the existing facts, which is what the gap asked to demonstrate.
 
 ### K9. Compile a pure rule with AustralVM when justified
 

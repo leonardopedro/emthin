@@ -319,6 +319,19 @@ the number of ranges changed; one undo step reverses it.
 {"jsonrpc":"2.0","method":"rename_definition","params":{"def_index":0,"new_name":"kind"}}
 ```
 
+### `proof_search`
+
+A second, independent query over the same proof facts (K9). `proof_search`
+filters definitions, references and unresolved names by case-insensitive name
+substring, sorts each bucket by source offset, and bounds each to `limit`. It
+returns `proof_matches` as `(name,start,end)` rows so a client can key a
+keyed/incremental view by the returned ranges; it never resplices or mutates
+the document. A search before any `proof_query` builds the view itself.
+
+```json
+{"jsonrpc":"2.0","method":"proof_search","params":{"query":"norm","limit":8}}
+```
+
 ### `client_identity`
 
 Read the kernel-verified local control-client credentials (K4). `SO_PEERCRED`
@@ -509,6 +522,7 @@ protocol).
 | `collab_share_access` | reply to `collab_shares` | `peer`, `visible` |
 | `semantic_outline` | reply to `semantic_outline` | `definitions` (`[index,name,uses,start,end]`), `uses` (`[name,start,end,definition]`), `unresolved` (`[name,start,end]`) |
 | `rename_result` | reply to `rename_definition` | `replacements`, `applied` |
+| `proof_matches` | reply to `proof_search` | `definitions`/`references` (`[name,start,end]`), `missing` |
 | `client_identity` | reply to `client_identity` | `pid`, `uid`, `gid` (kernel-verified, nullable) |
 | `lint_result` | reply to `lint_run` | `generation`, `accepted` |
 | `plugin_catalog` | reply to `plugin_catalog` | `plugins` (`[name,available,runs]`) |

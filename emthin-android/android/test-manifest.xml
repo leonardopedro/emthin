@@ -7,10 +7,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
-        android:label="emthin pad"
+        android:label="emthin pad (test)"
         android:allowBackup="false"
         android:extractNativeLibs="true"
         android:usesCleartextTraffic="true">
+        <meta-data android:name="com.emthin.pad.deviceTest" android:value="true" />
         <activity
             android:name="com.emthin.pad.MainActivity"
             android:exported="true"

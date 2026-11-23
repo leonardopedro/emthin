@@ -5,54 +5,58 @@ public final class ActionCatalog {
     private ActionCatalog() {}
 
     public enum Id {
-        NEW, UNDO, REDO, OPEN, SAVE, SAVE_COPY, FIND, FIND_REPLACE, FIND_NEXT,
+        NEW, UNDO, REDO, OPEN, SAVE, SAVE_COPY, EDIT_SOURCE, FIND, FIND_REPLACE, FIND_NEXT,
         FIND_PREVIOUS, NAVIGATE_LAST, NAVIGATE_REFERENCES, NAVIGATE_SECTIONS,
         NAV_BACK, NAV_FORWARD, FOLD, MARKERS, READING_SMALLER, READING_LARGER,
         ZOOM_OUT, ZOOM_IN, CLOSE_INSPECTOR, SESSIONS,
-        SHARE_OPEN, SHARE_JOIN, SHARE_LEAVE, SHARE_WATCH, PROOF
+        SHARE_OPEN, SHARE_JOIN, SHARE_LEAVE, SHARE_WATCH, PROOF, HISTORY, DIAGNOSTICS
     }
 
-    /** Toolbar order is the visible order; every entry also has a key binding. */
-    public static final Id[] TOOLBAR = {
-        Id.NEW, Id.UNDO, Id.REDO, Id.OPEN, Id.SAVE, Id.SAVE_COPY, Id.FIND,
-        Id.NAVIGATE_LAST, Id.NAV_BACK, Id.NAV_FORWARD, Id.FOLD, Id.MARKERS,
+    public static final Id[] TOOLBAR = {Id.OPEN, Id.SAVE, Id.UNDO, Id.FIND, Id.EDIT_SOURCE};
+    public static final Id[] DOCUMENT_MENU = {Id.NEW, Id.REDO, Id.SAVE_COPY, Id.HISTORY};
+    public static final Id[] NAVIGATION_MENU = {Id.NAVIGATE_LAST, Id.NAV_BACK, Id.NAV_FORWARD};
+    public static final Id[] VIEW_MENU = {
+        Id.FOLD, Id.MARKERS, Id.DIAGNOSTICS,
         Id.READING_SMALLER, Id.READING_LARGER, Id.ZOOM_OUT, Id.ZOOM_IN,
-        Id.CLOSE_INSPECTOR, Id.SESSIONS, Id.SHARE_OPEN, Id.SHARE_JOIN,
-        Id.SHARE_LEAVE, Id.SHARE_WATCH, Id.PROOF
+        Id.CLOSE_INSPECTOR
+    };
+    public static final Id[] SESSIONS_MENU = {
+        Id.SESSIONS, Id.SHARE_OPEN, Id.SHARE_JOIN, Id.SHARE_LEAVE, Id.SHARE_WATCH, Id.PROOF
     };
 
-    public static String label(Id id, boolean markersVisible, boolean findOpen) {
+    public static String label(Id id, boolean markersVisible) {
         switch (id) {
-            case NEW: return "^N New";
-            case UNDO: return "^Z Undo";
-            case REDO: return "^Y Redo";
-            case OPEN: return "^O Open";
-            case SAVE: return findOpen
-                    ? "^S Find next (Save: close Find)"
-                    : "^S Save (Find: next)";
-            case SAVE_COPY: return "^⇧S Copy";
-            case FIND: return "^F Find";
-            case FIND_REPLACE: return "^H Replace";
-            case FIND_NEXT: return "^S Next in Find";
-            case FIND_PREVIOUS: return "^R Previous";
-            case NAVIGATE_LAST: return "^K Navigate";
-            case NAVIGATE_REFERENCES: return "^K References";
-            case NAVIGATE_SECTIONS: return "^G Sections";
-            case NAV_BACK: return "Alt← Back";
-            case NAV_FORWARD: return "Alt→ Forward";
-            case FOLD: return "^L Fold";
-            case MARKERS: return markersVisible ? "Tab Hide markers" : "Tab Show markers";
-            case READING_SMALLER: return "A−";
-            case READING_LARGER: return "A+";
-            case ZOOM_OUT: return "Zoom−";
-            case ZOOM_IN: return "Zoom+";
-            case CLOSE_INSPECTOR: return "Esc Close";
+            case NEW: return "New";
+            case UNDO: return "Undo";
+            case REDO: return "Redo";
+            case OPEN: return "Open";
+            case SAVE: return "Save";
+            case SAVE_COPY: return "Save a copy";
+            case EDIT_SOURCE: return "Edit";
+            case FIND: return "Find";
+            case FIND_REPLACE: return "Replace";
+            case FIND_NEXT: return "Next";
+            case FIND_PREVIOUS: return "Previous";
+            case NAVIGATE_LAST: return "Go to…";
+            case NAVIGATE_REFERENCES: return "References";
+            case NAVIGATE_SECTIONS: return "Sections";
+            case NAV_BACK: return "Back";
+            case NAV_FORWARD: return "Forward";
+            case FOLD: return "Fold or unfold";
+            case MARKERS: return markersVisible ? "Hide markers" : "Show markers";
+            case READING_SMALLER: return "Smaller text";
+            case READING_LARGER: return "Larger text";
+            case ZOOM_OUT: return "Zoom out";
+            case ZOOM_IN: return "Zoom in";
+            case CLOSE_INSPECTOR: return "Show document";
             case SESSIONS: return "Sessions";
             case SHARE_OPEN: return "Share document";
             case SHARE_JOIN: return "Join share";
             case SHARE_LEAVE: return "Leave share";
             case SHARE_WATCH: return "Watch / Edit";
             case PROOF: return "MM0 proof";
+            case HISTORY: return "History";
+            case DIAGNOSTICS: return "Diagnostics";
             default: throw new IllegalArgumentException("unlabelled action " + id);
         }
     }

@@ -199,7 +199,10 @@ jobs:
              [ -z "$BASE_SHA" ] || \
              [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
             build=true
-          elif git diff --quiet "$BASE_SHA" HEAD -- emthin-android .github/workflows/ci.yml; then
+          elif git diff --quiet "$BASE_SHA" HEAD -- emthin-android \
+               crates/emthin/src/docui crates/emthin-collab crates/emthin-core-client \
+               crates/emthin-vt crates/ghostty-vt .cargo .github/actions \
+               .github/workflows/ci.yml docs/HERDR_COMPATIBILITY.toml scripts/build-ghostty-vt; then
             build=false
           else
             build=true

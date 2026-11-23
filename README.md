@@ -58,14 +58,14 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 687 cargo passed, 2 ignored (workspace, nix develop; re-measured 2026-11-21) + 28/28 wtype (headless sway) and 36/36 xdotool (X11 window on Xvfb) run.sh E2E green, including multi-page navigation and, on xdotool, Find cancel and fcitx5/rime preedit/commit checks (re-measured 2026-11-21; the tier-1 replay scenario and the E2E both run in CI) + 120 emthin-pad Rust host tests and 231 Java host checks (re-measured 2026-11-21; see AGENTS.md #emthin-android) + live-session timing baseline in docs/measurement-surfaces.md | last_verified: 2026-11-21 -->
+<!-- status: verified | tests: 734 cargo passed, 2 ignored (workspace, nix develop, one build job, measured 2026-11-22) + 28/28 wtype (headless sway) and 36/36 xdotool (sway on Xvfb) run.sh E2E, including multi-page navigation and embedded-client fcitx5 composition + 134 emthin-pad Rust host tests and 236 Java host checks (measured 2026-11-22) + Waydroid math preview pixel check and live-session timing in docs/measurement-surfaces.md | last_verified: 2026-11-22 -->
 
 ## Verification
 
 ```sh
 nix develop -c bash -c 'cargo fmt --all --check && \
   cargo clippy --workspace --all-targets -- -D warnings && \
-  cargo test --workspace'          # 687 passed, 2 ignored (2026-11-21)
+  cargo test --workspace'          # 734 passed, 2 ignored (2026-11-22)
 
 ./scripts/e2e/run.sh --config wtype      # 28/28, exit 0 (headless sway)
 ./scripts/e2e/run.sh --config xdotool    # 36/36, exit 0 (sway on Xvfb + Find + fcitx5 IME)

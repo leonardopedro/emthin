@@ -131,6 +131,20 @@ else
   ok "proof_query -> proof_view (definitions present)"
 fi
 
+# The second query: a bounded name search over the same facts, keyed by
+# source ranges. Independent of proof_query having been called first.
+search=$(ask "proof_search" "proof_matches" '{"query":"norm","limit":8}')
+if [ "$search" = "null" ]; then
+  fail "proof_search produced no proof_matches notification"
+else
+  count=$(printf '%s' "$search" | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("definitions",[])))' 2>/dev/null || echo 0)
+  if [ "$count" -lt 1 ]; then
+    fail "proof_search returned no definition matches"
+  else
+    ok "proof_search -> proof_matches ($count definition rows)"
+  fi
+fi
+
 # K9's live control-client case: deliver a verdict with the owner/proof id the
 # document itself advertised, then assert the next query reports it. A late
 # result for another owner is asserted ignored too.

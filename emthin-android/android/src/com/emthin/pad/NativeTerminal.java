@@ -169,6 +169,7 @@ final class NativeTerminal {
         switch (androidKey) {
             case KeyEvent.KEYCODE_ESCAPE: return 120;
             case KeyEvent.KEYCODE_ENTER: return 58;
+            case KeyEvent.KEYCODE_NUMPAD_ENTER: return 97;
             case KeyEvent.KEYCODE_DEL: return 53;
             case KeyEvent.KEYCODE_TAB: return 64;
             case KeyEvent.KEYCODE_SPACE: return 63;

@@ -5,13 +5,12 @@ import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.SharedPreferences;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Canvas;
 import android.graphics.Paint;
-import android.graphics.drawable.BitmapDrawable;
-import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
@@ -35,6 +34,8 @@ import android.util.Base64;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.KeyEvent;
+import android.view.Gravity;
+import android.view.SubMenu;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -50,6 +51,7 @@ import android.widget.HorizontalScrollView;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.FrameLayout;
 import android.widget.Spinner;
@@ -116,10 +118,7 @@ public class MainActivity extends Activity {
     private boolean shareWatchOnly;
     private EditText editor;
     private TextView undoButton;
-    private TextView redoButton;
-    private TextView markersButton;
-    private TextView saveButton;
-    private TextView navBackButton, navForwardButton;
+    private boolean canRedo;
     private EditText targetsField;
     private String appliedTargetList = "";
     private boolean showMarkers;
@@ -253,7 +252,7 @@ public class MainActivity extends Activity {
     private final Runnable viewNow = new Runnable() {
         @Override public void run() { captureViewNow(); }
     };
-    /** One caption + {@link ImageView} per rendered page, stacked. */
+    /** One caption and canvas per rendered page, stacked. */
     private LinearLayout previewPages;
     private LinearLayout previewBox;
     private ScrollView previewScroll;
@@ -284,6 +283,7 @@ public class MainActivity extends Activity {
     private JSONArray currentDiagnostics = new JSONArray();
     private String statusText = "";
     private int diagnosticCount;
+    private boolean deviceTest;
     private String fixtureText, fixtureModifier, fixtureTargets, fixtureModifier2, fixtureTargets2, fixtureMarker;
     private String fixtureOpenPath;
     private String fixtureGateway;
@@ -457,10 +457,11 @@ public class MainActivity extends Activity {
                     prefs.getLong(PREF_DOCUMENT_MODIFIED, 0));
         }
 
-        // Device-lane fixture hook: only an explicit adb intent supplies these.
-        // It makes the modifier-pair inspector repeatable without IME taps.
-        fixtureText = getIntent().getStringExtra("emthin.fixture");
-        String fixtureB64 = getIntent().getStringExtra("emthin.fixtureB64");
+        // Only the disposable test manifest enables launch fixtures.
+        deviceTest = deviceTestEnabled();
+        Intent testIntent = deviceTest ? getIntent() : new Intent();
+        fixtureText = testIntent.getStringExtra("emthin.fixture");
+        String fixtureB64 = testIntent.getStringExtra("emthin.fixtureB64");
         if (fixtureB64 != null) {
             try {
                 fixtureText = new String(Base64.decode(fixtureB64, Base64.DEFAULT),
@@ -469,9 +470,9 @@ public class MainActivity extends Activity {
                 fixtureText = null;
             }
         }
-        fixtureModifier = getIntent().getStringExtra("emthin.fixtureModifier");
-        fixtureTargets = getIntent().getStringExtra("emthin.fixtureTargets");
-        String fixtureTargetsB64 = getIntent().getStringExtra("emthin.fixtureTargetsB64");
+        fixtureModifier = testIntent.getStringExtra("emthin.fixtureModifier");
+        fixtureTargets = testIntent.getStringExtra("emthin.fixtureTargets");
+        String fixtureTargetsB64 = testIntent.getStringExtra("emthin.fixtureTargetsB64");
         if (fixtureTargetsB64 != null) {
             try {
                 fixtureTargets = new String(Base64.decode(fixtureTargetsB64, Base64.DEFAULT),
@@ -480,9 +481,9 @@ public class MainActivity extends Activity {
                 fixtureTargets = null;
             }
         }
-        fixtureModifier2 = getIntent().getStringExtra("emthin.fixtureModifier2");
-        fixtureTargets2 = getIntent().getStringExtra("emthin.fixtureTargets2");
-        String fixtureTargets2B64 = getIntent().getStringExtra("emthin.fixtureTargets2B64");
+        fixtureModifier2 = testIntent.getStringExtra("emthin.fixtureModifier2");
+        fixtureTargets2 = testIntent.getStringExtra("emthin.fixtureTargets2");
+        String fixtureTargets2B64 = testIntent.getStringExtra("emthin.fixtureTargets2B64");
         if (fixtureTargets2B64 != null) {
             try {
                 fixtureTargets2 = new String(Base64.decode(fixtureTargets2B64, Base64.DEFAULT),
@@ -491,17 +492,17 @@ public class MainActivity extends Activity {
                 fixtureTargets2 = null;
             }
         }
-        fixtureMarker = getIntent().getStringExtra("emthin.fixtureMarker");
-        fixtureOpenPath = getIntent().getStringExtra("emthin.fixtureOpenPath");
-        fixtureGateway = getIntent().getStringExtra("emthin.fixtureGateway");
-        fixtureGatewayGeneration = getIntent().getStringExtra("emthin.fixtureGatewayGeneration");
-        sessionPinFixturePending = getIntent().getBooleanExtra("emthin.fixtureSessionPin", false);
-        figureA11yFixturePending = getIntent().getBooleanExtra("emthin.fixtureFigureA11y", false);
-        vtSceneFixturePending = getIntent().getBooleanExtra("emthin.fixtureVtScene", false);
-        vtSceneZoomFixture = getIntent().getBooleanExtra("emthin.fixtureVtZoom", false);
-        vtSceneA11yFixture = getIntent().getBooleanExtra("emthin.fixtureVtA11y", false);
-        vtScenePagesFixture = getIntent().getBooleanExtra("emthin.fixtureVtPages", false);
-        float fixtureZoom = getIntent().getFloatExtra("emthin.fixtureViewZoom", -1f);
+        fixtureMarker = testIntent.getStringExtra("emthin.fixtureMarker");
+        fixtureOpenPath = testIntent.getStringExtra("emthin.fixtureOpenPath");
+        fixtureGateway = testIntent.getStringExtra("emthin.fixtureGateway");
+        fixtureGatewayGeneration = testIntent.getStringExtra("emthin.fixtureGatewayGeneration");
+        sessionPinFixturePending = testIntent.getBooleanExtra("emthin.fixtureSessionPin", false);
+        figureA11yFixturePending = testIntent.getBooleanExtra("emthin.fixtureFigureA11y", false);
+        vtSceneFixturePending = testIntent.getBooleanExtra("emthin.fixtureVtScene", false);
+        vtSceneZoomFixture = testIntent.getBooleanExtra("emthin.fixtureVtZoom", false);
+        vtSceneA11yFixture = testIntent.getBooleanExtra("emthin.fixtureVtA11y", false);
+        vtScenePagesFixture = testIntent.getBooleanExtra("emthin.fixtureVtPages", false);
+        float fixtureZoom = testIntent.getFloatExtra("emthin.fixtureViewZoom", -1f);
         if (fixtureZoom >= 1f) viewZoom = Math.min(4f, fixtureZoom);
         fixturePending = fixtureText != null || sessionPinFixturePending
                 || figureA11yFixturePending || vtSceneFixturePending;
@@ -546,14 +547,14 @@ public class MainActivity extends Activity {
         // The australVM Cranelift lane is a diagnostic, not normal startup
         // work. `device-lane.sh` launches with this exact extra so the logcat
         // proof still exists without a JIT compile on every editor open.
-        if (getIntent().getBooleanExtra("emthin.jitSmoke", false)) {
+        if (testIntent.getBooleanExtra("emthin.jitSmoke", false)) {
             Log.i("emthin-pad", "cranelift roundtrip: " + DocBridge.jitRoundtrip(42));
         }
 
         // K9 native rule artifact: the Rust entry runs the Austral module on
         // its own worker thread; call it from a Java background thread too so
         // the device proof covers both sides of the off-UI-thread boundary.
-        if (getIntent().getBooleanExtra("emthin.australRuleSmoke", false)) {
+        if (testIntent.getBooleanExtra("emthin.australRuleSmoke", false)) {
             new Thread(() -> {
                 try {
                     String facts = "{\"facts\":[{\"from\":\"a\",\"to\":\"b\"},"
@@ -563,6 +564,16 @@ public class MainActivity extends Activity {
                     Log.e("emthin-pad", "austral rule failed: " + t, t);
                 }
             }, "emthin-austral-rule").start();
+        }
+    }
+
+    private boolean deviceTestEnabled() {
+        try {
+            Bundle metadata = getPackageManager().getApplicationInfo(getPackageName(),
+                    android.content.pm.PackageManager.GET_META_DATA).metaData;
+            return metadata != null && metadata.getBoolean("com.emthin.pad.deviceTest");
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
         }
     }
 
@@ -580,6 +591,32 @@ public class MainActivity extends Activity {
 
             @Override public void afterTextChanged(Editable s) { commitEditorText(s); }
         });
+
+        if (deviceTest && getIntent().getBooleanExtra("emthin.historySmoke", false)) {
+            // The callback runs after setup on the model owner. Even read-only
+            // capture cannot borrow a DocModel beside a UI-thread mutation.
+            editor.post(this::runHistorySmoke);
+        }
+    }
+
+    private void runHistorySmoke() {
+        if (handle == 0 || isDestroyed()) return;
+        try {
+            String before = DocBridge.state(handle);
+            String remembered = DocBridge.historyRemember(handle, "device");
+            int count = new JSONObject(remembered).getInt("count");
+            JSONArray tokens = new JSONObject(DocBridge.historyFrontiers(handle))
+                    .getJSONArray("frontiers");
+            JSONObject preview = new JSONObject(
+                    DocBridge.historyPreview(handle, tokens.getString(tokens.length() - 1)));
+            if (count != tokens.length() || preview.getString("digest").isEmpty()
+                    || !before.equals(DocBridge.state(handle))) {
+                throw new IllegalStateException("history changed the live document");
+            }
+            Log.d("emthin-pad", "history smoke: count=" + count + " readOnly=true");
+        } catch (Exception e) {
+            Log.e("emthin-pad", "history smoke failed", e);
+        }
     }
 
     /** Commit a non-composing editor buffer as one native edit. */
@@ -931,7 +968,6 @@ public class MainActivity extends Activity {
                 : new StableAnchor(metadata.documentId, readingEncoded, readingSide, readingFallback);
         scrollToReadingAnchorAfterChunk = readingAnchorStable != null;
         updateMarkerVisibility();
-        refreshActionLabels();
         if (inspectorOpen) updateModifierPanel();
         scheduleRender();
         requestViewWrite(true);
@@ -944,6 +980,7 @@ public class MainActivity extends Activity {
         boolean fixture = fixturePending;
         fixturePending = false;
         handle = DocBridge.create(fixture && fixtureText != null ? fixtureText : STARTER);
+
         session.beginDocument();
         recoveryGeneration = 0;
         durableFingerprint = "";
@@ -1474,7 +1511,7 @@ public class MainActivity extends Activity {
         removeLegacy(prefs());
         if (gone) return;
         if (checkpointAction == null && recoveryOwed == null)
-            setStatus("Recovered · durable");
+            setStatus(unsaved ? "Recovery copy saved on this device" : "");
         if (recoveryOwed != null) {
             RecoveryCapture next = recoveryOwed;
             recoveryOwed = null;
@@ -1662,30 +1699,7 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(Color.parseColor("#101418"));
         root.setPadding(dp(12), dp(12), dp(12), dp(12));
 
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-
-        for (final ActionCatalog.Id action : ActionCatalog.TOOLBAR) {
-            TextView button = shortcut(ActionCatalog.label(action, showMarkers, false),
-                    new Runnable() {
-                        @Override public void run() { runAction(action); }
-                    });
-            switch (action) {
-                case UNDO: undoButton = button; break;
-                case REDO: redoButton = button; break;
-                case SAVE: saveButton = button; break;
-                case MARKERS: markersButton = button; break;
-                case NAV_BACK: navBackButton = button; button.setEnabled(false); break;
-                case NAV_FORWARD: navForwardButton = button; button.setEnabled(false); break;
-                default: break;
-            }
-            bar.addView(button);
-        }
-        HorizontalScrollView shortcuts = new HorizontalScrollView(this);
-        shortcuts.setHorizontalScrollBarEnabled(false);
-        shortcuts.addView(bar);
-        root.addView(shortcuts, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        buildToolbar(root);
         selectionBar = new LinearLayout(this);
         selectionBar.setOrientation(LinearLayout.HORIZONTAL);
         selectionBar.setBackgroundColor(Color.parseColor("#1A2229"));
@@ -1767,7 +1781,7 @@ public class MainActivity extends Activity {
             @Override public void run() { moveFind(-1); }
         }));
         searchNavRow.addView(shortcut(ActionCatalog.label(ActionCatalog.Id.FIND_NEXT,
-                false, true), new Runnable() {
+                false), new Runnable() {
             @Override public void run() { runAction(ActionCatalog.Id.FIND_NEXT); }
         }));
         searchNavRow.addView(shortcut("Enter Accept", new Runnable() {
@@ -1867,13 +1881,8 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
         previewScroll = new ScrollView(this);
-        // fillViewport(false) is load-bearing: with fillViewport(true) the
-        // ScrollView re-measures previewBox with EXACTLY(viewport), so the
-        // LinearLayout hands its children AT_MOST caps — adjustViewBounds
-        // clamps the full-height page raster (1892 x 2674) to the ~428px
-        // remainder and fitCenter squeezes text to sub-pixel (black screen).
-        // Unclamped, the wrap-content image measures its true height and the
-        // ScrollView simply scrolls.
+        // Each page is measured at its document aspect ratio. The viewport
+        // scrolls over that stack at both fit width and higher zoom levels.
         previewScroll.setFillViewport(false);
         previewScroll.setBackgroundColor(Color.parseColor("#14181D"));
         previewHScroll = new HorizontalScrollView(this);
@@ -1977,6 +1986,73 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f));
 
         setContentView(root);
+    }
+
+    private void buildToolbar(LinearLayout root) {
+        Configuration configuration = getResources().getConfiguration();
+        boolean twoRows = configuration.screenWidthDp < 360 || configuration.fontScale >= 1.35f;
+        LinearLayout row = addToolbarRow(root, configuration.screenWidthDp);
+        for (int i = 0; i < ActionCatalog.TOOLBAR.length; i++) {
+            if (twoRows && i == 3) row = addToolbarRow(root, configuration.screenWidthDp);
+            ActionCatalog.Id action = ActionCatalog.TOOLBAR[i];
+            TextView button = shortcut(ActionCatalog.label(action, false), () -> runAction(action));
+            if (action == ActionCatalog.Id.UNDO) {
+                undoButton = button;
+                undoButton.setEnabled(false);
+            }
+            addToolbarButton(row, button);
+        }
+        TextView more = new TextView(this);
+        more.setText("More");
+        more.setContentDescription("More actions");
+        more.setOnClickListener(this::showToolbarMenu);
+        addToolbarButton(row, more);
+    }
+
+    private LinearLayout addToolbarRow(LinearLayout root, int widthDp) {
+        LinearLayout row = new LinearLayout(this);
+        row.setBaselineAligned(false);
+        int width = widthDp >= 456 ? dp(432) : LinearLayout.LayoutParams.MATCH_PARENT;
+        root.addView(row, new LinearLayout.LayoutParams(width, LinearLayout.LayoutParams.WRAP_CONTENT));
+        return row;
+    }
+
+    private void addToolbarButton(LinearLayout row, TextView button) {
+        button.setGravity(Gravity.CENTER);
+        button.setTextSize(13f);
+        button.setMinHeight(dp(48));
+        button.setPadding(dp(3), dp(4), dp(3), dp(4));
+        button.setFocusable(true);
+        button.setTextColor(new android.content.res.ColorStateList(
+                new int[][] {new int[] {-android.R.attr.state_enabled}, new int[0]},
+                new int[] {0xff71808e, 0xffdce7ef}));
+        row.addView(button, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+    }
+
+    private void showToolbarMenu(View anchor) {
+        PopupMenu menu = new PopupMenu(this, anchor);
+        addToolbarMenu(menu.getMenu().addSubMenu("Document"), ActionCatalog.DOCUMENT_MENU);
+        addToolbarMenu(menu.getMenu().addSubMenu("Navigation"), ActionCatalog.NAVIGATION_MENU);
+        addToolbarMenu(menu.getMenu().addSubMenu("View"), ActionCatalog.VIEW_MENU);
+        addToolbarMenu(menu.getMenu().addSubMenu("Sessions and sharing"), ActionCatalog.SESSIONS_MENU);
+        menu.show();
+    }
+
+    private void addToolbarMenu(SubMenu menu, ActionCatalog.Id[] actions) {
+        for (ActionCatalog.Id action : actions) {
+            boolean enabled = true;
+            switch (action) {
+                case REDO: enabled = canRedo; break;
+                case NAV_BACK: enabled = navigation.canBack(); break;
+                case NAV_FORWARD: enabled = navigation.canForward(); break;
+                case CLOSE_INSPECTOR: enabled = inspectorOpen; break;
+                case DIAGNOSTICS: enabled = currentDiagnostics.length() > 0; break;
+                default: break;
+            }
+            menu.add(ActionCatalog.label(action, showMarkers)).setEnabled(enabled)
+                    .setOnMenuItemClickListener(item -> runAction(action));
+        }
     }
 
     private int dp(int v) {
@@ -2535,7 +2611,7 @@ public class MainActivity extends Activity {
         unsaved = !clean;
         captureRecoveryNow();
         if (clean) {
-            setStatus("Document saved · durable");
+            setStatus("");
             fileMessage("Document saved");
         } else {
             fileMessage("An earlier revision was saved; newer edits remain unsaved.");
@@ -2658,6 +2734,9 @@ public class MainActivity extends Activity {
             return;
         }
         finishActiveComposition();
+        // New retains its existing undo behavior, but read-only history
+        // belongs to the previous document instance.
+        DocBridge.historyClear(handle);
         forgetDocument();
         clearDocumentLabel();
         session.beginDocument();
@@ -3214,7 +3293,9 @@ public class MainActivity extends Activity {
 
     private final class RenderedPage extends FrameLayout {
         final int index;
-        final ImageView image;
+        Bitmap raster;
+        final Paint rasterPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+        final android.graphics.Rect rasterBounds = new android.graphics.Rect();
         JSONArray hits = new JSONArray();
         TextView caption;
         double textTop = -1;
@@ -3249,11 +3330,7 @@ public class MainActivity extends Activity {
         RenderedPage(android.content.Context context, int index) {
             super(context);
             this.index = index;
-            image = new ImageView(context);
-            image.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            addView(image, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT));
+            setWillNotDraw(false);
             caretPaint.setColor(Color.parseColor("#B3CFE4"));
             caretPaint.setStyle(Paint.Style.STROKE);
             caretPaint.setStrokeWidth(Math.max(2f, getResources().getDisplayMetrics().density));
@@ -3652,20 +3729,14 @@ public class MainActivity extends Activity {
         private android.graphics.RectF terminalRect(int index) {
             JSONObject figure = figures.optJSONObject(index);
             if (figure == null || jsonString(figure, "reference").isEmpty()) return null;
-            Drawable drawable = image.getDrawable();
-            if (drawable == null || widthPt <= 0) return null;
-            // Figure coordinates are Typst points. Move them into the page
-            // raster's pixel space first, then let the ImageView matrix place
-            // that raster inside this page view (including any letterboxing).
-            float scale = drawable.getIntrinsicWidth() / (float) widthPt;
+            if (raster == null || getWidth() <= 0 || widthPt <= 0) return null;
+            float scale = pointScale();
             float x = (float) figure.optDouble("x", 0) * scale;
             float y = (float) figure.optDouble("y", 0) * scale;
             float w = (float) figure.optDouble("w", 0) * scale;
             float h = (float) figure.optDouble("h", 0) * scale;
             if (w <= 0 || h <= 0) return null;
-            android.graphics.RectF placed = new android.graphics.RectF(x, y, x + w, y + h);
-            image.getImageMatrix().mapRect(placed);
-            return placed;
+            return new android.graphics.RectF(x, y, x + w, y + h);
         }
 
         int terminalIndexAt(float x, float y) {
@@ -4026,6 +4097,16 @@ public class MainActivity extends Activity {
             if (getParent() != null) getParent().requestSendAccessibilityEvent(RenderedPage.this, event);
         }
 
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (raster != null) {
+                // The raster can be smaller than the view under the pixel
+                // budget. Use the page bounds shared by the Typst hit map.
+                rasterBounds.set(0, 0, getWidth(), getHeight());
+                canvas.drawBitmap(raster, null, rasterBounds, rasterPaint);
+            }
+        }
+
         @Override protected void dispatchDraw(Canvas canvas) {
             super.dispatchDraw(canvas);
             drawTerminalScenes(canvas);
@@ -4209,15 +4290,6 @@ public class MainActivity extends Activity {
         if (ime != null) ime.hideSoftInputFromWindow(view.getWindowToken(), 0);
     }
 
-    private void refreshActionLabels() {
-        if (markersButton != null)
-            markersButton.setText(ActionCatalog.label(ActionCatalog.Id.MARKERS,
-                    showMarkers, findVisible()));
-        if (saveButton != null)
-            saveButton.setText(ActionCatalog.label(ActionCatalog.Id.SAVE,
-                    showMarkers, findVisible()));
-    }
-
     /** One implementation for every toolbar button and its advertised key. */
     // ----- native document sharing (K6) ---------------------------------
 
@@ -4287,6 +4359,18 @@ public class MainActivity extends Activity {
             case OPEN: chooseDocument(); break;
             case SAVE: saveToDocument(); break;
             case SAVE_COPY: saveCopyToDocument(); break;
+            case EDIT_SOURCE:
+                if (handle == 0) return false;
+                openSourceAt(editor.getSelectionStart(), editor.getSelectionEnd());
+                EditText source = sourceField;
+                if (source != null) source.post(() -> {
+                    if (source != sourceField || !source.hasFocus()) return;
+                    android.view.inputmethod.InputMethodManager ime =
+                            getSystemService(android.view.inputmethod.InputMethodManager.class);
+                    if (ime != null) ime.showSoftInput(source,
+                            android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+                });
+                break;
             case FIND: openSearch(); break;
             case FIND_REPLACE:
                 openSearch();
@@ -4313,6 +4397,8 @@ public class MainActivity extends Activity {
             case SHARE_WATCH: shareToggleWatch(); break;
             case PROOF: startActivityForResult(
                     new Intent(this, ProofClientActivity.class), REQUEST_PROOF); break;
+            case HISTORY: showHistory(); break;
+            case DIAGNOSTICS: showDiagnostics(); break;
             default: return false;
         }
         return true;
@@ -4320,6 +4406,8 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        boolean enter = keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER;
         if (event.getAction() == KeyEvent.ACTION_DOWN && terminalFocusedPage() != null) {
             if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
                 releaseTerminalFocus();
@@ -4368,7 +4456,7 @@ public class MainActivity extends Activity {
         if (event.getAction() == KeyEvent.ACTION_DOWN && searchBar != null
                 && searchBar.getVisibility() == View.VISIBLE) {
             if (event.getKeyCode() == KeyEvent.KEYCODE_ESCAPE) { closeSearch(true); return true; }
-            if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) { acceptFind(); return true; }
+            if (enter) { acceptFind(); return true; }
             if (event.isCtrlPressed() && event.getKeyCode() == KeyEvent.KEYCODE_S)
                 return runAction(ActionCatalog.Id.FIND_NEXT);
             if (event.isCtrlPressed() && event.getKeyCode() == KeyEvent.KEYCODE_R)
@@ -4453,8 +4541,8 @@ public class MainActivity extends Activity {
                 else deleteRenderedGrapheme(code == KeyEvent.KEYCODE_DEL ? -1 : 1);
                 return true;
             }
-            if (getCurrentFocus() instanceof RenderedPage && event.getUnicodeChar() >= 32) {
-                String typed = new String(Character.toChars(event.getUnicodeChar()));
+            if (getCurrentFocus() instanceof RenderedPage && (enter || event.getUnicodeChar() >= 32)) {
+                String typed = enter ? "\n" : new String(Character.toChars(event.getUnicodeChar()));
                 int[] range = selectionRange();
                 if (range != null) replaceRenderedRange(range[0], range[1], typed);
                 inspectorOpen = true;
@@ -4574,7 +4662,7 @@ public class MainActivity extends Activity {
                     return new FindController.Page(0, 0, 0, 0, 0,
                             new FindController.Match[0], o.getString("error"));
                 }
-                trace("findScope", "scope", scope, "query", request.query,
+                trace("findScope", "scope", scope, "query", deviceTest ? request.query : "",
                         "total", o.optInt("total"), "replaceable", o.optInt("replaceable"));
                 JSONArray array = o.optJSONArray("matches");
                 FindController.Match[] matches = new FindController.Match[
@@ -4635,7 +4723,6 @@ public class MainActivity extends Activity {
                 });
             }
         }
-        refreshActionLabels();
         searchField.requestFocus();
     }
 
@@ -4833,7 +4920,6 @@ public class MainActivity extends Activity {
                 (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (ime != null) ime.hideSoftInputFromWindow(searchField.getWindowToken(), 0);
         invalidateRenderedCaret();
-        refreshActionLabels();
         if (!cancel && !inspectorOpen) focusRenderedCaret();
     }
 
@@ -5130,12 +5216,6 @@ public class MainActivity extends Activity {
 
     private void resetNavigation() {
         navigation.reset(currentLocation("current", "Current"));
-        refreshNavigationButtons();
-    }
-
-    private void refreshNavigationButtons() {
-        if (navBackButton != null) navBackButton.setEnabled(navigation.canBack());
-        if (navForwardButton != null) navForwardButton.setEnabled(navigation.canForward());
     }
 
     /** Explicit destinations only: accepted search, sections, definitions/uses,
@@ -5146,17 +5226,13 @@ public class MainActivity extends Activity {
         if (navigation.current() == null) resetNavigation();
         else navigation.replaceCurrent(currentLocation("current", "Current"));
         NavigationController.Entry destination = destination(kind, label, start, end, inspector);
-        if (!navigation.push(destination)) {
-            refreshNavigationButtons();
-            return;
-        }
+        if (!navigation.push(destination)) return;
         NavigationController.Entry origin = navigation.entries().get(navigation.index() - 1);
         trace("navigate", "kind", kind, "start", start, "history", navigation.size(),
                 "index", navigation.index(), "inspector", inspector,
                 "originInspector", origin.inspector,
                 "originWholeDocument", origin.wholeDocument);
         restoreLocation(destination);
-        refreshNavigationButtons();
     }
 
     private void recordAcceptedFind(int start, int end, boolean source) {
@@ -5180,7 +5256,6 @@ public class MainActivity extends Activity {
         navigation.push(entry);
         trace("navigate", "kind", "search", "start", start, "history", navigation.size(),
                 "index", navigation.index());
-        refreshNavigationButtons();
     }
 
     private void navigateBack() {
@@ -5190,7 +5265,6 @@ public class MainActivity extends Activity {
                     "history", navigation.size(), "index", navigation.index());
             restoreLocation(entry);
         }
-        refreshNavigationButtons();
     }
 
     private void navigateForward() {
@@ -5200,7 +5274,6 @@ public class MainActivity extends Activity {
                     "history", navigation.size(), "index", navigation.index());
             restoreLocation(entry);
         }
-        refreshNavigationButtons();
     }
 
     /** Restore source selection, folds and reading position. A destination whose
@@ -5274,6 +5347,50 @@ public class MainActivity extends Activity {
             }
         }
         return null;
+    }
+
+    /**
+     * K5 read-only history preview. Retains a snapshot of the current note,
+     * lists the retained frontiers, and shows a preview on tap. Nothing here
+     * writes to the live document, its undo stack or its save baselines.
+     */
+    private void showHistory() {
+        if (handle == 0) { fileMessage("Open a note first"); return; }
+        try {
+            JSONObject remembered = new JSONObject(DocBridge.historyRemember(handle, "pad"));
+            if (remembered.has("error")) { fileMessage(remembered.getString("error")); return; }
+            String reply = DocBridge.historyFrontiers(handle);
+            JSONArray tokens = new JSONObject(reply).getJSONArray("frontiers");
+            if (tokens.length() == 0) { fileMessage("No retained snapshots yet"); return; }
+            final PadSession.Owner owner = session.capture(PadSession.HISTORY, "");
+            String[] labels = new String[tokens.length()];
+            for (int i = 0; i < tokens.length(); i++) {
+                labels[i] = i == 0 ? "Latest snapshot" : "Snapshot " + (tokens.length() - i);
+            }
+            new AlertDialog.Builder(this)
+                    .setTitle("Document history")
+                    .setItems(labels, (dialog, which) -> {
+                        if (!session.sameDocument(owner)) return;
+                        try {
+                            String preview = DocBridge.historyPreview(handle,
+                                    tokens.getString(tokens.length() - 1 - which));
+                            JSONObject p = new JSONObject(preview);
+                            if (p.has("error")) { fileMessage("Preview: " + p.getString("error")); return; }
+                            String text = p.getString("text");
+                            String body = text.isEmpty() ? "This snapshot is empty." : text;
+                            if (p.optBoolean("truncated")) body += "\n…";
+                            new AlertDialog.Builder(MainActivity.this)
+                                    .setTitle(labels[which] + " · read-only")
+                                    .setMessage(body)
+                                    .setPositiveButton("Close", null)
+                                    .show();
+                        } catch (Exception e) { fileMessage("Preview failed: " + e.getMessage()); }
+                    })
+                    .setPositiveButton("Close", null)
+                    .show();
+        } catch (Exception e) {
+            fileMessage("History failed: " + e.getMessage());
+        }
     }
 
     /** The Sessions surface: public references and their available actions. */
@@ -6325,7 +6442,6 @@ public class MainActivity extends Activity {
     private void toggleMarkers() {
         showMarkers = !showMarkers;
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_SHOW_MARKERS, showMarkers).apply();
-        refreshActionLabels();
         trace("markerVisibility", "shown", showMarkers);
         updateMarkerVisibility();
         updateSourceMarkerVisibility();
@@ -6452,6 +6568,7 @@ public class MainActivity extends Activity {
                 + "\n" + editor.getText().subSequence(start, end) + "\n" + targetList;
         if (signature.equals(inspectorSignature)) return;
         inspectorSignature = signature;
+        boolean restoreSourceFocus = sourceField != null && sourceField.hasFocus();
         modifierPanel.removeAllViews();
         modifierPanel.setVisibility(View.VISIBLE);
         modifierPanel.addView(shortcut("Show document", new Runnable() {
@@ -6520,6 +6637,7 @@ public class MainActivity extends Activity {
                 wideInspector ? 0 : LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, wideInspector ? 1f : 0f));
         updateSourceMarkerVisibility();
+        if (restoreSourceFocus) focusSourceCaret();
 
         if (!markedPart) {
             targetsField = null;
@@ -7148,8 +7266,7 @@ public class MainActivity extends Activity {
         // Keep the current pages visible until the replacement chunk is
         // accepted; their hit positions stay disabled meanwhile.
         trace("startRender", "owner", renderOwner, "textLen", text.length(),
-                "caret", caret,
-                "head", text.substring(0, Math.min(24, text.length())));
+                "caret", caret);
         initialPagePending = false;
         initialLocatePending = false;
         requestChunk(text, 0, caret, "initial");
@@ -7371,10 +7488,14 @@ public class MainActivity extends Activity {
         for (int i = 0; i < currentDiagnostics.length(); i++) {
             JSONObject diagnostic = currentDiagnostics.optJSONObject(i);
             if (diagnostic == null) continue;
-            if ("error".equals(diagnostic.optString("severity"))) errors++;
-            else if ("warning".equals(diagnostic.optString("severity"))) warnings++;
+            String severity = displayDiagnosticSeverity(diagnostic);
+            if ("error".equals(severity)) errors++;
+            else if ("warning".equals(severity)) warnings++;
         }
-        diagnosticCount = currentDiagnostics.length();
+        diagnosticCount = errors + warnings;
+        trace("diagnostics", "capture", capture, "count", diagnosticCount,
+                "errors", errors, "warnings", warnings,
+                "notes", currentDiagnostics.length() - diagnosticCount);
         setStatus(statusText);
         previewError.setOnClickListener(null);
         previewError.setClickable(false);
@@ -7393,8 +7514,12 @@ public class MainActivity extends Activity {
         previewError.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { showDiagnostics(); }
         });
-        trace("diagnostics", "capture", capture, "count", diagnosticCount,
-                "errors", errors, "warnings", warnings);
+    }
+
+    private static String displayDiagnosticSeverity(JSONObject diagnostic) {
+        // A free math variable can be valid Typst with no document definition.
+        if ("unresolved-name".equals(diagnostic.optString("code"))) return "note";
+        return diagnostic.optString("severity", "warning");
     }
 
     private void clearDiagnostics() {
@@ -7413,7 +7538,7 @@ public class MainActivity extends Activity {
 
     /** Status error/warning count opens this source-linked list. */
     private void showDiagnostics() {
-        if (diagnosticCount == 0) return;
+        if (currentDiagnostics.length() == 0) return;
         ScrollView scroll = new ScrollView(this);
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
@@ -7427,7 +7552,7 @@ public class MainActivity extends Activity {
         for (int i = 0; i < currentDiagnostics.length(); i++) {
             final JSONObject diagnostic = currentDiagnostics.optJSONObject(i);
             if (diagnostic == null) continue;
-            String severity = diagnostic.optString("severity", "warning");
+            String severity = displayDiagnosticSeverity(diagnostic);
             String code = diagnostic.optString("code", "diagnostic");
             String provenance = diagnostic.optString("provenance", "document");
             String markerPair = citationKeyText(diagnostic.optJSONArray("markerPair"));
@@ -7654,10 +7779,8 @@ public class MainActivity extends Activity {
             page.setClickable(true);
             page.setContentDescription("Page " + (i + 1) + " of " + total);
             installPageTouch(page);
-            int heightPx = Math.max(1,
-                    Math.round(width * (float) (heightPt / Math.max(1.0, widthPt))));
             previewPages.addView(page, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, heightPx));
+                    width, pageHeight(width, widthPt, heightPt)));
             renderedPages.add(page);
         }
         initialPagePending = false;
@@ -8130,8 +8253,10 @@ public class MainActivity extends Activity {
         if (scene == null) return;
         int key = NativeTerminal.ghosttyKey(androidKey);
         JSONObject state = scene.key(key, extraMods, text, unshifted);
-        trace("terminalInput", "key", androidKey, "ghostty", key,
-                "input", lastInput(state));
+        if (deviceTest) {
+            trace("terminalInput", "key", androidKey, "ghostty", key,
+                    "input", lastInput(state));
+        }
         sendGatewayInput(state);
         page.invalidate();
     }
@@ -8149,7 +8274,7 @@ public class MainActivity extends Activity {
         NativeTerminal scene = page.terminalScenes[index];
         if (scene == null) return;
         JSONObject state = scene.text(text);
-        trace("terminalInput", "text", text, "input", lastInput(state));
+        if (deviceTest) trace("terminalInput", "text", text, "input", lastInput(state));
         sendGatewayInput(state);
         page.invalidate();
     }
@@ -8573,13 +8698,13 @@ public class MainActivity extends Activity {
     private void applyDecodedPage(DecodedPage p) {
         if (p.index < 0 || p.index >= renderedPages.size()) return;
         RenderedPage page = renderedPages.get(p.index);
-        Bitmap old = page.image.getDrawable() instanceof BitmapDrawable
-                ? ((BitmapDrawable) page.image.getDrawable()).getBitmap() : null;
+        Bitmap old = page.raster;
         if (old != null && old != p.bitmap && !old.isRecycled()) {
             retainedBitmapBytes = Math.max(0, retainedBitmapBytes - page.bitmapBytes);
             old.recycle();
         }
-        page.image.setImageBitmap(p.bitmap);
+        page.raster = p.bitmap;
+        page.invalidate();
         page.hits = p.hits;
         page.textTop = p.textTop;
         page.widthPt = p.widthPt;
@@ -8605,10 +8730,9 @@ public class MainActivity extends Activity {
         retainedBitmapBytes += page.bitmapBytes;
         if (!retainedPages.contains(page)) retainedPages.add(page);
         int width = Math.round(basePageWidth() * viewZoom);
-        int height = Math.max(1, Math.round(width
-                * (float) (page.heightPt / Math.max(1.0, page.widthPt))));
+        int height = pageHeight(width, page.widthPt, page.heightPt);
         page.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, height));
+                width, height));
         if (page.caption != null) page.caption.setText("page " + (p.index + 1) + " / " + totalPages);
         trace("pageRaster", "page", p.index, "wh", p.width + "x" + p.height,
                 "visiblePx~", p.visiblePixels, "bytes", page.bitmapBytes);
@@ -8620,6 +8744,10 @@ public class MainActivity extends Activity {
             });
         }
         if (!inspectorOpen && !(getCurrentFocus() instanceof EditText)) focusRenderedCaret();
+    }
+
+    private static int pageHeight(int width, double widthPt, double heightPt) {
+        return Math.max(1, (int) Math.round(width * heightPt / Math.max(1.0, widthPt)));
     }
 
     private void locateInitialPage(int caret) {
@@ -8695,7 +8823,9 @@ public class MainActivity extends Activity {
             trace("captionScroll", "page", page + 1, "topPt", target.textTop,
                     "px", offset, "scrollY", y);
         } else if ("caret".equals(intent) || "search".equals(intent)) {
-            focusRenderedCaret();
+            // A background page restore can finish after the source or
+            // search field has acquired keyboard focus.
+            if (!(getCurrentFocus() instanceof EditText)) focusRenderedCaret();
         } else if ("navigation".equals(intent)) {
             CaretSpot spot = caretSpot(editor.getSelectionStart());
             if (spot.page != null && spot.distance <= 1) {
@@ -8770,13 +8900,17 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean dropPageRaster(RenderedPage page) {
+        Bitmap raster = page.raster;
+        page.raster = null;
+        page.invalidate();
+        if (raster == null || raster.isRecycled()) return false;
+        raster.recycle();
+        return true;
+    }
+
     private void releasePageBitmap(RenderedPage page) {
-        Drawable drawable = page.image.getDrawable();
-        page.image.setImageDrawable(null);
-        if (drawable instanceof BitmapDrawable) {
-            Bitmap bitmap = ((BitmapDrawable) drawable).getBitmap();
-            if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
-        }
+        dropPageRaster(page);
         if (page.terminalFocus >= 0) {
             page.terminalFocus = -1;
             if (terminalKeyRow != null) terminalKeyRow.setVisibility(View.GONE);
@@ -8813,15 +8947,7 @@ public class MainActivity extends Activity {
                 continue;
             }
             RenderedPage page = (RenderedPage) child;
-            Drawable drawable = page.image.getDrawable();
-            page.image.setImageDrawable(null);
-            if (drawable instanceof BitmapDrawable) {
-                Bitmap bmp = ((BitmapDrawable) drawable).getBitmap();
-                if (bmp != null && !bmp.isRecycled()) {
-                    bmp.recycle();
-                    released++;
-                }
-            }
+            if (dropPageRaster(page)) released++;
         }
         previewPages.removeAllViews();
         trace("releasePages", "bitmaps", released);
@@ -8911,7 +9037,7 @@ public class MainActivity extends Activity {
             }
 
             undoButton.setEnabled(o.getBoolean("canUndo"));
-            redoButton.setEnabled(o.getBoolean("canRedo"));
+            canRedo = o.getBoolean("canRedo");
             documentMarkers = o.optJSONArray("markers");
             if (documentMarkers == null) documentMarkers = new JSONArray();
             documentModifierLinks = o.optJSONArray("modifierLinks");

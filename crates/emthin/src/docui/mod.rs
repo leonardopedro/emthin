@@ -17,6 +17,7 @@
 
 pub mod a11y;
 pub mod ascii_interchange;
+mod caret;
 pub mod change;
 pub mod citations;
 pub mod diagnostics;
@@ -139,6 +140,8 @@ pub struct DocUi {
     /// preview would reappear on the next tick. Any edit or caret move changes
     /// the key and lets completion resume.
     completion_dismissed: Option<(u64, usize)>,
+    /// Page, layout generation, last caret and desired x for vertical moves.
+    vertical_goal: Option<(usize, u64, usize, f32)>,
     /// The view geometry (viewport, zoom, pan, visible page) changed. Unlike a
     /// text edit this needs no Typst rebuild, only a figure re-sync.
     geometry_dirty: bool,
@@ -221,6 +224,7 @@ impl DocUi {
             history_index: 0,
             completion: mathed_mini::completion_ui::CompletionUi::new(),
             completion_dismissed: None,
+            vertical_goal: None,
             geometry_dirty: false,
             pending_preferences: None,
             session_file: None,
@@ -927,14 +931,50 @@ impl DocUi {
     /// `None` outside the page or before the first layout. Used by pointer
     /// selection so a click and its drag share one hit test.
     pub fn byte_at(&self, point: Point<f64, Logical>) -> Option<usize> {
+        self.text_hit_at(point).map(|(_, caret)| caret)
+    }
+
+    /// The hit glyph and the insertion point at its nearest edge. Double
+    /// clicks use the glyph itself so its trailing edge still selects it.
+    pub(crate) fn text_hit_at(&self, point: Point<f64, Logical>) -> Option<(usize, usize)> {
         if !self.geometry_current() {
             return None;
         }
         let pos = self.layout.screen_to_doc(point)?;
-        self.layout
+        let (byte, after) = self
+            .layout
             .glyphs()?
-            .byte_for_point(mathed_core::glyphs::V2::new(pos.x as f32, pos.y as f32))
-            .map(|(byte, _after)| byte)
+            .byte_for_point(mathed_core::glyphs::V2::new(pos.x as f32, pos.y as f32))?;
+        let text = self.model.text();
+        Some((
+            caret::resolve_edge(text, byte, false),
+            caret::resolve_edge(text, byte, after),
+        ))
+    }
+
+    pub(crate) fn reset_vertical_goal(&mut self) {
+        self.vertical_goal = None;
+    }
+
+    pub(crate) fn move_caret_vertically(&mut self, down: bool, extend: bool) {
+        let page = self.current_page();
+        let generation = self.layout.generation();
+        let caret = self.model.caret();
+        let goal = self
+            .vertical_goal
+            .filter(|&(p, g, at, _)| (p, g, at) == (page, generation, caret))
+            .map(|(_, _, _, x)| x);
+        let Some((target, x)) = self.current_glyphs().and_then(|glyphs| {
+            caret::vertical_target(glyphs, self.model.text(), caret, down, goal)
+        }) else {
+            return;
+        };
+        if extend {
+            self.model.extend_selection_to(target);
+        } else {
+            self.model.set_caret(target);
+        }
+        self.vertical_goal = Some((page, generation, target, x));
     }
 
     /// Select the word containing `byte` (a double-click selection).
@@ -1334,6 +1374,7 @@ impl DocUi {
             voice: self.voice.in_flight(),
             formal: self.formals.calls() > 0,
             diagnostics: self.diagnostics.in_flight(),
+            inspect_events: 0, // populated by the IPC layer, which owns the trace
         }
     }
 

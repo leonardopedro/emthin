@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use emthin_core_client::unix::{Connection, TransportError};
-use emthin_core_client::{
-    controller::Endpoint, controller::Session, AttachRequest, Client, Event,
-};
+use emthin_core_client::{controller::Endpoint, controller::Session, AttachRequest, Client, Event};
 use emthin_vt::render::{Color, Image, Metrics, Renderer};
 use emthin_vt::{DejaVuFont, Pane};
 use mathed_core::figures::TerminalRef;
@@ -57,7 +55,13 @@ pub struct CoreSessionSource {
 }
 
 impl CoreSessionSource {
-    pub fn new(endpoint: Endpoint, reference: TerminalRef, channel: u32, cols: u16, rows: u16) -> Self {
+    pub fn new(
+        endpoint: Endpoint,
+        reference: TerminalRef,
+        channel: u32,
+        cols: u16,
+        rows: u16,
+    ) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
         Self {
@@ -113,7 +117,8 @@ impl CoreSessionSource {
     /// event changed this source; unrelated channels are ignored.
     pub fn apply(&mut self, event: &Event) -> Option<Vec<u8>> {
         let paint = self.pane.handle(event)?;
-        self.renderer.update(&paint.screen, &paint.damage, &mut self.font);
+        self.renderer
+            .update(&paint.screen, &paint.damage, &mut self.font);
         self.image = Some(self.renderer.compose(Color([18, 22, 28, 255])));
         self.revision = self.revision.saturating_add(1);
         Some(paint.replies)
@@ -187,11 +192,7 @@ impl CoreSessionSource {
         self.revision = self.revision.saturating_add(1);
     }
 
-    fn cell_at(
-        &self,
-        rect: Rectangle<i32, Logical>,
-        pos: Point<f64, Logical>,
-    ) -> (u16, u16) {
+    fn cell_at(&self, rect: Rectangle<i32, Logical>, pos: Point<f64, Logical>) -> (u16, u16) {
         let (cols, rows) = self.pane.viewport();
         let x = ((pos.x - f64::from(rect.loc.x)) / f64::from(CELL_WIDTH)).floor();
         let y = ((pos.y - f64::from(rect.loc.y)) / f64::from(CELL_HEIGHT)).floor();
@@ -334,15 +335,14 @@ impl CoreSessions {
         };
         let cols = (rect.size.w.max(1) as u16).div_ceil(CELL_WIDTH).max(1);
         let rows = (rect.size.h.max(1) as u16).div_ceil(CELL_HEIGHT).max(1);
-        let (connection, client, channel) =
-            match connect_live(&socket, reference, cols, rows) {
-                Ok(attached) => attached,
-                Err(error) => {
-                    tracing::warn!("terminal {key}: live attach failed: {error}");
-                    record_retry(&mut self.retries, &key);
-                    return;
-                }
-            };
+        let (connection, client, channel) = match connect_live(&socket, reference, cols, rows) {
+            Ok(attached) => attached,
+            Err(error) => {
+                tracing::warn!("terminal {key}: live attach failed: {error}");
+                record_retry(&mut self.retries, &key);
+                return;
+            }
+        };
         let stream = match connection.try_clone_stream() {
             Ok(stream) => stream,
             Err(error) => {
@@ -414,7 +414,10 @@ impl CoreSessions {
                     break;
                 }
                 Err(TransportError::Io(error))
-                    if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
                 {
                     break;
                 }
@@ -594,9 +597,9 @@ fn retry_delay(attempts: u32) -> Duration {
 }
 
 fn retry_ready(retries: &BTreeMap<String, RetryState>, key: &str) -> bool {
-    retries.get(key).is_none_or(|retry| {
-        retry.attempts < MAX_ATTACH_ATTEMPTS && Instant::now() >= retry.next_at
-    })
+    retries
+        .get(key)
+        .is_none_or(|retry| retry.attempts < MAX_ATTACH_ATTEMPTS && Instant::now() >= retry.next_at)
 }
 
 fn record_retry(retries: &mut BTreeMap<String, RetryState>, key: &str) {
@@ -642,9 +645,7 @@ fn connect_live(
 
     let mut client = Client::new();
     let (_, hello) = client.hello().map_err(|error| error.to_string())?;
-    connection
-        .send(hello)
-        .map_err(|error| error.to_string())?;
+    connection.send(hello).map_err(|error| error.to_string())?;
     let mut hello_core = None;
     for _ in 0..8 {
         let Some(outcome) = connection
@@ -672,9 +673,7 @@ fn connect_live(
     let (_, attach) = client
         .attach(AttachRequest::viewer(format!("t{terminal}"), cols, rows))
         .map_err(|error| error.to_string())?;
-    connection
-        .send(attach)
-        .map_err(|error| error.to_string())?;
+    connection.send(attach).map_err(|error| error.to_string())?;
     let mut channel = None;
     for _ in 0..8 {
         let Some(outcome) = connection
@@ -683,7 +682,9 @@ fn connect_live(
         else {
             return Err("Core closed during attach".into());
         };
-        if let Some(Event::Attached { channel: attached, .. }) = outcome
+        if let Some(Event::Attached {
+            channel: attached, ..
+        }) = outcome
             .events
             .into_iter()
             .find(|event| matches!(event, Event::Attached { .. }))
@@ -946,9 +947,7 @@ mod tests {
                     "result": {"channel": 7}
                 }),
             );
-            connection
-                .send(Frame::data(7, b"hi"))
-                .expect("attach data");
+            connection.send(Frame::data(7, b"hi")).expect("attach data");
             while let Ok(Some(_)) = connection.receive() {}
         });
 
@@ -1078,23 +1077,10 @@ mod tests {
         assert!(sessions.send_input(&reference(), &keys));
         let rect = Rectangle::from_size((640, 384).into());
         let pos = Point::new(9.0, 17.0);
-        let press = sessions.mouse_button(
-            &reference(),
-            rect,
-            pos,
-            0,
-            true,
-            (false, false, false),
-        );
+        let press = sessions.mouse_button(&reference(), rect, pos, 0, true, (false, false, false));
         assert_eq!(press, b"\x1b[<0;2;2M");
         assert!(sessions.send_input(&reference(), &press));
-        let motion = sessions.mouse_motion(
-            &reference(),
-            rect,
-            pos,
-            Some(0),
-            (false, false, false),
-        );
+        let motion = sessions.mouse_motion(&reference(), rect, pos, Some(0), (false, false, false));
         assert_eq!(motion, b"\x1b[<32;2;2M");
         assert!(sessions.send_input(&reference(), &motion));
         let ime = "界";
