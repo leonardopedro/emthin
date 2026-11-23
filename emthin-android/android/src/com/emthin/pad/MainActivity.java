@@ -8128,9 +8128,22 @@ public class MainActivity extends Activity {
         if (rect == null) return;
         int cols = Math.max(20, Math.min(100, (int) (rect.width() / TERMINAL_CELL_WIDTH)));
         int rows = Math.max(5, Math.min(30, (int) (rect.height() / TERMINAL_CELL_HEIGHT)));
-        boolean gatewayFixture = fixtureGateway != null && !fixtureGateway.trim().isEmpty();
+        String reference = jsonString(page.figures.optJSONObject(index), "reference");
+        // A paired gateway is reached through the registry; the lane's fixture
+        // extra is only an override for the same build. No target means the
+        // figure stays dormant rather than dialling a guess.
+        GatewayTarget gatewayTarget;
+        try {
+            gatewayTarget = GatewayTarget.resolve(fixtureGateway, fixtureGatewayGeneration,
+                    reference, gatewayEndpoints);
+        } catch (IllegalArgumentException e) {
+            trace("gatewayLease", "phase", "failed", "reason", String.valueOf(e.getMessage()),
+                    "target", String.valueOf(fixtureGateway));
+            gatewayTarget = null;
+        }
+        boolean gatewayLeaseBacked = gatewayTarget != null;
         NativeTerminal scene = new NativeTerminal(cols, rows, TERMINAL_CELL_WIDTH,
-                TERMINAL_CELL_HEIGHT, 14, !gatewayFixture);
+                TERMINAL_CELL_HEIGHT, 14, !gatewayLeaseBacked);
         if (!scene.valid()) {
             trace("vtScene", "phase", "failed", "reason", "create");
             return;
@@ -8141,19 +8154,18 @@ public class MainActivity extends Activity {
         page.terminalGridHeights = new int[page.figures.length()];
         page.terminalWatchOnly = new boolean[page.figures.length()];
         page.terminalConflict = new boolean[page.figures.length()];
-        String reference = jsonString(page.figures.optJSONObject(index), "reference");
         SessionCatalog.Entry entry = sessionCatalog.byReference(reference);
-        page.terminalWatchOnly[index] = gatewayFixture || (entry != null
+        page.terminalWatchOnly[index] = gatewayLeaseBacked || (entry != null
                 && entry.state == SessionCatalog.State.WATCHED);
         trace("terminalInput", "control", "watch", page.terminalWatchOnly[index],
-                "reason", gatewayFixture ? "gateway-initial" : "initial");
+                "reason", gatewayLeaseBacked ? "gateway-initial" : "initial");
         page.terminalGridWidths[index] = Math.round(rect.width());
         page.terminalGridHeights[index] = Math.round(rect.height());
         vtSceneFixturePending = false;
-        if (gatewayFixture) {
+        if (gatewayLeaseBacked) {
             // The gateway attach supplies the first DATA after its result. Do
             // not run the synthetic animation over a real lease stream.
-            startGatewayLease(reference);
+            startGatewayLease(gatewayTarget);
         } else {
             byte[] initial = ("\u001b[2J\u001b[Hemthin native VT\r\n"
                     + "frame 0 \u00b7 \u754c e\u0301\r\n$ ").getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -8173,7 +8185,7 @@ public class MainActivity extends Activity {
                 "w", Math.round(rect.width()), "h", Math.round(rect.height()),
                 "sx", loc[0] + Math.round(rect.left), "sy", loc[1] + Math.round(rect.top));
         revealTerminalTop(page, index);
-        if (!gatewayFixture) {
+        if (!gatewayLeaseBacked) {
             main.postDelayed(vtSceneAnimator(), 120);
         } else {
             final RenderedPage placedPage = page;
@@ -8200,60 +8212,38 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Connect the visible fixture scene to the scripted gateway peer. The
-     * lease is deliberately transport-owned: Watch/Take request a new attach,
-     * and a CLOSE frame revokes the old viewer rather than mutating a flag.
+     * Connect the visible scene to its gateway — the paired endpoint for this
+     * figure's Core ID, or the lane's scripted fixture when that extra is set.
+     * The lease is deliberately transport-owned: Watch/Take request a new
+     * attach, and a CLOSE frame revokes the old viewer rather than mutating a
+     * flag.
      */
-    private void startGatewayLease(String reference) {
-        String target = fixtureGateway == null ? "" : fixtureGateway.trim();
-        // The fixture lane offers either `host:port` (plain TCP) or
-        // `wss://host:port` with `emthin.fixtureGatewayCa` naming a PEM the app
-        // can read. A paired gateway never takes this path: it carries the
-        // stream URL, and `WssTransport` verifies the tailnet host name there.
-        boolean secure = target.startsWith("wss://");
-        String endpoint = secure ? target.substring("wss://".length()) : target;
-        int pathAt = endpoint.indexOf('/');
-        if (pathAt >= 0) endpoint = endpoint.substring(0, pathAt);
-        int colon = endpoint.lastIndexOf(':');
-        if (colon <= 0 || colon == endpoint.length() - 1) {
-            trace("gatewayLease", "phase", "failed", "reason", "endpoint", "target", target);
-            return;
-        }
-        String host = endpoint.substring(0, colon);
-        int port;
-        try {
-            port = Integer.parseInt(endpoint.substring(colon + 1));
-        } catch (NumberFormatException e) {
-            trace("gatewayLease", "phase", "failed", "reason", "port");
-            return;
-        }
+    private void startGatewayLease(GatewayTarget target) {
         GatewayTransport.Connector connector;
-        if (secure) {
-            if (fixtureGatewayCa == null || fixtureGatewayCa.trim().isEmpty()) {
-                trace("gatewayLease", "phase", "failed", "reason", "ca");
-                return;
-            }
+        if (target.secure) {
+            // A paired gateway is a tailnet host behind a public CA, so it uses
+            // the platform trust store; only the lane's fixture supplies its own
+            // certificate.
+            javax.net.ssl.SSLContext context;
             try {
-                connector = WssTransport.connector(host, port,
-                        PemTrust.load(fixtureGatewayCa.trim()), 5000, 30000);
+                context = target.fixtureCertificate
+                        ? PemTrust.load(fixtureGatewayCa == null ? "" : fixtureGatewayCa.trim())
+                        : PemTrust.system();
             } catch (java.io.IOException e) {
                 trace("gatewayLease", "phase", "failed", "reason", "ca",
                         "detail", e.getMessage());
                 return;
             }
+            connector = WssTransport.connector(target.host, target.port,
+                    context, 5000, 30000);
         } else {
-            connector = GatewayLeaseClient.tcpConnector(host, port);
+            connector = GatewayLeaseClient.tcpConnector(target.host, target.port);
         }
-        int slash = reference.lastIndexOf('/');
-        String address = slash >= 0 && slash + 1 < reference.length()
-                ? reference.substring(slash + 1) : reference;
-        String generation = fixtureGatewayGeneration == null
-                || fixtureGatewayGeneration.isEmpty()
-                ? "g-fixture-1" : fixtureGatewayGeneration;
         gatewayReady = false;
         gatewayConnected = false;
         gatewayAttaching = false;
-        gatewayLease = new GatewayLeaseClient(connector, address, generation,
+        gatewayLease = new GatewayLeaseClient(connector, target.coreId, target.address,
+                target.generation,
                 new GatewayLeaseClient.Listener() {
                     @Override public void onReady(final String mode, final String leaseId) {
                         main.post(new Runnable() {
@@ -8347,8 +8337,10 @@ public class MainActivity extends Activity {
                         });
                     }
                 });
-        trace("gatewayLease", "phase", "connect", "host", host, "port", port,
-                "address", address, "generation", generation, "secure", secure);
+        trace("gatewayLease", "phase", "connect", "host", target.host, "port", target.port,
+                "address", target.address,
+                "generation", target.generation == null ? "discover" : target.generation,
+                "secure", target.secure, "core", target.coreId);
         gatewayLease.connect();
     }
 

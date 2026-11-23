@@ -24,6 +24,18 @@ final class PemTrust {
     private PemTrust() {
     }
 
+    /**
+     * The platform trust store. A paired gateway presents a public CA
+     * certificate, so nothing app-supplied is involved on that path.
+     */
+    static SSLContext system() throws IOException {
+        try {
+            return SSLContext.getDefault();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException("platform trust store unavailable", e);
+        }
+    }
+
     static SSLContext load(String path) throws IOException {
         Certificate certificate;
         InputStream in;

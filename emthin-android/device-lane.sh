@@ -2396,12 +2396,23 @@ stop_wss_fixture() {
 
 wss_lease_launch() {
     local fixture="$1"
+    # An empty generation (the second argument, "" ) omits the extra, which
+    # makes the pad ask the core for it with `sessions.list` — the path a
+    # paired gateway takes, since a pairing link names no generation.
+    local generation="${2-g-fixture-1}"
+    local generation_args=()
+    if [ -n "$generation" ]; then
+        generation_args=(--es emthin.fixtureGatewayGeneration "$generation")
+    fi
+    # The fixture extras are read in onCreate, so a warm activity would ignore
+    # them; every fixture launch has to be a cold start.
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
     D logcat -c >/dev/null 2>&1 || true
     D shell am start -W -n "$ACTIVITY" \
         --ez emthin.fixtureVtScene true \
         --es emthin.fixtureGateway "wss://127.0.0.1:$WSS_PORT" \
         --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" \
-        --es emthin.fixtureGatewayGeneration 'g-fixture-1' \
+        ${generation_args[@]+"${generation_args[@]}"} \
         --ef emthin.fixtureViewZoom 1.0 \
         --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
         >/dev/null 2>&1
@@ -2438,6 +2449,24 @@ cmd_gateway_wss() {
     wait_for_log "$log" 'gatewayLease data .*gateway lease' \
         || { fail "WSS gateway DATA did not reach the native scene"; stop_wss_fixture; return 1; }
     pass "WSS gateway DATA reached the scene"
+
+    # A paired gateway supplies no generation, so the pad has to read it from
+    # the core before attaching. Launching without the extra exercises exactly
+    # that against the same fixture, which answers `sessions.list`.
+    if wss_lease_launch "$fixture" ""; then
+        pass "launched the fixture without a generation"
+    else
+        fail "relaunch the fixture without a generation"
+        stop_wss_fixture
+        return 1
+    fi
+    wait_for_log "$log" 'gatewayLease phase connect .*generation discover' \
+        || { fail "the pad did not ask the core for the generation"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease phase ready mode watch' \
+        || { fail "discovered generation did not lead to a lease"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease data .*gateway lease' \
+        || { fail "DATA did not follow the discovered generation"; stop_wss_fixture; return 1; }
+    pass "the pad discovered the generation through sessions.list"
     stop_wss_fixture
 }
 

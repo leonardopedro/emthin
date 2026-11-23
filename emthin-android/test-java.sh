@@ -57,12 +57,14 @@ make_cert "$OUT/other.p12" other.example
     android/src/com/emthin/pad/PairingLink.java \
     android/src/com/emthin/pad/PairingProtocol.java \
     android/src/com/emthin/pad/GatewayEndpoints.java \
+    android/src/com/emthin/pad/GatewayTarget.java \
     android/src/com/emthin/pad/HttpsGatewayHttp.java \
     android/src/com/emthin/pad/GatewayTransport.java \
     android/src/com/emthin/pad/WebSocketFrame.java \
     android/src/com/emthin/pad/WebSocketHandshake.java \
     android/src/com/emthin/pad/WssTransport.java \
     android/test/com/emthin/pad/GatewayPairingTest.java \
+    android/test/com/emthin/pad/GatewayTargetTest.java \
     android/test/com/emthin/pad/WebSocketTest.java \
     android/test/com/emthin/pad/OwnershipTest.java \
     android/test/com/emthin/pad/RecoveryCodecTest.java \
@@ -85,5 +87,6 @@ make_cert "$OUT/other.p12" other.example
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.ActionCatalogTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.SessionCatalogTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.GatewayPairingTest
+"$JAVA" -ea -cp "$OUT" com.emthin.pad.GatewayTargetTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.WebSocketTest \
     "$OUT/localhost.p12" "$OUT/other.p12"

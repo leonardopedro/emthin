@@ -35,8 +35,10 @@ final class GatewayLeaseClient {
     private static final int MAX_FRAME = 64 * 1024;
 
     private final GatewayTransport.Connector connector;
+    private final String coreId;
     private final String address;
-    private final String generation;
+    /** null until `sessions.list` names the address's generation. */
+    private volatile String generation;
     private final Listener listener;
     private final AtomicInteger nextId = new AtomicInteger(2);
     private final Object writeLock = new Object();
@@ -46,19 +48,16 @@ final class GatewayLeaseClient {
     private volatile boolean closed;
     private volatile int channel;
     private volatile int pendingAttachId;
+    private volatile int pendingListId;
     private volatile String mode;
     private volatile String leaseId;
     private volatile boolean controlling;
     private volatile boolean helloDone;
 
-    GatewayLeaseClient(String host, int port, String address, String generation,
-            Listener listener) {
-        this(new TcpConnector(host, port), address, generation, listener);
-    }
-
-    GatewayLeaseClient(GatewayTransport.Connector connector, String address,
-            String generation, Listener listener) {
+    GatewayLeaseClient(GatewayTransport.Connector connector, String coreId,
+            String address, String generation, Listener listener) {
         this.connector = connector;
+        this.coreId = coreId;
         this.address = address;
         this.generation = generation;
         this.listener = listener;
@@ -158,7 +157,7 @@ final class GatewayLeaseClient {
         try {
             JSONObject params = new JSONObject();
             params.put("version", 1);
-            params.put("core_id", "6ab09a20fd1288983dfbbac2bb349231");
+            params.put("core_id", coreId);
             params.put("features", new org.json.JSONArray()
                     .put("resize_notifications").put("automatic_input"));
             JSONObject request = new JSONObject();
@@ -170,6 +169,43 @@ final class GatewayLeaseClient {
         } catch (Exception e) {
             throw new IOException("hello request", e);
         }
+    }
+
+    /**
+     * Ask the core which generation the address is on. A paired gateway is
+     * reached without any local generation, and `terminal.attach` will not take
+     * a guessed one; a fixture target supplies it and skips this step.
+     */
+    private void listSessions() {
+        try {
+            int id = nextId.getAndIncrement();
+            pendingListId = id;
+            JSONObject params = new JSONObject();
+            params.put("limit", 32);
+            params.put("addresses", new org.json.JSONArray().put(address));
+            JSONObject request = new JSONObject();
+            request.put("jsonrpc", "2.0");
+            request.put("id", id);
+            request.put("method", "sessions.list");
+            request.put("params", params);
+            writeFrame(0, DATA, request.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            fail("request");
+        }
+    }
+
+    /** The generation `sessions.list` reports for our address, or null. */
+    private String generationFor(JSONObject result) {
+        if (result == null) return null;
+        org.json.JSONArray rows = result.optJSONArray("rows");
+        if (rows == null) return null;
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i);
+            if (row == null || !address.equals(row.optString("address", ""))) continue;
+            String found = row.optString("generation", "");
+            return found.isEmpty() ? null : found;
+        }
+        return null;
     }
 
     private void attach(String requestedMode) {
@@ -227,11 +263,27 @@ final class GatewayLeaseClient {
                 JSONObject data = error == null ? null : error.optJSONObject("data");
                 String kind = data == null ? "request" : data.optString("kind", "request");
                 if (id == pendingAttachId) pendingAttachId = 0;
+                if (id == pendingListId) pendingListId = 0;
                 listener.onError(kind);
                 return;
             }
             if (id == 1 && reply.has("result")) {
                 helloDone = true;
+                if (generation == null || generation.isEmpty()) {
+                    listSessions();
+                } else {
+                    attach("watch");
+                }
+                return;
+            }
+            if (id == pendingListId && reply.has("result")) {
+                pendingListId = 0;
+                String found = generationFor(reply.optJSONObject("result"));
+                if (found == null) {
+                    listener.onError("not_found");
+                    return;
+                }
+                generation = found;
                 attach("watch");
                 return;
             }

@@ -51,6 +51,19 @@ final class GatewayEndpoints {
         return endpoints.get(host);
     }
 
+    /**
+     * The row paired with a Core ID. Hosts key the registry (that is what the
+     * list shows and Forget removes), but a figure names a Core, so the
+     * connection path looks rows up by it.
+     */
+    Endpoint findByCore(String coreId) {
+        if (coreId == null) return null;
+        for (Endpoint endpoint : endpoints.values()) {
+            if (endpoint.coreId.equals(coreId)) return endpoint;
+        }
+        return null;
+    }
+
     /** Adds or refreshes a row. Returns false when the pair would be invalid. */
     boolean add(String host, String coreId, String name) {
         if (!validHost(host) || !PairingLink.isCoreId(coreId)) return false;
