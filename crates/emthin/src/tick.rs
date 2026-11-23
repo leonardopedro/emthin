@@ -119,11 +119,13 @@ pub fn event_loop_tick(state: &mut EmthinState) {
     match state.collab_local_edit() {
         Ok(outbound) => {
             for out in outbound {
+                let epoch = state.collab.peer_epoch(&out.peer);
                 state.ipc.send(crate::ipc::OutgoingMessage::CollabDelta {
                     peer: out.peer,
                     seq: out.seq,
                     delta: crate::ipc::hex::encode(&out.delta),
                     scope: out.scope,
+                    epoch,
                 });
             }
         }

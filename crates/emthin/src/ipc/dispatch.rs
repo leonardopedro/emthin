@@ -61,8 +61,9 @@ pub fn handle_ipc_message(state: &mut EmthinState, msg: IncomingMessage) {
             seq,
             delta,
             scope,
-        } => ipc_collab_delta(state, &peer, seq, &delta, scope),
-        IncomingMessage::CollabAck { peer, seq } => ipc_collab_ack(state, &peer, seq),
+            epoch,
+        } => ipc_collab_delta(state, &peer, seq, &delta, scope, epoch),
+        IncomingMessage::CollabAck { peer, seq, epoch } => ipc_collab_ack(state, &peer, seq, epoch),
         IncomingMessage::CollabLeave { peer } => {
             tracing::debug!("IPC collab_leave {peer}");
             state.collab.leave(&peer);
@@ -510,6 +511,9 @@ fn ipc_collab_join(state: &mut EmthinState, peer: &str, version: &str, scope: Op
         seq: out.seq,
         delta: crate::ipc::hex::encode(&out.delta),
         scope: out.scope,
+        // The handshake assigned this peer's epoch; later frames must echo it
+        // so a reconnect (which assigns a fresh one) fences the old stream.
+        epoch: state.collab.peer_epoch(peer),
     });
     state.collab_publish_presence(true);
 }
@@ -548,19 +552,37 @@ fn ipc_collab_delta(
     seq: u64,
     delta: &str,
     scope: Option<u64>,
+    epoch: Option<u64>,
 ) {
     let delta = match crate::ipc::hex::decode(delta) {
         Ok(delta) => delta,
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e),
     };
-    // A share with explicit grants enforces them; an unconfigured share keeps
-    // the documented unscoped compatibility path.
-    if state.collab.has_explicit_grants() {
-        let principal = emthin_collab::grants::Principal::verified(peer.to_string());
-        if !state
-            .collab
-            .permitted(&principal, emthin_collab::grants::Grant::Edit)
-        {
+    // A share with explicit grants enforces them through the session, which
+    // also refuses an epoch a revoke invalidated; an unconfigured share keeps
+    // the documented unscoped compatibility path. Either way the frame must
+    // match the live connection epoch and document scope.
+    let outcome = {
+        let model = state.doc.model_mut();
+        model.set_change_origin(crate::docui::change::ChangeOrigin::Peer);
+        let doc = model.math_doc_mut();
+        if state.collab.has_explicit_grants() {
+            let principal = emthin_collab::grants::Principal::verified(peer.to_string());
+            state
+                .collab
+                .receive_granted(doc, &principal, peer, seq, &delta, scope, epoch)
+        } else {
+            state
+                .collab
+                .receive_v2(doc, peer, seq, &delta, scope, epoch)
+        }
+    };
+    // `math_doc_mut` dirtied the model; rebuild the scan even when the
+    // import failed after applying some of the buffered commands.
+    state.doc.model_mut().rescan();
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(emthin_collab::SessionError::Denied) => {
             state.inspect_event(
                 crate::docui::inspect::EventKind::Refused,
                 peer,
@@ -574,18 +596,6 @@ fn ipc_collab_delta(
                 "no edit grant for this share",
             );
         }
-    }
-    let outcome = {
-        let model = state.doc.model_mut();
-        model.set_change_origin(crate::docui::change::ChangeOrigin::Peer);
-        let doc = model.math_doc_mut();
-        state.collab.receive_scoped(doc, peer, seq, &delta, scope)
-    };
-    // `math_doc_mut` dirtied the model; rebuild the scan even when the
-    // import failed after applying some of the buffered commands.
-    state.doc.model_mut().rescan();
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
         Err(e) => return error(state, IpcErrorCode::CollabFailed, e.to_string()),
     };
     let outbound = match outcome {
@@ -625,17 +635,21 @@ fn ipc_collab_delta(
     );
     state.collab_after_remote();
     for out in outbound {
+        let epoch = state.collab.peer_epoch(&out.peer);
         state.ipc.send(OutgoingMessage::CollabDelta {
             peer: out.peer,
             seq: out.seq,
             delta: crate::ipc::hex::encode(&out.delta),
             scope: out.scope,
+            epoch,
         });
     }
 }
 
-fn ipc_collab_ack(state: &mut EmthinState, peer: &str, seq: u64) {
-    if let Err(e) = state.collab.ack(peer, seq) {
+fn ipc_collab_ack(state: &mut EmthinState, peer: &str, seq: u64, epoch: Option<u64>) {
+    // An acknowledgement from a replaced connection must not advance the
+    // stream, or a revoked peer could release frames it should never see.
+    if let Err(e) = state.collab.ack_v2(peer, seq, epoch) {
         return error(state, IpcErrorCode::CollabFailed, e.to_string());
     }
     // The cumulative ack confirms operations through `seq`; it says nothing

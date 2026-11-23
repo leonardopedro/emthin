@@ -116,6 +116,8 @@ public class MainActivity extends Activity {
     private long shareHandle;
     /** A watching peer can copy content but cannot commit document edits. */
     private boolean shareWatchOnly;
+    /** Guards the publish -> drain -> apply -> save recursion. */
+    private boolean publishingShare;
     private EditText editor;
     private TextView undoButton;
     private boolean canRedo;
@@ -1428,6 +1430,28 @@ public class MainActivity extends Activity {
     private void saveDocument() {
         scheduleRecovery(false);
         requestViewWrite(false);
+        // Every committed change passes through here, so this is the one place
+        // a local edit can reach an open share. Re-entrant calls come from the
+        // remote-apply path and must not publish what we just imported.
+        if (!publishingShare) publishShare();
+    }
+
+    /** Publish the live document's delta to the sharing worker, then drain. */
+    private void publishShare() {
+        if (shareHandle == 0 || shareWatchOnly || handle == 0) return;
+        publishingShare = true;
+        try {
+            org.json.JSONObject reply = new org.json.JSONObject(
+                    DocBridge.shareSync(handle, shareHandle));
+            if (!reply.optBoolean("ok", false)) {
+                trace("share", "publish_failed", reply.optString("error", ""));
+            }
+            pollShare();
+        } catch (org.json.JSONException e) {
+            trace("share", "publish_failed", e.getMessage());
+        } finally {
+            publishingShare = false;
+        }
     }
 
     /**
@@ -4298,6 +4322,21 @@ public class MainActivity extends Activity {
         String peer = "pad-" + android.os.Process.myPid();
         shareHandle = DocBridge.shareOpen(DocBridge.snapshotBytes(handle), peer, peer);
         shareWatchOnly = false;
+        // A peer socket supplied by the launch intent is the frame transport:
+        // the worker dials it once and carries both directions from there.
+        String socket = getIntent() == null
+                ? null : getIntent().getStringExtra("emthin.shareSocket");
+        if (shareHandle != 0 && socket != null && !socket.isEmpty()) {
+            try {
+                org.json.JSONObject reply = new org.json.JSONObject(
+                        DocBridge.shareConnect(shareHandle, socket));
+                if (!reply.optBoolean("ok", false)) {
+                    trace("share", "link_failed", reply.optString("error", ""));
+                }
+            } catch (org.json.JSONException e) {
+                trace("share", "link_failed", e.getMessage());
+            }
+        }
         setStatus(shareHandle != 0 ? "Share ready" : "Share unavailable");
         trace("share", "opened", shareHandle != 0);
     }
@@ -4332,6 +4371,18 @@ public class MainActivity extends Activity {
             for (int i = 0; i < events.length(); i++) {
                 org.json.JSONObject event = events.getJSONObject(i);
                 String kind = event.optString("kind", "");
+                if ("error".equals(kind)) {
+                    trace("share", "error", event.optString("message", ""));
+                    continue;
+                }
+                if ("outbound".equals(kind)) {
+                    // With a socket link the worker writes the frame itself; a
+                    // frame that surfaces here has no attached transport, so
+                    // record it rather than dropping it silently.
+                    trace("share", "outbound", event.optString("peer", "")
+                            + " " + event.optLong("seq", 0));
+                    continue;
+                }
                 if (shareWatchOnly) continue;
                 if ("catch_up".equals(kind) || "applied".equals(kind)) {
                     org.json.JSONArray deltas = "catch_up".equals(kind)
@@ -4342,8 +4393,6 @@ public class MainActivity extends Activity {
                         String delta = deltas.optString(d, "");
                         if (!delta.isEmpty()) applyState(DocBridge.shareApply(handle, delta), true);
                     }
-                } else if ("error".equals(kind)) {
-                    trace("share", "error", event.optString("message", ""));
                 }
             }
         } catch (org.json.JSONException e) {

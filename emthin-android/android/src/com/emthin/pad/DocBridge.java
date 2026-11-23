@@ -169,6 +169,16 @@ public final class DocBridge {
     /** Publish one hex local delta; returns {ok,error}. */
     public static native String sharePublish(long handle, String delta);
 
+    /**
+     * Publish the live document's current delta to the worker; returns
+     * {ok,error}. This is the local-edit path: the UI thread owns the model,
+     * so the worker cannot read it itself.
+     */
+    public static native String shareSync(long docHandle, long shareHandle);
+
+    /** Attach the worker's Unix-socket peer link; returns {ok,error}. */
+    public static native String shareConnect(long handle, String path);
+
     /** Accept one inbound frame; scope -1 means legacy/unscoped. */
     public static native String shareReceive(long handle, String peer, long seq,
                                              String delta, long scope);

@@ -492,6 +492,14 @@ impl Session {
         })
     }
 
+    /// The epoch currently assigned to `peer`, if it has a live link.
+    ///
+    /// A client learns this from its join reply and stamps it on later
+    /// frames, so a reconnect fences everything the old connection sends.
+    pub fn peer_epoch(&self, peer: &str) -> Option<u64> {
+        self.peers.get(peer).map(|state| state.epoch)
+    }
+
     /// Whether `epoch` is the epoch currently assigned to `peer`.
     pub fn is_peer_epoch_current(&self, peer: &str, epoch: u64) -> bool {
         self.peers

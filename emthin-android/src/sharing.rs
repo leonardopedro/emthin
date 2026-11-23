@@ -3,16 +3,31 @@
 //! The worker thread owns the transport-side replica and the collaboration
 //! `Session`. The live `DocModel` stays on the UI thread: it only receives
 //! encoded deltas (one grouped apply) and publishes its own encoded deltas.
-//! The transport is scripted through channels here; a real socket/gateway
-//! adapter is the device-lane gap recorded in the plan.
+//!
+//! Frames leave the worker two ways. With a peer link attached
+//! ([`ShareHandle::connect`]) the worker writes them to that Unix socket in the
+//! shared `emthin_collab::wire` framing and reads inbound frames back; with no
+//! link they are published as [`ShareEvent::Outbound`] so a scripted transport
+//! (the host tests) or a future gateway adapter can deliver them.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use emthin_collab::wire::ShareId;
+use emthin_collab::unix::{LinkRead, UnixLink};
+use emthin_collab::wire::{ShareId, Wire};
 use emthin_collab::{Outbound, ReceiveOutcome, Session};
 use mathed_core::doc::MathDoc;
 use serde_json::{json, Value};
+
+/// The peer id a socket link's remote end is registered under. The pad dials a
+/// host it cannot name, so one stable label stands in for its identity.
+const LINK_PEER: &str = "host";
+/// How long the worker blocks for a command while a link is attached. Short
+/// enough that inbound frames are serviced promptly without busy-waiting.
+const LINK_TICK: Duration = Duration::from_millis(10);
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -42,6 +57,12 @@ enum WorkerCommand {
         delta: Vec<u8>,
         scope: Option<u64>,
     },
+    /// Dial a peer's Unix socket and carry frames over it.
+    Connect {
+        path: PathBuf,
+    },
+    /// Drop the socket link without leaving the share.
+    Disconnect,
     Leave,
     Stop,
 }
@@ -94,6 +115,7 @@ impl ShareHandle {
             session: Session::new(local_peer, local_name, 30_000),
             replica,
             joined: false,
+            link: None,
         };
         let share_id = *worker_state.session.share_id();
         let (commands, command_rx) = channel();
@@ -143,6 +165,21 @@ impl ShareHandle {
                 delta,
                 scope,
             })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Dial a peer's Unix socket. Once attached, the worker writes every frame
+    /// for that peer to the socket and feeds inbound frames back into the
+    /// session, so only frames for other peers reach `ShareEvent::Outbound`.
+    pub fn connect(&self, path: impl Into<PathBuf>) -> Result<(), String> {
+        self.commands
+            .send(WorkerCommand::Connect { path: path.into() })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn disconnect(&self) -> Result<(), String> {
+        self.commands
+            .send(WorkerCommand::Disconnect)
             .map_err(|error| error.to_string())
     }
 
@@ -211,84 +248,254 @@ struct WorkerState {
     session: Session,
     replica: MathDoc,
     joined: bool,
+    /// An attached peer socket, when one is connected.
+    link: Option<UnixLink>,
 }
 
 impl WorkerState {
-    fn run(self, commands: Receiver<WorkerCommand>, events: Sender<ShareEvent>) {
-        let mut state = self;
-        while let Ok(command) = commands.recv() {
-            match command {
-                WorkerCommand::Join { peer, version } => {
-                    match state.session.join(&state.replica, peer, &version) {
-                        Ok(out) => {
-                            state.joined = true;
-                            let _ = events.send(ShareEvent::CatchUp { delta: out.delta });
-                            state.publish_state(&events);
-                        }
-                        Err(error) => {
-                            let _ = events.send(ShareEvent::Error(error.to_string()));
-                        }
-                    }
+    fn run(mut self, commands: Receiver<WorkerCommand>, events: Sender<ShareEvent>) {
+        loop {
+            // With a link attached, command waits must not stall inbound frames.
+            let command = if self.link.is_some() {
+                match commands.recv_timeout(LINK_TICK) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                WorkerCommand::Publish { delta } => {
-                    if let Err(error) = state.replica.import_delta(&delta) {
-                        let _ = events.send(ShareEvent::Error(error.to_string()));
-                        continue;
-                    }
-                    match state.session.local_edit(&state.replica) {
-                        Ok(out) => state.publish_outbounds(out, &events),
-                        Err(error) => {
-                            let _ = events.send(ShareEvent::Error(error.to_string()));
-                        }
-                    }
+            } else {
+                match commands.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => break,
                 }
-                WorkerCommand::Receive {
-                    peer,
-                    seq,
-                    delta,
-                    scope,
-                } => {
-                    match state.session.receive_scoped(
-                        &mut state.replica,
-                        &peer,
-                        seq,
-                        &delta,
-                        scope,
-                    ) {
-                        Ok(ReceiveOutcome::Applied { outbound, .. }) => {
-                            let _ = events.send(ShareEvent::Applied {
-                                deltas: vec![delta],
-                            });
-                            state.publish_outbounds(outbound, &events);
-                            state.publish_state(&events);
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let _ = events.send(ShareEvent::Error(error.to_string()));
-                        }
-                    }
-                }
-                WorkerCommand::Leave => {
-                    state.session.clear_peers();
-                    state.joined = false;
-                    state.publish_state(&events);
-                }
-                WorkerCommand::Stop => break,
+            };
+            let mut stop = false;
+            if let Some(command) = command {
+                stop = self.handle(command, &events);
+            }
+            self.pump_link(&events);
+            if stop {
+                break;
             }
         }
     }
 
-    fn publish_outbounds(&self, outbounds: Vec<Outbound>, events: &Sender<ShareEvent>) {
-        // Outbounds are the frames a real transport would send. Each one is
-        // published with its peer, sequence and delta, so a transport (or a
-        // scripted test relay) can deliver it instead of losing it in the
-        // worker.
-        for out in outbounds {
-            let _ = events.send(ShareEvent::Outbound {
-                peer: out.peer,
-                seq: out.seq,
-                delta: out.delta,
-            });
+    /// Run one command. Returns `true` when the worker must stop.
+    fn handle(&mut self, command: WorkerCommand, events: &Sender<ShareEvent>) -> bool {
+        match command {
+            WorkerCommand::Join { peer, version } => {
+                match self.session.join(&self.replica, peer, &version) {
+                    Ok(out) => {
+                        self.joined = true;
+                        let _ = events.send(ShareEvent::CatchUp {
+                            delta: out.delta.clone(),
+                        });
+                        self.send_outbound(out, events);
+                        self.publish_state(events);
+                    }
+                    Err(error) => {
+                        let _ = events.send(ShareEvent::Error(error.to_string()));
+                    }
+                }
+            }
+            WorkerCommand::Publish { delta } => {
+                if let Err(error) = self.replica.import_delta(&delta) {
+                    let _ = events.send(ShareEvent::Error(error.to_string()));
+                    return false;
+                }
+                match self.session.local_edit(&self.replica) {
+                    Ok(out) => {
+                        for out in out {
+                            self.send_outbound(out, events);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events.send(ShareEvent::Error(error.to_string()));
+                    }
+                }
+            }
+            WorkerCommand::Receive {
+                peer,
+                seq,
+                delta,
+                scope,
+            } => {
+                match self
+                    .session
+                    .receive_scoped(&mut self.replica, &peer, seq, &delta, scope)
+                {
+                    Ok(ReceiveOutcome::Applied { outbound, .. }) => {
+                        let _ = events.send(ShareEvent::Applied {
+                            deltas: vec![delta],
+                        });
+                        for out in outbound {
+                            self.send_outbound(out, events);
+                        }
+                        self.publish_state(events);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = events.send(ShareEvent::Error(error.to_string()));
+                    }
+                }
+            }
+            WorkerCommand::Connect { path } => self.connect(&path, events),
+            WorkerCommand::Disconnect => {
+                self.drop_link();
+                self.publish_state(events);
+            }
+            WorkerCommand::Leave => {
+                self.drop_link();
+                self.session.clear_peers();
+                self.joined = false;
+                self.publish_state(events);
+            }
+            WorkerCommand::Stop => return true,
+        }
+        false
+    }
+
+    /// Dial `path` and handshake. The link carries every frame for [`LINK_PEER`]
+    /// from here on, so the worker is a transport peer rather than a scripted
+    /// relay.
+    fn connect(&mut self, path: &Path, events: &Sender<ShareEvent>) {
+        self.drop_link();
+        let stream = match UnixStream::connect(path) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = events.send(ShareEvent::Error(format!("share link: {error}")));
+                return;
+            }
+        };
+        if let Err(error) = stream.set_nonblocking(true) {
+            let _ = events.send(ShareEvent::Error(format!("share link: {error}")));
+            return;
+        }
+        let mut link = UnixLink::new(stream);
+        let hello = Wire::Hello {
+            peer: self.session.local_peer().to_string(),
+            version: Vec::new(),
+        };
+        if let Err(error) = link.send(&hello) {
+            let _ = events.send(ShareEvent::Error(format!("share link: {error}")));
+            return;
+        }
+        // Register the remote end so inbound frames have a reliable line and
+        // outbound frames a destination. The handshake delta travels over the
+        // same socket as everything else.
+        if !self.session.has_peer(LINK_PEER) {
+            match self.session.join(&self.replica, LINK_PEER, &[]) {
+                Ok(out) => {
+                    if let Err(error) = link.send(&Wire::Delta {
+                        seq: out.seq,
+                        delta: out.delta,
+                    }) {
+                        let _ = events.send(ShareEvent::Error(format!("share link: {error}")));
+                        return;
+                    }
+                    self.joined = true;
+                }
+                Err(error) => {
+                    let _ = events.send(ShareEvent::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
+        self.link = Some(link);
+        self.publish_state(events);
+    }
+
+    /// Read and apply everything the link has without waiting.
+    fn pump_link(&mut self, events: &Sender<ShareEvent>) {
+        let Some(mut link) = self.link.take() else {
+            return;
+        };
+        let mut pending: Vec<Outbound> = Vec::new();
+        let mut alive = true;
+        let mut ack = None;
+        loop {
+            match link.try_recv() {
+                Ok(LinkRead::Message(Wire::Delta { seq, delta })) => {
+                    match self
+                        .session
+                        .receive(&mut self.replica, LINK_PEER, seq, &delta)
+                    {
+                        Ok(ReceiveOutcome::Applied { outbound, .. }) => {
+                            let _ = events.send(ShareEvent::Applied {
+                                deltas: vec![delta],
+                            });
+                            pending.extend(outbound);
+                            ack = Some(seq);
+                        }
+                        // A duplicate is still received: acknowledge it so the
+                        // host releases the retained copy.
+                        Ok(_) => ack = Some(seq),
+                        Err(error) => {
+                            let _ = events.send(ShareEvent::Error(error.to_string()));
+                        }
+                    }
+                }
+                // Resync and any frame the link's other direction owns are
+                // not document traffic for this replica.
+                Ok(LinkRead::Message(_)) => {}
+                Ok(LinkRead::Pending) => break,
+                Ok(LinkRead::Closed) => {
+                    alive = false;
+                    break;
+                }
+                Err(error) => {
+                    let _ = events.send(ShareEvent::Error(format!("share link: {error}")));
+                    alive = false;
+                    break;
+                }
+            }
+        }
+        if alive {
+            // The host retains every frame until it is acknowledged; without
+            // this a long share grows its per-peer queue until it isolates
+            // the pad. One cumulative ack covers everything read this pass.
+            if let Some(seq) = ack {
+                let _ = link.send(&Wire::Ack { seq });
+            }
+            let _ = link.flush();
+            self.link = Some(link);
+        } else {
+            self.session.leave(LINK_PEER);
+            self.publish_state(events);
+        }
+        for out in pending {
+            self.send_outbound(out, events);
+        }
+    }
+
+    /// Write one frame to the attached link, or publish it for a relay when the
+    /// link is absent or belongs to another peer.
+    fn send_outbound(&mut self, out: Outbound, events: &Sender<ShareEvent>) {
+        if out.peer == LINK_PEER {
+            if let Some(link) = self.link.as_mut() {
+                let frame = Wire::Delta {
+                    seq: out.seq,
+                    delta: out.delta.clone(),
+                };
+                match link.send(&frame) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        let _ = events.send(ShareEvent::Error(format!("share link: {error}")));
+                    }
+                }
+            }
+            self.drop_link();
+        }
+        let _ = events.send(ShareEvent::Outbound {
+            peer: out.peer,
+            seq: out.seq,
+            delta: out.delta,
+        });
+    }
+
+    fn drop_link(&mut self) {
+        if let Some(link) = self.link.take() {
+            let _ = link.shutdown();
+            self.session.leave(LINK_PEER);
         }
     }
 
@@ -429,6 +636,115 @@ mod tests {
 
         a.stop();
         b.stop();
+    }
+
+    /// A real socket peer, not a scripted relay: the worker dials an
+    /// `emthin_collab::unix::Host` and frames travel in the shared wire
+    /// framing. A connected peer's edit reaches the replica, and a published
+    /// local edit reaches the host.
+    #[test]
+    fn a_socket_link_carries_edits_both_ways() {
+        use emthin_collab::unix::Host;
+        use std::time::{Duration, Instant};
+
+        let base = MathDoc::with_text("base");
+        let snapshot = base.snapshot();
+        let dir = std::env::temp_dir().join(format!("emthin-pad-share-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("share.sock");
+        let mut host = Host::bind(
+            &path,
+            MathDoc::from_snapshot(&snapshot).unwrap(),
+            "host",
+            "Host",
+            60_000,
+        )
+        .expect("bind the share socket");
+        let handle = ShareHandle::start(&snapshot, "pad", "Pad").unwrap();
+        handle.connect(&path).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            host.poll().expect("host poll");
+            let _ = handle.poll();
+            if host.has_peer("pad") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the pad's link never handshook");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Host -> worker: the frame arrives over the socket and applies to the
+        // transport replica, without any relay in the test.
+        host.doc_mut().insert(0, "H");
+        host.local_edit().unwrap();
+        assert!(
+            !host.session().resend("pad", 0).unwrap().is_empty(),
+            "the host retains a frame until the pad acknowledges it"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut applied = false;
+        while !applied {
+            host.poll().expect("host poll");
+            applied = handle
+                .poll()
+                .iter()
+                .any(|event| matches!(event, ShareEvent::Applied { .. }));
+            assert!(Instant::now() < deadline, "the host's edit never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after_host = replica_text(&handle, "probe-host");
+        assert!(after_host.contains('H'), "replica text was {after_host:?}");
+
+        // Worker -> host: a published local edit is written to the socket by
+        // the worker itself, so no outbound event is needed for this peer.
+        let mut live = MathDoc::from_snapshot(&snapshot).unwrap();
+        live.insert(live.text().len(), "P");
+        handle.publish(live.export_delta()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            host.poll().expect("host poll");
+            let events = handle.poll();
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    ShareEvent::Outbound { peer, .. } if peer == LINK_PEER
+                )),
+                "a connected frame must not also be published for a relay: {events:?}"
+            );
+            if host.doc().text().contains('P') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pad's edit never reached the host"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Both replicas agree on both edits.
+        let published = replica_text(&handle, "probe-pad");
+        assert_eq!(published, host.doc().text());
+        assert!(published.contains('H') && published.contains('P'));
+
+        // The pad acknowledges what it received, so the host releases its
+        // retained frames instead of growing the queue until it isolates the
+        // peer. Without the ack this list keeps every sent frame.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            host.poll().expect("host poll");
+            let _ = handle.poll();
+            if host.session().resend("pad", 0).unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pad never acknowledged the host's stream"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -171,12 +171,14 @@ token in `collab_join`; it is opaque and must not be parsed by the client.
 Add a collaborating peer and answer with the delta it is missing. `version`
 is the peer's hex-encoded version token, or `""` for a new peer that needs
 the whole document. The answer is `collab_delta`; `seq` is the first frame
-on that peer's reliable stream. Calling it again for a peer that is already
-joined is a reconnect: the peer's stream restarts at sequence 1 and the
-delta is calculated from the supplied token. The optional `scope` is the
-caller's document generation; a scope-aware peer learns this host's generation
-from the response and echoes it on later frames. Omitting it keeps the legacy
-unscoped path.
+on that peer's reliable stream and `epoch` is the connection epoch assigned to
+this peer, which it must echo on the frames it sends back. Calling it again for
+a peer that is already joined is a reconnect: the peer's stream restarts at
+sequence 1, a fresh `epoch` is assigned (frames stamped with the old one are
+refused) and the delta is calculated from the supplied token. The optional
+`scope` is the caller's document generation; a scope-aware peer learns this
+host's generation from the response and echoes it on later frames. Omitting it
+keeps the legacy unscoped path.
 
 ```json
 {"jsonrpc":"2.0","method":"collab_join","params":{"peer":"alice","version":"","scope":1}}
@@ -190,7 +192,12 @@ are buffered; a duplicate is ignored. Applying a delta may answer with
 `collab_delta` notifications for the other peers. `scope` echoes the receiving
 host's document generation; a mismatch is stale traffic from a replaced
 document and is ignored. Scope-aware peers must include it; omitting it keeps
-the legacy path and is accepted only for a legacy join.
+the legacy path and is accepted only for a legacy join. `epoch` is the
+connection epoch this peer learned from its `collab_join` reply: a frame from a
+replaced connection, or one whose epoch a `collab_revoke` invalidated, is
+refused before it touches the document. On a share with explicit grants the
+session itself checks the grant, so a read-only peer cannot commit. Omitting
+`epoch` keeps the unfenced legacy path.
 
 ```json
 {"jsonrpc":"2.0","method":"collab_delta","params":{"peer":"alice","seq":1,"delta":"0a0b","scope":1}}
@@ -199,10 +206,14 @@ the legacy path and is accepted only for a legacy join.
 ### `collab_ack`
 
 Acknowledge every frame through `seq` for a peer. This releases the retained
-frames; an acknowledgement beyond what was sent is clamped.
+frames; an acknowledgement beyond what was sent is clamped. `epoch` is the
+connection epoch this peer learned from its `collab_join` reply: an
+acknowledgement stamped with a replaced epoch is refused as `collab_failed`, so
+it cannot release frames for a connection that no longer exists. Omitting
+`epoch` keeps the unfenced legacy path.
 
 ```json
-{"jsonrpc":"2.0","method":"collab_ack","params":{"peer":"alice","seq":4}}
+{"jsonrpc":"2.0","method":"collab_ack","params":{"peer":"alice","seq":4,"epoch":2}}
 ```
 
 ### `collab_leave`

@@ -113,15 +113,24 @@ pub enum IncomingMessage {
         scope: Option<u64>,
     },
     /// Apply a delta frame from a peer. `seq` is that peer's reliable-stream
-    /// sequence number; `delta` is hex encoded.
+    /// sequence number; `delta` is hex encoded. `epoch` is the connection
+    /// epoch the peer learned from its `collab_join` reply: a frame from a
+    /// replaced connection or a revoked epoch is refused instead of applied.
     CollabDelta {
         peer: String,
         seq: u64,
         delta: String,
         scope: Option<u64>,
+        epoch: Option<u64>,
     },
-    /// Acknowledge every frame through `seq` from `peer`.
-    CollabAck { peer: String, seq: u64 },
+    /// Acknowledge every frame through `seq` from `peer`. `epoch` is the
+    /// connection epoch the peer learned from its `collab_join` reply; an ack
+    /// from a replaced connection cannot advance a stream.
+    CollabAck {
+        peer: String,
+        seq: u64,
+        epoch: Option<u64>,
+    },
     /// Drop a peer and its reliable stream.
     CollabLeave { peer: String },
     /// Apply one remote presence payload. `peer` is the transmitting peer and
@@ -382,12 +391,14 @@ pub enum OutgoingMessage {
     DbusRouterRuleRemoved {
         id: String,
     },
-    /// A collaboration frame for a peer. `delta` is hex encoded.
+    /// A collaboration frame for a peer. `delta` is hex encoded; `epoch` is
+    /// the connection epoch `peer` must stamp on the frame it transports.
     CollabDelta {
         peer: String,
         seq: u64,
         delta: String,
         scope: Option<u64>,
+        epoch: Option<u64>,
     },
     /// The document's current version token, hex encoded.
     CollabVersion {
@@ -775,10 +786,12 @@ impl IncomingMessage {
                 seq: params_get_u64(params, "seq")?,
                 delta: params_get_string(params, "delta")?,
                 scope: params_get_optional_u64(params, "scope")?,
+                epoch: params_get_optional_u64(params, "epoch")?,
             },
             "collab_ack" => Self::CollabAck {
                 peer: params_get_string(params, "peer")?,
                 seq: params_get_u64(params, "seq")?,
+                epoch: params_get_optional_u64(params, "epoch")?,
             },
             "collab_leave" => Self::CollabLeave {
                 peer: params_get_string(params, "peer")?,
@@ -1156,11 +1169,13 @@ impl OutgoingMessage {
                 seq,
                 delta,
                 scope,
+                epoch,
             } => serde_json::json!({
                 "peer": peer,
                 "seq": seq,
                 "delta": delta,
                 "scope": scope,
+                "epoch": epoch,
             }),
             Self::CollabVersion { version } => serde_json::json!({"version": version}),
             Self::CollabPresence {
@@ -1541,6 +1556,7 @@ mod tests {
             seq: 2,
             delta: "00ff".into(),
             scope: Some(7),
+            epoch: Some(3),
         };
         assert_eq!(msg.method_name(), "collab_delta");
         let json = msg.into_params_value();
@@ -1548,6 +1564,7 @@ mod tests {
         assert_eq!(json["seq"], 2);
         assert_eq!(json["delta"], "00ff");
         assert_eq!(json["scope"], 7);
+        assert_eq!(json["epoch"], 3);
 
         let msg = OutgoingMessage::CollabVersion {
             version: "0a0b".into(),
@@ -1691,6 +1708,7 @@ mod tests {
                 seq: 1,
                 delta: "00".into(),
                 scope: Some(1),
+                epoch: Some(1),
             },
             OutgoingMessage::CollabVersion {
                 version: "00".into(),

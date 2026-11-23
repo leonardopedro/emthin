@@ -699,6 +699,60 @@ the additional cache work.
   `binding_error` fields filled in to compile; that was outside the card's
   product behavior.
 
+## Execution run (2026-11-23)
+
+Every card above is recorded done, so this run executed the plan's own release
+checks against the current tree and fixed what they exposed. Source:
+`main` at `14b3740` plus this session's uncommitted changes. Commands ran
+inside `nix develop`, with `CARGO_BUILD_JOBS=2` after the recorded OOM history.
+
+| Check | Result |
+|---|---|
+| `cargo test --locked --workspace --offline` | **736 passed, 0 failed, 2 ignored** (`emthin` lib 511, `collab_ipc` 6, `docui_async_restore` 2, 18/5 xwayland, 14 clipboard, 66 collab, 23 core-client, 2 scripted-peer/unix-fixture, 40 dbus, 23 emthin-vt, 15 ghostty-vt, 5 herdr fixtures) |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | exit 0 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items` | exit 0 |
+| `cargo fmt --all --check` | green for every package in this checkout; the remaining diffs are the external `velysterm`/`unfer` path dependencies, which carry their own edition-2024 formatting |
+| `bash scripts/verify-invariants` | 7 passed, 0 failed, 0 gaps (includes `check-ipc-docsync`, 48 client→server / 36 server→client) |
+| `python3 scripts/check-links` | OK — 35 documents, 87 relative links |
+| `cd emthin-android && cargo test --locked --offline` | **136 passed, 0 failed** |
+| `bash scripts/agent/replay.sh scripts/agent/scenarios/figure-resize.txt` | 13 assertions ok, 0 failed |
+| `bash scripts/agent/replay.sh scripts/agent/scenarios/proof-note.txt` | 17 assertions ok, 0 failed |
+| `bash scripts/e2e/live-ipc.sh` | every check passed (inspect, history, proof, semantic rename, kernel/launcher/plugin/atproto descriptors) |
+| `bash scripts/e2e/process-kill.sh` | every check passed (committed write boundary, SIGKILL without graceful shutdown, relaunch restores the verified pair and the page) |
+| `bash scripts/e2e/run.sh --config wtype` | **28 ran, 0 skipped, 0 failed** — clipboard both directions plus keyboard, doc-copy paste and PgUp/PgDn, on the harness-owned headless sway |
+| `bash scripts/e2e/run.sh --config xdotool` | **36 ran, 0 skipped, 0 failed** — the same clipboard/keyboard/navigation checks over XTEST plus Find (open, 1/1, F3 reveal, Escape restores the pre-search page) and the fcitx5 IME commit of 你好 with its preedit logged, on the harness's own Xvfb + sway (wlroots x11 backend) |
+
+Fixed while running these: `scripts/e2e/lib.sh` referred to `stop_compositor`
+and `cleanup` from the `live-ipc.sh`, `live-mm0.sh` and `process-kill.sh` exit
+traps, but defined neither, and the traps' `2>/dev/null || true` hid it. A run
+left its headless sway holding the harness's stdout, so a piped invocation
+(`... | tail`) never terminated after the checks had passed, and the next run
+inherited a compositor it did not create. Both functions now live in the
+shared library: `stop_compositor` is scoped by the harness config path and the
+private display, so a host session's own sway/Xvfb is never touched, and
+`cleanup` is `stop_ime` + `stop_compositor`. `run.sh` keeps its own fuller
+`cleanup`. Re-running `live-ipc.sh` piped now exits 0 and leaves no sway.
+
+Both desktop E2E lanes ran, so the 2026-11-18 pairing (28 Wayland + 36
+XTEST) is reproduced end to end on this host. The XTEST lane does **not** need
+a free logind session: `--config xdotool` boots its own Xvfb and sway with
+`WLR_BACKENDS=x11` (`scripts/e2e/lib.sh::start_compositor`), and only the
+Mutter configurations ask logind for a session. Both runs left no Xvfb or
+sway behind (`pgrep -x Xvfb`/`pgrep -x sway` empty afterwards), which is the
+`stop_compositor` fix above earning its keep.
+
+Named gaps for this run, not regressions:
+
+- **Device / real-phone lanes** (`device-lane.sh`, `terminal-lease`, the
+  arm64 APK): no `adb` on this host, so nothing was installed or driven. The
+  pad's host lane ran.
+- **Live `mm0web` verifier run** (`scripts/e2e/live-mm0.sh`): the mm0web binary
+  is present, but its proof fixture is not — `/tmp/mm0/examples` was cleaned and
+  no mm0 checkout exists to rebuild `peano.mm0`/`.mm1` from, so the script
+  would stop at its fixture check. Loopback only; no credentials needed.
+- **Live Zenodo sandbox checkpoint**: needs the separately configured test
+  account; only the offline and scripted MM0 lanes ran here.
+
 ## Implementation handoff
 
 Use the cheaper model for one card at a time. Give it the card's files,

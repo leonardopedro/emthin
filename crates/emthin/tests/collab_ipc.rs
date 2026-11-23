@@ -197,6 +197,43 @@ impl Peer {
         );
     }
 
+    /// A `collab_delta` frame including the connection epoch the peer must
+    /// stamp on it.
+    fn wait_collab_delta_fenced(&mut self, peer: &str) -> (u64, String, Option<u64>, Option<u64>) {
+        let message = self.wait_for("a fenced collaboration delta", |message| {
+            message["method"] == "collab_delta" && message["params"]["peer"] == peer
+        });
+        (
+            message["params"]["seq"].as_u64().expect("seq"),
+            message["params"]["delta"]
+                .as_str()
+                .expect("delta")
+                .to_string(),
+            message["params"]["scope"].as_u64(),
+            message["params"]["epoch"].as_u64(),
+        )
+    }
+
+    fn send_delta_fenced(
+        &mut self,
+        peer: &str,
+        seq: u64,
+        delta: &str,
+        scope: Option<u64>,
+        epoch: Option<u64>,
+    ) {
+        self.client.send(
+            "collab_delta",
+            json!({
+                "peer": peer,
+                "seq": seq,
+                "delta": delta,
+                "scope": scope,
+                "epoch": epoch,
+            }),
+        );
+    }
+
     fn document(&mut self) -> String {
         self.client.send("list_state", json!({}));
         let message = self.wait_for("a state reply", |message| message["method"] == "state");
@@ -454,6 +491,73 @@ fn mark_edits_converge_and_a_replaced_document_rejects_old_frames() {
     // Both sides established fresh peer sessions on the replacement.
     assert!(a.state.collab.has_peer(&b_peer));
     assert!(b.state.collab.has_peer(&a_peer));
+}
+
+#[test]
+fn a_delta_from_a_replaced_connection_epoch_is_refused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut a = Peer::new("fence-a", "base");
+    let mut b = Peer::new("fence-b", "");
+    let a_peer = a.state.collab.local_peer().to_string();
+    let b_peer = b.state.collab.local_peer().to_string();
+
+    // Each join reply names the epoch the joining peer must stamp on the
+    // frames it sends to that host.
+    a.client.send(
+        "collab_join",
+        json!({"peer": b_peer, "version": "", "scope": b.state.collab.scope()}),
+    );
+    b.client.send(
+        "collab_join",
+        json!({"peer": a_peer, "version": "", "scope": a.state.collab.scope()}),
+    );
+    let (a_seq, a_delta, a_scope, a_epoch) = a.wait_collab_delta_fenced(&b_peer);
+    let (b_seq, b_delta, b_scope, b_epoch) = b.wait_collab_delta_fenced(&a_peer);
+    let live_epoch = a_epoch.expect("the join reply names an epoch");
+    assert!(b_epoch.is_some());
+    b.send_delta_fenced(&a_peer, a_seq, &a_delta, a_scope, Some(live_epoch));
+    a.send_delta_fenced(&b_peer, b_seq, &b_delta, b_scope, b_epoch);
+    assert_eq!(b.document(), "base");
+
+    // B's edit, stamped with an epoch A never assigned, is traffic from a
+    // replaced connection and must not reach the document.
+    b.edit("base + fenced");
+    let (edit_seq, edit_delta, edit_scope, _) = b.wait_collab_delta_fenced(&a_peer);
+    let before = a.state.doc.model().text().to_string();
+    a.send_delta_fenced(
+        &b_peer,
+        edit_seq,
+        &edit_delta,
+        edit_scope,
+        Some(live_epoch + 1),
+    );
+    a.pump();
+    assert_eq!(
+        a.state.doc.model().text(),
+        before,
+        "a frame from a replaced epoch is refused"
+    );
+
+    // The same frame stamped with the live epoch converges, so the refusal
+    // above was the epoch and nothing else.
+    a.send_delta_fenced(&b_peer, edit_seq, &edit_delta, edit_scope, Some(live_epoch));
+    a.pump();
+    assert_eq!(a.state.doc.model().text(), b.state.doc.model().text());
+
+    // An acknowledgement from the replaced epoch is refused too, so it cannot
+    // release retained frames for a connection that no longer exists.
+    a.client.send(
+        "collab_ack",
+        json!({"peer": b_peer, "seq": 1, "epoch": live_epoch + 1}),
+    );
+    a.pump();
+    assert!(
+        a.client
+            .drain()
+            .iter()
+            .any(|message| message["method"] == "error"),
+        "a stale-epoch acknowledgement must be refused"
+    );
 }
 
 #[test]

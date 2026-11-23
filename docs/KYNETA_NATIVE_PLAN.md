@@ -689,3 +689,86 @@ Record the two native build commands, revisions, package or APK hash,
 capabilities, fixture results and any missing deployment/device evidence.
 A synthetic replay proves ordering and scope, while the actual mobile run
 proves lifecycle, input and transport across platforms.
+
+## Review findings (2026-11-23)
+
+Verification of the native Kyneta work, with the defects it surfaced. Each
+fix carries a regression test; the counts are from
+`cargo test --locked --workspace` (734 passed, 2 ignored) and the Android
+host lane (134 passed).
+
+Fixed:
+
+- **Readiness ack ordering** (`docui/readiness.rs`). `acknowledge` replaced
+the stored ack on arrival order, so a late completion for an older
+generation overwrote a newer one — contradicting the module's own contract.
+It now keeps the newest generation per kind.
+- **Proof index facts** (`docui/proof_index.rs`). `uses` was looked up by the
+raw `definition.name` while the map is keyed unquoted, so every quoted
+`\def` name counted zero uses; `references.target` reported a
+name→exists lookup instead of the definition the occurrence actually
+resolved to. `ProofView` also gained `expected_proof`, so a result is
+rejected when the document cites no `\formal` at all (previously any
+`proof_id` was accepted, and `resolve_formal` accepts any spanned segment,
+hence the `PropKind::Formal` filter).
+- **IPC proof query** (`ipc/dispatch.rs`). `proof_id` is taken from
+`ProofView::expected_proof`; the field is computed before the struct is
+consumed, and `verdict` is `null` rather than `""` when no result is
+installed (additive; the `docs/ipc.md` field list still holds).
+- **Android sharing transport seam** (`emthin-android/src/sharing.rs`). The
+worker computed outbound frames and then dropped them into a peer-name-only
+`State` event, so nothing could ever be sent. `ShareEvent::Outbound
+{ peer, seq, delta }` now carries each frame through `poll_json` as
+`{"kind":"outbound",...}`; the convergence test relays real frames through
+an offline→reconnect exchange instead of asserting nothing about the
+replicas.
+
+Closed after the review (same day):
+
+- **Unix epoch fence covers every frame** (`emthin-collab/src/unix.rs`).
+`Host::handle` routed `DeltaV2`/`AckV2`/`PresenceV2` through the unfenced
+`receive`/`ack`/`apply_presence` after a manual epoch check, so the document
+scope on those frames was discarded and a revoked epoch was not consulted. It
+now calls `receive_v2`/`ack_v2`/`apply_presence_v2`, keeping the peer-named
+`StaleEpoch` error. Regression:
+`unix::tests::a_v2_frame_tagged_with_a_replaced_scope_is_dropped` (the same
+frame is refused with a stale scope and applied with the live one).
+- **IPC deltas are granted and fenced** (`ipc/messages.rs`, `ipc/dispatch.rs`,
+`tick.rs`, `docs/ipc.md`). `collab_join`'s reply and `collab_delta` now carry
+an optional `epoch` (`Session::peer_epoch`); `ipc_collab_delta` goes through
+`Session::receive_granted` on a share with explicit grants and `receive_v2`
+otherwise, so the edit grant, the revoked-epoch check, the live connection
+epoch and the document scope are all enforced by the session instead of an
+inline `permitted` check. Omitting `epoch` keeps the legacy path. Regression:
+`tests/collab_ipc.rs::a_delta_from_a_replaced_connection_epoch_is_refused`.
+- **The pad publishes and has a frame transport**
+(`emthin-android`). `saveDocument` — the single post-change hook — calls a new
+`shareSync` native that exports the live model's delta into the worker, and
+`pollShare` records `outbound` frames instead of dropping them. The worker now
+carries a peer link: `ShareHandle::connect(path)` dials a Unix socket with the
+shared `emthin_collab::wire` framing, writes every frame for that peer and
+feeds inbound frames back into the session; `MainActivity.shareOpen` dials it
+when the launch intent supplies `emthin.shareSocket`. Regressions:
+`sharing::tests::a_socket_link_carries_edits_both_ways` (a real
+`unix::Host` peer, both directions, no relay) and
+`lib.rs::sharing_publishes_local_edits_and_attaches_a_transport` (Java source
+pin).
+
+Remaining gaps (not defects in shipped behaviour, but unproven or
+unfenced):
+
+- `collab_ack` now takes the same optional `epoch` as `collab_delta` and goes
+through `Session::ack_v2`, so an acknowledgement from a replaced connection is
+refused instead of releasing retained frames (regression: the stale-epoch case
+in `tests/collab_ipc.rs::a_delta_from_a_replaced_connection_epoch_is_refused`).
+- The pad's link acknowledges the host's stream. Without an ack the host
+retains every frame it sends until the per-peer queue overflows and isolates
+the pad; the socket test now pins both halves (the host holds a frame until the
+ack, and the ack empties it).
+- The pad's link still uses the legacy `Hello`, so frames on it are unscoped
+(`receive` rather than `receive_v2`, no epoch exchange). It is a fresh
+single-peer socket the worker drops and redials as a whole, so there is no
+stale-connection window on the pad side; the desktop host side is fenced.
+- Not run here: the real-phone/Tailscale gateway lane (K6) and a live
+compositor + control-client session. The Austral artifact lane (K9) is
+recorded above as passed on the arm64 Waydroid device.

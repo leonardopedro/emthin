@@ -420,6 +420,49 @@ stop_emthin() {
   kill -KILL "$pid" 2>/dev/null || true
 }
 
+# Take down the compositor and X server *this run* started.
+#
+# The traps in live-ipc.sh, live-mm0.sh and process-kill.sh call
+# `stop_compositor` and `cleanup`; neither was defined here, and the traps'
+# `2>/dev/null || true` hid it. The cost was not cosmetic: the leaked sway
+# kept the harness's stdout open, so `./scripts/e2e/live-ipc.sh | tail` never
+# saw EOF even after every check had passed, and the next run started against a
+# workspace it did not create. Scoped by command line and display so a host
+# session's own sway/Xvfb is never touched.
+stop_compositor() {
+  local pid
+  local sway_pids
+  sway_pids="$(pgrep -f "sway -c $E2E_ROOT/sway.conf" 2>/dev/null)"
+  for pid in $sway_pids; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -f "gnome-shell --headless --wayland --wayland-display=$E2E_DISPLAY" 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -a -x Xvfb 2>/dev/null | awk -v d="$E2E_XVFB_DISPLAY" '$3 == d { print $1 }'); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  for pid in $sway_pids; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -f "gnome-shell --headless --wayland --wayland-display=$E2E_DISPLAY" 2>/dev/null); do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -a -x Xvfb 2>/dev/null | awk -v d="$E2E_XVFB_DISPLAY" '$3 == d { print $1 }'); do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  rm -f "$E2E_XDG"/wayland-* 2>/dev/null || true
+}
+
+# The shared exit path for lanes that do not define their own: the IME client
+# and the compositor belong to this run. `run.sh` overrides this with the full
+# sequence that also stops emthin first.
+cleanup() {
+  stop_ime
+  stop_compositor
+}
+
 # Leftovers from a previous run are not a rare edge case, they are the default:
 # the compositor and emthin outlive a failed run, and the next one then starts on
 # top of them. Observed exactly: a run that worked against a freshly created

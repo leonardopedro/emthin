@@ -608,10 +608,16 @@ impl Host {
                     .apply_presence(&blob)
                     .map_err(HostError::Session)?;
             }
-            // V2 frames fence by the handshake epoch before any document
-            // state is touched. A stale epoch is rejected, never applied.
+            // V2 frames fence by the handshake epoch *and* the document
+            // scope before any document state is touched. A stale epoch is
+            // rejected, never applied; a stale scope is dropped by the
+            // session. Both travel on the frame, so the check happens here
+            // only to report which peer sent the stale epoch.
             Wire::DeltaV2 {
-                epoch, seq, delta, ..
+                epoch,
+                scope,
+                seq,
+                delta,
             } => {
                 if !self.session.is_peer_epoch_current(peer, epoch) {
                     return Err(HostError::StaleEpoch {
@@ -619,7 +625,14 @@ impl Host {
                         epoch,
                     });
                 }
-                let outcome = self.session.receive(&mut self.doc, peer, seq, &delta)?;
+                let outcome = self.session.receive_v2(
+                    &mut self.doc,
+                    peer,
+                    seq,
+                    &delta,
+                    scope,
+                    Some(epoch),
+                )?;
                 if let ReceiveOutcome::Applied { outbound, .. } = outcome {
                     self.route(&outbound)?;
                 }
@@ -631,9 +644,9 @@ impl Host {
                         epoch,
                     });
                 }
-                self.session.ack(peer, seq)?;
+                self.session.ack_v2(peer, seq, Some(epoch))?;
             }
-            Wire::PresenceV2 { epoch, blob, .. } => {
+            Wire::PresenceV2 { epoch, scope, blob } => {
                 if !self.session.is_peer_epoch_current(peer, epoch) {
                     return Err(HostError::StaleEpoch {
                         peer: peer.to_string(),
@@ -641,7 +654,7 @@ impl Host {
                     });
                 }
                 self.session
-                    .apply_presence(&blob)
+                    .apply_presence_v2(&blob, scope, Some(epoch))
                     .map_err(HostError::Session)?;
             }
             Wire::Hello { .. } | Wire::HelloV2 { .. } => return Err(HostError::BadHandshake),
@@ -845,6 +858,68 @@ mod tests {
             matches!(err, HostError::StaleEpoch { .. }),
             "expected StaleEpoch, got {err}"
         );
+    }
+
+    #[test]
+    fn a_v2_frame_tagged_with_a_replaced_scope_is_dropped() {
+        let path = socket_path();
+        let mut host =
+            Host::bind(&path, MathDoc::with_text("base"), "host", "Host", 60_000).expect("bind");
+        let share = *host.session.share_id();
+        let mut client = UnixLink::new(UnixStream::connect(&path).expect("connect"));
+        client
+            .send(&Wire::HelloV2 {
+                peer: "v2-client".into(),
+                share_id: share,
+                protocol_version: PROTOCOL_VERSION_V2,
+                envelope_version: ENVELOPE_VERSION,
+                epoch: 0,
+                version: Vec::new(),
+            })
+            .unwrap();
+        host.accept().unwrap().expect("v2 peer accepted");
+        let epoch = match client.recv().unwrap() {
+            Some(Wire::HelloV2 { epoch, .. }) => epoch,
+            other => panic!("expected HelloV2, got {other:?}"),
+        };
+        let Some(Wire::DeltaV2 { delta, .. }) = client.recv().unwrap() else {
+            panic!("expected the catch-up delta");
+        };
+
+        // Build a real edit against the catch-up state, so the only reason it
+        // can be refused is the scope tag.
+        let mut replica = MathDoc::new();
+        replica.import_delta(&delta).unwrap();
+        let before = replica.version_vector();
+        replica.insert(0, "X");
+        let edit = replica.export_delta_since(&before).unwrap();
+
+        // A scope this session never had is traffic from a replaced document:
+        // the epoch is current, but the frame must not reach the reliable line.
+        let scope = host.session().scope();
+        client
+            .send(&Wire::DeltaV2 {
+                epoch,
+                scope: Some(scope.wrapping_add(1)),
+                seq: 1,
+                delta: edit.clone(),
+            })
+            .unwrap();
+        assert!(host.receive_from("v2-client").unwrap());
+        assert_eq!(host.doc().text(), "base", "a stale scope is dropped");
+
+        // The same frame with the live scope is applied, and its sequence
+        // number was not consumed by the refused one.
+        client
+            .send(&Wire::DeltaV2 {
+                epoch,
+                scope: Some(scope),
+                seq: 1,
+                delta: edit,
+            })
+            .unwrap();
+        assert!(host.receive_from("v2-client").unwrap());
+        assert_eq!(host.doc().text(), "Xbase");
     }
 
     #[test]

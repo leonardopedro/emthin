@@ -3013,6 +3013,44 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_sharePublish<'local>(
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
+/// Publish the live document's current delta to the sharing worker. The UI
+/// thread owns the model, so this is the only way a local edit reaches the
+/// transport.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareSync<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    doc_handle: jlong,
+    share_handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            // SAFETY: both handles are owned by the UI thread.
+            let delta = unsafe { model_mut(doc_handle) }.math_doc().export_delta();
+            let result = unsafe { share_handle_mut(share_handle) }.publish(delta);
+            share_json_result(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Attach the sharing worker's Unix-socket link to a collaborating peer.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_shareConnect<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    path: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let path = path.to_string();
+            // SAFETY: UI-thread-owned handle.
+            let result = unsafe { share_handle_mut(handle) }.connect(path);
+            share_json_result(env, result)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_shareReceive<'local>(
     mut unowned_env: EnvUnowned<'local>,
@@ -4386,6 +4424,44 @@ mod tests {
             mathed_android::engine::BG[1],
             mathed_android::engine::BG[2],
         );
+    }
+
+    /// K6 device wiring: a local edit must reach the sharing worker, and the
+    /// worker's frames must have a transport. Both halves used to be missing —
+    /// the worker computed outbound frames that nothing consumed and the pad
+    /// never called `sharePublish`. Reads the shipped Java source, so it
+    /// guards what `build-apk.sh` compiles.
+    #[test]
+    fn sharing_publishes_local_edits_and_attaches_a_transport() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/MainActivity.java"
+        ))
+        .expect("MainActivity.java must be readable");
+        let bridge = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/android/src/com/emthin/pad/DocBridge.java"
+        ))
+        .expect("DocBridge.java must be readable");
+
+        assert!(
+            java.contains("DocBridge.shareSync(handle, shareHandle)"),
+            "a committed local edit must be published to the sharing worker"
+        );
+        assert!(
+            java.contains("getStringExtra(\"emthin.shareSocket\")"),
+            "the peer socket path comes from the launch intent"
+        );
+        assert!(
+            java.contains("DocBridge.shareConnect(shareHandle, socket)"),
+            "the worker's socket link must actually be dialed"
+        );
+        assert!(
+            java.contains("\"outbound\".equals(kind)"),
+            "a frame with no transport must be recorded, not dropped silently"
+        );
+        assert!(bridge.contains("shareSync(long docHandle, long shareHandle)"));
+        assert!(bridge.contains("shareConnect(long handle, String path)"));
     }
 
     /// Round-6 pin (2026-10-20): the page ImageView must be laid out at
