@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
+""":"
+exec python3 "$0" "$@"
+"""
 """Print and validate the pinned inputs for the terminal-figure programme.
 
 Reads only. Never starts Core, touches a socket, evaluates a NixOS profile, or
 updates a fixture. Missing optional sibling checkouts are validation failures.
-"""
 
-from __future__ import annotations
+The first three lines are a shell/Python polyglot: run with `bash` or `sh`
+they re-exec this file under python3. Without it a shell run crawls through the
+Python source line by line and blocks on `import` (ImageMagick's screen grab
+waiting on a display), which looks like a hang and reports nothing.
+"""
 
 import argparse
 import json
@@ -134,7 +140,9 @@ def check_toolchains(manifest: dict[str, object], strict: bool) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Validate the pinned Herdr compatibility inputs."
+    )
     parser.add_argument("--json", action="store_true", help="print a machine-readable report")
     parser.add_argument(
         "--strict-toolchains",
