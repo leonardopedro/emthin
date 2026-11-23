@@ -863,12 +863,9 @@ which transport is underneath.
   app source also compiles clean against `platforms/android-37.0/android.jar`,
   which is what makes the `MainActivity` wiring (`wss://host:port` plus a
   fixture-only CA file under the app's `files/`) typecheck.
-- **Gap.** The device step `./device-lane.sh gateway-wss` (opt-in as
-  `LANE_WSS=1`) has not run, because the APK cannot be rebuilt on this host
-  right now: the NDK `ld.lld` (x86_64, under box64) aborts with
-  `free(): invalid next size` while linking `emthin_pad`, so the installed APK
-  predates these Java sources. Pairing is also still a parser and registry —
-  there is no Paste/approve screen yet.
+- **Device step.** `./device-lane.sh gateway-wss` (opt-in as `LANE_WSS=1`)
+  now runs; see the 2026-11-23 record below for the linker bug that had blocked
+  the APK rebuild and for the measured result.
 
 ### Clean-install rerun of the device lane (2026-11-23)
 
@@ -881,6 +878,63 @@ checks, 0 failed**, `device lane: all steps passed`, and the installed
 `base.apk` md5-matched the build
 (`42a01ae938bf4a53b3cb669fa97bb067`). The normal path did not need the
 reinstall branch; the retry remains as the documented cure for a stale uid.
+
+### APK link repair, pairing screen, and the WSS device lane (2026-11-23)
+
+Two blockers stood between the Java WSS/pairing sources and a device verdict.
+
+- **The link step could not run on an aarch64 host.** `setup-box64-toolchain.sh`
+  shims the SDK's x86_64 `clang` through box64, which also put the NDK's
+  `ld.lld` under box64; that binary aborts (`free(): invalid next size (normal)`,
+  `ld.lld+0x34d45b5`, `clang-21: error: unable to execute command: Aborted`)
+  while linking `emthin_pad`. Fix: the clang/clang++ shims pass `--ld-path` to a
+  **native aarch64** `lld` (nixpkgs 21.1.8) resolved by setup and recorded in
+  `.toolchain/env.sh` as `EMTHIN_NATIVE_LLD`; the emulated driver still compiles,
+  only the link leaves box64. Setup now also finishes with a real `-shared`
+  link, so a broken `--ld-path` fails there rather than mid-build. Because a
+  nixpkgs weekly rename otherwise forces building a new SDK/glibc just to
+  regenerate four shims, setup reuses an existing `ANDROID_SDK_ROOT`,
+  `JAVA_HOME`, `EMTHIN_BOX64`, `EMTHIN_NATIVE_LLD`, and keeps the existing
+  x86_64 runtime farm when the freshly resolved
+  glibc/libcxx/libgcc/zlib paths are unbuilt. `./build-apk.sh` then completed all
+  six steps: `OK: build/emthin-pad.apk`, 28,750,309 bytes, debug-signed,
+  arm64-v8a.
+- **The fixture certificate could not be delivered to the app directory.** The
+  lane pushed `fixture-ca.pem` with `adb shell run-as`, which this container
+  refuses (`run-as: setegid(AID_PACKAGE_INFO) failed: Operation not permitted`:
+  the shell has no `CAP_SETGID`), and `/sdcard/Android/data` is denied to the
+  shell too. Fix: the PEM rides the launch intent as
+  `emthin.fixtureGatewayCaPem` (base64) and `MainActivity` writes it into
+  `getFilesDir()` itself. The certificate now also names `IP:127.0.0.1`, because
+  the pad dials the reversed port by address and the platform's HTTPS endpoint
+  identification rejected a `localhost`-only SAN (`gatewayLease error kind
+  transport` 17 ms after connect). The test manifest marks the package
+  `debuggable`, which is correct for a test APK even though `run-as` is unusable
+  here.
+- **Pairing screen.** `ActionCatalog` gained `PAIR` ("Pair gateway") in the
+  sessions menu; `MainActivity` gained `showPairing()` — the registry list
+  (`No gateways paired yet.` when empty, each row with its tailnet origin and a
+  Forget action), a `PASTE LINK` step that parses with `PairingLink` and starts
+  `PairingProtocol` on a worker that posts back to the main thread, a live
+  status line for pending/approved/denied/expired, and a `GatewayEndpoints`
+  store backed by `SharedPreferences` (`gatewayEndpoints`). Only an approved
+  answer for the pasted Core ID is stored; Forget removes the local row and does
+  not revoke on the host. No lease path consumes the registry yet — the lane
+  fixture still passes `emthin.fixtureGateway` directly.
+- **Verification.** `bash test-java.sh`: all suites pass, including
+  `ActionCatalogTest` (65 checks) and `GatewayPairingTest` (126) /
+  `WebSocketTest` (51). On device, the pairing dialog was driven by
+  `uiautomator`: `Pair a gateway`, the descriptor, `No gateways paired yet.`,
+  `CLOSE`/`PASTE LINK`, and the paste dialog's hint plus `PASTE`/`CANCEL`/`PAIR`
+  all render. Then `LANE_WSS=1 ./device-lane.sh e2e` from a fresh build: **220
+  checks, 0 failed**, `device lane: all steps passed`, installed `base.apk`
+  md5-matching the build (`2f96af48d82c49a7616e2a7916474334`). The `gateway-wss`
+  step's logcat shows `gatewayLease phase connect ... secure true`,
+  `gatewayLease resize cols 80 rows 24`, and `gatewayLease data bytes 41`
+  ending in `emthin gateway lease |t7 watch |$ ` — TLS handshake, `/v1/stream`
+  upgrade, watch attach, grid, and DATA all reached the native scene. T14's
+  device step is therefore verified; the remaining T14/T15 items (a real Go
+  gateway, tailnet, physical phone, OpenShell) are unchanged.
 
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 

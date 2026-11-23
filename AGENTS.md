@@ -608,6 +608,18 @@ the chosen ABI's `--target`, so rerun setup when switching device ABIs.
 It is idempotent and needs no edit after `nix flake update` because
 nothing is hash-pinned.
 
+The NDK's **emulated `ld.lld` crashes** on this host (`free(): invalid
+next size` from `ld.lld` while linking `emthin_pad`), so the clang shims
+pass `--ld-path` to a **native aarch64** `lld` from nixpkgs: the x86_64
+driver still compiles, and the link step never runs under box64. The
+self-check does a real `-shared` link, not just `clang --version`, so a
+broken `--ld-path` fails in setup instead of mid-build. Two more
+concessions keep re-provisioning cheap: an existing
+`ANDROID_SDK_ROOT`/`JAVA_HOME`/`EMTHIN_BOX64`/`EMTHIN_NATIVE_LLD` is
+reused, and the x86_64 runtime farm is left alone when a nixpkgs bump
+renames glibc/libcxx/libgcc/zlib into unbuilt store paths (re-deriving
+them would otherwise mean building an SDK to regenerate four shims).
+
 `build-apk.sh` resolves its toolchain as **environment →
 `.toolchain/env.sh` → hard-pinned store paths** — the pins are only a
 fallback for a host that can exec the SDK binaries natively, and they do
@@ -660,7 +672,14 @@ the box64 setup remains the local aarch64-host path.
   and Undo bounds with `uiautomator dump`, so its taps do not depend on
   pixel constants. The preview drag is sized from `wm size` unless `SWIPE_*`
   is set. `SKIP_BUILD=1` reuses the current APK for a capture-only visual
-  rerun; `DEVICE`/`ADB` override the target.
+  rerun; `DEVICE`/`ADB` override the target. `LANE_WSS=1` adds
+  `gateway-wss` (TLS handshake with the fixture CA, `/v1/stream` upgrade,
+  watch attach, 80×24 grid, gateway DATA) and can also be run alone as
+  `./device-lane.sh gateway-wss`. Its certificate names both `localhost`
+  and `IP:127.0.0.1`, and the PEM travels as launch data
+  (`emthin.fixtureGatewayCaPem`) because `run-as` is refused on this
+  container (no `CAP_SETGID`) and `/sdcard/Android/data` is denied; the
+  host-side equivalent is `emthin-android/wss-lane-check.sh`.
 
 ## Device tier — waydroid (measured 2026-10-19)
 
