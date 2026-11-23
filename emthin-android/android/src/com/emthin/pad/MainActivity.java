@@ -100,6 +100,7 @@ public class MainActivity extends Activity {
     private static final String PREF_DOCUMENT_HASH = "document_hash";
     private static final String PREF_DOCUMENT_SIZE = "document_size";
     private static final String PREF_DOCUMENT_MODIFIED = "document_modified";
+    private static final String PREF_GATEWAY_ENDPOINTS = "gatewayEndpoints";
 
     /** Translucent highlight over ranges the model resolved to segments. */
     private static final int SEGMENT_HIGHLIGHT = 0x3346B883;
@@ -292,6 +293,11 @@ public class MainActivity extends Activity {
     private String fixtureGatewayGeneration;
     private String fixtureGatewayCa;
     private GatewayLeaseClient gatewayLease;
+    /** Paired gateways, revalidated on every load; see {@link GatewayEndpoints}. */
+    private GatewayEndpoints gatewayEndpoints;
+    private boolean pairingInFlight;
+    private String pairingStatusText = "No gateway paired";
+    private LinearLayout pairingRows;
     private boolean gatewayReady;
     private boolean gatewayConnected;
     private boolean gatewayAttaching;
@@ -500,6 +506,39 @@ public class MainActivity extends Activity {
         fixtureGateway = testIntent.getStringExtra("emthin.fixtureGateway");
         fixtureGatewayGeneration = testIntent.getStringExtra("emthin.fixtureGatewayGeneration");
         fixtureGatewayCa = testIntent.getStringExtra("emthin.fixtureGatewayCa");
+        // A shell cannot write into this app's directory on the Waydroid image
+        // (run-as is refused without CAP_SETGID), so the lane can hand the
+        // fixture certificate over as launch data instead. Fixture-only: the
+        // production path is a public CA through the platform trust store.
+        String fixtureGatewayCaPem = testIntent.getStringExtra("emthin.fixtureGatewayCaPem");
+        if ((fixtureGatewayCa == null || fixtureGatewayCa.trim().isEmpty())
+                && fixtureGatewayCaPem != null && !fixtureGatewayCaPem.trim().isEmpty()) {
+            try {
+                byte[] pem = Base64.decode(fixtureGatewayCaPem.trim(), Base64.DEFAULT);
+                java.io.File ca = new java.io.File(getFilesDir(), "fixture-ca.pem");
+                java.io.FileOutputStream out = new java.io.FileOutputStream(ca);
+                try {
+                    out.write(pem);
+                } finally {
+                    out.close();
+                }
+                fixtureGatewayCa = ca.getAbsolutePath();
+            } catch (Exception e) {
+                trace("gatewayLease", "phase", "failed", "reason", "ca",
+                        "detail", String.valueOf(e.getMessage()));
+            }
+        }
+        gatewayEndpoints = new GatewayEndpoints(new GatewayEndpoints.Store() {
+            @Override public String read() {
+                return prefs().getString(PREF_GATEWAY_ENDPOINTS, "");
+            }
+
+            @Override public void write(String value) {
+                prefs().edit().putString(PREF_GATEWAY_ENDPOINTS, value).apply();
+            }
+        });
+        int paired = gatewayEndpoints.list().size();
+        if (paired > 0) pairingStatusText = paired == 1 ? "1 gateway paired" : paired + " gateways paired";
         sessionPinFixturePending = testIntent.getBooleanExtra("emthin.fixtureSessionPin", false);
         figureA11yFixturePending = testIntent.getBooleanExtra("emthin.fixtureFigureA11y", false);
         vtSceneFixturePending = testIntent.getBooleanExtra("emthin.fixtureVtScene", false);
@@ -4445,6 +4484,7 @@ public class MainActivity extends Activity {
             case ZOOM_IN: changeViewZoom(0.5f); break;
             case CLOSE_INSPECTOR: closeInspector(); break;
             case SESSIONS: showSessions(); break;
+            case PAIR: showPairing(); break;
             case SHARE_OPEN: shareOpen(); break;
             case SHARE_JOIN: shareJoin(); break;
             case SHARE_LEAVE: shareLeave(); break;
@@ -5456,6 +5496,215 @@ public class MainActivity extends Activity {
     }
 
     /** The Sessions surface: public references and their available actions. */
+    // ----- gateway pairing (paste link) -----------------------------------
+
+    /**
+     * The Paste-link screen. Pairing itself runs off the UI thread; the status
+     * line is the state machine (pending, approved, denied, expired, forbidden,
+     * mismatched, unavailable) and only an approved answer adds a row.
+     */
+    private void showPairing() {
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setPadding(dp(12), dp(8), dp(12), dp(12));
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(rows);
+        pairingRows = rows;
+        AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Pair a gateway")
+                .setView(scroll)
+                .setPositiveButton("Paste link", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int which) { showPasteLink(); }
+                })
+                .setNegativeButton("Close", null)
+                .create();
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface d) { pairingRows = null; }
+        });
+        renderPairingRows();
+        dialog.show();
+        trace("gatewayPair", "phase", "screen");
+    }
+
+    private void renderPairingRows() {
+        LinearLayout rows = pairingRows;
+        if (rows == null) return;
+        rows.removeAllViews();
+        rows.addView(panelLabel("Pairing is approved on the host. Only an approved answer for the Core ID in the link is stored."));
+        TextView status = panelLabel(pairingStatusText);
+        status.setContentDescription(pairingStatusText);
+        rows.addView(status);
+        List<GatewayEndpoints.Endpoint> known = gatewayEndpoints == null
+                ? new ArrayList<GatewayEndpoints.Endpoint>() : gatewayEndpoints.list();
+        if (known.isEmpty()) {
+            rows.addView(panelLabel("No gateways paired yet."));
+            return;
+        }
+        for (final GatewayEndpoints.Endpoint endpoint : known) {
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(0, dp(8), 0, dp(8));
+            TextView heading = panelLabel(endpoint.name + " \u00b7 " + endpoint.host);
+            heading.setContentDescription(endpoint.name + ", " + endpoint.host);
+            card.addView(heading);
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            actions.addView(shortcut("Forget", new Runnable() {
+                @Override public void run() { forgetEndpoint(endpoint); }
+            }));
+            card.addView(actions);
+            rows.addView(card);
+        }
+    }
+
+    /** Forget removes the row here; it never revokes anything on the host. */
+    private void forgetEndpoint(GatewayEndpoints.Endpoint endpoint) {
+        if (gatewayEndpoints == null) return;
+        gatewayEndpoints.remove(endpoint.host);
+        setPairingStatus("Forgot " + endpoint.name + " \u2014 revoke the grant on the host to complete this");
+        trace("gatewayPair", "phase", "forget", "host", endpoint.host);
+    }
+
+    private void showPasteLink() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(8), dp(16), dp(4));
+        final EditText field = new EditText(this);
+        field.setHint("https://host.tailnet.ts.net/pair?v=1&core=\u2026");
+        field.setSingleLine(false);
+        field.setMaxLines(3);
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        box.addView(field);
+        final TextView error = panelLabel("");
+        box.addView(error);
+        final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Paste pairing link")
+                .setView(box)
+                .setPositiveButton("Pair", null)
+                .setNeutralButton("Paste", null)
+                .setNegativeButton("Cancel", null)
+                .create();
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface d) {
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        String text = clipText();
+                        if (text != null && !text.trim().isEmpty()) field.setText(text.trim());
+                        field.setSelection(field.getText().length());
+                    }
+                });
+                // The positive button is overridden so a rejected link keeps
+                // the field open with the reason instead of closing.
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        PairingLink link;
+                        try {
+                            link = PairingLink.parse(field.getText().toString());
+                        } catch (IllegalArgumentException e) {
+                            error.setText("Link not accepted: " + e.getMessage());
+                            trace("gatewayPair", "phase", "rejected", "reason", e.getMessage());
+                            return;
+                        }
+                        dialog.dismiss();
+                        startPairing(link);
+                    }
+                });
+            }
+        });
+        dialog.show();
+    }
+
+    private String clipText() {
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard == null || !clipboard.hasPrimaryClip() || clipboard.getPrimaryClip() == null
+                || clipboard.getPrimaryClip().getItemCount() == 0) return null;
+        CharSequence value = clipboard.getPrimaryClip().getItemAt(0).coerceToText(this);
+        return value == null ? null : value.toString();
+    }
+
+    private void startPairing(final PairingLink link) {
+        if (pairingInFlight) {
+            setPairingStatus("A pairing request is already waiting for approval");
+            return;
+        }
+        pairingInFlight = true;
+        setPairingStatus("Pending on " + link.displayName() + " \u2014 approve this device on the host");
+        trace("gatewayPair", "phase", "request", "host", link.host, "core", link.coreId);
+        new Thread(new Runnable() {
+            @Override public void run() {
+                HttpsGatewayHttp http = new HttpsGatewayHttp();
+                try {
+                    PairingProtocol.Result result = PairingProtocol.start(http, link);
+                    while (!result.state.terminal()) {
+                        final int expires = result.expiresInS;
+                        main.post(new Runnable() {
+                            @Override public void run() {
+                                setPairingStatus("Pending on " + link.displayName()
+                                        + (expires > 0
+                                        ? " \u2014 approve this device on the host (" + expires + "s)"
+                                        : " \u2014 approve this device on the host"));
+                            }
+                        });
+                        Thread.sleep(PairingProtocol.POLL_MS);
+                        result = PairingProtocol.poll(http, link, result.requestId);
+                    }
+                    final PairingProtocol.Result done = result;
+                    main.post(new Runnable() {
+                        @Override public void run() { completePairing(link, done); }
+                    });
+                } catch (Exception e) {
+                    main.post(new Runnable() {
+                        @Override public void run() {
+                            pairingInFlight = false;
+                            setPairingStatus("Unavailable \u2014 " + link.displayName() + " did not answer");
+                            trace("gatewayPair", "phase", "unavailable", "host", link.host);
+                        }
+                    });
+                }
+            }
+        }, "gateway-pairing").start();
+    }
+
+    private void completePairing(PairingLink link, PairingProtocol.Result result) {
+        pairingInFlight = false;
+        switch (result.state) {
+            case APPROVED:
+                if (gatewayEndpoints != null
+                        && gatewayEndpoints.add(link.host, link.coreId, link.displayName())) {
+                    setPairingStatus("Approved \u2014 " + link.displayName() + " is paired");
+                } else {
+                    setPairingStatus("Approved, but the link could not be stored");
+                }
+                break;
+            case DENIED:
+                setPairingStatus("Denied \u2014 the host refused this device");
+                break;
+            case EXPIRED:
+                setPairingStatus("Expired \u2014 the request timed out; start again");
+                break;
+            case FORBIDDEN:
+                setPairingStatus("Forbidden \u2014 this network is not allowed to pair");
+                break;
+            case CORE_MISMATCH:
+                setPairingStatus("Mismatched \u2014 the host approved a different Core");
+                break;
+            case UNAVAILABLE:
+                setPairingStatus("Unavailable \u2014 the host is offline or rate limiting");
+                break;
+            default:
+                setPairingStatus("Invalid \u2014 the host's reply was not understood");
+                break;
+        }
+        trace("gatewayPair", "phase", result.describe(), "host", link.host,
+                "state", result.state.name());
+    }
+
+    private void setPairingStatus(String text) {
+        pairingStatusText = text;
+        renderPairingRows();
+    }
+
     private void showSessions() {
         ScrollView scroll = new ScrollView(this);
         LinearLayout rows = new LinearLayout(this);

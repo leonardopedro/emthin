@@ -9,7 +9,8 @@ public final class ActionCatalog {
         FIND_PREVIOUS, NAVIGATE_LAST, NAVIGATE_REFERENCES, NAVIGATE_SECTIONS,
         NAV_BACK, NAV_FORWARD, FOLD, MARKERS, READING_SMALLER, READING_LARGER,
         ZOOM_OUT, ZOOM_IN, CLOSE_INSPECTOR, SESSIONS,
-        SHARE_OPEN, SHARE_JOIN, SHARE_LEAVE, SHARE_WATCH, PROOF, HISTORY, DIAGNOSTICS
+        SHARE_OPEN, SHARE_JOIN, SHARE_LEAVE, SHARE_WATCH, PROOF, HISTORY, DIAGNOSTICS,
+        PAIR
     }
 
     public static final Id[] TOOLBAR = {Id.OPEN, Id.SAVE, Id.UNDO, Id.FIND, Id.EDIT_SOURCE};
@@ -21,7 +22,7 @@ public final class ActionCatalog {
         Id.CLOSE_INSPECTOR
     };
     public static final Id[] SESSIONS_MENU = {
-        Id.SESSIONS, Id.SHARE_OPEN, Id.SHARE_JOIN, Id.SHARE_LEAVE, Id.SHARE_WATCH, Id.PROOF
+        Id.SESSIONS, Id.PAIR, Id.SHARE_OPEN, Id.SHARE_JOIN, Id.SHARE_LEAVE, Id.SHARE_WATCH, Id.PROOF
     };
 
     public static String label(Id id, boolean markersVisible) {
@@ -50,6 +51,7 @@ public final class ActionCatalog {
             case ZOOM_IN: return "Zoom in";
             case CLOSE_INSPECTOR: return "Show document";
             case SESSIONS: return "Sessions";
+            case PAIR: return "Pair gateway";
             case SHARE_OPEN: return "Share document";
             case SHARE_JOIN: return "Join share";
             case SHARE_LEAVE: return "Leave share";
