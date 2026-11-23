@@ -478,20 +478,30 @@ passes, so the local evidence is recorded rather than deferred.
 | T11 | Verified | `cargo test -p herdr-gateway-fixtures` (5 tests) and `validate-herdr-gateway-fixtures` print `validated 32 Herdr gateway v1 fixtures`. |
 | T12 | Fixture-only | `fixtures/herdr-gateway-v1/lease_fixture.py` driven end to end on the Waydroid device: watch attach → authoritative grid → DATA → Take control → controller input round trip → operator revoke → fresh lease. `emthin-collab` (66 + 23 tests) and `emthin-core-client` (1 + 1) cover the local adapters. Gap: no Go gateway, so no credit-preserving relay, writer handoff, denied-target channel reuse or stalled-client isolation. |
 | T13 | Gap | No Tailscale/tsnet identity, approval CLI or pairing service lives in this repository, and no test tailnet was exercised. |
-| T14 | Gap | The pad's transport is the plain TCP fixture connection. No WSS endpoint registry, paste-pairing UI or certificate-failure lane exists yet. |
+| T14 | Partly verified (host only) | The WSS transport, pairing parser/state machine and endpoint registry exist and are exercised on the host JVM: `emthin-android/test-java.sh` adds `GatewayPairingTest` (126 checks) and `WebSocketTest` (51 checks — a real TLS round trip plus the plain-HTTP, unknown-certificate and wrong-hostname failures). `emthin-android/wss-lane-check.sh` runs `fixtures/herdr-gateway-v1/wss_fixture.py` (the same scripted Core behind TLS/WebSocket) against `WssTransport` via `WssFixtureProbe` (9 checks: upgrade, hello, control attach, lease, 80×24 grid, banner). Gap: `./device-lane.sh gateway-wss` has **not** run — the APK cannot be rebuilt on this host (the NDK `ld.lld` binary under box64 aborts while linking), so the installed APK predates these sources; and pairing is a parser + registry, not a Paste/approve screen (`MainActivity` still has no pairing UI). QR scanning is T15. |
 | T15 | Gap | Needs T13–T14 and a physical arm64 phone; this run used the Waydroid container, which is not a pairing target. |
 | T16 | Gap | No OpenShell fleet or gateway host registry is available here, so no real session could be enrolled. |
 
 Run A of the [acceptance run](HERDR_ACCEPTANCE_RUN.md) is exercised by
 `emthin-android/device-lane.sh e2e`: **215 checks, 0 failed** on 2026-11-23
 (persistence, sessions pin, figure accessibility, terminal scene, reflow,
-pages and lease). Run B — two paired test hosts over Tailscale with no SSH —
-remains a hardware and deployment gap and was not attempted.
+pages and lease), re-run the same day from a clean install (package
+uninstalled first, `SKIP_BUILD=1`, installed APK md5-matched to the build).
+Run B — two paired test hosts over Tailscale with no SSH — remains a hardware
+and deployment gap and was not attempted.
 
-`scripts/check-herdr-inputs` was not part of this verdict: it did not finish in
-three minutes on this host (it reads sibling checkouts and the Nix inputs), so
-there is no recorded result for it here. Treat that validator as unrun rather
-than passing.
+The WSS device step is wired but opt-in: `LANE_WSS=1 ./device-lane.sh e2e`
+(or `./device-lane.sh gateway-wss` alone). It is off by default because it needs
+an APK built from the transport sources, and this host's NDK link currently
+crashes under box64 (`free(): invalid next size` from `ld.lld` while linking),
+so the installed APK would silently fall back to plain TCP. The transport's own
+checks run on the host instead (`test-java.sh`, `wss-lane-check.sh`).
+
+`scripts/check-herdr-inputs` **fails** here (0.2 s): `velysterm` is at
+`00f24a7` against pinned `423a8c4` and `openshell` at `a0a1d2d` against pinned
+`b98d464`; `herdr` and `herdr-core` match, with `herdr-core` dirty only by a
+local `crates/ghostty-vt/src/lib.rs` edit. Those sibling checkouts are outside
+this tree, so the drifts are recorded rather than reverted.
 
 ## T17–T22. OpenShell launch, sharing and old Herdr
 

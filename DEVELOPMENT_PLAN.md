@@ -822,6 +822,66 @@ hide lives on the open paths instead. Verified: those three steps plus
 `device-lane.sh e2e` run — **215 checks, 0 failed** — with the installed APK
 md5-matching the build.
 
+### WSS transport and paste pairing for T14 (2026-11-23)
+
+The pad's gateway connection was plain TCP to the scripted fixture, which is
+why T14 read as a gap: no TLS, no endpoint registry, no pairing parser. That
+is now implemented in plain Java (no new dependency) behind one seam,
+`GatewayTransport` — a byte stream in, one emthin frame per `send` — so
+`GatewayLeaseClient`'s framing, lease and revocation logic is unchanged by
+which transport is underneath.
+
+- **Transport.** `WssTransport` upgrades `GET /v1/stream` with subprotocol
+  `emthin-terminal.v1` over an `SSLSocket` whose `SSLParameters` carry the
+  `HTTPS` endpoint-identification algorithm (so hostname checks are the
+  platform's), then frames with `WebSocketFrame` (masked binary only, 64 KiB
+  cap, fragmented messages reassembled, ping answered, 20 s idle ping, two
+  silent periods end the stream). `WebSocketHandshake` fails closed on any
+  status other than 101, a redirect, a repeated header, a mismatched accept
+  key, a different or missing subprotocol, or an unsolicited extension.
+- **Pairing.** `PairingLink` parses the pasted QR text with the contract's
+  rules (https, `<host>.<tailnet>.ts.net`, port 443, exact `/pair`, exactly `v`
+  and `core`, no credentials/fragment/IP literal, 1 KiB cap) and deliberately
+  trims surrounding whitespace but rejects embedded control characters, because
+  pasting from a chat app appends a newline. `PairingProtocol` maps every
+  status the contract names to a state — pending, approved, denied, expired,
+  forbidden, core mismatch, unavailable — and calls an approval for another
+  Core ID a mismatch rather than a success. `GatewayEndpoints` keeps at most 16
+  rows and revalidates each on load, so a hand-edited registry cannot smuggle a
+  non-tailnet origin into the connection path.
+- **Fixture.** `fixtures/herdr-gateway-v1/wss_fixture.py` reuses
+  `lease_fixture.Gateway` verbatim by handing it a socket-shaped object whose
+  `recv`/`sendall` ride WebSocket binary messages, so there is still exactly
+  one implementation of the protocol and only the transport varies.
+- **Evidence (host).** `emthin-android/test-java.sh` now runs
+  `GatewayPairingTest` (126 checks) and `WebSocketTest` (51 checks, including a
+  real TLS round trip against an in-process server and the plain-HTTP,
+  unknown-certificate and wrong-hostname failures).
+  `emthin-android/wss-lane-check.sh` generates a certificate, starts the WSS
+  fixture and drives it with the pad's own transport (`WssFixtureProbe`, 9
+  checks: upgrade → hello → control attach → lease → 80×24 → banner). The whole
+  app source also compiles clean against `platforms/android-37.0/android.jar`,
+  which is what makes the `MainActivity` wiring (`wss://host:port` plus a
+  fixture-only CA file under the app's `files/`) typecheck.
+- **Gap.** The device step `./device-lane.sh gateway-wss` (opt-in as
+  `LANE_WSS=1`) has not run, because the APK cannot be rebuilt on this host
+  right now: the NDK `ld.lld` (x86_64, under box64) aborts with
+  `free(): invalid next size` while linking `emthin_pad`, so the installed APK
+  predates these Java sources. Pairing is also still a parser and registry —
+  there is no Paste/approve screen yet.
+
+### Clean-install rerun of the device lane (2026-11-23)
+
+The 2026-11-23 lane record above was produced on an installed package. Because
+`terminal_lease_check` can now uninstall and reinstall to cure a dead uid, the
+lane was re-run from a clean install: `pm uninstall com.emthin.pad.test`, then
+`SKIP_BUILD=1 ./device-lane.sh e2e` (no source or Java file newer than the built
+APK, so `SKIP_BUILD` is sound evidence for the lease change). Result: **215
+checks, 0 failed**, `device lane: all steps passed`, and the installed
+`base.apk` md5-matched the build
+(`42a01ae938bf4a53b3cb669fa97bb067`). The normal path did not need the
+reinstall branch; the retry remains as the documented cure for a stale uid.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the
