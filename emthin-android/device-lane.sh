@@ -76,6 +76,13 @@
 #   terminal-reflow  streaming scene -> view zoom -> page rebuild -> grid
 #                reflow -> continued animation after a pan
 #                (used by e2e; requires the disposable test APK)
+#   pairing      paste a tailnet link -> pending -> approve through the TLS
+#                fixture's admin socket -> row stored across a relaunch ->
+#                Forget (LANE_WSS=1; requires the disposable test APK, python3
+#                and openssl)
+#   gateway-wss  TLS -> upgrade -> watch attach -> grid -> banner, then the
+#                same without a generation so sessions.list supplies it
+#                (LANE_WSS=1; requires the disposable test APK and python3)
 #   e2e          authorize, connect, build, install, launch, screencap,
 #                swipe, screencap, logcat, persistence, new-reset,
 #                scroll-anchor, search-replace, focus-stack, composing-ime,
@@ -2328,6 +2335,9 @@ WSS_PORT=${WSS_PORT:-47658}
 WSS_ADMIN_PORT=${WSS_ADMIN_PORT:-47659}
 WSS_DIR=""
 WSS_PID=""
+# The scripted Core's ID (lease_fixture.CORE_ID): the fixture only approves a
+# pairing request that names it.
+PAIR_CORE=6ab09a20fd1288983dfbbac2bb349231
 
 start_wss_fixture() {
     command -v openssl >/dev/null 2>&1 || {
@@ -2392,6 +2402,12 @@ stop_wss_fixture() {
     fi
     rm -rf "$WSS_DIR"
     WSS_DIR=""
+}
+
+wss_admin() {
+    (exec 3<>/dev/tcp/127.0.0.1/$WSS_ADMIN_PORT
+     printf '%s\n' "$1" >&3
+     cat <&3) 2>/dev/null
 }
 
 wss_lease_launch() {
@@ -2467,6 +2483,158 @@ cmd_gateway_wss() {
     wait_for_log "$log" 'gatewayLease data .*gateway lease' \
         || { fail "DATA did not follow the discovered generation"; stop_wss_fixture; return 1; }
     pass "the pad discovered the generation through sessions.list"
+    stop_wss_fixture
+}
+
+# `tap_toolbar_menu` dumps the hierarchy immediately after each tap, which is
+# too fast for the sessions submenu's enter animation; this opener waits for
+# each popup instead and proves the pairing dialog is the next thing on screen.
+pair_open() {
+    local ui="$1" bounds
+    # node_bounds reads the last dump, so there has to be one for this screen.
+    cmd_uidump "$ui" >/dev/null || return 1
+    bounds=$(node_bounds 'content-desc="More actions"') || return 1
+    tap_center "$bounds"
+    sleep 0.8
+    cmd_uidump "$ui" >/dev/null || return 1
+    bounds=$(node_bounds 'text="Sessions and sharing"') || return 1
+    tap_center "$bounds"
+    sleep 0.8
+    cmd_uidump "$ui" >/dev/null || return 1
+    bounds=$(node_bounds 'text="Pair gateway"') || return 1
+    tap_center "$bounds"
+    sleep 0.8
+    cmd_uidump "$ui" >/dev/null || return 1
+    node_bounds 'text="PASTE LINK"' >/dev/null
+}
+
+# The pairing screen end to end against the TLS fixture. The link is a real
+# tailnet link — production parse and validation — and only its origin is
+# remapped to loopback by `emthin.fixturePairBase`.
+cmd_pairing() {
+    local ui="$OUTDIR/pairing-ui.xml"
+    local log="$OUTDIR/pairing-logcat.txt"
+    local link="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
+    local bounds
+    say "==> pairing: paste link -> pending -> approve -> stored -> forget"
+    mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
+    cmd_clear_data || return
+    if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
+
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" \
+            --es emthin.fixturePairBase "https://127.0.0.1:$WSS_PORT" \
+            --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" >/dev/null 2>&1; then
+        fail "launch the pad against the pairing fixture"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "launched the pad against the pairing fixture"
+    sleep 3
+
+    if ! pair_open "$ui"; then
+        fail "open the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="No gateways paired yet."' "$ui"; then
+        fail "a fresh registry does not report itself empty"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the pairing screen starts with an empty registry"
+
+    bounds=$(node_bounds 'text="PASTE LINK"') \
+        || { fail "Paste link is missing"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    bounds=$(node_bounds 'class="android.widget.EditText"') \
+        || { fail "the link field is missing"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    sleep 0.5
+    if ! D shell "input text '$link'" >/dev/null 2>&1; then
+        fail "type the pairing link"
+        stop_wss_fixture
+        return 1
+    fi
+    sleep 0.5
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'fleet.leo.ts.net/pair?v=1' "$ui"; then
+        fail "the typed link did not reach the field"
+        stop_wss_fixture
+        return 1
+    fi
+    bounds=$(node_bounds 'text="PAIR"') \
+        || { fail "Pair is missing"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
+        fail "the pasted link did not open a pairing request"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the pasted link opened a pairing request"
+
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'Pending on fleet' "$ui"; then
+        fail "the screen does not show the request as pending"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the screen shows the request waiting for the host"
+
+    wss_admin "pair approve" >/dev/null 2>&1 || true
+    if ! wait_for_log "$log" 'gatewayPair phase approved host fleet.leo.ts.net'; then
+        fail "the approved answer did not arrive"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the approval arrived through the poll"
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net"' "$ui"; then
+        fail "the approved endpoint is not listed"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the approved endpoint is listed"
+
+    # The registry is SharedPreferences state, so it has to survive a launch
+    # with no fixture extras at all.
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" >/dev/null 2>&1; then
+        fail "relaunch the pad"
+        stop_wss_fixture
+        return 1
+    fi
+    sleep 3
+    if ! pair_open "$ui"; then
+        fail "reopen the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net"' "$ui"; then
+        fail "the paired endpoint did not survive a relaunch"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the paired endpoint survived a relaunch"
+
+    bounds=$(node_bounds 'text="Forget"') \
+        || { fail "Forget is missing"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'gatewayPair phase forget host fleet.leo.ts.net'; then
+        fail "Forget did not remove the row"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'text="No gateways paired yet."' "$ui"; then
+        fail "the registry still lists the forgotten endpoint"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "Forget removed the local row"
     stop_wss_fixture
 }
 
@@ -2761,6 +2929,7 @@ cmd_e2e() {
     # sources, and until the NDK link works again the installed APK predates
     # them, so enabling it by default would only fail on a stale binary.
     if [ "${LANE_WSS:-0}" = "1" ]; then
+        cmd_pairing
         cmd_gateway_wss
     fi
 
@@ -3010,6 +3179,7 @@ case "$cmd" in
     terminal-pages) cmd_terminal_pages ;;
     terminal-lease) cmd_terminal_lease ;;
     gateway-wss) cmd_gateway_wss ;;
+    pairing)   cmd_pairing ;;
     austral-rule) cmd_austral_rule ;;
     history-preview) cmd_history_preview ;;
     e2e)       cmd_e2e ;;

@@ -292,6 +292,8 @@ public class MainActivity extends Activity {
     private String fixtureGateway;
     private String fixtureGatewayGeneration;
     private String fixtureGatewayCa;
+    /** Lane-only origin for pairing HTTP; the link still parses as a tailnet one. */
+    private String fixturePairBase;
     private GatewayLeaseClient gatewayLease;
     /** Paired gateways, revalidated on every load; see {@link GatewayEndpoints}. */
     private GatewayEndpoints gatewayEndpoints;
@@ -506,6 +508,7 @@ public class MainActivity extends Activity {
         fixtureGateway = testIntent.getStringExtra("emthin.fixtureGateway");
         fixtureGatewayGeneration = testIntent.getStringExtra("emthin.fixtureGatewayGeneration");
         fixtureGatewayCa = testIntent.getStringExtra("emthin.fixtureGatewayCa");
+        fixturePairBase = testIntent.getStringExtra("emthin.fixturePairBase");
         // A shell cannot write into this app's directory on the Waydroid image
         // (run-as is refused without CAP_SETGID), so the lane can hand the
         // fixture certificate over as launch data instead. Fixture-only: the
@@ -5607,6 +5610,10 @@ public class MainActivity extends Activity {
                         }
                         dialog.dismiss();
                         startPairing(link);
+                        // The request's state is reported on the pairing screen,
+                        // and showing the paste field dismissed it; bring it
+                        // back rather than pairing with nothing on screen.
+                        showPairing();
                     }
                 });
             }
@@ -5633,8 +5640,15 @@ public class MainActivity extends Activity {
         trace("gatewayPair", "phase", "request", "host", link.host, "core", link.coreId);
         new Thread(new Runnable() {
             @Override public void run() {
-                HttpsGatewayHttp http = new HttpsGatewayHttp();
                 try {
+                    HttpsGatewayHttp http;
+                    if (fixturePairBase == null || fixturePairBase.trim().isEmpty()) {
+                        http = new HttpsGatewayHttp();
+                    } else {
+                        http = new HttpsGatewayHttp(fixturePairBase.trim(),
+                                PemTrust.load(fixtureGatewayCa == null
+                                        ? "" : fixtureGatewayCa.trim()));
+                    }
                     PairingProtocol.Result result = PairingProtocol.start(http, link);
                     while (!result.state.terminal()) {
                         final int expires = result.expiresInS;

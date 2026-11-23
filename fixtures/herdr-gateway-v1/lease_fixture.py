@@ -333,6 +333,14 @@ def admin_client(gateway, conn):
             reply = gateway.revoke()
         elif command == "status":
             reply = gateway.status()
+        elif command.startswith("pair "):
+            # Pairing lives on the TLS fixture (`wss_fixture.py`); a plain-TCP
+            # gateway has none, and says so instead of pretending to approve.
+            pairing = getattr(gateway, "pairing", None)
+            if pairing is None:
+                reply = {"error": "pairing not enabled"}
+            else:
+                reply = pairing.admin(command.split(" ", 1)[1].strip())
         else:
             reply = {"error": "unknown command"}
         conn.sendall((json.dumps(reply, separators=(",", ":")) + "\n").encode())

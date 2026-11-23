@@ -13,14 +13,17 @@ Usage:
         --cert cert.pem --key key.pem
 
 The certificate is presented as-is: a test client trusts it explicitly.  This
-fixture does not implement pairing, tailnet names, or the Core upstream; it
-speaks the stream half of docs/HERDR_GATEWAY_V1.md so the pad's TLS, upgrade,
-framing and lease logic can be exercised end to end.
+fixture does not implement tailnet names or the Core upstream; it speaks the
+stream half of docs/HERDR_GATEWAY_V1.md so the pad's TLS, upgrade, framing and
+lease logic can be exercised end to end, plus `/v1/pair` so the pairing screen
+can be driven against a peer that answers pending until the admin socket says
+`pair approve` or `pair deny`.
 """
 
 import argparse
 import base64
 import hashlib
+import json
 import socket
 import ssl
 import struct
@@ -34,6 +37,7 @@ import lease_fixture  # noqa: E402  (path is set up directly above)
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 SUBPROTOCOL = "emthin-terminal.v1"
 PATH = "/v1/stream"
+PAIR_PATH = "/v1/pair"
 MAX_HEAD = 8 * 1024
 MAX_MESSAGE = 64 * 1024
 
@@ -181,6 +185,120 @@ def encode(opcode, payload, mask):
     return bytes(out)
 
 
+class Pairing:
+    """`POST /v1/pair` and `GET /v1/pair/<id>` from the v1 contract.
+
+    A create answers pending and stays there until the admin socket answers
+    `pair approve` or `pair deny`. A lane needs that split: the screen has to
+    show a pending request before it can show the approval, and a fixture that
+    approved on its own would leave the pending state unobservable.
+    """
+
+    def __init__(self, core_id):
+        self.core_id = core_id
+        self.lock = threading.Lock()
+        self.requests = {}
+        self.next_id = 1
+        self.decision = None
+
+    def create(self, core_id):
+        with self.lock:
+            if core_id != self.core_id:
+                return 409, {"error": {"kind": "core_mismatch"}}
+            request_id = "pair-{}".format(self.next_id)
+            self.next_id += 1
+            self.decision = None
+            self.requests[request_id] = "pending"
+            return 202, self._body("pending", request_id)
+
+    def poll(self, request_id):
+        with self.lock:
+            if request_id not in self.requests:
+                return 404, {"error": {"kind": "expired"}}
+            if self.decision in ("approved", "denied"):
+                self.requests[request_id] = self.decision
+            return 200, self._body(self.requests[request_id], request_id)
+
+    def admin(self, action):
+        with self.lock:
+            if action == "approve":
+                self.decision = "approved"
+            elif action == "deny":
+                self.decision = "denied"
+            else:
+                return {"state": self.decision or "idle",
+                        "requests": sorted(self.requests)}
+            return {"state": self.decision, "requests": sorted(self.requests)}
+
+    def _body(self, state, request_id):
+        return {"state": state, "request_id": request_id,
+                "core_id": self.core_id,
+                "expires_in_s": 120 if state == "pending" else 0}
+
+
+def respond(sock, status, payload):
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    reason = {200: "OK", 202: "Accepted", 400: "Bad Request", 404: "Not Found",
+              405: "Method Not Allowed", 409: "Conflict"}.get(status, "Error")
+    head = ("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n"
+            "Cache-Control: no-store\r\nContent-Length: {}\r\n"
+            "Connection: close\r\n\r\n").format(status, reason, len(body))
+    sock.sendall(head.encode("iso-8859-1") + body)
+
+
+def header_value(head, name):
+    for line in head.split("\r\n")[1:]:
+        field, _, value = line.partition(":")
+        if field.strip().lower() == name:
+            return value.strip()
+    return None
+
+
+def read_body(sock, head, rest):
+    raw = header_value(head, "content-length") or "0"
+    try:
+        length = int(raw)
+    except ValueError:
+        raise ValueError("bad content-length")
+    if length < 0 or length > MAX_HEAD:
+        raise ValueError("request body too large")
+    body = bytearray(rest)
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            raise ConnectionError("peer closed during the request body")
+        body.extend(chunk)
+    return bytes(body[:length])
+
+
+def serve_pairing(sock, pairing, method, path, head, rest):
+    if path == PAIR_PATH:
+        if method != "POST":
+            respond(sock, 405, {"error": {"kind": "method"}})
+            return
+        try:
+            request = json.loads(read_body(sock, head, rest).decode("utf-8") or "{}")
+        except (UnicodeDecodeError, ValueError):
+            respond(sock, 400, {"error": {"kind": "invalid"}})
+            return
+        if not isinstance(request, dict) or request.get("version") != 1:
+            respond(sock, 400, {"error": {"kind": "version"}})
+            return
+        core_id = request.get("core_id")
+        if not isinstance(core_id, str):
+            respond(sock, 400, {"error": {"kind": "core_id"}})
+            return
+        status, body = pairing.create(core_id)
+        respond(sock, status, body)
+        return
+    prefix = PAIR_PATH + "/"
+    if path.startswith(prefix) and method == "GET":
+        status, body = pairing.poll(path[len(prefix):])
+        respond(sock, status, body)
+        return
+    respond(sock, 404, {"error": {"kind": "not_found"}})
+
+
 def read_head(sock):
     data = bytearray()
     while b"\r\n\r\n" not in data:
@@ -194,8 +312,7 @@ def read_head(sock):
     return head.decode("iso-8859-1"), rest
 
 
-def upgrade(sock):
-    head, rest = read_head(sock)
+def upgrade(sock, head, rest):
     lines = head.split("\r\n")
     if not lines or not lines[0].startswith("GET "):
         raise ValueError("not a GET")
@@ -237,12 +354,25 @@ def upgrade(sock):
     return rest
 
 
-def serve_channel(gateway, sock, address):
+def serve_connection(gateway, pairing, sock, address):
+    """Dispatch one TLS connection: the stream upgrade or an HTTP pairing call."""
     try:
-        leftover = upgrade(sock)
-        channel = Channel(sock)
-        channel.buffer.extend(leftover)
-        gateway.serve(channel, address)
+        head, rest = read_head(sock)
+        request = head.split("\r\n", 1)[0].split(" ")
+        method = request[0] if request else ""
+        path = request[1] if len(request) > 1 else ""
+        if path == PATH:
+            if method != "GET":
+                respond(sock, 405, {"error": {"kind": "method"}})
+                return
+            leftover = upgrade(sock, head, rest)
+            channel = Channel(sock)
+            channel.buffer.extend(leftover)
+            gateway.serve(channel, address)
+        elif path == PAIR_PATH or path.startswith(PAIR_PATH + "/"):
+            serve_pairing(sock, pairing, method, path, head, rest)
+        else:
+            respond(sock, 404, {"error": {"kind": "not_found"}})
     except (ValueError, ConnectionError, OSError):
         try:
             sock.close()
@@ -274,6 +404,9 @@ def main():
     admin.listen(4)
 
     gateway = lease_fixture.Gateway()
+    # The admin socket reaches pairing through the gateway object, so the shared
+    # `revoke`/`status` handlers stay exactly as they are.
+    gateway.pairing = Pairing(gateway.core_id)
     threading.Thread(target=lease_fixture.admin_loop, args=(gateway, admin),
                      daemon=True).start()
     print("wss fixture listening {} admin {}".format(args.listen, args.admin),
@@ -285,7 +418,8 @@ def main():
             except ssl.SSLError:
                 # A client that rejects our certificate is not a fixture fault.
                 continue
-            threading.Thread(target=serve_channel, args=(gateway, conn, address),
+            threading.Thread(target=serve_connection,
+                             args=(gateway, gateway.pairing, conn, address),
                              daemon=True).start()
     except KeyboardInterrupt:
         pass
