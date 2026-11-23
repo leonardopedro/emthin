@@ -532,6 +532,15 @@ launch restores all three and scrolls the editor to the restored caret
 (without opening the IME). The New confirmation uses the dark platform
 dialog theme so it matches the pad.
 
+A figure's terminal lease reaches a **paired** gateway, not a hardcoded
+host: `GatewayTarget` reads the `hc://<core>/<address>` reference, looks
+the Core ID up in `GatewayEndpoints` (a `*.ts.net` row created by the
+Paste-link screen), and connects over HTTPS on 443 with the platform
+trust store — `hello` sends that Core ID, and `sessions.list` supplies the
+generation before `terminal.attach`. The `emthin.fixtureGateway*` extras
+remain a device-lane override that points the same build at a loopback
+scripted core; when they are set they win.
+
 ## Layout and the seam
 
 - `emthin-pad` is a **standalone workspace**: its `Cargo.toml` carries an

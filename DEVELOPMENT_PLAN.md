@@ -936,6 +936,51 @@ Two blockers stood between the Java WSS/pairing sources and a device verdict.
   device step is therefore verified; the remaining T14/T15 items (a real Go
   gateway, tailnet, physical phone, OpenShell) are unchanged.
 
+### A paired endpoint drives the lease (2026-11-23)
+
+The pairing registry was only a list: the lease path still dialled whatever
+`emthin.fixtureGateway` named, so pairing a host changed nothing. Resolution
+now lives in `GatewayTarget`, keyed by the figure's own reference.
+
+- **Order.** The fixture extra still wins while it is set, because the device
+  lane points the same build at a loopback scripted core. Otherwise
+  `hc://<core>/<address>` is parsed and the Core ID is looked up in
+  `GatewayEndpoints` — which needed a new `findByCore`: hosts key the registry
+  (that is what the list shows and Forget removes), but a figure names a
+  Core ID. A reference whose Core has no row resolves to no target, and the
+  figure keeps its existing synthetic scene instead of dialling a guess.
+- **Paired means HTTPS on 443 with the platform trust store.** The fixture CA
+  path (`emthin.fixtureGatewayCa`) is fixture-only and is not reachable from a
+  paired target; `PemTrust.system()` supplies the default trust, and
+  `WssTransport`'s endpoint identification checks the tailnet name it dialled.
+- **The Core ID is sent, not assumed.** `GatewayLeaseClient` used to hardcode
+  the scripted peer's Core ID in `hello`; it now carries the target's, which is
+  what a paired gateway validates.
+- **A paired gateway has no local generation.** `terminal.attach` takes a
+  program generation the pad cannot know, and guessing one is rejected, so a
+  target with no generation makes the client call `sessions.list` for the
+  address after `hello` and attach with the generation the core reports (a
+  missing row is `not_found`, not an attach attempt). The fixture lane keeps
+  its explicit generation extra, which skips that step.
+- **Verification.** `GatewayTargetTest` (new, 51 checks in `test-java.sh`)
+  covers registry lookup by Core ID, unpaired cores, malformed references
+  (wrong scheme, non-hex core, empty address, whitespace), the fixture override and its
+  `host:port`/`wss://`, path and port parsing, and the "no generation means
+  discover" rule. On device, `gateway-wss` gained a second launch that omits
+  the generation extra: logcat shows `phase connect … generation discover`,
+  then `phase ready mode watch`, the 80×24 grid and the banner, which is the
+  paired path's whole wire sequence over the same fixture (the only difference
+  is the trust store). Full `LANE_WSS=1 ./device-lane.sh e2e`: **222 checks, 0
+  failed**, `device lane: all steps passed`, installed `base.apk` md5
+  `1a66eda550f3ab93055bd7a5b14fba5e`. Two lane details surfaced: fixture
+  launches now `am force-stop` first (the extras are read in `onCreate`, so a
+  warm activity silently ignored them), and a single-step run installs no APK,
+  so it must be installed first.
+- **Gap.** No tailnet host exists in this environment, so the paired branch's
+  trust store is exercised only through the resolver tests; everything
+  downstream of it (hello with the paired Core ID, discovery, attach) is the
+  same code the fixture run above executes. Pairing a QR code is still T15.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the
