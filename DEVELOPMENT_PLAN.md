@@ -741,17 +741,78 @@ Mutter configurations ask logind for a session. Both runs left no Xvfb or
 sway behind (`pgrep -x Xvfb`/`pgrep -x sway` empty afterwards), which is the
 `stop_compositor` fix above earning its keep.
 
-Named gaps for this run, not regressions:
+The device and service lanes then ran too — see the two sections below. One
+device step (`terminal-lease`) stays a named gap, and it is the same one the
+2026-11-22 record already names.
 
-- **Device / real-phone lanes** (`device-lane.sh`, `terminal-lease`, the
-  arm64 APK): no `adb` on this host, so nothing was installed or driven. The
-  pad's host lane ran.
-- **Live `mm0web` verifier run** (`scripts/e2e/live-mm0.sh`): the mm0web binary
-  is present, but its proof fixture is not — `/tmp/mm0/examples` was cleaned and
-  no mm0 checkout exists to rebuild `peano.mm0`/`.mm1` from, so the script
-  would stop at its fixture check. Loopback only; no credentials needed.
-- **Live Zenodo sandbox checkpoint**: needs the separately configured test
-  account; only the offline and scripted MM0 lanes ran here.
+### Device lane (2026-11-23)
+
+`adb` is on this host after all: `android-tools 37.0.0p1` ships it in the nix
+store (`/nix/store/…-android-tools-37.0.0p1/bin/adb`), it just is not on the
+default PATH. The Waydroid session was started (`waydroid session start`; the
+container service was already active) and the pad's key was already seeded in
+`data/misc/adb/adb_keys`, so `adb connect 192.168.240.112:5555` came up as
+`device` immediately. Device: `lineage_waydroid_arm64_only`, aarch64 host,
+2943x1638 panel, disposable test package `com.emthin.pad.test`.
+
+`emthin-android/device-lane.sh e2e` (arm64 APK built by `build-apk.sh` through
+the `.toolchain/` box64 shims, installed, cold-launched) finished with **213
+checks passed, 1 failed**, and the installed APK md5-matched the build. That
+covers persistence, new-reset, scroll-anchor, search-replace, focus-stack,
+composing-ime (CJK + emoji), accessibility, diagnostics, named-document,
+modifier-inspector, session-pin, figure-a11y, terminal-scene, terminal-reflow,
+terminal-pages and terminal-lease.
+
+The first run failed twice. One was the harness, fixed here:
+
+- **`modifier-inspector` (fixed).** The relationship list is its own scroll
+  pane, and the lane swiped at a fixed `1400 850`, which on this tablet is
+  *below* that pane (`[34,604][2909,826]`) — the drag scrolled the document and
+  the two outgoing rows never came into the hierarchy. The lane now reads the
+  scrollable box around the "Outgoing targets"/"Incoming modifiers" headings
+  out of the uiautomator dump (`relationship_drag`) and drags inside it, keeping
+  the geometry for later scrolls once the headings themselves scroll away
+  (`relationship_scroll`). Step re-run alone: all steps passed, and the full
+  e2e then passed this step too.
+- **`terminal-lease` (open gap).** `gateway watch attach did not become ready`.
+  The app logs `gatewayLease phase connect host 127.0.0.1 port 47654` and then
+  `gatewayLease error kind transport` exactly 4 s later — its Java connect
+  timeout (`GatewayLeaseClient.java`: `connect(…, 4000)`). During the run
+  `adb reverse --list` shows `tcp:47654 tcp:47654` continuously, and
+  `adb shell 'toybox nc 127.0.0.1 47654'` connects to the same fixture while
+  the lane's reverse is in place, so adb and the fixture are fine and the
+  failure sits in the app process. That is the same symptom recorded on
+  2026-11-22 over both ADB reverse and the private bridge, and it still needs a
+  device-side diagnostic (the app logs the failure kind, not the exception).
+  Per the editor release checks above, `terminal-lease` must pass before the
+  Herdr integration checkpoint, so this stays open.
+
+### Live MM0 verifier and Zenodo sandbox (2026-11-23)
+
+- **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the
+  fixture path: the Peano pair lives in `../mm0-rs/examples/`, and both
+  checkers are installed (`mm0-rs`, `mm0-c` on PATH). Run as
+  `MM0_DIR=…/mm0-rs/examples MM0WEB_BIN=…/unfer/target/debug/mm0web`:
+  mm0web served on loopback, accepted the real Peano proof through mm0-rs +
+  mm0-c, minted `Peano-live-66bfb078`, and emthin's `proof_query` for a
+  document citing it through `proof:` reported the backend verdict.
+  Fixed while running it: `STATE="$(mktemp -d /tmp/opencode/mm0web-live-XXXXXX)"`
+  failed because `/tmp/opencode` need not exist, and the empty `STATE` then made
+  the audit-trail path `/events.jsonl` — the lane reported "no verified proof
+  id" after the checker had already accepted the proof. It now uses
+  `${TMPDIR:-/tmp}`.
+- **Live Zenodo sandbox checkpoint — passed.** Credential read from the
+  git-ignored `.e2e/api` (never echoed or logged), sandbox host explicitly
+  selected as `MM0WEB_ZENODO_BASE=https://sandbox.zenodo.org/api`, synthetic
+  11-byte `sort Prop;` spec/proof pair (sha256 `acd539decfd1992b…`).
+  `/healthz` reported the sandbox host with both checkers ready; the pair
+  verified locally; one explicit publish queued proof
+  `emthin-sandbox-checkpoint-5a720607` and settled to `state: published`, DOI
+  `10.5072/zenodo.647585`. The draft's returned `mm0`/`mm1` were byte-identical
+  to the local fixture, and a fresh `GET /proof` still reported published.
+  Cleanup was not requested, so the draft was left in place. Publication and
+  versioning coverage remain on the mock; this lane verifies and uploads one
+  draft only.
 
 ## Implementation handoff
 

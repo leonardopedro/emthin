@@ -26,7 +26,11 @@ fail() { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)
 MM0WEB_BIN="${MM0WEB_BIN:-/home/leo/Projects/unfer/target/debug/mm0web}"
 MM0_DIR="${MM0_DIR:-/tmp/mm0/examples}"
 PORT="${MM0WEB_PORT:-18081}"
-STATE="$(mktemp -d /tmp/opencode/mm0web-live-XXXXXX)"
+# `mktemp -d <prefix>` needs the prefix's parent to exist; a hardcoded
+# /tmp/opencode does not on most hosts, and an empty STATE then made the audit
+# trail path `/events.jsonl` and the proof-id read fail after the checker had
+# already accepted the proof.
+STATE="$(mktemp -d "${TMPDIR:-/tmp}/emthin-mm0web-live-XXXXXX")"
 WEB_PID=""
 
 cleanup_web() {

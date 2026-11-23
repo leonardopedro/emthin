@@ -452,6 +452,66 @@ keyboard_shown() {
         | grep -q 'mInputShown=true'
 }
 
+# `relationship_drag <dump>` answers "x1 y1 x2 y2 ms" for a drag inside the
+# scrollable pane that holds the modifier inspector's relationship headings, or
+# nothing when the dump shows no such pane. The pane's y range follows the
+# layout, not the screen, so a pixel constant tuned to one device lands outside
+# it on another and silently scrolls the document instead.
+relationship_drag() {
+    python3 - "$1" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    sys.exit(0)
+box = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
+headings = {"Outgoing targets", "Incoming modifiers"}
+
+def bounds(node):
+    m = box.match(node.get("bounds", ""))
+    return tuple(int(v) for v in m.groups()) if m else None
+
+class Found(Exception):
+    def __init__(self, text):
+        self.text = text
+
+def walk(node, scrollable):
+    if node.get("scrollable") == "true":
+        scrollable = node
+    if node.get("text") in headings and scrollable is not None:
+        raise Found(scrollable)
+    for child in node:
+        walk(child, scrollable)
+
+try:
+    walk(root, None)
+except Found as found:
+    b = bounds(found.text)
+    if b and b[3] - b[1] > 40:
+        x = (b[0] + b[2]) // 2
+        span = max(40, (b[3] - b[1]) // 2)
+        print(x, b[3] - 12, x, b[3] - 12 - span, 300)
+PY
+}
+
+# `relationship_scroll <dump> <up|down>` drags inside that pane. The pane's own
+# headings scroll out of view once the list moves, so the first geometry found is
+# kept in REL_DRAG and reused when the current dump no longer describes it.
+relationship_scroll() {
+    local found
+    found="$(relationship_drag "$1")"
+    [ -n "$found" ] && REL_DRAG="$found"
+    [ -n "${REL_DRAG:-}" ] || return 0
+    local x1 y1 x2 y2 ms
+    read -r x1 y1 x2 y2 ms <<< "$REL_DRAG"
+    if [ "$2" = up ]; then
+        D shell input swipe "$x1" "$y1" "$x2" "$y2" "$ms" >/dev/null 2>&1
+    else
+        D shell input swipe "$x2" "$y2" "$x1" "$y1" "$ms" >/dev/null 2>&1
+    fi
+}
+
 wait_for_log() {
     local out="$1" pattern="$2" tries=0
     while [ "$tries" -lt 50 ]; do
@@ -1718,13 +1778,19 @@ _modifier_inspector() {
     # landscape tablet even the two outgoing rows do not fit in it at once,
     # so collect each row over successive scroll positions instead of
     # requiring one dump to contain both.
+    #
+    # The swipe has to land *inside* that viewport, and its y range depends on
+    # the pane layout rather than the screen size: a fixed y=850 was below the
+    # list's 604..826 box on a 2943x1638 tablet, so the drag missed the list and
+    # scrolled the document instead, and both rows stayed unreachable. Read the
+    # scrollable box around "Outgoing targets" from the dump and aim at it.
     local saw12=0 saw34=0
     for i in $(seq 1 8); do
         cmd_uidump "$ui" || return
         grep -q '#1 #2' "$ui" && saw12=1
         grep -q '#3 #4' "$ui" && saw34=1
         [ "$saw12" = 1 ] && [ "$saw34" = 1 ] && break
-        D shell input swipe 1400 850 1400 780 300 >/dev/null 2>&1
+        relationship_scroll "$ui" up
         sleep 0.4
     done
     [ "$saw12" = 1 ] \
@@ -1740,7 +1806,9 @@ _modifier_inspector() {
         cmd_uidump "$ui" || return
         b=$(node_bounds '#5 #6') && break
         b=
-        D shell input swipe 1400 780 1400 850 300 >/dev/null 2>&1
+        # Scroll back toward the top of the relationship viewport rather than
+        # at a fixed screen y, which misses the pane on a taller device.
+        relationship_scroll "$ui" down
         sleep 0.35
     done
     [ -n "$b" ] || { fail "incoming relationship heading not tappable"; return; }
@@ -1760,8 +1828,9 @@ _modifier_inspector() {
             break
         fi
         # Stay inside the relationship viewport: a swipe starting near the
-        # source field scrolls the panel instead of the comparison list.
-        D shell input swipe 1400 850 1400 780 300 >/dev/null 2>&1
+        # source field scrolls the panel instead of the comparison list. Its
+        # y range comes from the dump for the same reason.
+        relationship_scroll "$ui" up
         sleep 0.5
     done
     if [ "$expanded" != 1 ]; then
