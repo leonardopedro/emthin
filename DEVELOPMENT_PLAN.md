@@ -981,6 +981,21 @@ now lives in `GatewayTarget`, keyed by the figure's own reference.
   downstream of it (hello with the paired Core ID, discovery, attach) is the
   same code the fixture run above executes. Pairing a QR code is still T15.
 
+### Two more full lane runs, for the diagnostics Back failure (2026-11-23)
+
+One full run during the pairing work failed `diagnostics` at "Back did not
+restore the modifier-at-caret inspector", and `./device-lane.sh diagnostics`
+passed on its own both before and after. Two further full
+`LANE_WSS=1 ./device-lane.sh e2e` runs from a rebuilt APK then passed
+completely: **222 checks, 0 failed** and `device lane: all steps passed` both
+times, with `Back restored the modifier inspector and its target list` green in
+each (`/tmp/flake1`, `/tmp/flake2`; installed APKs
+`a953c8896c83c59e7116b8e5b118e546` and `56946e63fc134b0361dae9e6136d12cb`). The
+failed run was one of five on the older APK and also lost its WSS step to the
+certificate SAN bug, so the likeliest reading is a timing flake in the
+post-Back `uiautomator dump` rather than a defect; nothing was changed for it,
+and it will need a third sighting to earn a wait or a retry.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the
