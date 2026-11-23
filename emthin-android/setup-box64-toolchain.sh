@@ -57,21 +57,56 @@ nix_path() {
 }
 
 echo "==> [1/4] resolving toolchain from nixpkgs"
-SDK_STORE=$(
-    nix eval --impure --raw --expr "
-      let
-        f = builtins.getFlake \"nixpkgs\";
-        pkgs = import f.outPath { system = \"aarch64-linux\"; config.allowUnfree = true; };
-      in (pkgs.androidenv.composeAndroidPackages {
-        platformVersions = [ \"$PLATFORM\" ];
-        buildToolsVersions = [ \"$BUILD_TOOLS\" ];
-        includeNDK = true;
-        ndkVersion = \"$NDK_VERSION\";
-      }).androidsdk.outPath
-    "
-)
-JDK=$(nix_path jdk21_headless)
-BOX64=$(nix_path box64)
+# An SDK that is already on disk wins: re-resolving it from the current
+# nixpkgs weekly pins a *different* composition path, which then has to be
+# built from scratch just to regenerate four shims. Set ANDROID_SDK_ROOT (the
+# .toolchain/env.sh one is used automatically below) to reuse it.
+if [[ -z "${ANDROID_SDK_ROOT:-}" && -f .toolchain/env.sh ]]; then
+    # shellcheck disable=SC1091
+    . .toolchain/env.sh
+fi
+SDK_STORE=""
+if [[ -n "${ANDROID_SDK_ROOT:-}" && -d "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" ]]; then
+    SDK="$ANDROID_SDK_ROOT"
+    echo "    reusing SDK $SDK"
+else
+    SDK_STORE=$(
+        nix eval --impure --raw --expr "
+          let
+            f = builtins.getFlake \"nixpkgs\";
+            pkgs = import f.outPath { system = \"aarch64-linux\"; config.allowUnfree = true; };
+          in (pkgs.androidenv.composeAndroidPackages {
+            platformVersions = [ \"$PLATFORM\" ];
+            buildToolsVersions = [ \"$BUILD_TOOLS\" ];
+            includeNDK = true;
+            ndkVersion = \"$NDK_VERSION\";
+          }).androidsdk.outPath
+        "
+    )
+    SDK="$SDK_STORE/libexec/android-sdk"
+fi
+# Same rule as the SDK: a component that already works stays. A weekly nixpkgs
+# bump renames the JDK/box64 derivation, and rebuilding those (or the SDK) just
+# to regenerate shims is not what this script is for.
+if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/javac" ]]; then
+    JDK=$JAVA_HOME
+else
+    JDK=$(nix_path jdk21_headless)
+fi
+if [[ -n "${EMTHIN_BOX64:-}" && -x "$EMTHIN_BOX64/bin/box64" ]]; then
+    BOX64=$EMTHIN_BOX64
+else
+    BOX64=$(nix_path box64)
+fi
+# The NDK's own ld.lld (x86_64, under box64) aborts with `free(): invalid next
+# size` on this box while linking the pad, so clang is pointed at a *native*
+# lld instead. It is the same LLVM release as the NDK's (21), so the Android
+# target and sysroot arguments behave identically.
+if [[ -n "${EMTHIN_NATIVE_LLD:-}" && -x "$EMTHIN_NATIVE_LLD" ]]; then
+    NATIVE_LLD=$(dirname "$(dirname "$EMTHIN_NATIVE_LLD")")
+else
+    NATIVE_LLD=$(nix_path lld)
+fi
 GLIBC=$(nix eval --impure --raw --expr '
   let f = builtins.getFlake "nixpkgs";
   in f.legacyPackages.x86_64-linux.glibc.outPath')
@@ -85,15 +120,15 @@ ZLIB=$(nix eval --impure --raw --expr '
   let f = builtins.getFlake "nixpkgs";
   in f.legacyPackages.x86_64-linux.zlib.outPath')
 
-for p in "$SDK_STORE" "$JDK" "$BOX64" "$GLIBC" "$LIBCXX" "$LIBGCC" "$ZLIB"; do
+for p in $SDK_STORE "$SDK" "$JDK" "$BOX64" "$NATIVE_LLD/bin/ld.lld"; do
     [ -e "$p" ] || { echo "error: resolved path is missing: $p" >&2; exit 1; }
 done
-echo "    sdk    $SDK_STORE"
+echo "    sdk    $SDK"
 echo "    jdk    $JDK"
 echo "    box64  $BOX64"
 echo "    glibc  $GLIBC (x86_64)"
+echo "    lld    $NATIVE_LLD/bin/ld.lld (native)"
 
-SDK="$SDK_STORE/libexec/android-sdk"
 LLVM="$SDK/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
 ANDROID_JAR="$SDK/platforms/android-$PLATFORM/android.jar"
 for p in "$SDK/build-tools/$BUILD_TOOLS/aapt2" "$LLVM/clang-21" "$ANDROID_JAR"; do
@@ -103,8 +138,18 @@ done
 # Mirror what the executed binaries look for: glibc's loader and libc in
 # lib/, the C++ and gcc runtimes beside them, and lib64/ + etc/ + share/
 # for the pieces that are resolved by path rather than by soname.
-echo "==> [2/4] building the x86_64 sysroot farm in $TC/sysroot"
+#
+# Only rebuilt when every resolved x86_64 package is actually on disk. A
+# nixpkgs weekly bump renames them into unbuilt store paths, and the farm from
+# the previous run still provides exactly the same loader, so re-provisioning
+# the shims must not turn into building glibc to satisfy a symlink.
 SR=$TC/sysroot
+FARM_OK=1
+for src in "$GLIBC/lib" "$LIBCXX/lib" "$LIBGCC/lib" "$ZLIB/lib"; do
+    [ -d "$src" ] || FARM_OK=0
+done
+if [[ "$FARM_OK" == 1 ]]; then
+echo "==> [2/4] building the x86_64 sysroot farm in $SR"
 rm -rf "$SR"
 mkdir -p "$SR/lib" "$SR/share"
 
@@ -131,6 +176,15 @@ for src in "$GLIBC/share" "$LIBCXX/share" "$ZLIB/share"; do
     link_entries "$SR/share" "$src"
 done
 echo "    $(ls "$SR/lib" | wc -l) entries in lib/, $(ls "$SR/share" | wc -l) in share/"
+else
+    echo "==> [2/4] keeping the existing sysroot farm in $SR"
+    echo "    (resolved glibc/libcxx/libgcc/zlib are not built; the farm already has them)"
+    [ -e "$SR/lib/ld-linux-x86-64.so.2" ] || {
+        echo "error: no usable x86_64 sysroot at $SR and the resolved packages are missing" >&2
+        echo "       build them first, e.g. nix build nixpkgs#legacyPackages.x86_64-linux.glibc" >&2
+        exit 1
+    }
+fi
 
 # Absolute paths: the shims below are executed from arbitrary cwds.
 SR=$(cd "$SR" && pwd)
@@ -162,8 +216,10 @@ box_shim aapt2 "$BT/aapt2"
 box_shim zipalign "$BT/zipalign"
 # The NDK's own x86_64-linux-android33-clang is a shell script that would
 # resolve `clang` on PATH; give the driver the target directly instead.
-box_shim clang "$LLVM/clang-21" "--target=$TARGET$API"
-box_shim clang++ "$LLVM/clang++" "--target=$TARGET$API"
+# `--ld-path` swaps only the linker: the x86_64 driver still compiles, but the
+# link step runs the native lld above instead of the emulated one that crashes.
+box_shim clang "$LLVM/clang-21" "--target=$TARGET$API" "--ld-path=$NATIVE_LLD/bin/ld.lld"
+box_shim clang++ "$LLVM/clang++" "--target=$TARGET$API" "--ld-path=$NATIVE_LLD/bin/ld.lld"
 box_shim llvm-ar "$LLVM/llvm-ar"
 
 # GC-root the resolved paths so a `nix-collect-garbage` between setup and
@@ -176,8 +232,9 @@ root_path() { # <name> <store-path>
     fi
     echo "    warning: could not GC-root $1 (still usable until the next GC)" >&2
 }
-for pair in "android-sdk:$SDK_STORE" "jdk:$JDK" "box64:$BOX64" \
-            "glibc:$GLIBC" "libcxx:$LIBCXX" "libgcc:$LIBGCC" "zlib:$ZLIB"; do
+for pair in ${SDK_STORE:+"android-sdk:$SDK_STORE"} "jdk:$JDK" "box64:$BOX64" \
+            "glibc:$GLIBC" "libcxx:$LIBCXX" "libgcc:$LIBGCC" "zlib:$ZLIB" \
+            "lld:$NATIVE_LLD"; do
     root_path "${pair%%:*}" "${pair#*:}"
 done
 
@@ -192,6 +249,10 @@ export ANDROID_API="$API"
 # the connected device for its ABI and uses this only as the no-device
 # fallback / mismatch check.
 export EMTHIN_TOOLCHAIN_ABI="$ABI"
+# Native aarch64 lld the clang shims pass to --ld-path; the emulated NDK
+# ld.lld aborts on this host. No backticks here: this heredoc expands.
+export EMTHIN_NATIVE_LLD="$NATIVE_LLD/bin/ld.lld"
+export EMTHIN_BOX64="$BOX64"
 export JAVA_HOME="$JDK"
 # Box64 shims for the x86_64 aapt2/zipalign/LLVM; must precede the
 # build-tools directory on PATH or the raw ELFs win and fail with ENOEXEC.
@@ -208,6 +269,18 @@ echo "==> [4/4] self-check"
     exit 1
 }
 echo "    aapt2 / clang execute"
+# A link, not just a compile: this is the step that used to abort inside the
+# emulated ld.lld, so a broken `--ld-path` fails here instead of mid-build.
+LINK_PROBE=$(mktemp -d)
+printf 'int emthin_probe(void){return 1;}\n' > "$LINK_PROBE/p.c"
+if "$TC_BIN/clang" -shared -o "$LINK_PROBE/p.so" "$LINK_PROBE/p.c" 2>/dev/null; then
+    echo "    clang links (native lld)"
+else
+    echo "error: clang shim compiles but cannot link; check $NATIVE_LLD" >&2
+    rm -rf "$LINK_PROBE"
+    exit 1
+fi
+rm -rf "$LINK_PROBE"
 
 echo
 echo "OK: toolchain in $TC/ (ABI $ABI, target $TARGET)"
