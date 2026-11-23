@@ -2,12 +2,10 @@ package com.emthin.pad;
 
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -36,8 +34,7 @@ final class GatewayLeaseClient {
     private static final int RESIZE = 3;
     private static final int MAX_FRAME = 64 * 1024;
 
-    private final String host;
-    private final int port;
+    private final GatewayTransport.Connector connector;
     private final String address;
     private final String generation;
     private final Listener listener;
@@ -45,8 +42,7 @@ final class GatewayLeaseClient {
     private final Object writeLock = new Object();
     private final ExecutorService writes = Executors.newSingleThreadExecutor();
 
-    private volatile Socket socket;
-    private volatile OutputStream output;
+    private volatile GatewayTransport transport;
     private volatile boolean closed;
     private volatile int channel;
     private volatile int pendingAttachId;
@@ -57,11 +53,34 @@ final class GatewayLeaseClient {
 
     GatewayLeaseClient(String host, int port, String address, String generation,
             Listener listener) {
-        this.host = host;
-        this.port = port;
+        this(new TcpConnector(host, port), address, generation, listener);
+    }
+
+    GatewayLeaseClient(GatewayTransport.Connector connector, String address,
+            String generation, Listener listener) {
+        this.connector = connector;
         this.address = address;
         this.generation = generation;
         this.listener = listener;
+    }
+
+    /** Plain TCP to the scripted fixture. */
+    static GatewayTransport.Connector tcpConnector(String host, int port) {
+        return new TcpConnector(host, port);
+    }
+
+    private static final class TcpConnector implements GatewayTransport.Connector {
+        private final String host;
+        private final int port;
+
+        TcpConnector(String host, int port) {
+            this.host = host;
+            this.port = port;
+        }
+
+        @Override public GatewayTransport open() throws IOException {
+            return GatewayTransport.tcp(host, port, 4000);
+        }
     }
 
     void connect() {
@@ -104,25 +123,15 @@ final class GatewayLeaseClient {
     void close() {
         closed = true;
         writes.shutdownNow();
-        Socket current = socket;
-        if (current != null) {
-            try {
-                current.close();
-            } catch (IOException ignored) {
-                // Best effort teardown.
-            }
-        }
+        GatewayTransport current = transport;
+        if (current != null) current.close();
     }
 
     private void runConnection() {
         try {
-            Socket current = new Socket();
-            socket = current;
-            current.connect(new InetSocketAddress(host, port), 4000);
-            current.setTcpNoDelay(true);
-            current.setSoTimeout(30000);
-            output = current.getOutputStream();
-            InputStream input = current.getInputStream();
+            GatewayTransport current = connector.open();
+            transport = current;
+            InputStream input = current.input();
             sendHello();
             while (!closed) {
                 int[] header = readHeader(input);
@@ -140,12 +149,8 @@ final class GatewayLeaseClient {
             if (!closed) fail("protocol");
         } finally {
             closed = true;
-            try {
-                Socket current = socket;
-                if (current != null) current.close();
-            } catch (IOException ignored) {
-                // Best effort teardown.
-            }
+            GatewayTransport current = transport;
+            if (current != null) current.close();
         }
     }
 
@@ -272,16 +277,19 @@ final class GatewayLeaseClient {
     }
 
     private void writeFrame(int frameChannel, int kind, byte[] payload) throws IOException {
-        OutputStream current = output;
+        GatewayTransport current = transport;
         if (current == null) throw new IOException("not connected");
+        // One emthin frame per WebSocket message, so the header and payload are
+        // assembled here rather than written straight to the socket.
+        ByteArrayOutputStream packet = new ByteArrayOutputStream(payload.length + 9);
         byte[] header = new byte[9];
         putLe32(header, 0, frameChannel);
         header[4] = (byte) kind;
         putLe32(header, 5, payload.length);
+        packet.write(header, 0, header.length);
+        packet.write(payload, 0, payload.length);
         synchronized (writeLock) {
-            current.write(header);
-            current.write(payload);
-            current.flush();
+            current.send(packet.toByteArray());
         }
     }
 

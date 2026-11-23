@@ -26,8 +26,20 @@ find_jdk_tool() { # <tool>
 
 JAVAC=$(find_jdk_tool javac)
 JAVA=$(find_jdk_tool java)
+KEYTOOL=$(find_jdk_tool keytool)
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/emthin-java-tests.XXXXXX")
 trap 'rm -rf "$OUT"' EXIT
+
+# Two throwaway certificates for the WSS test: one naming localhost (what the
+# client asks for) and one naming a host it never asks for, so the
+# endpoint-identification check has something trusted-but-wrong to reject.
+make_cert() { # <file> <dns-name>
+    "$KEYTOOL" -genkeypair -alias t -keyalg RSA -keysize 2048 -validity 2 \
+        -dname "CN=$2" -ext "SAN=dns:$2" -storetype PKCS12 \
+        -keystore "$1" -storepass changeit -keypass changeit >/dev/null 2>&1
+}
+make_cert "$OUT/localhost.p12" localhost
+make_cert "$OUT/other.p12" other.example
 
 "$JAVAC" -Xlint:all -d "$OUT" \
     android/src/com/emthin/pad/PadSession.java \
@@ -41,6 +53,17 @@ trap 'rm -rf "$OUT"' EXIT
     android/src/com/emthin/pad/StatusModel.java \
     android/src/com/emthin/pad/ActionCatalog.java \
     android/src/com/emthin/pad/SessionCatalog.java \
+    android/src/com/emthin/pad/GatewayJson.java \
+    android/src/com/emthin/pad/PairingLink.java \
+    android/src/com/emthin/pad/PairingProtocol.java \
+    android/src/com/emthin/pad/GatewayEndpoints.java \
+    android/src/com/emthin/pad/HttpsGatewayHttp.java \
+    android/src/com/emthin/pad/GatewayTransport.java \
+    android/src/com/emthin/pad/WebSocketFrame.java \
+    android/src/com/emthin/pad/WebSocketHandshake.java \
+    android/src/com/emthin/pad/WssTransport.java \
+    android/test/com/emthin/pad/GatewayPairingTest.java \
+    android/test/com/emthin/pad/WebSocketTest.java \
     android/test/com/emthin/pad/OwnershipTest.java \
     android/test/com/emthin/pad/RecoveryCodecTest.java \
     android/test/com/emthin/pad/ProviderIoTest.java \
@@ -61,3 +84,6 @@ trap 'rm -rf "$OUT"' EXIT
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.StatusModelTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.ActionCatalogTest
 "$JAVA" -ea -cp "$OUT" com.emthin.pad.SessionCatalogTest
+"$JAVA" -ea -cp "$OUT" com.emthin.pad.GatewayPairingTest
+"$JAVA" -ea -cp "$OUT" com.emthin.pad.WebSocketTest \
+    "$OUT/localhost.p12" "$OUT/other.p12"

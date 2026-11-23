@@ -2319,6 +2319,125 @@ EOF
         && say "    captured $OUTDIR/terminal-lease.png"
 }
 
+# T14: the same scripted Core behind TLS and a WebSocket upgrade. The pad's
+# transport differs end to end (certificate checks, upgrade, masked frames,
+# one emthin frame per message), so this step asserts the stream it produces is
+# the one the lease step already trusts: a watch attach, the authoritative grid
+# and the banner.
+WSS_PORT=${WSS_PORT:-47658}
+WSS_ADMIN_PORT=${WSS_ADMIN_PORT:-47659}
+WSS_DIR=""
+WSS_PID=""
+
+start_wss_fixture() {
+    command -v openssl >/dev/null 2>&1 || {
+        fail "openssl is required for the WSS fixture certificate"
+        return 1
+    }
+    WSS_DIR=$(mktemp -d /tmp/emthin-wss.XXXXXX) || return 1
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost" \
+            -keyout "$WSS_DIR/key.pem" -out "$WSS_DIR/cert.pem" >/dev/null 2>&1; then
+        fail "generate the WSS fixture certificate"
+        return 1
+    fi
+    python3 "$SCRIPT_DIR/../fixtures/herdr-gateway-v1/wss_fixture.py" \
+        --listen "127.0.0.1:$WSS_PORT" \
+        --admin "127.0.0.1:$WSS_ADMIN_PORT" \
+        --cert "$WSS_DIR/cert.pem" --key "$WSS_DIR/key.pem" \
+        >"$WSS_DIR/server.log" 2>&1 &
+    WSS_PID=$!
+    local tries=0
+    while [ "$tries" -lt 30 ]; do
+        grep -q 'wss fixture listening' "$WSS_DIR/server.log" 2>/dev/null && break
+        if ! kill -0 "$WSS_PID" 2>/dev/null; then
+            say "    wss fixture exited: $(cat "$WSS_DIR/server.log" 2>/dev/null)"
+            fail "wss fixture exited before it listened"
+            return 1
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    if ! grep -q 'wss fixture listening' "$WSS_DIR/server.log" 2>/dev/null; then
+        fail "wss fixture did not start"
+        return 1
+    fi
+    if ! D reverse "tcp:$WSS_PORT" "tcp:$WSS_PORT" >/dev/null 2>&1; then
+        fail "adb reverse for the wss fixture"
+        return 1
+    fi
+    # The pad trusts exactly this certificate, so it has to be inside the app's
+    # own directory; run-as works because the lane installs a debug build.
+    if ! D shell run-as "$PKG" mkdir -p files >/dev/null 2>&1 \
+            || ! D shell run-as "$PKG" sh -c 'cat > files/fixture-ca.pem' \
+                <"$WSS_DIR/cert.pem" >/dev/null 2>&1; then
+        fail "push the fixture certificate into the app's files"
+        return 1
+    fi
+    return 0
+}
+
+stop_wss_fixture() {
+    D reverse --remove "tcp:$WSS_PORT" >/dev/null 2>&1 || true
+    if [ -n "$WSS_PID" ]; then
+        kill "$WSS_PID" >/dev/null 2>&1 || true
+        wait "$WSS_PID" 2>/dev/null || true
+    fi
+    WSS_PID=""
+    if [ -n "$WSS_DIR" ] && [ -f "$WSS_DIR/server.log" ]; then
+        cp "$WSS_DIR/server.log" "$OUTDIR/gateway-wss-server.txt" 2>/dev/null || true
+    fi
+    rm -rf "$WSS_DIR"
+    WSS_DIR=""
+}
+
+wss_lease_launch() {
+    local fixture="$1"
+    D logcat -c >/dev/null 2>&1 || true
+    D shell am start -W -n "$ACTIVITY" \
+        --ez emthin.fixtureVtScene true \
+        --es emthin.fixtureGateway "wss://127.0.0.1:$WSS_PORT" \
+        --es emthin.fixtureGatewayCa "/data/data/$PKG/files/fixture-ca.pem" \
+        --es emthin.fixtureGatewayGeneration 'g-fixture-1' \
+        --ef emthin.fixtureViewZoom 1.0 \
+        --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+        >/dev/null 2>&1
+}
+
+cmd_gateway_wss() {
+    local log="$OUTDIR/gateway-wss-logcat.txt"
+    local fixture
+    say "==> gateway wss: tls -> upgrade -> watch attach -> grid -> banner"
+    mkdir -p "$OUTDIR"
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' \
+        '#1 Build log #2 \app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")')
+    if ! start_wss_fixture; then
+        stop_wss_fixture
+        return 1
+    fi
+    if wss_lease_launch "$fixture"; then
+        pass "launched the disposable WSS gateway fixture"
+    else
+        fail "launch the WSS gateway fixture"
+        stop_wss_fixture
+        return 1
+    fi
+    wait_for_log "$log" 'vtScene phase ready' \
+        || { fail "WSS fixture scene did not start"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease phase connect .*secure true' \
+        || { fail "the pad did not choose the WSS transport"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease phase ready mode watch' \
+        || { fail "WSS watch attach did not become ready"; stop_wss_fixture; return 1; }
+    pass "WSS watch attach became a gateway lease"
+    wait_for_log "$log" 'gatewayLease resize cols 80 rows 24' \
+        || { fail "WSS gateway did not publish its grid"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease data .*gateway lease' \
+        || { fail "WSS gateway DATA did not reach the native scene"; stop_wss_fixture; return 1; }
+    pass "WSS gateway DATA reached the scene"
+    stop_wss_fixture
+}
+
 cmd_terminal_lease() {
     local log="$OUTDIR/terminal-lease-logcat.txt"
     local fixture
@@ -2606,6 +2725,12 @@ cmd_e2e() {
     cmd_terminal_reflow
     cmd_terminal_pages
     cmd_terminal_lease
+    # Opt in with LANE_WSS=1: the step needs an APK built from the transport
+    # sources, and until the NDK link works again the installed APK predates
+    # them, so enabling it by default would only fail on a stale binary.
+    if [ "${LANE_WSS:-0}" = "1" ]; then
+        cmd_gateway_wss
+    fi
 
     # Byte-identity of the installed APK, the launch proof's companion.
     cmd_pull
@@ -2852,6 +2977,7 @@ case "$cmd" in
     terminal-reflow) cmd_terminal_reflow ;;
     terminal-pages) cmd_terminal_pages ;;
     terminal-lease) cmd_terminal_lease ;;
+    gateway-wss) cmd_gateway_wss ;;
     austral-rule) cmd_austral_rule ;;
     history-preview) cmd_history_preview ;;
     e2e)       cmd_e2e ;;

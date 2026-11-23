@@ -290,6 +290,7 @@ public class MainActivity extends Activity {
     private String fixtureOpenPath;
     private String fixtureGateway;
     private String fixtureGatewayGeneration;
+    private String fixtureGatewayCa;
     private GatewayLeaseClient gatewayLease;
     private boolean gatewayReady;
     private boolean gatewayConnected;
@@ -498,6 +499,7 @@ public class MainActivity extends Activity {
         fixtureOpenPath = testIntent.getStringExtra("emthin.fixtureOpenPath");
         fixtureGateway = testIntent.getStringExtra("emthin.fixtureGateway");
         fixtureGatewayGeneration = testIntent.getStringExtra("emthin.fixtureGatewayGeneration");
+        fixtureGatewayCa = testIntent.getStringExtra("emthin.fixtureGatewayCa");
         sessionPinFixturePending = testIntent.getBooleanExtra("emthin.fixtureSessionPin", false);
         figureA11yFixturePending = testIntent.getBooleanExtra("emthin.fixtureFigureA11y", false);
         vtSceneFixturePending = testIntent.getBooleanExtra("emthin.fixtureVtScene", false);
@@ -7955,18 +7957,43 @@ public class MainActivity extends Activity {
      */
     private void startGatewayLease(String reference) {
         String target = fixtureGateway == null ? "" : fixtureGateway.trim();
-        int colon = target.lastIndexOf(':');
-        if (colon <= 0 || colon == target.length() - 1) {
+        // The fixture lane offers either `host:port` (plain TCP) or
+        // `wss://host:port` with `emthin.fixtureGatewayCa` naming a PEM the app
+        // can read. A paired gateway never takes this path: it carries the
+        // stream URL, and `WssTransport` verifies the tailnet host name there.
+        boolean secure = target.startsWith("wss://");
+        String endpoint = secure ? target.substring("wss://".length()) : target;
+        int pathAt = endpoint.indexOf('/');
+        if (pathAt >= 0) endpoint = endpoint.substring(0, pathAt);
+        int colon = endpoint.lastIndexOf(':');
+        if (colon <= 0 || colon == endpoint.length() - 1) {
             trace("gatewayLease", "phase", "failed", "reason", "endpoint", "target", target);
             return;
         }
-        String host = target.substring(0, colon);
+        String host = endpoint.substring(0, colon);
         int port;
         try {
-            port = Integer.parseInt(target.substring(colon + 1));
+            port = Integer.parseInt(endpoint.substring(colon + 1));
         } catch (NumberFormatException e) {
             trace("gatewayLease", "phase", "failed", "reason", "port");
             return;
+        }
+        GatewayTransport.Connector connector;
+        if (secure) {
+            if (fixtureGatewayCa == null || fixtureGatewayCa.trim().isEmpty()) {
+                trace("gatewayLease", "phase", "failed", "reason", "ca");
+                return;
+            }
+            try {
+                connector = WssTransport.connector(host, port,
+                        PemTrust.load(fixtureGatewayCa.trim()), 5000, 30000);
+            } catch (java.io.IOException e) {
+                trace("gatewayLease", "phase", "failed", "reason", "ca",
+                        "detail", e.getMessage());
+                return;
+            }
+        } else {
+            connector = GatewayLeaseClient.tcpConnector(host, port);
         }
         int slash = reference.lastIndexOf('/');
         String address = slash >= 0 && slash + 1 < reference.length()
@@ -7977,7 +8004,7 @@ public class MainActivity extends Activity {
         gatewayReady = false;
         gatewayConnected = false;
         gatewayAttaching = false;
-        gatewayLease = new GatewayLeaseClient(host, port, address, generation,
+        gatewayLease = new GatewayLeaseClient(connector, address, generation,
                 new GatewayLeaseClient.Listener() {
                     @Override public void onReady(final String mode, final String leaseId) {
                         main.post(new Runnable() {
@@ -8072,7 +8099,7 @@ public class MainActivity extends Activity {
                     }
                 });
         trace("gatewayLease", "phase", "connect", "host", host, "port", port,
-                "address", address, "generation", generation);
+                "address", address, "generation", generation, "secure", secure);
         gatewayLease.connect();
     }
 
