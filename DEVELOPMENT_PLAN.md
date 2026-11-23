@@ -902,11 +902,12 @@ service only after the offline workflow works.
   `CARGO_BUILD_JOBS=1`. The 2026-11-22 kernel log recorded two system-wide
   OOM kills of `ld.gold` during concurrent desktop links. The serialized
   workspace run completed with the same source.
-- Repeat `device-lane.sh terminal-lease` before passing the Herdr integration
-  checkpoint. Waydroid reached the placed terminal scene on 2026-11-22, then
-  the socket timed out before the fixture's Watch attach, over both ADB reverse
-  and a direct connection to the private bridge. Local terminal input and
-  rendering passed independently.
+- ~~Repeat `device-lane.sh terminal-lease` before passing the Herdr integration
+  checkpoint.~~ **Done 2026-11-23**: the socket timeout was a stale install uid
+  whose packets never left the container; see `### Device lane (2026-11-23)`.
+  The checkpoint itself is still open for the reasons recorded in
+  `docs/HERDR_INTEGRATION_PLAN.md` §Checkpoint 3 status (no Go gateway,
+  Tailscale pairing, WSS transport or OpenShell fleet in this checkout).
 
 ### MM0 proof workflow fixture
 

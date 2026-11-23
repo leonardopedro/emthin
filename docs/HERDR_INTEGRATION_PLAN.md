@@ -465,6 +465,34 @@ real socket races are still not represented.
   fails enrollment. Device revocation and normal app close leave the
   existing fleet and workspace available.
 
+### Checkpoint 3 status (2026-11-23)
+
+Checkpoint 3 is **not passed**. The fixture-verifiable half is green and the
+remaining half needs the gateway/Tailscale/OpenShell repositories, credentials
+and a physical phone that this checkout does not have. The
+`terminal-lease` device step that gated this checkpoint (2026-11-22 record) now
+passes, so the local evidence is recorded rather than deferred.
+
+| Card | State here | Evidence or gap |
+|---|---|---|
+| T11 | Verified | `cargo test -p herdr-gateway-fixtures` (5 tests) and `validate-herdr-gateway-fixtures` print `validated 32 Herdr gateway v1 fixtures`. |
+| T12 | Fixture-only | `fixtures/herdr-gateway-v1/lease_fixture.py` driven end to end on the Waydroid device: watch attach → authoritative grid → DATA → Take control → controller input round trip → operator revoke → fresh lease. `emthin-collab` (66 + 23 tests) and `emthin-core-client` (1 + 1) cover the local adapters. Gap: no Go gateway, so no credit-preserving relay, writer handoff, denied-target channel reuse or stalled-client isolation. |
+| T13 | Gap | No Tailscale/tsnet identity, approval CLI or pairing service lives in this repository, and no test tailnet was exercised. |
+| T14 | Gap | The pad's transport is the plain TCP fixture connection. No WSS endpoint registry, paste-pairing UI or certificate-failure lane exists yet. |
+| T15 | Gap | Needs T13–T14 and a physical arm64 phone; this run used the Waydroid container, which is not a pairing target. |
+| T16 | Gap | No OpenShell fleet or gateway host registry is available here, so no real session could be enrolled. |
+
+Run A of the [acceptance run](HERDR_ACCEPTANCE_RUN.md) is exercised by
+`emthin-android/device-lane.sh e2e`: **215 checks, 0 failed** on 2026-11-23
+(persistence, sessions pin, figure accessibility, terminal scene, reflow,
+pages and lease). Run B — two paired test hosts over Tailscale with no SSH —
+remains a hardware and deployment gap and was not attempted.
+
+`scripts/check-herdr-inputs` was not part of this verdict: it did not finish in
+three minutes on this host (it reads sibling checkouts and the Nix inputs), so
+there is no recorded result for it here. Treat that validator as unrun rather
+than passing.
+
 ## T17–T22. OpenShell launch, sharing and old Herdr
 
 ### T17. Make the fleet launcher safe to plan and repeat

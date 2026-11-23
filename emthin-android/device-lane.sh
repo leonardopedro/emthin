@@ -2173,16 +2173,33 @@ lease_admin() {
      cat <&3) 2>/dev/null
 }
 
+# Launch the fixture scene against the scripted gateway. Clearing the log here
+# makes a retry start from a clean history.
+lease_launch() {
+    local fixture="$1"
+    D logcat -c >/dev/null 2>&1 || true
+    D shell am start -W -n "$ACTIVITY" \
+        --ez emthin.fixtureVtScene true \
+        --es emthin.fixtureGateway "127.0.0.1:$LEASE_PORT" \
+        --es emthin.fixtureGatewayGeneration 'g-fixture-1' \
+        --ef emthin.fixtureViewZoom 1.0 \
+        --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+        >/dev/null 2>&1
+}
+
+# A fresh install hands the package a new uid. A stale uid whose packets the
+# container drops (seen on 2026-11-23: the app's connect sat in SYN_SENT and the
+# host listener saw nothing, while the shell uid and an ordinary app reached the
+# same port) fails this step forever, and without root reinstalling is the only
+# lever.
+lease_reinstall() {
+    D uninstall "$PKG" >/dev/null 2>&1 || true
+    D install -r "$APK" >/dev/null 2>&1
+}
+
 terminal_lease_check() {
     local log="$1" fixture="$2" placed x y w h cx cy status
-    D logcat -c >/dev/null 2>&1 || true
-    if D shell am start -W -n "$ACTIVITY" \
-            --ez emthin.fixtureVtScene true \
-            --es emthin.fixtureGateway "127.0.0.1:$LEASE_PORT" \
-            --es emthin.fixtureGatewayGeneration 'g-fixture-1' \
-            --ef emthin.fixtureViewZoom 1.0 \
-            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
-            >/dev/null 2>&1; then
+    if lease_launch "$fixture"; then
         pass "launched the disposable gateway-lease fixture"
     else
         fail "launch the gateway-lease fixture"
@@ -2190,8 +2207,26 @@ terminal_lease_check() {
     fi
     wait_for_log "$log" 'vtScene phase ready' \
         || { fail "lease fixture scene did not start"; return; }
-    wait_for_log "$log" 'gatewayLease phase ready mode watch' \
-        || { fail "gateway watch attach did not become ready"; return; }
+    if ! wait_for_log "$log" 'gatewayLease phase ready mode watch'; then
+        if ! grep -q 'gatewayLease error kind transport' "$log"; then
+            fail "gateway watch attach did not become ready"
+            return
+        fi
+        say "    info the app's connect never reached the fixture; reinstalling for a fresh uid"
+        if ! lease_reinstall; then
+            fail "reinstall the pad after a dead transport"
+            return
+        fi
+        if ! lease_launch "$fixture"; then
+            fail "relaunch the gateway-lease fixture after a fresh install"
+            return
+        fi
+        wait_for_log "$log" 'vtScene phase ready' \
+            || { fail "lease fixture scene did not start after a fresh install"; return; }
+        wait_for_log "$log" 'gatewayLease phase ready mode watch' \
+            || { fail "gateway watch attach still failed after a fresh install"; return; }
+        pass "a fresh install restored the app's network egress"
+    fi
     pass "watch attach became a gateway lease"
     wait_for_log "$log" 'gatewayLease resize cols 80 rows 24' \
         || { fail "gateway did not publish its authoritative grid"; return; }
