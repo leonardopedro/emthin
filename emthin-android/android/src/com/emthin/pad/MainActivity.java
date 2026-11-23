@@ -1250,6 +1250,9 @@ public class MainActivity extends Activity {
             wholeDocumentEditing = false;
             editor.setSelection(caret);
             inspectorSignature = "";
+            // Same layout as tapping Edit, so the lane measures the pane a user
+            // actually gets.
+            previewScroll.setVisibility(View.GONE);
             updateModifierPanel();
             focusSourceCaret();
             trace("fixture", "modifier", fixtureModifier, "targets", fixtureTargets,
@@ -4916,6 +4919,14 @@ public class MainActivity extends Activity {
         inspectorOpen = true;
         wholeDocumentEditing = wholeDocument;
         inspectorSignature = "";
+        // The inspector opens with the source field focused, so the IME already
+        // takes ~400dp of a tall tablet. Keep the preview's weighted share too
+        // and the relationship list is squeezed to ~130dp -- two rows of five,
+        // reachable only by scrolling. The preview is the reading surface and
+        // the inspector is the editing one; nobody needs both at once. Only a
+        // user-intent open yields it: a cold start that restores the inspector
+        // still has to lay the preview out to apply the saved reading offset.
+        previewScroll.setVisibility(View.GONE);
         updateModifierPanel();
         focusSourceCaret();
         if (sourceField != null) {
@@ -6568,6 +6579,7 @@ public class MainActivity extends Activity {
         }
         if (!inspectorOpen) {
             modifierPanel.setVisibility(View.GONE);
+            previewScroll.setVisibility(View.VISIBLE);
             return;
         }
         int caret = editor.getSelectionStart();
@@ -6931,6 +6943,7 @@ public class MainActivity extends Activity {
         session.invalidate(PadSession.INSPECTOR);
         main.removeCallbacks(updateModifierComparisons);
         modifierPanel.setVisibility(View.GONE);
+        previewScroll.setVisibility(View.VISIBLE);
         android.view.inputmethod.InputMethodManager ime =
                 (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (ime != null) ime.hideSoftInputFromWindow(modifierPanel.getWindowToken(), 0);

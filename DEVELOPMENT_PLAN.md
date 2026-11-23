@@ -741,9 +741,9 @@ Mutter configurations ask logind for a session. Both runs left no Xvfb or
 sway behind (`pgrep -x Xvfb`/`pgrep -x sway` empty afterwards), which is the
 `stop_compositor` fix above earning its keep.
 
-The device and service lanes then ran too — see the two sections below. One
-device step (`terminal-lease`) stays a named gap, and it is the same one the
-2026-11-22 record already names.
+The device and service lanes then ran too — see the sections below. That also
+closes the `terminal-lease` gap the 2026-11-22 record named, and the
+relationship-pane sizing question it left implicit.
 
 ### Device lane (2026-11-23)
 
@@ -756,14 +756,15 @@ container service was already active) and the pad's key was already seeded in
 2943x1638 panel, disposable test package `com.emthin.pad.test`.
 
 `emthin-android/device-lane.sh e2e` (arm64 APK built by `build-apk.sh` through
-the `.toolchain/` box64 shims, installed, cold-launched) finished with **213
-checks passed, 1 failed**, and the installed APK md5-matched the build. That
+the `.toolchain/` box64 shims, installed, cold-launched) finished with **215
+checks passed, 0 failed**, and the installed APK md5-matched the build. That
 covers persistence, new-reset, scroll-anchor, search-replace, focus-stack,
 composing-ime (CJK + emoji), accessibility, diagnostics, named-document,
 modifier-inspector, session-pin, figure-a11y, terminal-scene, terminal-reflow,
-terminal-pages and terminal-lease.
+terminal-pages and terminal-lease. The pad's host lane still passes (136
+tests, run through `nix develop`).
 
-The first run failed twice. One was the harness, fixed here:
+The first run failed twice; both causes are identified and fixed here:
 
 - **`modifier-inspector` (fixed).** The relationship list is its own scroll
   pane, and the lane swiped at a fixed `1400 850`, which on this tablet is
@@ -774,18 +775,52 @@ The first run failed twice. One was the harness, fixed here:
   the geometry for later scrolls once the headings themselves scroll away
   (`relationship_scroll`). Step re-run alone: all steps passed, and the full
   e2e then passed this step too.
-- **`terminal-lease` (open gap).** `gateway watch attach did not become ready`.
-  The app logs `gatewayLease phase connect host 127.0.0.1 port 47654` and then
-  `gatewayLease error kind transport` exactly 4 s later — its Java connect
-  timeout (`GatewayLeaseClient.java`: `connect(…, 4000)`). During the run
-  `adb reverse --list` shows `tcp:47654 tcp:47654` continuously, and
-  `adb shell 'toybox nc 127.0.0.1 47654'` connects to the same fixture while
-  the lane's reverse is in place, so adb and the fixture are fine and the
-  failure sits in the app process. That is the same symptom recorded on
-  2026-11-22 over both ADB reverse and the private bridge, and it still needs a
-  device-side diagnostic (the app logs the failure kind, not the exception).
-  Per the editor release checks above, `terminal-lease` must pass before the
-  Herdr integration checkpoint, so this stays open.
+- **`terminal-lease` (fixed — the install's uid, not the transport).** The step
+  failed with `gateway watch attach did not become ready`: the app logged
+  `gatewayLease phase connect host 127.0.0.1 port 47654` and then
+  `gatewayLease error kind transport` exactly 4 s later, its Java connect
+  timeout (`GatewayLeaseClient.java`: `connect(…, 4000)`). The transport was
+  never at fault. Reading the app's own socket table during the attempt showed
+  a `SYN_SENT` entry for uid 10067 with TCP retransmits (`01:00000026`,
+  `02`, `03` in the timer column) to the host and to `1.1.1.1:443`, while the
+  host-side listener accepted nothing — the container dropped every packet
+  from that uid. The same host port was reachable from the shell uid 2000 over
+  loopback and the waydroid0 bridge, and `org.lineageos.jelly` (uid 10097)
+  loaded `http://192.168.240.1:47654/` fine, so it was not ADB reverse, the
+  bridge, or the fixture. A `pm uninstall` + fresh `adb install` gave the
+  package a new uid (10075) and its egress worked immediately; the step then
+  passed in full (watch attach → DATA → Take → controller input → operator
+  revoke → fresh lease). The stale uid's network registration is a container
+  property, not pad code — no root on this image to inspect `netd`'s firewall
+  state, which is why the diagnosis stops at "that uid's packets never leave".
+- **Harness bug found while reproducing it.** With the fixture's port already
+  bound, `start_lease_fixture` printed `lease fixture exited: …` and returned
+  non-zero, but `cmd_terminal_lease` only `return`ed — the lane reported *all
+  steps passed* with zero checks run. It now records a `fail` for that case.
+
+### Relationship pane sizing on a tall tablet (2026-11-23)
+
+Measured rather than assumed, because the pane being *reachable* by scrolling
+is not the same as it being *sized* sensibly. On the 2943x1638 panel (density
+270, i.e. 971 dp tall) the inspector opens with the source field focused, so
+the IME takes ~690 px and the app content is 698 px. Inside that, the preview
+kept its weighted share (183 px) and the relationship `ScrollView` got
+`[34,604][2909,826]` — 222 px, 132 dp, about **two of the five rows**, with the
+rest behind the scroll the lane had learned to do.
+
+Fix: a user-intent open (`openSourceAt`, i.e. the toolbar's Edit, and the
+fixture path the lane uses) hides the preview while the inspector is up, and
+`closeInspector` / the not-open branch restore it. The pane then measured
+`[34,421][2909,826]` — 405 px, 240 dp, ~4 rows — and “Show document” brought
+the preview back at full height. The first attempt hid the preview in
+`updateModifierPanel`, which also fires for a **cold start that restores
+`inspectorOpen`** (`showMarkers` pref): the hidden preview was never laid out,
+so `restorePreviewScroll` landed at 0 instead of the saved 5087 and
+`persistence`, `scroll-anchor` and `terminal-scene` failed. That is why the
+hide lives on the open paths instead. Verified: those three steps plus
+`modifier-inspector` pass individually, then the whole
+`device-lane.sh e2e` run — **215 checks, 0 failed** — with the installed APK
+md5-matching the build.
 
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 

@@ -2136,6 +2136,7 @@ start_lease_fixture() {
         fi
         if ! kill -0 "$LEASE_PID" 2>/dev/null; then
             say "    lease fixture exited: $(cat "$LEASE_DIR/server.log" 2>/dev/null)"
+            fail "gateway lease fixture exited before it listened"
             return 1
         fi
         sleep 0.1
