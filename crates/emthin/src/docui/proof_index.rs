@@ -544,6 +544,24 @@ mod tests {
     }
 
     #[test]
+    fn a_second_query_searches_names_and_keys_by_source_range() {
+        let view = view(&fixture());
+        let matches = view.search("sort", 8);
+        assert!(!matches.definitions.is_empty(), "definition matched");
+        for row in &matches.definitions {
+            assert!(row.start <= row.end);
+            assert!(row.name.to_lowercase().contains("sort"));
+        }
+        assert_eq!(view.search("SORT", 8), matches, "case-insensitive");
+        assert_eq!(view.search("", 1).definitions.len(), 1, "bounded");
+        assert!(
+            !view.search("ghost", 8).missing.is_empty(),
+            "unresolved names are searchable"
+        );
+        assert!(view.search("no-such-name", 8).definitions.is_empty());
+    }
+
+    #[test]
     fn a_dependency_query_deduplicates_and_handles_cycles() {
         let mut view = view(&fixture());
         view.definitions = vec![

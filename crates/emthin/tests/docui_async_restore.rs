@@ -58,22 +58,34 @@ fn stale_geometry_is_withheld_and_the_accepted_replacement_restores_it() {
         f64::from(page.loc.x + page.size.w / 2),
         f64::from(page.loc.y + page.size.h / 10),
     );
-    assert!(ui.byte_at(point).is_some(), "the initial hit must be current");
+    assert!(
+        ui.byte_at(point).is_some(),
+        "the initial hit must be current"
+    );
     let figure = ui.figures().figures().first().cloned();
     if let Some(figure) = &figure {
         let centre = smithay::utils::Point::<f64, smithay::utils::Logical>::new(
             f64::from(figure.rect.loc.x + figure.rect.size.w / 2),
             f64::from(figure.rect.loc.y + figure.rect.size.h / 2),
         );
-        assert!(ui.figure_at(centre).is_some(), "the figure is hittable initially");
+        assert!(
+            ui.figure_at(centre).is_some(),
+            "the figure is hittable initially"
+        );
     }
 
     // A multibyte insert changes every following byte offset. Until the worker
     // accepts a replacement, no source-derived hit may use the old glyph index.
     ui.model_mut().replace(0..0, "é ");
-    assert!(!ui.geometry_current(), "the edit invalidates geometry immediately");
+    assert!(
+        !ui.geometry_current(),
+        "the edit invalidates geometry immediately"
+    );
     assert!(ui.byte_at(point).is_none(), "no hit against stale offsets");
-    assert!(ui.caret_rect().is_none(), "no IME caret against stale offsets");
+    assert!(
+        ui.caret_rect().is_none(),
+        "no IME caret against stale offsets"
+    );
     if let Some(figure) = &figure {
         let centre = smithay::utils::Point::<f64, smithay::utils::Logical>::new(
             f64::from(figure.rect.loc.x + figure.rect.size.w / 2),
@@ -84,11 +96,20 @@ fn stale_geometry_is_withheld_and_the_accepted_replacement_restores_it() {
             "a stale figure rect must not accept a launch/resize hit"
         );
     }
-    assert!(ui.model().text().starts_with("é "), "keyboard editing continues");
+    assert!(
+        ui.model().text().starts_with("é "),
+        "keyboard editing continues"
+    );
 
     ui.relayout();
-    assert!(wait_current(&mut ui), "the replacement did not restore geometry");
-    assert!(ui.byte_at(point).is_some(), "the accepted replacement restores hits");
+    assert!(
+        wait_current(&mut ui),
+        "the replacement did not restore geometry"
+    );
+    assert!(
+        ui.byte_at(point).is_some(),
+        "the accepted replacement restores hits"
+    );
 
     // Open while a layout is in flight: the new document owns geometry, not
     // the result the worker still has queued.
@@ -101,7 +122,10 @@ fn stale_geometry_is_withheld_and_the_accepted_replacement_restores_it() {
         !ui.geometry_current(),
         "Open invalidates geometry before the new result arrives"
     );
-    assert!(wait_current(&mut ui), "the opened document's layout did not arrive");
+    assert!(
+        wait_current(&mut ui),
+        "the opened document's layout did not arrive"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

@@ -13,29 +13,32 @@ public final class ActionCatalogTest {
 
     public static void main(String[] args) {
         Set<ActionCatalog.Id> seen = new HashSet<>();
-        for (ActionCatalog.Id id : ActionCatalog.TOOLBAR) {
-            check(seen.add(id), "toolbar action appears once: " + id);
-            check(!ActionCatalog.label(id, false, false).isEmpty(),
-                    "toolbar action has a label: " + id);
+        ActionCatalog.Id[][] groups = {
+            ActionCatalog.TOOLBAR, ActionCatalog.DOCUMENT_MENU, ActionCatalog.NAVIGATION_MENU,
+            ActionCatalog.VIEW_MENU, ActionCatalog.SESSIONS_MENU
+        };
+        for (ActionCatalog.Id[] group : groups) {
+            for (ActionCatalog.Id id : group) {
+                check(seen.add(id), "action appears once: " + id);
+                check(!ActionCatalog.label(id, false).isEmpty(), "action has a label: " + id);
+            }
         }
-        check(seen.contains(ActionCatalog.Id.SAVE), "Save is advertised");
+        check(java.util.Arrays.equals(ActionCatalog.TOOLBAR, new ActionCatalog.Id[] {
+                ActionCatalog.Id.OPEN, ActionCatalog.Id.SAVE, ActionCatalog.Id.UNDO,
+                ActionCatalog.Id.FIND, ActionCatalog.Id.EDIT_SOURCE
+        }), "primary editing actions fit in one toolbar");
         check(seen.contains(ActionCatalog.Id.MARKERS), "Markers is advertised");
         check(seen.contains(ActionCatalog.Id.CLOSE_INSPECTOR), "Close is advertised");
 
-        check(ActionCatalog.label(ActionCatalog.Id.SAVE, false, false)
-                        .equals("^S Save (Find: next)"),
-                "toolbar Save explains the Find context");
-        check(ActionCatalog.label(ActionCatalog.Id.SAVE, false, true)
-                        .equals("^S Find next (Save: close Find)"),
-                "toolbar Save flips while Find is open");
-        check(ActionCatalog.label(ActionCatalog.Id.FIND_NEXT, false, true)
-                        .equals("^S Next in Find"),
-                "Find's next action says it is in Find");
-        check(ActionCatalog.label(ActionCatalog.Id.MARKERS, true, false)
-                        .equals("Tab Hide markers"),
+        check(ActionCatalog.label(ActionCatalog.Id.SAVE, false).equals("Save"),
+                "toolbar Save names what the button does");
+        check(ActionCatalog.label(ActionCatalog.Id.FIND_NEXT, false).equals("Next"),
+                "Find names what its next button does");
+        check(ActionCatalog.label(ActionCatalog.Id.MARKERS, true)
+                        .equals("Hide markers"),
                 "Markers has dynamic visible state");
-        check(ActionCatalog.label(ActionCatalog.Id.MARKERS, false, false)
-                        .equals("Tab Show markers"),
+        check(ActionCatalog.label(ActionCatalog.Id.MARKERS, false)
+                        .equals("Show markers"),
                 "Markers has the hidden state label");
 
         check(ActionCatalog.ctrlS(false, false) == ActionCatalog.Id.SAVE,

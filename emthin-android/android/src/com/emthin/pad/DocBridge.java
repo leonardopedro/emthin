@@ -256,4 +256,16 @@ public final class DocBridge {
      *         {@code {"error":"…"}}
      */
     public static native String australRule(String factsJson);
+
+    /** K5: retain a read-only snapshot of the current document. */
+    public static native String historyRemember(long handle, String owner);
+
+    /** Clear the retained snapshots when New keeps the live model handle. */
+    public static native void historyClear(long handle);
+
+    /** K5: list retained frontiers as hex tokens. */
+    public static native String historyFrontiers(long handle);
+
+    /** K5: read-only preview of one frontier; never changes the live model. */
+    public static native String historyPreview(long handle, String frontierHex);
 }

@@ -67,24 +67,11 @@ impl Pane {
         self.vt.wheel(up)
     }
 
-    pub fn mouse_button(
-        &self,
-        x: u16,
-        y: u16,
-        button: u8,
-        press: bool,
-        mods: u8,
-    ) -> Vec<u8> {
+    pub fn mouse_button(&self, x: u16, y: u16, button: u8, press: bool, mods: u8) -> Vec<u8> {
         self.vt.mouse_button(x, y, button, press, mods)
     }
 
-    pub fn mouse_motion(
-        &self,
-        x: u16,
-        y: u16,
-        button: Option<u8>,
-        mods: u8,
-    ) -> Vec<u8> {
+    pub fn mouse_motion(&self, x: u16, y: u16, button: Option<u8>, mods: u8) -> Vec<u8> {
         self.vt.mouse_motion(x, y, button, mods)
     }
 

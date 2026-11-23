@@ -375,13 +375,10 @@ fn ipc_a11y_nodes(state: &mut EmthinState) {
 
 fn ipc_proof_search(state: &mut EmthinState, query: &str, limit: usize) {
     // A search before any query builds the view first, so the second query is
-    // independent of whether `proof_query` was called.
-    if state.doc.proof_view.is_none() {
-        let share = crate::ipc::hex::encode(state.collab.share_id());
-        let key = state.doc.document_key().unwrap_or("untitled").to_string();
-        let _ = state.doc.proof_view(state.collab.share_id(), &key);
-        let _ = (share, key);
-    }
+    // independent of whether `proof_query` was called. `proof_view_cached`
+    // keeps an already-accepted verdict instead of silently rebuilding it.
+    let key = state.doc.document_key().unwrap_or("untitled").to_string();
+    let _ = state.doc.proof_view_cached(state.collab.share_id(), &key);
     let matches = state.doc.proof_search(query, limit);
     state.ipc.send(OutgoingMessage::ProofMatches {
         definitions: matches
@@ -948,7 +945,9 @@ fn ipc_list_state(state: &mut EmthinState) {
     let peers = state.collab_peers();
     let collab_local_peer = state.collab.local_peer().to_string();
     let collab_local_name = state.collab_local_name.clone();
-    let status_model = state.doc.status(peers.len());
+    let mut status_model = state.doc.status(peers.len());
+    // The inspect trace is owned by the compositor state, not the document.
+    status_model.inspect_events = state.inspect.events().count();
     let status = Box::new(status_model.line());
     let save_state = status_model.save.as_str();
     let recovery_state = status_model.recovery.as_str();

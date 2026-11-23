@@ -62,7 +62,10 @@ mod tests {
     fn the_cache_replaces_the_image_when_the_line_changes() {
         let mut cache = StatusBarCache::default();
         let first = cache.get("paper.typ  unsaved").expect("first").width;
-        let second = cache.get("paper.typ  unsaved  Find 2/3").expect("second").width;
+        let second = cache
+            .get("paper.typ  unsaved  Find 2/3")
+            .expect("second")
+            .width;
         assert!(second > first, "{first} -> {second}");
     }
 }

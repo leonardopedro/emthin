@@ -174,9 +174,7 @@ fn claim_figure(
         .figures()
         .iter()
         .filter(|f| {
-            f.spec.is_wayland()
-                && f.is_dormant()
-                && matches_id(f.spec.id.as_deref(), app_id, title)
+            f.spec.is_wayland() && f.is_dormant() && matches_id(f.spec.id.as_deref(), app_id, title)
         })
         .map(|f| f.key.clone())
         .collect();

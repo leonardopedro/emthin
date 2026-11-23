@@ -30,6 +30,7 @@ final class PadSession {
     static final String CITATION = "citation";
     static final String OPEN = "open";
     static final String FILE = "file";
+    static final String HISTORY = "history";
 
     /** Immutable identity of one accepted piece of work. */
     static final class Owner {

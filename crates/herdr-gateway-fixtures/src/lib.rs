@@ -100,8 +100,8 @@ pub fn validate_corpus(dir: &Path) -> Result<usize, String> {
     for path in &paths {
         let raw = fs::read_to_string(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-        let fixture: Fixture = serde_json::from_str(&raw)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let fixture: Fixture =
+            serde_json::from_str(&raw).map_err(|error| format!("{}: {error}", path.display()))?;
         if !names.insert(fixture.name.clone()) {
             return Err(format!("duplicate fixture name {:?}", fixture.name));
         }
@@ -130,10 +130,7 @@ pub fn validate_corpus(dir: &Path) -> Result<usize, String> {
                 }
             }
             (true, Err(error)) => {
-                return Err(format!(
-                    "{}: expected valid, got {error:?}",
-                    fixture.name
-                ))
+                return Err(format!("{}: expected valid, got {error:?}", fixture.name))
             }
             (false, Ok(())) => {
                 return Err(format!(
@@ -202,7 +199,9 @@ fn validate_chunks(fixture: &Fixture) -> Result<(), String> {
     }
     let expected = fixture.frames.unwrap_or(1);
     if decoded != expected {
-        return Err(format!("chunks decode to {decoded} frames, want {expected}"));
+        return Err(format!(
+            "chunks decode to {decoded} frames, want {expected}"
+        ));
     }
     Ok(())
 }
@@ -292,7 +291,9 @@ pub fn validate_message(message: &Value) -> Result<(), String> {
         return Err("jsonrpc must be \"2.0\"".into());
     }
     if let Some(method) = object.get("method") {
-        let method = method.as_str().ok_or_else(|| "method must be a string".to_owned())?;
+        let method = method
+            .as_str()
+            .ok_or_else(|| "method must be a string".to_owned())?;
         if method == "sessions.changed" && !object.contains_key("id") {
             let params = object
                 .get("params")
@@ -326,7 +327,9 @@ pub fn validate_message(message: &Value) -> Result<(), String> {
         return Ok(());
     }
     if let Some(error) = object.get("error") {
-        let error = error.as_object().ok_or_else(|| "error must be an object".to_owned())?;
+        let error = error
+            .as_object()
+            .ok_or_else(|| "error must be an object".to_owned())?;
         let kind = error
             .get("data")
             .and_then(|data| data.get("kind"))
@@ -622,8 +625,7 @@ pub fn validate_frame(frame: &[u8]) -> Result<(), String> {
             if channel == 0 || payload.len() > MAX_FACTS_PAYLOAD {
                 return Err("FACTS must be bounded JSON on a stream".into());
             }
-            serde_json::from_slice::<Value>(payload)
-                .map_err(|_| "FACTS is not JSON".to_owned())?;
+            serde_json::from_slice::<Value>(payload).map_err(|_| "FACTS is not JSON".to_owned())?;
         }
         6 => {
             if channel == 0 || payload.len() > MAX_DATA_PAYLOAD {
@@ -801,27 +803,52 @@ mod tests {
     #[test]
     fn chunked_frames_and_scenarios_enforce_transport_state() {
         let mut chunks = fixture("split", "valid", "chunks");
-        chunks.chunks = Some(vec![
-            "07 00 00 00 00 03".into(),
-            "00 00 00 18 4f 4b".into(),
-        ]);
+        chunks.chunks = Some(vec!["07 00 00 00 00 03".into(), "00 00 00 18 4f 4b".into()]);
         chunks.frames = Some(1);
         assert!(validate_fixture(&chunks).is_ok());
 
         let mut reused = fixture("reuse", "valid", "scenario");
         reused.steps = Some(vec![
-            ScenarioStep { op: "watch".into(), channel: Some(7), lease: None },
-            ScenarioStep { op: "close".into(), channel: Some(7), lease: None },
-            ScenarioStep { op: "attach".into(), channel: Some(7), lease: None },
-            ScenarioStep { op: "input".into(), channel: Some(7), lease: None },
+            ScenarioStep {
+                op: "watch".into(),
+                channel: Some(7),
+                lease: None,
+            },
+            ScenarioStep {
+                op: "close".into(),
+                channel: Some(7),
+                lease: None,
+            },
+            ScenarioStep {
+                op: "attach".into(),
+                channel: Some(7),
+                lease: None,
+            },
+            ScenarioStep {
+                op: "input".into(),
+                channel: Some(7),
+                lease: None,
+            },
         ]);
         assert!(validate_fixture(&reused).is_ok());
 
         let mut expired = fixture("expired", "invalid", "scenario");
         expired.steps = Some(vec![
-            ScenarioStep { op: "take_lease".into(), channel: None, lease: Some(1) },
-            ScenarioStep { op: "expire".into(), channel: None, lease: None },
-            ScenarioStep { op: "input_lease".into(), channel: None, lease: Some(1) },
+            ScenarioStep {
+                op: "take_lease".into(),
+                channel: None,
+                lease: Some(1),
+            },
+            ScenarioStep {
+                op: "expire".into(),
+                channel: None,
+                lease: None,
+            },
+            ScenarioStep {
+                op: "input_lease".into(),
+                channel: None,
+                lease: Some(1),
+            },
         ]);
         assert!(validate_fixture(&expired).unwrap_err().contains("stale"));
     }

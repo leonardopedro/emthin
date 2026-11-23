@@ -15,6 +15,31 @@ The [native terminal figure plan](../docs/HERDR_INTEGRATION_PLAN.md) defines
 the later Herdr Core and OpenShell work. The scope exclusions below apply
 to this editor milestone.
 
+## Preview release check
+
+Run `./device-lane.sh math-preview` against the disposable APK with Python
+Pillow installed. It captures a note with a displayed equation and verifies
+visible ink inside the preview's accessibility bounds. It then taps the
+equation, edits its source, and checks that Undo restores both text and
+source focus. The 2026-11-22
+Waydroid trial found a blank preview even though the bitmap and hit map
+arrived. The page now draws its bitmap at the same explicit dimensions
+used by the caret, touch and terminal figures. Keep this check alongside
+the scroll, IME and reflow lanes. Repeat the phone acceptance steps in
+the [editor release checks](../DEVELOPMENT_PLAN.md#editor-release-checks).
+
+Open, Save, Undo, Find and Edit stay in the toolbar. Edit opens the existing
+source editor at the caret and requests the keyboard. More groups document,
+navigation, view and session actions. Compact windows and large fonts use
+two toolbar rows. At 360 dp on a phone, verify that a user can start editing
+an equation, undo and save through Android's file picker.
+
+Ordinary free variables stay available as source-linked notes under More,
+View, Diagnostics. The global banner counts actionable errors and warnings.
+The math fixture verifies that valid equations keep the banner quiet, and
+the diagnostics fixture verifies that real warnings and modifier errors
+still appear and lead to their source.
+
 ## Execution status
 
 Updated 2026-11-17. Checkpoint M0 and cards A2–A7 are implemented; A8 is partially implemented (touch selection, handles and virtual reading nodes; TalkBack binding, an automated spoken-page utterance check through `TALKBACK_APK`, and CJK/emoji InputConnection composing are covered, while a full human spoken walkthrough remains); A9 and A11–A15 are implemented; A10 is complete with a separate disposable test package, automated TalkBack coverage and a real composing-IME path.

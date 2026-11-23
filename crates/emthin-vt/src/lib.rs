@@ -144,7 +144,9 @@ impl Vt {
             let history_y = history + u32::from(y) - offset;
             for x in 0..self.cols {
                 cells.push(if history_y < history {
-                    self.terminal.history_cell(x, history_y).unwrap_or_else(|| blank.clone())
+                    self.terminal
+                        .history_cell(x, history_y)
+                        .unwrap_or_else(|| blank.clone())
                 } else {
                     self.terminal
                         .cell(x, (history_y - history) as u16)
@@ -187,14 +189,7 @@ impl Vt {
     /// A button event at cell `(x, y)`, using SGR or X10 encoding according to
     /// the program's modes. Empty when it did not request button reports.
     /// `mods` uses shift=1, alt=2, ctrl=4.
-    pub fn mouse_button(
-        &self,
-        x: u16,
-        y: u16,
-        button: u8,
-        press: bool,
-        mods: u8,
-    ) -> Vec<u8> {
+    pub fn mouse_button(&self, x: u16, y: u16, button: u8, press: bool, mods: u8) -> Vec<u8> {
         if !(self.mode(1000) || self.mode(1002) || self.mode(1003)) {
             return Vec::new();
         }
@@ -210,13 +205,7 @@ impl Vt {
 
     /// A pointer-motion report at cell `(x, y)`. 1002 sends motion only while
     /// a button is held; 1003 sends it for hover too (`button` is then None).
-    pub fn mouse_motion(
-        &self,
-        x: u16,
-        y: u16,
-        button: Option<u8>,
-        mods: u8,
-    ) -> Vec<u8> {
+    pub fn mouse_motion(&self, x: u16, y: u16, button: Option<u8>, mods: u8) -> Vec<u8> {
         if !(self.mode(1002) || self.mode(1003)) {
             return Vec::new();
         }
@@ -288,8 +277,8 @@ mod tests {
         assert_eq!(a.style.fg, Some(StyleColor::Palette(1)));
         let combining = screen.cell(2, 0).unwrap();
         assert_eq!(combining.text.chars().count(), 2);
-        let wide = screen.cell(4, 0).unwrap();        assert_eq!(
-            wide.text, "界");
+        let wide = screen.cell(4, 0).unwrap();
+        assert_eq!(wide.text, "界");
         assert_eq!(wide.wide, 1);
         assert_eq!(screen.cell(5, 0).unwrap().wide, 2, "spacer tail");
     }

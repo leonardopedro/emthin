@@ -685,7 +685,8 @@ impl EmthinState {
     /// next click elsewhere, so double-click counting never leaks across
     /// unrelated targets.
     fn start_text_selection(&mut self, pos: Point<f64, Logical>, time: u32) {
-        let Some(byte) = self.doc.byte_at(pos) else {
+        self.doc.reset_vertical_goal();
+        let Some((glyph, byte)) = self.doc.text_hit_at(pos) else {
             self.doc.model_mut().clear_selection();
             self.text_selection.drag = None;
             self.text_selection.last_click = None;
@@ -713,8 +714,8 @@ impl EmthinState {
         tracing::debug!("text selection: click count={count} byte={byte}");
 
         let selected = match count {
-            2 => self.doc.select_word_at(byte),
-            3 => self.doc.select_line_at(byte),
+            2 => self.doc.select_word_at(glyph),
+            3 => self.doc.select_line_at(glyph),
             _ => false,
         };
         if selected {
@@ -868,6 +869,7 @@ impl EmthinState {
 
     /// Apply a global document binding.
     fn run_doc_action(&mut self, action: crate::docui::keymap::Action) {
+        self.doc.reset_vertical_goal();
         use crate::docui::keymap::Action;
         let context = keymap::ActionContext {
             has_query: !self.doc.find().query().is_empty(),
@@ -1197,6 +1199,9 @@ impl EmthinState {
     /// editing — the same set any editor has — so it lives in one place
     /// rather than being scattered through the input path.
     fn edit_document_key_inner(&mut self, keysym: u32) -> bool {
+        if !matches!(keysym, keysyms::KEY_Up | keysyms::KEY_Down) {
+            self.doc.reset_vertical_goal();
+        }
         // The launcher palette is the innermost text-capturing overlay: its
         // query must not leak into the find bar or the document behind it.
         if self.doc.launcher().is_open() {
@@ -1240,9 +1245,9 @@ impl EmthinState {
             }
             keysyms::KEY_Left => self.move_caret_horizontally(ctrl, shift, false),
             keysyms::KEY_Right => self.move_caret_horizontally(ctrl, shift, true),
-            k if k == keysyms::KEY_Up || k == keysyms::KEY_Down => {
-                self.move_caret_vertically(k == keysyms::KEY_Down)
-            }
+            k if k == keysyms::KEY_Up || k == keysyms::KEY_Down => self
+                .doc
+                .move_caret_vertically(k == keysyms::KEY_Down, shift),
             _ => {
                 // Ctrl+letter is a chord, not a character; anything else
                 // with a control modifier is the client's business.
@@ -1414,7 +1419,7 @@ impl EmthinState {
         self.doc.model_mut().take_selection();
     }
 
-    /// Paste the host clipboard at the caret.
+    /// Paste at the caret or replace the selection as one edit.
     fn paste_clipboard(&mut self) {
         let Some(text) = crate::clipboard_bridge::host_clipboard(self) else {
             return;
@@ -1422,12 +1427,25 @@ impl EmthinState {
         if text.is_empty() {
             return;
         }
-        self.doc.model_mut().take_selection();
-        self.doc.model_mut().insert_at_caret(&text);
+        let model = self.doc.model_mut();
+        if let Some(selection) = model.selection() {
+            model.replace(selection, &text);
+        } else {
+            model.insert_at_caret(&text);
+        }
     }
 
     /// Move the caret left/right by one grapheme, or one word with Ctrl.
     fn move_caret_horizontally(&mut self, word: bool, extend: bool, forward: bool) {
+        if let Some(selection) = self.doc.model().selection().filter(|_| !word && !extend) {
+            let edge = if forward {
+                selection.end
+            } else {
+                selection.start
+            };
+            self.doc.model_mut().set_caret(edge);
+            return;
+        }
         let (text, caret, len) = {
             let m = self.doc.model();
             (m.text().to_string(), m.caret(), m.len())
@@ -1452,33 +1470,6 @@ impl EmthinState {
             model.extend_selection_to(next);
         } else {
             model.set_caret(next);
-        }
-    }
-
-    /// Move the caret between lines, using the glyph index's line bands so
-    /// navigation agrees with what's actually on screen.
-    fn move_caret_vertically(&mut self, down: bool) {
-        let Some(glyphs) = self.doc.current_glyphs() else {
-            return;
-        };
-        let caret = self.doc.model().caret();
-        let Some(band) = glyphs.band_for_byte(caret) else {
-            return;
-        };
-        let target = if down {
-            band.saturating_add(1)
-        } else {
-            band.saturating_sub(1)
-        };
-        // `band_for_byte` counts from the top; the first entry of the target
-        // band is that line's leftmost byte.
-        let target_byte = glyphs
-            .entries
-            .iter()
-            .find(|e| e.band as usize == target)
-            .map(|e| e.doc_byte);
-        if let Some(byte) = target_byte {
-            self.doc.model_mut().set_caret(byte);
         }
     }
 
