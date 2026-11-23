@@ -996,6 +996,49 @@ certificate SAN bug, so the likeliest reading is a timing flake in the
 post-Back `uiautomator dump` rather than a defect; nothing was changed for it,
 and it will need a third sighting to earn a wait or a retry.
 
+### The pairing screen, driven by the device lane (2026-11-23)
+
+The pairing screen had only ever been opened by hand, so it gets a lane step
+(`./device-lane.sh pairing`, included in `LANE_WSS=1 ./device-lane.sh e2e`).
+
+- **A peer that answers `/v1/pair`.** `wss_fixture.py` now serves the pairing
+  half of the contract over the same TLS socket: `POST /v1/pair` opens a
+  request and answers pending, `GET /v1/pair/<id>` keeps answering pending
+  until the admin socket says `pair approve` or `pair deny`. The split is the
+  point — a fixture that approved by itself would make the pending state
+  unobservable. The admin command lives in `lease_fixture.admin_client`, which
+  reaches the state through `gateway.pairing`, so the existing
+  `revoke`/`status` handlers are untouched and a plain-TCP gateway answers
+  "pairing not enabled" rather than pretending.
+- **The link stays a real tailnet link.** `PairingLink` is unchanged, so the
+  step exercises the production parse and validation; only the request's
+  origin is remapped. `HttpsGatewayHttp` gained a lane-only constructor
+  (`base` + an `SSLContext`), and `MainActivity` builds it from
+  `emthin.fixturePairBase` with the fixture's CA. The production path is still
+  a no-argument `HttpsGatewayHttp` against the link's own origin.
+- **A defect the step found.** Tapping PAIR in the paste dialog dismissed the
+  dialog, and the pairing screen had already been dismissed to show the paste
+  field — so a request ran with nothing on screen to report pending or
+  approval. The step's pending assertion failed on exactly that. Fixed by
+  reopening the pairing screen after starting the request, which is also what
+  a user needs in order to see the outcome.
+- **What the step asserts.** Empty registry (`No gateways paired yet.`), a
+  typed link reaching the field, `gatewayPair phase request host
+  fleet.leo.ts.net`, the pending line on screen, `gatewayPair phase approved`
+  after the admin approval, the row (`fleet.leo · fleet.leo.ts.net`), the row
+  surviving a relaunch with no fixture extras, and `Forget` leaving the
+  registry empty. It also needed a dedicated menu opener: `tap_toolbar_menu`
+  dumps immediately after a tap, which is too fast for the sessions submenu's
+  animation (and `node_bounds` reads the last dump, so the opener dumps first).
+- **Result.** `./device-lane.sh pairing`: 14 checks, all passed. Full
+  `LANE_WSS=1 ./device-lane.sh e2e`: **236 checks, 0 failed**, `device lane:
+  all steps passed`, installed `base.apk` md5
+  `18c70c9b9acb90071b9c050da953a5f2`.
+- **Gap.** Approval goes through the fixture's admin socket, not a human on a
+  real host, and the paired endpoint is forgotten at the end of the step, so
+  the lease still runs against the fixture extras rather than the row this
+  step creates (no tailnet host exists here).
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the

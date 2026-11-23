@@ -690,6 +690,15 @@ the box64 setup remains the local aarch64-host path.
   container (no `CAP_SETGID`) and `/sdcard/Android/data` is denied; the
   host-side equivalent is `emthin-android/wss-lane-check.sh`.
 
+  `LANE_WSS=1` also adds `pairing` (`./device-lane.sh pairing` alone): the
+  screen is driven through uiautomator — empty registry, Paste link, type a
+  real `https://fleet.leo.ts.net/pair?v=1&core=<id>` link, pending, then
+  `pair approve` on the fixture's admin socket, the row listed, a relaunch
+  proving it persisted, and Forget. The link parses as production does; only
+  its origin is remapped to loopback by the `emthin.fixturePairBase` extra.
+  `wss_fixture.py` serves `/v1/pair` (`POST` pending, `GET` until the admin
+  answers), so the fixture stays the one scripted Core.
+
 ## Device tier — waydroid (measured 2026-10-19)
 
 Operating notes from the first full device verification (built →
