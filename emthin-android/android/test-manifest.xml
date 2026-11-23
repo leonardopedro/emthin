@@ -8,6 +8,7 @@
 
     <application
         android:label="emthin pad (test)"
+        android:debuggable="true"
         android:allowBackup="false"
         android:extractNativeLibs="true"
         android:usesCleartextTraffic="true">

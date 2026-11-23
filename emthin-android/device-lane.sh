@@ -2335,8 +2335,11 @@ start_wss_fixture() {
         return 1
     }
     WSS_DIR=$(mktemp -d /tmp/emthin-wss.XXXXXX) || return 1
+    # The pad dials the reversed port as 127.0.0.1, and its HTTPS endpoint
+    # identification checks the name it dialled, so the certificate has to
+    # name that address as well as `localhost`.
     if ! openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
             -keyout "$WSS_DIR/key.pem" -out "$WSS_DIR/cert.pem" >/dev/null 2>&1; then
         fail "generate the WSS fixture certificate"
         return 1
@@ -2366,12 +2369,12 @@ start_wss_fixture() {
         fail "adb reverse for the wss fixture"
         return 1
     fi
-    # The pad trusts exactly this certificate, so it has to be inside the app's
-    # own directory; run-as works because the lane installs a debug build.
-    if ! D shell run-as "$PKG" mkdir -p files >/dev/null 2>&1 \
-            || ! D shell run-as "$PKG" sh -c 'cat > files/fixture-ca.pem' \
-                <"$WSS_DIR/cert.pem" >/dev/null 2>&1; then
-        fail "push the fixture certificate into the app's files"
+    # The pad trusts exactly this certificate. Getting it into the app's own
+    # directory needs `run-as`, which this container refuses (the shell has no
+    # CAP_SETGID), so the PEM travels as launch data and the app writes it into
+    # its files dir itself.
+    if ! WSS_CA_B64=$(base64 -w0 "$WSS_DIR/cert.pem"); then
+        fail "encode the fixture certificate"
         return 1
     fi
     return 0
@@ -2397,7 +2400,7 @@ wss_lease_launch() {
     D shell am start -W -n "$ACTIVITY" \
         --ez emthin.fixtureVtScene true \
         --es emthin.fixtureGateway "wss://127.0.0.1:$WSS_PORT" \
-        --es emthin.fixtureGatewayCa "/data/data/$PKG/files/fixture-ca.pem" \
+        --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" \
         --es emthin.fixtureGatewayGeneration 'g-fixture-1' \
         --ef emthin.fixtureViewZoom 1.0 \
         --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
