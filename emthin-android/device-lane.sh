@@ -2446,6 +2446,20 @@ wss_admin() {
      cat <&3) 2>/dev/null
 }
 
+# An admin command the step cannot continue without. The fixture answers every
+# command with JSON, so silence means the socket is gone — worth naming here,
+# where it is the cause, instead of letting the step wait out the request's
+# pending timeout and report the answer that never came.
+wss_admin_checked() {
+    local reply
+    reply=$(wss_admin "$1")
+    if [ -z "$reply" ]; then
+        fail "the WSS fixture admin socket answered nothing to '$1'"
+        return 1
+    fi
+    printf '%s\n' "$reply"
+}
+
 wss_lease_launch() {
     local fixture="$1"
     # An empty generation (the second argument, "" ) omits the extra, which
@@ -2617,7 +2631,7 @@ cmd_pairing() {
     fi
     pass "the screen shows the request waiting for the host"
 
-    wss_admin "pair approve" >/dev/null 2>&1 || true
+    wss_admin_checked "pair approve" >/dev/null || { stop_wss_fixture; return 1; }
     if ! wait_for_log "$log" 'gatewayPair phase approved host fleet.leo.ts.net'; then
         fail "the approved answer did not arrive"
         stop_wss_fixture
@@ -2698,7 +2712,7 @@ cmd_pairing_answers() {
         stop_wss_fixture
         return 1
     fi
-    wss_admin "pair deny" >/dev/null 2>&1 || true
+    wss_admin_checked "pair deny" >/dev/null || { stop_wss_fixture; return 1; }
     if ! wait_for_log "$log" 'gatewayPair phase denied host fleet.leo.ts.net'; then
         fail "a denial was not reported"
         stop_wss_fixture
@@ -2724,7 +2738,7 @@ cmd_pairing_answers() {
         stop_wss_fixture
         return 1
     fi
-    wss_admin "pair expire" >/dev/null 2>&1 || true
+    wss_admin_checked "pair expire" >/dev/null || { stop_wss_fixture; return 1; }
     if ! wait_for_log "$log" 'gatewayPair phase expired host fleet.leo.ts.net'; then
         fail "a lapsed request was not reported"
         stop_wss_fixture
@@ -2772,10 +2786,11 @@ cmd_pairing_answers() {
 # all the paired path's.
 cmd_paired_lease() {
     local ui="$OUTDIR/paired-lease-ui.xml"
+    local actions_ui="$OUTDIR/paired-lease-actions-ui.xml"
     local log="$OUTDIR/paired-lease-logcat.txt"
     local link="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
-    local fixture
-    say "==> paired lease: approve a row -> a figure leases through it"
+    local fixture placed x y w h bounds status
+    say "==> paired lease: approve a row -> lease -> take -> operator revoke"
     mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
     cmd_clear_data || return
     if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
@@ -2790,7 +2805,7 @@ cmd_paired_lease() {
         stop_wss_fixture
         return 1
     fi
-    wss_admin "pair approve" >/dev/null 2>&1 || true
+    wss_admin_checked "pair approve" >/dev/null || { stop_wss_fixture; return 1; }
     if ! wait_for_log "$log" 'gatewayPair phase approved host fleet.leo.ts.net'; then
         fail "the approval did not arrive"
         stop_wss_fixture
@@ -2843,6 +2858,65 @@ cmd_paired_lease() {
         return 1
     fi
     pass "DATA arrived over the paired row"
+
+    # Watch is only the row's first half: the same row has to carry control,
+    # and the host still owns the revoke that ends it.
+    wait_for_log "$log" 'vtScene phase placed' \
+        || { fail "the paired-lease scene did not publish its placed rect"; stop_wss_fixture; return 1; }
+    placed=$(sed -n 's/.*vtScene phase placed x \([-0-9]*\) y \([-0-9]*\) w \([0-9]*\) h \([0-9]*\).*/\1 \2 \3 \4/p' "$log" | tail -1)
+    read -r x y w h <<EOF
+$placed
+EOF
+    if [ -z "$x" ] || [ -z "$y" ] || [ -z "$w" ] || [ -z "$h" ]; then
+        fail "could not parse the paired-lease scene rect from $log"
+        stop_wss_fixture
+        return 1
+    fi
+    D shell input tap "$((x + w / 2))" "$((y + h / 2))" >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput phase focus' \
+        || { fail "tapping the paired scene did not focus it"; stop_wss_fixture; return 1; }
+
+    if ! cmd_uidump "$actions_ui" >/dev/null 2>&1 || ! bounds=$(node_bounds 'text="Take"'); then
+        fail "the paired lease has no Take action"
+        stop_wss_fixture
+        return 1
+    fi
+    tap_center "$bounds"
+    wait_for_log "$log" 'gatewayLease phase request control' \
+        || { fail "Take on the paired row did not request control"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease phase ready mode control' \
+        || { fail "Take on the paired row did not become a controller"; stop_wss_fixture; return 1; }
+    pass "Take on the paired row acquired a controller lease"
+
+    D shell input text 'pairedtake' >/dev/null 2>&1
+    wait_for_log "$log" 'gatewayLease input bytes' \
+        || { fail "controller input did not cross the paired row"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease data .*echo:' \
+        || { fail "the paired row did not echo the controller input"; stop_wss_fixture; return 1; }
+    status=$(wss_admin status)
+    if ! printf '%s' "$status" | grep -q 'pairedtake'; then
+        fail "the paired gateway did not receive the complete controller input"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "controller input crossed the paired row and returned as DATA"
+
+    wss_admin_checked revoke >/dev/null || { stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease closed reason .*revoked' \
+        || { fail "operator revoke did not close the paired lease"; stop_wss_fixture; return 1; }
+    pass "operator revoke closed the paired lease"
+
+    D logcat -c >/dev/null 2>&1 || true
+    D shell input text 'after-revoke' >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput blocked conflict' \
+        || { fail "the revoked paired controller still accepted input"; stop_wss_fixture; return 1; }
+    status=$(wss_admin status)
+    if printf '%s' "$status" | grep -q 'after-revoke'; then
+        fail "revoked input reached the paired gateway"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "revoked paired lease rejected input before the transport"
     stop_wss_fixture
 }
 

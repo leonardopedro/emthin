@@ -706,7 +706,12 @@ the box64 setup remains the local aarch64-host path.
   a row and then launches a figure with no `emthin.fixtureGateway` at all —
   only `emthin.fixtureConnect` remapping the row's origin to loopback — so the
   registry lookup, the row's Core ID in `hello` and `sessions.list` generation
-  discovery are the paired path's. A launch fixture names the document to
+  discovery are the paired path's. It then drives the rest of the lifecycle
+  through that row: Take becomes a controller lease, typed input crosses it and
+  returns as DATA, and the fixture's admin `revoke` closes it and makes the
+  app reject further input before the transport. Admin commands the steps cannot
+  continue without go through `wss_admin_checked`, which fails naming the silent
+  socket instead of waiting out the request's pending timeout. A launch fixture names the document to
   open and therefore outranks a recovery copy (`fixtureText` is set only by the
   test APK); without that, a relaunch of the same build restored the previous
   document and the figure never appeared.
