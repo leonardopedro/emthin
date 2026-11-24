@@ -59,6 +59,9 @@ class Peer:
         self.server = server
         self.sock = sock
         self.address = address
+        # Which Core ID this connection said `hello` with; one process can
+        # answer for more than one, so the catalogue is chosen per peer.
+        self.core_id = None
         self.lock = threading.Lock()
         self.channels = {}
         self.next_channel = 1
@@ -110,8 +113,14 @@ class Peer:
 
 
 class Gateway:
-    def __init__(self, core_id=CORE_ID):
+    def __init__(self, core_id=CORE_ID, second_core_id=None):
         self.core_id = core_id
+        # A lane that pairs two hosts gets one process answering for both, so
+        # the picker's merge sees two real catalogues rather than two copies of
+        # one. The second identity is absent unless asked for, which keeps a
+        # Core-ID mismatch a 409 for every other step.
+        self.second_core_id = second_core_id
+        self.cores = {core_id} if not second_core_id else {core_id, second_core_id}
         self.lock = threading.Lock()
         self.active = None  # (peer, channel, lease)
         self.peers = set()
@@ -219,12 +228,13 @@ class Gateway:
             if version != 1:
                 peer.error(request_id, -32602, "unsupported version")
                 return
-            if core_id != self.core_id:
+            if core_id not in self.cores:
                 peer.error(request_id, -32000, "core mismatch", "core_mismatch")
                 return
+            peer.core_id = core_id
             peer.result(request_id, {
                 "version": 1,
-                "core_id": self.core_id,
+                "core_id": core_id,
                 "features": ["resize_notifications", "automatic_input"],
                 "methods": ["hello", "sessions.list", "terminal.attach",
                             "control.request", "control.respond"],
@@ -239,12 +249,13 @@ class Gateway:
             peer.error(request_id, -32000, "unavailable", "not_found")
             return
         if method == "sessions.list":
+            second = self.second_core_id is not None and peer.core_id == self.second_core_id
             peer.result(request_id, {
-                "revision": "r-fixture-1",
+                "revision": "r-fixture-2" if second else "r-fixture-1",
                 "rows": [{
-                    "address": "t7",
-                    "generation": "g-fixture-1",
-                    "label": "Lease fixture",
+                    "address": "t9" if second else "t7",
+                    "generation": "g-fixture-2" if second else "g-fixture-1",
+                    "label": "Loft fixture" if second else "Lease fixture",
                     "grid": {"cols": 80, "rows": 24},
                     "lifecycle": "live",
                     "status": None,

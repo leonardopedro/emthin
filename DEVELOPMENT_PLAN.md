@@ -1144,6 +1144,43 @@ hardcoded rows) and the pairing dialog's only entry was Paste link.
   revocation still need a tailnet and a phone, and Reconnect refreshes the
   whole fleet rather than one host.
 
+### Per-host Reconnect, a two-host picker, and a lease that re-asks (2026-11-24)
+
+Three gaps left by the first fan-out pass, closed together because they share
+one model change: a catalogue row now names its host.
+
+- **Row → host.** `SessionCatalog.Entry` gained the registry key it came from
+  (`host`), so `SessionCatalog.withHost(updated, rows, pinned)` can replace one
+  host's rows and outcome while leaving the others exactly as they were, and
+  `GatewayCatalog.one` is the single place a fetch failure becomes a host row
+  with a reason.
+- **Reconnect is per host.** Tapping a Sessions row re-fetches that endpoint
+  only (`sessions phase reconnect host <host>`); a dead host no longer costs
+  the reachable ones their catalogue, which the old fleet-wide refresh did.
+- **Two hosts, one picker, on the device.** `wss_fixture.py` gained
+  `--second-core` and echoes the requested Core ID back in its pairing answer,
+  so one scripted process can be paired twice under two identities and answer
+  each peer a different `sessions.list`. The new `sessions-hosts` step pairs
+  both, asserts one picker lists both rows (`Lease fixture` / `Loft fixture`),
+  then taps the second host's Reconnect and asserts the first host was not
+  dialled after that tap.
+- **A dead lease re-asks the registry.** `GatewayTarget.retryFor` resolves the
+  failed figure's own Core ID through the registry and, when that row names a
+  different origin, the lease reopens there once
+  (`gatewayLease phase retry host <new> from <old>`); the same origin, an
+  unpaired core or another core's row all decline. The figure is never edited
+  and no other core's host is guessed at.
+- **Result.** `bash test-java.sh` green; `GatewayTargetTest` 71 → 83 checks and
+  `GatewayCatalogTest` grew the two-host refresh case. `./device-lane.sh
+  sessions-hosts`: 9 checks, all passed. `./device-lane.sh paired-lease` still
+  passes against the changed fixture. Full `LANE_WSS=1 ./device-lane.sh e2e`
+  with the installed APK reused (`SKIP_BUILD=1`): **258 checks, 0 failed**,
+  installed `base.apk` byte-identical to the build
+  (md5 `15f126d280f90da47637f1d239cef3d7`).
+- **Gap.** The retry's positive path needs a host to change origin under a live
+  lease, which this container cannot stage; only the same-origin refusal is
+  reachable on the device. The camera and the tailnet remain open as before.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the

@@ -314,6 +314,10 @@ public class MainActivity extends Activity {
     private boolean gatewayReady;
     private boolean gatewayConnected;
     private boolean gatewayAttaching;
+    /** The figure reference this lease serves, so a failure can re-resolve it. */
+    private String gatewayLeaseReference;
+    /** One registry retry per lease; a second failure is reported, not looped. */
+    private boolean gatewayLeaseRetried;
     private boolean sessionPinFixturePending;
     private boolean figureA11yFixturePending;
     private boolean vtSceneFixturePending;
@@ -5913,9 +5917,50 @@ public class MainActivity extends Activity {
      * whole picker being an error, and every host's rows are rebuilt together
      * because a refresh is one merge, not per-host patching.
      */
-    private void reconnectHost(SessionCatalog.Host host) {
+    /**
+     * Reconnect one host. Only its rows and its outcome are replaced — a host
+     * that did not answer must not cost the others their catalogue, which is
+     * what a fleet-wide refresh would do when it is the dead one being retried.
+     */
+    private void reconnectHost(final SessionCatalog.Host host) {
+        GatewayEndpoints.Endpoint endpoint = gatewayEndpoints == null
+                ? null : gatewayEndpoints.find(host.host);
+        if (endpoint == null) {
+            trace("sessions", "phase", "reconnect", "host", host.host, "failed", "unpaired");
+            return;
+        }
+        if (sessionRefreshInFlight) return;
         trace("sessions", "phase", "reconnect", "host", host.host);
-        refreshSessionCatalog();
+        final GatewayEndpoints.Endpoint target = endpoint;
+        final Set<String> pinned = pinnedReferences();
+        sessionRefreshInFlight = true;
+        if (sessionsRows != null) renderSessionRows();
+        Thread worker = new Thread(new Runnable() {
+            @Override public void run() {
+                final GatewayCatalog.HostResult result =
+                        GatewayCatalog.one(target, new GatewayCatalog.Fetcher() {
+                            @Override public List<SessionCatalog.Entry> fetch(
+                                    GatewayEndpoints.Endpoint endpoint) throws java.io.IOException {
+                                return fetchHostCatalogue(endpoint);
+                            }
+                        });
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        sessionRefreshInFlight = false;
+                        sessionCatalog = sessionCatalog.withHost(result.host,
+                                result.rows == null ? new ArrayList<SessionCatalog.Entry>()
+                                        : result.rows, pinned);
+                        if (sessionsRows != null) renderSessionRows();
+                        trace("sessions", "phase", "host", result.host.host,
+                                result.rows == null ? "failed" : "rows",
+                                result.rows == null ? String.valueOf(result.host.error)
+                                        : String.valueOf(result.rows.size()));
+                    }
+                });
+            }
+        }, "emthin-sessions-host");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /**
@@ -5981,7 +6026,11 @@ public class MainActivity extends Activity {
         } else {
             connector = GatewayLeaseClient.tcpConnector(target.host, target.port);
         }
-        return GatewaySessions.list(connector, endpoint.coreId, endpoint.name);
+        // The row's label and its sessions' labels are the same string, so a
+        // picker row and a session under it never disagree about the host.
+        String label = endpoint.name == null || endpoint.name.isEmpty()
+                ? endpoint.host : endpoint.name;
+        return GatewaySessions.list(connector, endpoint.coreId, endpoint.host, label);
     }
 
     /** The document's public references; a row they name keeps its Pin row marked. */
@@ -8415,7 +8464,7 @@ public class MainActivity extends Activity {
         if (gatewayLeaseBacked) {
             // The gateway attach supplies the first DATA after its result. Do
             // not run the synthetic animation over a real lease stream.
-            startGatewayLease(gatewayTarget);
+            startGatewayLease(gatewayTarget, reference);
         } else {
             byte[] initial = ("\u001b[2J\u001b[Hemthin native VT\r\n"
                     + "frame 0 \u00b7 \u754c e\u0301\r\n$ ").getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -8468,7 +8517,9 @@ public class MainActivity extends Activity {
      * attach, and a CLOSE frame revokes the old viewer rather than mutating a
      * flag.
      */
-    private void startGatewayLease(GatewayTarget target) {
+    private void startGatewayLease(final GatewayTarget target, final String reference) {
+        gatewayLeaseReference = reference;
+        gatewayLeaseRetried = false;
         GatewayTransport.Connector connector;
         if (target.secure) {
             // A paired gateway is a tailnet host behind a public CA, so it uses
@@ -8570,9 +8621,18 @@ public class MainActivity extends Activity {
                                 gatewayReady = false;
                                 // A lease conflict is retryable; a transport or
                                 // protocol failure is not.
-                                gatewayConnected = !("transport".equals(kind)
+                                boolean dead = "transport".equals(kind)
                                         || "closed".equals(kind)
-                                        || "protocol".equals(kind));
+                                        || "protocol".equals(kind);
+                                // A lease that dies on the wire asks the registry
+                                // where its figure's Core ID lives now, and dials
+                                // that host once. `gatewayLease == null` means the
+                                // lease was closed deliberately, not lost.
+                                if (dead && !gatewayLeaseRetried && gatewayLease != null) {
+                                    gatewayLeaseRetried = true;
+                                    if (retryLeaseOnPairedHost(target, reference)) return;
+                                }
+                                gatewayConnected = !dead;
                                 gatewayReady = gatewayConnected;
                                 gatewayAttaching = false;
                                 RenderedPage page = vtScenePage();
@@ -8592,6 +8652,37 @@ public class MainActivity extends Activity {
                 "generation", target.generation == null ? "discover" : target.generation,
                 "secure", target.secure, "core", target.coreId);
         gatewayLease.connect();
+    }
+
+    /**
+     * Re-resolve the figure's Core ID through the registry and dial that host,
+     * once per lease.
+     *
+     * @return true when a fresh lease was started, so the caller stops
+     */
+    private boolean retryLeaseOnPairedHost(GatewayTarget failed, String reference) {
+        GatewayTarget next;
+        try {
+            next = GatewayTarget.retryFor(reference, gatewayEndpoints,
+                    failed.host, failed.port);
+            if (next != null) next = next.remap(fixtureConnect);
+        } catch (IllegalArgumentException e) {
+            trace("gatewayLease", "phase", "retry", "host", failed.host,
+                    "failed", "malformed");
+            return false;
+        }
+        if (next == null || (next.host.equals(failed.host) && next.port == failed.port)) {
+            trace("gatewayLease", "phase", "retry", "host", failed.host,
+                    "failed", next == null ? "unpaired" : "same-origin");
+            return false;
+        }
+        trace("gatewayLease", "phase", "retry", "host", next.host, "port", next.port,
+                "from", failed.host, "core", next.coreId);
+        closeGatewayLease();
+        startGatewayLease(next, reference);
+        // Starting a lease resets the flag; a retry is still the last one.
+        gatewayLeaseRetried = true;
+        return true;
     }
 
     private void closeGatewayLease() {

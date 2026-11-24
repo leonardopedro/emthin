@@ -18,14 +18,17 @@ public final class SessionCatalog {
     public static final class Entry {
         public final String reference;
         public final String caption;
+        /** Registry key of the host that answered, so one host refreshes alone. */
+        public final String host;
         public final String hostLabel;
         public final State state;
         public final boolean pinned;
 
-        Entry(String reference, String caption, String hostLabel, State state,
+        Entry(String reference, String caption, String host, String hostLabel, State state,
                 boolean pinned) {
             this.reference = reference;
             this.caption = caption;
+            this.host = host;
             this.hostLabel = hostLabel;
             this.state = state;
             this.pinned = pinned;
@@ -86,14 +89,52 @@ public final class SessionCatalog {
      * with {@code pinned} naming the references the open document holds.
      */
     public static SessionCatalog of(List<Host> hosts, List<Entry> entries, Set<String> pinned) {
+        return new SessionCatalog(hosts, markPinned(entries, pinned));
+    }
+
+    /**
+     * One host's answer replacing its rows, every other host kept as it was.
+     *
+     * <p>Reconnect is per host: a picker with three paired hosts must not make
+     * the two that answered wait for the one that did not. Rows of the
+     * refreshed host keep their place in endpoint order, and the whole list is
+     * re-marked against {@code pinned} because the document may have changed
+     * since the last fetch.
+     */
+    public SessionCatalog withHost(Host updated, List<Entry> rows, Set<String> pinned) {
+        List<Host> nextHosts = new ArrayList<>(hosts.size() + 1);
+        boolean replaced = false;
+        for (Host host : hosts) {
+            if (host.host.equals(updated.host)) {
+                nextHosts.add(updated);
+                replaced = true;
+            } else {
+                nextHosts.add(host);
+            }
+        }
+        if (!replaced) nextHosts.add(updated);
+        List<Entry> nextEntries = new ArrayList<>(entries.size());
+        for (Host host : nextHosts) {
+            if (host.host.equals(updated.host)) {
+                if (rows != null) nextEntries.addAll(rows);
+                continue;
+            }
+            for (Entry entry : entries) {
+                if (entry.host.equals(host.host)) nextEntries.add(entry);
+            }
+        }
+        return new SessionCatalog(nextHosts, markPinned(nextEntries, pinned));
+    }
+
+    private static List<Entry> markPinned(List<Entry> entries, Set<String> pinned) {
         List<Entry> marked = new ArrayList<>(entries.size());
         for (Entry entry : entries) {
             boolean held = pinned != null && pinned.contains(entry.reference);
             marked.add(held == entry.pinned ? entry
-                    : new Entry(entry.reference, entry.caption, entry.hostLabel,
-                            entry.state, held));
+                    : new Entry(entry.reference, entry.caption, entry.host,
+                            entry.hostLabel, entry.state, held));
         }
-        return new SessionCatalog(hosts, marked);
+        return marked;
     }
 
     /** The device lane's scripted catalogue for the pin step. Not live data. */
@@ -101,16 +142,16 @@ public final class SessionCatalog {
         List<Entry> entries = new ArrayList<>();
         entries.add(new Entry(
                 "hc://6ab09a20fd1288983dfbbac2bb349231/t3",
-                "Fleet · Infinity", "local Core", State.LIVE, true));
+                "Fleet · Infinity", "fixture-core", "local Core", State.LIVE, true));
         entries.add(new Entry(
                 "hc://0123456789abcdef0123456789abcdef/t7",
-                "Build log", "studio", State.WATCHED, false));
+                "Build log", "studio", "studio", State.WATCHED, false));
         entries.add(new Entry(
                 "hc://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/t9",
-                "Remote shell", "loft", State.OFFLINE, false));
+                "Remote shell", "loft", "loft", State.OFFLINE, false));
         entries.add(new Entry(
                 "herdr-local://fedcba9876543210fedcba9876543210/pane%20one",
-                "Legacy pane", "Herdr 0.9.5", State.UNAVAILABLE, false));
+                "Legacy pane", "loft", "Herdr 0.9.5", State.UNAVAILABLE, false));
         List<Host> hosts = new ArrayList<>();
         hosts.add(new Host("fixture-core", "local Core", null));
         hosts.add(new Host("studio", "studio", null));
@@ -174,8 +215,8 @@ public final class SessionCatalog {
         List<Entry> next = new ArrayList<>();
         for (Entry entry : entries) {
             if (entry.reference.equals(reference)) {
-                next.add(new Entry(entry.reference, entry.caption, entry.hostLabel,
-                        state == null ? entry.state : state, pinned));
+                next.add(new Entry(entry.reference, entry.caption, entry.host,
+                        entry.hostLabel, state == null ? entry.state : state, pinned));
             } else {
                 next.add(entry);
             }

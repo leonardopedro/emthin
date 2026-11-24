@@ -61,6 +61,28 @@ final class GatewayTarget {
     }
 
     /**
+     * The origin a failed lease should retry, or null when retrying would dial
+     * the same place again.
+     *
+     * <p>A lease that dies on its transport re-asks the registry for the
+     * figure's own Core ID: a host re-paired since the document was written
+     * (new tailnet name, new port) is then reached without editing the figure,
+     * and the row is the authority on where that core lives. It deliberately
+     * never tries a *different* core's host — the address belongs to this
+     * core, and dialling another host for it would be a guess.
+     */
+    static GatewayTarget retryFor(String reference, GatewayEndpoints endpoints,
+            String failedHost, int failedPort) {
+        Reference parsed = Reference.parse(reference);
+        if (parsed == null || endpoints == null) return null;
+        GatewayEndpoints.Endpoint paired = endpoints.findByCore(parsed.coreId);
+        if (paired == null) return null;
+        if (paired.host.equals(failedHost) && PAIRED_PORT == failedPort) return null;
+        return new GatewayTarget(paired.host, PAIRED_PORT, parsed.coreId,
+                parsed.address, null, true, false);
+    }
+
+    /**
      * A registry row as an endpoint: that host, no figure address, generation
      * discovered. Used by the Sessions picker, which has a host but no session.
      */

@@ -195,22 +195,27 @@ class Pairing:
     denial and lapse the screen also has to report — unobservable.
     """
 
-    def __init__(self, core_id):
+    def __init__(self, core_id, second_core_id=None):
         self.core_id = core_id
+        self.second_core_id = second_core_id
         self.lock = threading.Lock()
         self.requests = {}
+        # Which Core ID each request was created for, so a poll answers for the
+        # host it named rather than whichever identity the fixture prefers.
+        self.cores = {}
         self.next_id = 1
         self.decision = None
 
     def create(self, core_id):
         with self.lock:
-            if core_id != self.core_id:
+            if core_id != self.core_id and core_id != self.second_core_id:
                 return 409, {"error": {"kind": "core_mismatch"}}
             request_id = "pair-{}".format(self.next_id)
             self.next_id += 1
             self.decision = None
             self.requests[request_id] = "pending"
-            return 202, self._body("pending", request_id)
+            self.cores[request_id] = core_id
+            return 202, self._body("pending", request_id, core_id)
 
     def poll(self, request_id):
         with self.lock:
@@ -218,7 +223,8 @@ class Pairing:
                 return 404, {"error": {"kind": "expired"}}
             if self.decision in ("approved", "denied"):
                 self.requests[request_id] = self.decision
-            return 200, self._body(self.requests[request_id], request_id)
+            return 200, self._body(self.requests[request_id], request_id,
+                                   self.cores.get(request_id, self.core_id))
 
     def admin(self, action):
         with self.lock:
@@ -230,6 +236,7 @@ class Pairing:
                 # A request the host let lapse: forgetting it makes the next
                 # poll answer 404, which the app reports as expired.
                 self.requests.clear()
+                self.cores.clear()
                 self.decision = None
                 return {"state": "expired", "requests": []}
             else:
@@ -237,9 +244,12 @@ class Pairing:
                         "requests": sorted(self.requests)}
             return {"state": self.decision, "requests": sorted(self.requests)}
 
-    def _body(self, state, request_id):
+    def _body(self, state, request_id, core_id):
+        # The requested Core ID is echoed, not the fixture's own: with two
+        # identities paired, the screen has to store each row under the core
+        # that host actually answers for.
         return {"state": state, "request_id": request_id,
-                "core_id": self.core_id,
+                "core_id": core_id,
                 "expires_in_s": 120 if state == "pending" else 0}
 
 
@@ -393,6 +403,8 @@ def main():
     parser.add_argument("--admin", default="127.0.0.1:47657")
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
+    parser.add_argument("--second-core", default=None,
+                        help="also answer for this Core ID (a second paired host)")
     args = parser.parse_args()
     listen_host, listen_port = args.listen.rsplit(":", 1)
     admin_host, admin_port = args.admin.rsplit(":", 1)
@@ -410,10 +422,10 @@ def main():
     admin.bind((admin_host, int(admin_port)))
     admin.listen(4)
 
-    gateway = lease_fixture.Gateway()
+    gateway = lease_fixture.Gateway(second_core_id=args.second_core)
     # The admin socket reaches pairing through the gateway object, so the shared
     # `revoke`/`status` handlers stay exactly as they are.
-    gateway.pairing = Pairing(gateway.core_id)
+    gateway.pairing = Pairing(gateway.core_id, args.second_core)
     threading.Thread(target=lease_fixture.admin_loop, args=(gateway, admin),
                      daemon=True).start()
     print("wss fixture listening {} admin {}".format(args.listen, args.admin),

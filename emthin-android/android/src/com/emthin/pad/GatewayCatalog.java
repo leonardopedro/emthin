@@ -26,7 +26,39 @@ final class GatewayCatalog {
         List<SessionCatalog.Entry> fetch(GatewayEndpoints.Endpoint endpoint) throws IOException;
     }
 
+    /** One endpoint's answer: its host row and, when it answered, its rows. */
+    static final class HostResult {
+        final SessionCatalog.Host host;
+        final List<SessionCatalog.Entry> rows;
+
+        HostResult(SessionCatalog.Host host, List<SessionCatalog.Entry> rows) {
+            this.host = host;
+            this.rows = rows;
+        }
+    }
+
     private GatewayCatalog() {
+    }
+
+    /**
+     * One endpoint's catalogue. A failure is a {@link SessionCatalog.Host} with
+     * a reason and no rows, never an exception outward: the picker shows it as
+     * a row with Reconnect.
+     */
+    static HostResult one(GatewayEndpoints.Endpoint endpoint, Fetcher fetcher) {
+        List<SessionCatalog.Entry> rows;
+        try {
+            rows = fetcher.fetch(endpoint);
+        } catch (IOException e) {
+            return new HostResult(
+                    new SessionCatalog.Host(endpoint.host, endpoint.name, reason(e)), null);
+        } catch (RuntimeException e) {
+            // A malformed reply is the host's fault, not the pad's: it becomes
+            // the same unreachable row as a refused socket.
+            return new HostResult(
+                    new SessionCatalog.Host(endpoint.host, endpoint.name, "unreadable"), null);
+        }
+        return new HostResult(new SessionCatalog.Host(endpoint.host, endpoint.name, null), rows);
     }
 
     /**
@@ -40,20 +72,9 @@ final class GatewayCatalog {
         if (endpoints != null) {
             for (GatewayEndpoints.Endpoint endpoint : endpoints) {
                 if (endpoint == null) continue;
-                List<SessionCatalog.Entry> rows;
-                try {
-                    rows = fetcher.fetch(endpoint);
-                } catch (IOException e) {
-                    hosts.add(new SessionCatalog.Host(endpoint.host, endpoint.name, reason(e)));
-                    continue;
-                } catch (RuntimeException e) {
-                    // A malformed reply is the host's fault, not the pad's: it
-                    // becomes the same unreachable row as a refused socket.
-                    hosts.add(new SessionCatalog.Host(endpoint.host, endpoint.name, "unreadable"));
-                    continue;
-                }
-                hosts.add(new SessionCatalog.Host(endpoint.host, endpoint.name, null));
-                if (rows != null) entries.addAll(rows);
+                HostResult result = one(endpoint, fetcher);
+                hosts.add(result.host);
+                if (result.rows != null) entries.addAll(result.rows);
             }
         }
         return SessionCatalog.of(hosts, entries, pinned);

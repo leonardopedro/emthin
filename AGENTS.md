@@ -720,6 +720,13 @@ the box64 setup remains the local aarch64-host path.
   `wss_fixture.py` serves `/v1/pair` (`POST` pending, `GET` until the admin
   answers), so the fixture stays the one scripted Core.
 
+  `sessions-hosts` (`./device-lane.sh sessions-hosts`) pairs two hosts with
+  two Core IDs against one fixture process (`--second-core`, which also makes
+  the fixture answer each peer a different `sessions.list`), then asserts one
+  Sessions picker shows both host rows, both catalogues, and that tapping the
+  second host's Reconnect fetches that host alone — the trace after the tap
+  must carry `phase host loft.leo.ts.net` and no `phase host fleet.leo.ts.net`.
+
   Two more steps cover the rest of that screen and its consequence:
   `pairing-answers` drives a denial (`pair deny`), a lapse (`pair expire`) and
   a Core mismatch (a link naming another ID, refused 409 at create), and

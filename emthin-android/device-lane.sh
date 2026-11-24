@@ -82,6 +82,9 @@
 #                and openssl)
 #   pairing-answers  the same screen's other answers: deny, lapse and a Core
 #                mismatch, none of which may store a row (LANE_WSS=1)
+#   sessions-hosts  pair two hosts with two Core IDs, then prove one Sessions
+#                picker merges both catalogues and that Reconnect refreshes
+#                only the host whose row was tapped (LANE_WSS=1)
 #   paired-lease   approve a row through the screen, then let a figure lease
 #                through it with only its origin remapped to loopback
 #                (LANE_WSS=1)
@@ -419,6 +422,16 @@ cmd_uidump() {
         return 1
     fi
     pass "uiautomator hierarchy -> $out"
+}
+
+# Bounds of the Nth (1-based) node whose opening tag contains PATTERN.
+node_bounds_nth() {
+    local pattern="$1" index="$2" node
+    node=$(grep -o "<node[^>]*${pattern}[^>]*>" "$UI_XML" 2>/dev/null \
+        | sed -n "${index}p" || true)
+    [ -n "$node" ] || return 1
+    printf '%s\n' "$node" | sed -n \
+        's/.*bounds="\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\]".*/\1 \2 \3 \4/p'
 }
 
 # Bounds of the first node whose opening tag contains PATTERN, as
@@ -2415,6 +2428,9 @@ WSS_PROBE_PID=""
 # The scripted Core's ID (lease_fixture.CORE_ID): the fixture only approves a
 # pairing request that names it.
 PAIR_CORE=6ab09a20fd1288983dfbbac2bb349231
+# The fixture's second identity (`--second-core`): the two-host step pairs one
+# row per Core ID, so the picker's merge spans two real catalogues.
+SECOND_CORE=b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0
 
 start_wss_fixture() {
     command -v openssl >/dev/null 2>&1 || {
@@ -2434,6 +2450,7 @@ start_wss_fixture() {
     python3 "$SCRIPT_DIR/../fixtures/herdr-gateway-v1/wss_fixture.py" \
         --listen "127.0.0.1:$WSS_PORT" \
         --admin "127.0.0.1:$WSS_ADMIN_PORT" \
+        --second-core "$SECOND_CORE" \
         --cert "$WSS_DIR/cert.pem" --key "$WSS_DIR/key.pem" \
         >"$WSS_DIR/server.log" 2>&1 &
     WSS_PID=$!
@@ -2618,7 +2635,7 @@ pair_launch() {
 # Tap PASTE LINK, type LINK into the field, and press PAIR, leaving the pairing
 # screen (which PAIR reopens) as the last dump.
 pair_paste() {
-    local link="$1" ui bounds
+    local link="$1" expect="${2:-fleet.leo.ts.net}" ui bounds
     ui=$UI_XML
     bounds=$(node_bounds 'text="PASTE LINK"') \
         || { fail "Paste link is missing"; return 1; }
@@ -2631,7 +2648,7 @@ pair_paste() {
     D shell "input text '$link'" >/dev/null 2>&1 || { fail "type the pairing link"; return 1; }
     sleep 0.5
     cmd_uidump "$ui" >/dev/null || return 1
-    if ! grep -q 'fleet.leo.ts.net/pair?v=1' "$ui"; then
+    if ! grep -q "$expect/pair?v=1" "$ui"; then
         fail "the typed link did not reach the field"
         return 1
     fi
@@ -2826,6 +2843,136 @@ cmd_pairing() {
         return 1
     fi
     pass "Forget removed the local row"
+    stop_wss_fixture
+}
+
+# Two paired hosts, each with its own Core ID and its own `sessions.list`
+# catalogue, in one picker — and Reconnect that stays per host.
+cmd_sessions_hosts() {
+    local ui="$OUTDIR/sessions-hosts-ui.xml"
+    local log="$OUTDIR/sessions-hosts-logcat.txt"
+    local first="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
+    local second="https://loft.leo.ts.net/pair?v=1&core=$SECOND_CORE"
+    local bounds
+
+    say "==> two hosts: pair both -> one merged picker -> Reconnect one"
+    mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
+    cmd_clear_data || return
+    if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
+    if ! pair_launch "$ui"; then
+        fail "open the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+
+    # Host one, under the fixture's primary identity.
+    pair_paste "$first" || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
+        fail "the first link opened no pairing request"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin_checked "pair approve" >/dev/null || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase approved host fleet.leo.ts.net'; then
+        fail "the first host never approved"
+        stop_wss_fixture
+        return 1
+    fi
+    # The approval re-renders the pairing screen in place; node_bounds reads
+    # the last dump, so take a fresh one before the second link.
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    pass "the first host paired"
+
+    # Host two, under the fixture's second identity: same process, different
+    # Core ID and catalog. The fixture refuses any other ID, so reaching here
+    # means the row really carries `SECOND_CORE`.
+    pair_paste "$second" loft.leo.ts.net || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase request host loft.leo.ts.net'; then
+        fail "the second link opened no pairing request"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin_checked "pair approve" >/dev/null || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase approved host loft.leo.ts.net'; then
+        fail "the second host never approved"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net"' "$ui" \
+            || ! grep -q 'content-desc="loft.leo, loft.leo.ts.net"' "$ui"; then
+        fail "the second row did not land beside the first"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "both hosts are paired under their own Core IDs"
+
+    # One picker, both catalogues.
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    sleep 0.5
+    if ! tap_toolbar_menu "Sessions and sharing" "Sessions"; then
+        fail "open the sessions picker"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! wait_for_log "$log" 'sessions phase catalogue hosts 2 rows 2'; then
+        fail "the picker did not merge two hosts' catalogues"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net, answered"' "$ui" \
+            || ! grep -q 'content-desc="loft.leo, loft.leo.ts.net, answered"' "$ui"; then
+        fail "one of the two hosts is not shown as answered"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="Lease fixture ·' "$ui" || ! grep -q 'text="Loft fixture ·' "$ui"; then
+        fail "the merged list is missing one host's sessions.list row"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "one picker listed both hosts' sessions.list rows"
+
+    # Reconnect the second host only. Its own fetch is traced; the first host
+    # must not be dialled again, which would be a fleet-wide refresh.
+    bounds=$(node_bounds_nth 'text="Reconnect"' 2) \
+        || { fail "the second host has no Reconnect"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'sessions phase reconnect host loft.leo.ts.net'; then
+        fail "tapping Reconnect did not start a per-host fetch"
+        stop_wss_fixture
+        return 1
+    fi
+    # The first catalogue fetch logged the same host line, so the assertion is
+    # on what comes after the reconnect marker, not on the file as a whole.
+    local after="$OUTDIR/sessions-hosts-after-reconnect.txt" tries=0
+    while [ "$tries" -lt 40 ]; do
+        # A fresh capture each round: $log is a snapshot, not a stream, so
+        # reading it again would never see the worker's line.
+        D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' > "$log"
+        sed -n '/sessions phase reconnect host loft/,$p' "$log" > "$after"
+        grep -q 'sessions phase host loft.leo.ts.net rows 1' "$after" && break
+        sleep 0.5
+        tries=$((tries + 1))
+    done
+    if ! grep -q 'sessions phase host loft.leo.ts.net rows 1' "$after"; then
+        fail "the tapped host's own catalogue was not fetched"
+        stop_wss_fixture
+        return 1
+    fi
+    if grep -q 'sessions phase host fleet.leo.ts.net' "$after"; then
+        fail "Reconnect refreshed the host that was not tapped"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'text="Lease fixture ·' "$ui" || ! grep -q 'text="Loft fixture ·' "$ui"; then
+        fail "the per-host refresh lost one of the two catalogues"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "Reconnect refreshed only the tapped host and kept both catalogues"
     stop_wss_fixture
 }
 
@@ -3466,6 +3613,7 @@ cmd_e2e() {
     # build would only fail on a binary that predates them.
     if [ "${LANE_WSS:-0}" = "1" ]; then
         cmd_pairing
+        cmd_sessions_hosts
         cmd_pairing_answers
         cmd_paired_lease
         cmd_gateway_wss
@@ -3718,6 +3866,7 @@ case "$cmd" in
     terminal-lease) cmd_terminal_lease ;;
     gateway-wss) cmd_gateway_wss ;;
     pairing)   cmd_pairing ;;
+    sessions-hosts) cmd_sessions_hosts ;;
     pairing-answers) cmd_pairing_answers ;;
     paired-lease)    cmd_paired_lease ;;
     austral-rule) cmd_austral_rule ;;

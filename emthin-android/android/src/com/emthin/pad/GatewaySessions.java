@@ -45,7 +45,7 @@ final class GatewaySessions {
      *     picker
      */
     static List<SessionCatalog.Entry> list(GatewayTransport.Connector connector, String coreId,
-            String hostLabel) throws IOException {
+            String host, String hostLabel) throws IOException {
         GatewayTransport transport = connector.open();
         long deadline = System.currentTimeMillis() + DEADLINE_MS;
         try {
@@ -70,7 +70,7 @@ final class GatewaySessions {
                 }
                 if (at == 2) {
                     try {
-                        return rows(reply.get("result"), coreId, hostLabel);
+                        return rows(reply.get("result"), coreId, host, hostLabel);
                     } catch (IllegalArgumentException e) {
                         throw new IOException("protocol", e);
                     }
@@ -84,7 +84,8 @@ final class GatewaySessions {
     }
 
     /** Rows of a `sessions.list` result, deduplicated and bounded. */
-    static List<SessionCatalog.Entry> rows(Object resultValue, String coreId, String hostLabel) {
+    static List<SessionCatalog.Entry> rows(Object resultValue, String coreId, String host,
+            String hostLabel) {
         if (!(resultValue instanceof Map)) throw new IllegalArgumentException("expected result");
         Map<?, ?> result = (Map<?, ?>) resultValue;
         Object rowsValue = result.get("rows");
@@ -106,7 +107,7 @@ final class GatewaySessions {
                     ? (String) label : (String) addressValue;
             Object lifecycle = row.get("lifecycle");
             byReference.put(reference, new SessionCatalog.Entry(reference, caption,
-                    hostLabel, state(lifecycle), false));
+                    host, hostLabel, state(lifecycle), false));
         }
         return new ArrayList<>(byReference.values());
     }

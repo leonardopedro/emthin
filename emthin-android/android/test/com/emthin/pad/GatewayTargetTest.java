@@ -47,7 +47,40 @@ public final class GatewayTargetTest {
         fixture();
         fixtureWins();
         remap();
+        retryAfterATransportFailure();
         System.out.println("GatewayTargetTest: " + checks + " checks");
+    }
+
+    /**
+     * A dead lease re-asks the registry for the figure's own Core ID. The
+     * answer is worth dialling only when it is a different origin, and it is
+     * never another core's host.
+     */
+    private static void retryAfterATransportFailure() {
+        GatewayEndpoints endpoints = paired();
+        check(GatewayTarget.retryFor(REFERENCE, endpoints, "fleet.leo.ts.net",
+                GatewayTarget.PAIRED_PORT) == null,
+                "the same origin is not retried");
+        GatewayTarget moved = GatewayTarget.retryFor(REFERENCE, endpoints,
+                "old.leo.ts.net", GatewayTarget.PAIRED_PORT);
+        check(moved != null, "a host that moved is retried");
+        check(moved != null && moved.host.equals("fleet.leo.ts.net"),
+                "at the registry's current host for that Core ID");
+        check(moved != null && moved.coreId.equals(CORE), "keeping the figure's core");
+        check(moved != null && moved.address.equals("t7"), "and its address");
+        check(moved != null && moved.generation == null,
+                "with the generation discovered again");
+        check(moved != null && moved.port == GatewayTarget.PAIRED_PORT, "on the paired port");
+        check(GatewayTarget.retryFor(REFERENCE, new GatewayEndpoints(MEMORY),
+                "old.leo.ts.net", GatewayTarget.PAIRED_PORT) == null,
+                "an unpaired core has no host to retry");
+        check(GatewayTarget.retryFor("hc://" + OTHER_CORE + "/t7", endpoints,
+                "fleet.leo.ts.net", GatewayTarget.PAIRED_PORT) == null,
+                "another core's row is not dialled for this figure");
+        check(GatewayTarget.retryFor(null, endpoints, "fleet.leo.ts.net",
+                GatewayTarget.PAIRED_PORT) == null, "no reference, no retry");
+        check(GatewayTarget.retryFor(REFERENCE, null, "fleet.leo.ts.net",
+                GatewayTarget.PAIRED_PORT) == null, "no registry, no retry");
     }
 
     private static void pairedLookup() {

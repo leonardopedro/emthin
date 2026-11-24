@@ -28,6 +28,7 @@ public final class GatewayCatalogTest {
 
     public static void main(String[] args) throws Exception {
         rowsFromARealHost();
+        aRefreshReplacesOnlyItsOwnHost();
         unreachableHostBecomesARow();
         malformedReplyBecomesARow();
         pinnedRowsKeepTheirMark();
@@ -38,18 +39,73 @@ public final class GatewayCatalogTest {
     private static void rowsFromARealHost() throws Exception {
         List<Throwable> failures = new ArrayList<>();
         int port = startHost(LIST_RESULT, failures);
-        List<SessionCatalog.Entry> rows = GatewaySessions.list(tcp(port), CORE, "fleet");
+        List<SessionCatalog.Entry> rows =
+                GatewaySessions.list(tcp(port), CORE, "fleet.leo.ts.net", "fleet");
         check(failures.isEmpty(), "the host thread stayed healthy: " + failures);
         check(rows.size() == 2, "two valid rows out of four (bad address and missing one dropped)");
         SessionCatalog.Entry live = rows.get(0);
         check(live.reference.equals("hc://" + CORE + "/t7"), "reference is the public one");
         check(live.caption.equals("Lease fixture"), "label is the caption");
         check(live.hostLabel.equals("fleet"), "host label comes from the registry row");
+        check(live.host.equals("fleet.leo.ts.net"), "and the row keeps its host key");
         check(live.state == SessionCatalog.State.LIVE, "live lifecycle");
         check(!live.pinned, "a fresh row is not pinned");
         SessionCatalog.Entry lost = rows.get(1);
         check(lost.caption.equals("t8"), "an empty label falls back to the address");
         check(lost.state == SessionCatalog.State.OFFLINE, "lost lifecycle is offline");
+    }
+
+    /**
+     * Reconnect is per host: one host's fresh answer replaces its rows and its
+     * outcome, and the host that answered before keeps both.
+     */
+    private static void aRefreshReplacesOnlyItsOwnHost() throws Exception {
+        List<Throwable> failures = new ArrayList<>();
+        int first = startHost(LIST_RESULT, failures);
+        int second = startHost(LIST_RESULT, failures);
+        final int firstPort = first;
+        final int secondPort = second;
+        List<GatewayEndpoints.Endpoint> endpoints = new ArrayList<>();
+        endpoints.add(new GatewayEndpoints.Endpoint("one.leo.ts.net", CORE, "one"));
+        endpoints.add(new GatewayEndpoints.Endpoint("two.leo.ts.net", CORE, "two"));
+        SessionCatalog catalog = GatewayCatalog.build(endpoints,
+                new GatewayCatalog.Fetcher() {
+                    @Override public List<SessionCatalog.Entry> fetch(
+                            GatewayEndpoints.Endpoint endpoint) throws IOException {
+                        int port = "one.leo.ts.net".equals(endpoint.host) ? firstPort : secondPort;
+                        return GatewaySessions.list(tcp(port), endpoint.coreId,
+                                endpoint.host, endpoint.name);
+                    }
+                }, Collections.<String>emptySet());
+        check(catalog.hosts().size() == 2, "two hosts, two rows");
+        check(catalog.entries().size() == 4, "and both catalogues in one list");
+
+        // The second host goes away; only its rows and outcome move.
+        SessionCatalog afterFailure = catalog.withHost(
+                new SessionCatalog.Host("two.leo.ts.net", "two", "unreachable"),
+                new ArrayList<SessionCatalog.Entry>(), Collections.<String>emptySet());
+        check(afterFailure.hosts().size() == 2, "the host rows are still both there");
+        check(!afterFailure.hosts().get(1).reachable(), "the tapped host is the one marked");
+        check(afterFailure.hosts().get(0).reachable(), "the untouched host keeps its answer");
+        check(afterFailure.entries().size() == 2, "only the failed host's rows are gone");
+        for (SessionCatalog.Entry entry : afterFailure.entries()) {
+            check(entry.host.equals("one.leo.ts.net"), "the survivor belongs to the other host");
+        }
+
+        // And it comes back without disturbing the order of the picker. The
+        // fixture Core serves one connection, so the retry dials a fresh one
+        // on the same registry row.
+        int third = startHost(LIST_RESULT, failures);
+        List<SessionCatalog.Entry> refreshed = GatewaySessions.list(
+                tcp(third), CORE, "two.leo.ts.net", "two");
+        SessionCatalog afterReturn = afterFailure.withHost(
+                new SessionCatalog.Host("two.leo.ts.net", "two", null), refreshed,
+                Collections.<String>emptySet());
+        check(afterReturn.entries().size() == 4, "the returning host's rows are back");
+        check(afterReturn.entries().get(0).host.equals("one.leo.ts.net"),
+                "the first host stays first");
+        check(afterReturn.entries().get(3).host.equals("two.leo.ts.net"),
+                "and the refreshed host's rows follow it");
     }
 
     private static void unreachableHostBecomesARow() throws Exception {
@@ -61,7 +117,8 @@ public final class GatewayCatalogTest {
                 new GatewayCatalog.Fetcher() {
                     @Override public List<SessionCatalog.Entry> fetch(
                             GatewayEndpoints.Endpoint endpoint) throws IOException {
-                        return GatewaySessions.list(tcp(port), endpoint.coreId, endpoint.name);
+                        return GatewaySessions.list(tcp(port), endpoint.coreId,
+                                endpoint.host, endpoint.name);
                     }
                 }, Collections.<String>emptySet());
         check(catalog.hosts().size() == 1, "the refused host still has a row");
@@ -78,7 +135,8 @@ public final class GatewayCatalogTest {
                 new GatewayCatalog.Fetcher() {
                     @Override public List<SessionCatalog.Entry> fetch(
                             GatewayEndpoints.Endpoint endpoint) throws IOException {
-                        return GatewaySessions.list(tcp(port), endpoint.coreId, endpoint.name);
+                        return GatewaySessions.list(tcp(port), endpoint.coreId,
+                                endpoint.host, endpoint.name);
                     }
                 }, Collections.<String>emptySet());
         SessionCatalog.Host host = catalog.hosts().get(0);
@@ -96,7 +154,8 @@ public final class GatewayCatalogTest {
                 new GatewayCatalog.Fetcher() {
                     @Override public List<SessionCatalog.Entry> fetch(
                             GatewayEndpoints.Endpoint endpoint) throws IOException {
-                        return GatewaySessions.list(tcp(port), endpoint.coreId, endpoint.name);
+                        return GatewaySessions.list(tcp(port), endpoint.coreId,
+                                endpoint.host, endpoint.name);
                     }
                 }, pinned);
         check(catalog.byReference("hc://" + CORE + "/t7").pinned, "a reference the document holds is pinned");
