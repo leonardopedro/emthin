@@ -2264,7 +2264,7 @@ lease_reinstall() {
 }
 
 terminal_lease_check() {
-    local log="$1" fixture="$2" placed x y w h cx cy status
+    local log="$1" fixture="$2" placed x y w h cx cy status first_lease second_lease
     if lease_launch "$fixture"; then
         pass "launched the disposable gateway-lease fixture"
     else
@@ -2325,6 +2325,11 @@ EOF
         || { fail "Take did not request a control attach"; return; }
     wait_for_log "$log" 'gatewayLease phase ready mode control' \
         || { fail "control attach did not become ready"; return; }
+    first_lease=$(sed -n 's/.*gatewayLease phase ready mode control lease \([^ ]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$first_lease" ] || [ "$first_lease" = none ]; then
+        fail "the gateway controller lease was not named in the log"
+        return
+    fi
     pass "Take acquired a gateway controller lease"
 
     D shell input text 'gatewayinput' >/dev/null 2>&1
@@ -2365,6 +2370,16 @@ EOF
     tap_center "$b"
     wait_for_log "$log" 'gatewayLease phase ready mode control' \
         || { fail "a second Take did not acquire a fresh lease"; return; }
+    second_lease=$(sed -n 's/.*gatewayLease phase ready mode control lease \([^ ]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$second_lease" ] || [ "$second_lease" = none ]; then
+        fail "the second Take did not name its lease"
+        return
+    fi
+    if [ "$second_lease" = "$first_lease" ]; then
+        fail "the second Take reused the revoked lease '$first_lease'"
+        return
+    fi
+    pass "the second Take acquired a lease the gateway named differently"
     D shell input text 'retakeinput' >/dev/null 2>&1
     wait_for_log "$log" 'gatewayLease data .*echo:' \
         || { fail "fresh lease did not carry input"; return; }
