@@ -706,10 +706,15 @@ the box64 setup remains the local aarch64-host path.
   host-side equivalent is `emthin-android/wss-lane-check.sh`.
 
   `LANE_WSS=1` also adds `pairing` (`./device-lane.sh pairing` alone): the
-  screen is driven through uiautomator — empty registry, Scan QR (this
-  container has no camera HAL, so it must report that and leave Paste link
-  offered; the decode itself is `QrScanTest`'s), Paste link, type a
-  real `https://fleet.leo.ts.net/pair?v=1&core=<id>` link, pending, then
+  screen is driven through uiautomator — empty registry, Scan QR with the
+  camera permission denied (the prompt is answered by the platform's
+  `permission_deny_button`, and the scanner must report "camera permission
+  denied", not "no camera"; the preview surface is laid out before the answer
+  arrives, so it is remembered rather than opened), Scan QR with the
+  permission granted (this container has no camera HAL, so it must report
+  that and leave Paste link offered; the decode itself is `QrScanTest`'s),
+  then Paste link with a real
+  `https://fleet.leo.ts.net/pair?v=1&core=<id>` link, pending, then
   `pair approve` on the fixture's admin socket, the row listed, a relaunch
   proving it persisted, and Forget. It also opens Sessions twice: once while
   a fixture endpoint is unreachable (its row must carry the reason and a

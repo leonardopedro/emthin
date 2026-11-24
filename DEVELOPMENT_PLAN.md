@@ -1181,6 +1181,35 @@ one model change: a catalogue row now names its host.
   lease, which this container cannot stage; only the same-origin refusal is
   reachable on the device. The camera and the tailnet remain open as before.
 
+### A denied camera permission is its own answer (2026-11-24)
+
+Scan QR had only ever been driven with `CAMERA` already granted, and that hid a
+bug on any device that has to ask: the preview surface is laid out while the
+permission prompt is still up, so `surfaceCreated` called `Camera.open()` on a
+permission that did not exist yet. The platform refuses that call, the scanner
+reported the refusal as "no camera", and it finished *underneath* the prompt —
+a denial read as a missing camera, and the Pair screen came back without ever
+saying what had happened. `QrScanActivity` now only remembers the holder on
+`surfaceCreated` and opens once the permission is granted; a denial finishes
+with the reason `camera permission denied`.
+
+The `pairing` step now revokes `CAMERA`, taps Scan QR, answers the platform
+prompt through its `permission_deny_button` (a resource id, so the tap does not
+depend on the dialog's wording or locale; a package the platform has already
+denied twice answers without a prompt, which the check also accepts), and
+asserts the reported reason, a Pair dialog that still offers Paste link, and an
+unchanged document before it grants the permission and runs the existing
+no-camera check.
+
+- **Result.** `./device-lane.sh pairing` alone: 18 checks, all passed. Full
+  `LANE_WSS=1 ./device-lane.sh e2e` with the installed APK reused
+  (`SKIP_BUILD=1`): **260 checks, 0 failed**, `device lane: all steps passed`,
+  installed `base.apk` byte-identical to the build
+  (md5 `3c82dd3570102ac96ff9bda930e0e019`).
+- **Gap.** The camera itself, a real prompt on a phone and the tailnet remain
+  open; what is device-proven here is the denial path on a container whose
+  prompt comes from the platform's permission controller.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the

@@ -45,6 +45,8 @@ public final class QrScanActivity extends Activity implements SurfaceHolder.Call
     private Camera camera;
     private boolean decoding;
     private boolean finished;
+    /** The preview surface, which arrives before the permission answer does. */
+    private SurfaceHolder pendingHolder;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -81,15 +83,30 @@ public final class QrScanActivity extends Activity implements SurfaceHolder.Call
         super.onRequestPermissionsResult(request, permissions, results);
         if (request != REQUEST_CAMERA) return;
         boolean granted = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
-        if (!granted) finishWith(null, REASON_DENIED);
+        if (!granted) {
+            finishWith(null, REASON_DENIED);
+            return;
+        }
+        if (pendingHolder != null) openCamera(pendingHolder);
     }
 
+    // The surface is created as soon as the view is laid out, which is before
+    // the permission dialog is answered. Opening here regardless would report
+    // a denial as "no camera" (open() throws) and dismiss the screen while the
+    // dialog is still up, so the surface is only remembered until the answer.
     @Override public void surfaceCreated(SurfaceHolder holder) {
-        openCamera(holder);
+        pendingHolder = holder;
+        if (granted()) openCamera(holder);
     }
 
     @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        if (camera == null) openCamera(holder);
+        pendingHolder = holder;
+        if (camera == null && granted()) openCamera(holder);
+    }
+
+    private boolean granted() {
+        return checkSelfPermission(android.Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     @Override public void surfaceDestroyed(SurfaceHolder holder) {

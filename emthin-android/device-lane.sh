@@ -2658,6 +2658,27 @@ pair_paste() {
     sleep 0.5
 }
 
+# Answer the system camera-permission prompt with "Don't allow". The button's
+# resource id is the platform's, so the tap does not depend on the dialog's
+# wording or locale. A package that has already been denied twice is answered
+# without a prompt, so a missing dialog is not a failure by itself.
+deny_camera_prompt() {
+    local ui="$OUTDIR/pairing-permission.xml" tries=0 bounds
+    UI_XML="$ui"
+    mkdir -p "$OUTDIR" || return 1
+    while [ "$tries" -lt 20 ]; do
+        if D shell uiautomator dump "$UI_DUMP_REMOTE" >/dev/null 2>&1 \
+            && D exec-out cat "$UI_DUMP_REMOTE" 2>/dev/null | tr -d '\r' >"$ui" \
+            && bounds=$(node_bounds 'permission_deny_button'); then
+            tap_center "$bounds"
+            return 0
+        fi
+        sleep 0.5
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 # The pairing screen end to end against the TLS fixture. The link is a real
 # tailnet link — production parse and validation — and only its origin is
 # remapped to loopback by `emthin.fixturePairBase`.
@@ -2687,9 +2708,48 @@ cmd_pairing() {
     # same link. This container exposes no camera, so the check that matters
     # here is that the scanner says so and leaves pairing usable — the decode
     # itself is the host suite's (QrScanTest).
-    # Grant what the app would ask for, so the check sees the scanner's own
+    #
+    # A denial is its own answer, and it arrives before the scanner can open
+    # anything: the preview surface is laid out while the prompt is still up.
+    # Opening there would report the denial as "no camera" and dismiss the
+    # screen underneath the prompt, so the pad must say "camera permission
+    # denied", keep pairing usable and leave the document alone.
+    local scanner
+    local doc_before
+    D logcat -d -s emthin-pad:D >"$log" 2>/dev/null || true
+    doc_before=$(last_text_len "$log")
+    D shell pm revoke "$PKG" android.permission.CAMERA >/dev/null 2>&1 \
+        || { fail "revoke $PKG's camera permission"; stop_wss_fixture; return 1; }
+    scanner=$(node_bounds 'text="SCAN QR"') \
+        || { fail "Scan QR is missing from the pairing screen"; stop_wss_fixture; return 1; }
+    tap_center "$scanner"
+    deny_camera_prompt || true
+    if ! wait_for_log "$log" 'gatewayPair phase scan-failed reason camera permission denied'; then
+        fail "a denied camera permission was not reported as a denial"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'Scanner unavailable' "$ui" || ! grep -q 'camera permission denied' "$ui"; then
+        fail "the denial is not reported on the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="PASTE LINK"' "$ui"; then
+        fail "a denied permission left no way to pair by link"
+        stop_wss_fixture
+        return 1
+    fi
+    if [ "$(last_text_len "$log")" != "$doc_before" ]; then
+        fail "the denial changed the document"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a denied camera permission is reported, pairing stays usable and the document is untouched"
+
+    # Grant what the app would ask for, so the next check sees the scanner's own
     # answer instead of a permission prompt.
-    D shell pm grant "$TEST_PACKAGE" android.permission.CAMERA >/dev/null 2>&1 || true
+    D shell pm grant "$PKG" android.permission.CAMERA >/dev/null 2>&1 || true
     local scan
     scan=$(node_bounds 'text="SCAN QR"') \
         || { fail "Scan QR is missing from the pairing screen"; stop_wss_fixture; return 1; }
