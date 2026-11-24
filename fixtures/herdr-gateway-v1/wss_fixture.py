@@ -189,9 +189,10 @@ class Pairing:
     """`POST /v1/pair` and `GET /v1/pair/<id>` from the v1 contract.
 
     A create answers pending and stays there until the admin socket answers
-    `pair approve` or `pair deny`. A lane needs that split: the screen has to
-    show a pending request before it can show the approval, and a fixture that
-    approved on its own would leave the pending state unobservable.
+    `pair approve`, `pair deny` or `pair expire`. A lane needs that split: the
+    screen has to show a pending request before it can show an answer, and a
+    fixture that answered on its own would leave the pending state — and the
+    denial and lapse the screen also has to report — unobservable.
     """
 
     def __init__(self, core_id):
@@ -225,6 +226,12 @@ class Pairing:
                 self.decision = "approved"
             elif action == "deny":
                 self.decision = "denied"
+            elif action == "expire":
+                # A request the host let lapse: forgetting it makes the next
+                # poll answer 404, which the app reports as expired.
+                self.requests.clear()
+                self.decision = None
+                return {"state": "expired", "requests": []}
             else:
                 return {"state": self.decision or "idle",
                         "requests": sorted(self.requests)}

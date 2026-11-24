@@ -93,6 +93,43 @@ final class GatewayTarget {
                 address, generation, secure, secure);
     }
 
+    /**
+     * Rewrites only the socket origin, keeping who is dialled and how.
+     *
+     * <p>The device lane cannot resolve a tailnet name, so a row paired through
+     * the pairing screen is reached at loopback instead. The Core ID, the
+     * address and the "discover the generation" path stay the paired ones:
+     * only the origin moves, so the step still proves the registry resolved the
+     * target.
+     *
+     * @param override {@code host:port}, or {@code https://host:port} /
+     *     {@code wss://host:port} to trust the fixture certificate
+     * @return this target when {@code override} is empty
+     * @throws IllegalArgumentException with {@code endpoint} or {@code port} as
+     *     its message when the override is malformed
+     */
+    GatewayTarget remap(String override) {
+        String extra = override == null ? "" : override.trim();
+        if (extra.isEmpty()) return this;
+        boolean tls = extra.startsWith("https://") || extra.startsWith("wss://");
+        String endpoint = tls ? extra.substring(extra.indexOf("://") + 3) : extra;
+        int pathAt = endpoint.indexOf('/');
+        if (pathAt >= 0) endpoint = endpoint.substring(0, pathAt);
+        int colon = endpoint.lastIndexOf(':');
+        if (colon <= 0 || colon == endpoint.length() - 1) {
+            throw new IllegalArgumentException("endpoint");
+        }
+        int port;
+        try {
+            port = Integer.parseInt(endpoint.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("port");
+        }
+        if (port <= 0 || port > 65535) throw new IllegalArgumentException("port");
+        String host = endpoint.substring(0, colon);
+        return new GatewayTarget(host, port, coreId, address, generation, tls, tls);
+    }
+
     /** A public terminal reference: `hc://<core-id>/<address>`. */
     static final class Reference {
         final String coreId;

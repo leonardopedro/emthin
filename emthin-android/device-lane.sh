@@ -434,16 +434,47 @@ EOF
     D shell input tap "$(( (x1 + x2) / 2 ))" "$(( (y1 + y2) / 2 ))" >/dev/null 2>&1
 }
 
+# PopupMenus animate in, so a dump taken immediately after a tap can still be
+# the previous frame — and a nested group opens a second popup, which is the
+# slowest case. Wait for each popup, and if one does not appear retry the whole
+# sequence with the menu closed again.
 tap_toolbar_menu() {
+    local group="$1" action="$2" attempt=0 rc=0
+    while [ "$attempt" -lt 4 ]; do
+        rc=0
+        tap_toolbar_menu_once "$group" "$action" || rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        # 2 means a popup was open: Back puts the document back where it was so
+        # the retry starts from the toolbar. 1 means nothing opened at all.
+        if [ "$rc" -eq 2 ]; then
+            D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+            sleep 0.5
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+# 0 = action tapped, 1 = no menu button on screen, 2 = a popup was open but the
+# entry for the next step was not in it.
+tap_toolbar_menu_once() {
     local group="$1" action="$2" bounds
+    cmd_uidump "$UI_XML" >/dev/null || return 1
     bounds=$(node_bounds 'content-desc="More actions"') || return 1
     tap_center "$bounds" || return 1
-    cmd_uidump "$UI_XML" || return 1
-    bounds=$(node_bounds "text=\"$group\"") || return 1
-    tap_center "$bounds" || return 1
-    cmd_uidump "$UI_XML" || return 1
-    bounds=$(node_bounds "text=\"$action\"") || return 1
-    tap_center "$bounds"
+    sleep 0.8
+    cmd_uidump "$UI_XML" >/dev/null || return 2
+    bounds=$(node_bounds "text=\"$group\"") || return 2
+    tap_center "$bounds" || return 2
+    sleep 0.8
+    cmd_uidump "$UI_XML" >/dev/null || return 2
+    bounds=$(node_bounds "text=\"$action\"") || return 2
+    tap_center "$bounds" || return 2
+    sleep 0.5
+    # Leave a dump of whatever the action opened, since callers read the last
+    # dump to assert on it.
+    cmd_uidump "$UI_XML" >/dev/null || true
+    return 0
 }
 
 # First paint focuses the rendered page at the document end. Tapping the

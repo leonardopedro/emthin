@@ -46,6 +46,7 @@ public final class GatewayTargetTest {
         references();
         fixture();
         fixtureWins();
+        remap();
         System.out.println("GatewayTargetTest: " + checks + " checks");
     }
 
@@ -123,6 +124,44 @@ public final class GatewayTargetTest {
         expectInvalid("127.0.0.1:nope", "port");
         expectInvalid("127.0.0.1:0", "port");
         expectInvalid("127.0.0.1:70000", "port");
+    }
+
+    private static void remap() {
+        GatewayTarget target = GatewayTarget.resolve(null, null, REFERENCE, paired());
+        GatewayTarget loopback = target.remap("wss://127.0.0.1:47658");
+        check("127.0.0.1".equals(loopback.host), "the remap moves the origin");
+        check(loopback.port == 47658, "the remap takes the override's port");
+        check(loopback.secure, "wss:// stays TLS");
+        check(loopback.fixtureCertificate, "the remapped origin trusts the fixture CA");
+        check(CORE.equals(loopback.coreId), "the remap keeps the row's core identity");
+        check("t7".equals(loopback.address), "the remap keeps the figure's address");
+        check(loopback.generation == null, "a remapped row still discovers its generation");
+
+        check(target.remap("") == target, "an absent override leaves the target alone");
+        check(target.remap(null) == target, "a null override leaves the target alone");
+
+        GatewayTarget plain = target.remap("127.0.0.1:9000");
+        check(!plain.secure, "a bare host:port remaps to plain TCP");
+        check(!plain.fixtureCertificate, "plain TCP needs no fixture CA");
+
+        for (String bad : new String[] {"127.0.0.1", "127.0.0.1:", "https://127.0.0.1"}) {
+            try {
+                target.remap(bad);
+            } catch (IllegalArgumentException expected) {
+                checks++;
+                check("endpoint".equals(expected.getMessage()), "bad remap " + bad);
+                continue;
+            }
+            throw new AssertionError("accepted remap " + bad);
+        }
+        try {
+            target.remap("127.0.0.1:nope");
+        } catch (IllegalArgumentException expected) {
+            checks++;
+            check("port".equals(expected.getMessage()), "a non-numeric remap port");
+            return;
+        }
+        throw new AssertionError("accepted a non-numeric remap port");
     }
 
     private static void fixtureWins() {

@@ -294,6 +294,8 @@ public class MainActivity extends Activity {
     private String fixtureGatewayCa;
     /** Lane-only origin for pairing HTTP; the link still parses as a tailnet one. */
     private String fixturePairBase;
+    /** Lane-only origin for a paired row's socket, keeping its Core ID. */
+    private String fixtureConnect;
     private GatewayLeaseClient gatewayLease;
     /** Paired gateways, revalidated on every load; see {@link GatewayEndpoints}. */
     private GatewayEndpoints gatewayEndpoints;
@@ -509,6 +511,7 @@ public class MainActivity extends Activity {
         fixtureGatewayGeneration = testIntent.getStringExtra("emthin.fixtureGatewayGeneration");
         fixtureGatewayCa = testIntent.getStringExtra("emthin.fixtureGatewayCa");
         fixturePairBase = testIntent.getStringExtra("emthin.fixturePairBase");
+        fixtureConnect = testIntent.getStringExtra("emthin.fixtureConnect");
         // A shell cannot write into this app's directory on the Waydroid image
         // (run-as is refused without CAP_SETGID), so the lane can hand the
         // fixture certificate over as launch data instead. Fixture-only: the
@@ -8150,9 +8153,14 @@ public class MainActivity extends Activity {
         try {
             gatewayTarget = GatewayTarget.resolve(fixtureGateway, fixtureGatewayGeneration,
                     reference, gatewayEndpoints);
+            // The device lane cannot resolve a tailnet name, so a row paired
+            // through the screen is reached at loopback; the target is still
+            // the registry's, and only its origin moves.
+            if (gatewayTarget != null) gatewayTarget = gatewayTarget.remap(fixtureConnect);
         } catch (IllegalArgumentException e) {
             trace("gatewayLease", "phase", "failed", "reason", String.valueOf(e.getMessage()),
-                    "target", String.valueOf(fixtureGateway));
+                    "target", String.valueOf(fixtureGateway),
+                    "connect", String.valueOf(fixtureConnect));
             gatewayTarget = null;
         }
         boolean gatewayLeaseBacked = gatewayTarget != null;
