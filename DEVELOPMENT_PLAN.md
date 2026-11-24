@@ -1063,11 +1063,17 @@ stored row had never been used. Two steps close both gaps.
   only by the test APK), and the lane waits for `force-stop` to actually end
   the process, since a start that races the teardown drops its extras.
 - **The rest of the lifecycle.** Watch is only half the row: `paired-lease`
-  now taps the scene, takes control, types input that the fixture sees, then
-  has the fixture's admin socket `revoke` it and proves the app rejects further
-  input before the transport. Admin commands a step cannot continue without use
+  taps the scene, takes control, types input that the fixture sees, then has
+  the fixture's admin socket `revoke` it and proves the app rejects further
+  input before the transport. A second Take must then attach again and come
+  back with a lease id the fixture names differently — a reused generation
+  would keep the old one — and that fresh lease's input must reach the
+  fixture. Admin commands a step cannot continue without use
   `wss_admin_checked`, which names a silent admin socket rather than letting the
-  step wait out the pending timeout and blame the answer that never came.
+  step wait out the pending timeout and blame the answer that never came, and
+  `wait_for_log` now checks the running fixture's process and log tail, so a
+  fixture that dies mid-step fails immediately with the reason instead of a
+  10 s trace timeout that blames the app.
 - **The menu helper.** `tap_toolbar_menu` now waits for each popup and retries
   the sequence with Back when one does not appear, which removed the bespoke
   opener the pairing step needed; the sessions submenu's entry animation is no
@@ -1077,10 +1083,12 @@ stored row had never been used. Two steps close both gaps.
   `nix develop -c` or the devshell's gcc-wrapper to `PATH` when cargo actually
   has to compile.
 - **Result.** Each step alone: `pairing` 11 checks, `pairing-answers` 8,
-  `paired-lease` 10 (approve → lease → Take → controller input → revoke →
-  rejected input) — all passed. Full `LANE_WSS=1 ./device-lane.sh e2e`:
-  **239 checks, 0 failed**, `device lane: all steps passed`, installed
-  `base.apk` md5 `d762f9a7e7923ce3e57d08e67b19dffd`. Host `bash test-java.sh`:
+  `paired-lease` 12 (approve → lease → Take → controller input → revoke →
+  rejected input → retake with a distinct lease → input) — all passed. Full
+  `LANE_WSS=1 ./device-lane.sh e2e` with the installed APK reused
+  (`SKIP_BUILD=1`, which omits the build check): **240 checks, 0 failed**,
+  `device lane: all steps passed`, and the installed `base.apk` still
+  byte-identical to the build (md5 `d762f9a7e7923ce3e57d08e67b19dffd`). Host `bash test-java.sh`:
   `GatewayTargetTest` grew from 51 to 71 checks with the remap cases.
 
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)

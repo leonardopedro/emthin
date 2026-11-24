@@ -709,9 +709,14 @@ the box64 setup remains the local aarch64-host path.
   discovery are the paired path's. It then drives the rest of the lifecycle
   through that row: Take becomes a controller lease, typed input crosses it and
   returns as DATA, and the fixture's admin `revoke` closes it and makes the
-  app reject further input before the transport. Admin commands the steps cannot
+  app reject further input before the transport. A second Take then has to come
+  back with a lease the gateway names differently, so the revoke demonstrably
+  ended the generation rather than the row. Admin commands the steps cannot
   continue without go through `wss_admin_checked`, which fails naming the silent
-  socket instead of waiting out the request's pending timeout. A launch fixture names the document to
+  socket instead of waiting out the request's pending timeout, and every
+  `wait_for_log` checks the running fixture's process and log tail, so a
+  fixture that dies mid-step fails at once with its reason instead of a trace
+  timeout that blames the app. A launch fixture names the document to
   open and therefore outranks a recovery copy (`fixtureText` is set only by the
   test APK); without that, a relaunch of the same build restored the previous
   document and the figure never appeared.

@@ -555,12 +555,35 @@ relationship_scroll() {
     fi
 }
 
+# A scripted fixture that exits mid-step turns every later wait into a 10 s
+# timeout whose failure blames the app. Check the process and the tail of its
+# log at the wait instead, so the failure names the thing that actually went
+# away. Returns 0 when a started fixture is gone, 1 when it is alive or was
+# never started by this step.
+fixture_gone() {
+    local pid="$1" dir="$2" label="$3" want="$4" line
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null && return 1
+    say "    info the $label process exited; '$want' cannot arrive"
+    if [ -n "$dir" ] && [ -f "$dir/server.log" ]; then
+        while IFS= read -r line; do
+            say "    info $label: $line"
+        done < <(tail -n 5 "$dir/server.log")
+    fi
+    return 0
+}
+
 wait_for_log() {
     local out="$1" pattern="$2" tries=0
     while [ "$tries" -lt 50 ]; do
         D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$out"
         if grep -q "$pattern" "$out"; then
             return 0
+        fi
+        if fixture_gone "${LEASE_PID:-}" "${LEASE_DIR:-}" \
+                "gateway lease fixture" "$pattern" \
+            || fixture_gone "${WSS_PID:-}" "${WSS_DIR:-}" "WSS fixture" "$pattern"; then
+            return 1
         fi
         sleep 0.2
         tries=$((tries + 1))
@@ -2452,6 +2475,10 @@ wss_admin() {
 # pending timeout and report the answer that never came.
 wss_admin_checked() {
     local reply
+    if fixture_gone "${WSS_PID:-}" "${WSS_DIR:-}" "WSS fixture" "admin $1"; then
+        fail "the WSS fixture process died mid-step"
+        return 1
+    fi
     reply=$(wss_admin "$1")
     if [ -z "$reply" ]; then
         fail "the WSS fixture admin socket answered nothing to '$1'"
@@ -2789,7 +2816,7 @@ cmd_paired_lease() {
     local actions_ui="$OUTDIR/paired-lease-actions-ui.xml"
     local log="$OUTDIR/paired-lease-logcat.txt"
     local link="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
-    local fixture placed x y w h bounds status
+    local fixture placed x y w h bounds status first_lease second_lease
     say "==> paired lease: approve a row -> lease -> take -> operator revoke"
     mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
     cmd_clear_data || return
@@ -2886,6 +2913,12 @@ EOF
         || { fail "Take on the paired row did not request control"; stop_wss_fixture; return 1; }
     wait_for_log "$log" 'gatewayLease phase ready mode control' \
         || { fail "Take on the paired row did not become a controller"; stop_wss_fixture; return 1; }
+    first_lease=$(sed -n 's/.*gatewayLease phase ready mode control lease \([^ ]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$first_lease" ] || [ "$first_lease" = none ]; then
+        fail "the paired controller lease was not named in the log"
+        stop_wss_fixture
+        return 1
+    fi
     pass "Take on the paired row acquired a controller lease"
 
     D shell input text 'pairedtake' >/dev/null 2>&1
@@ -2917,6 +2950,41 @@ EOF
         return 1
     fi
     pass "revoked paired lease rejected input before the transport"
+
+    # Revocation ends the generation, not the row. A second Take must attach
+    # again and come back with a lease the gateway names differently; a reused
+    # generation would keep the old name.
+    D logcat -c >/dev/null 2>&1 || true
+    if ! cmd_uidump "$actions_ui" >/dev/null 2>&1 || ! bounds=$(node_bounds 'text="Take"'); then
+        fail "the paired lease has no Take action after the revoke"
+        stop_wss_fixture
+        return 1
+    fi
+    tap_center "$bounds"
+    wait_for_log "$log" 'gatewayLease phase ready mode control' \
+        || { fail "a second Take did not acquire a fresh lease"; stop_wss_fixture; return 1; }
+    second_lease=$(sed -n 's/.*gatewayLease phase ready mode control lease \([^ ]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$second_lease" ] || [ "$second_lease" = none ]; then
+        fail "the second Take did not name its lease"
+        stop_wss_fixture
+        return 1
+    fi
+    if [ "$second_lease" = "$first_lease" ]; then
+        fail "the second Take reused the revoked lease '$first_lease'"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the second Take acquired a lease the gateway named differently"
+    D shell input text 'retakepair' >/dev/null 2>&1
+    wait_for_log "$log" 'gatewayLease data .*echo:' \
+        || { fail "the fresh lease did not echo its input"; stop_wss_fixture; return 1; }
+    status=$(wss_admin status)
+    if ! printf '%s' "$status" | grep -q 'retakepair'; then
+        fail "the fresh lease did not reach the gateway"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the fresh lease carried input through the paired row"
     stop_wss_fixture
 }
 
