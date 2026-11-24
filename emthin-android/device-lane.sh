@@ -3290,9 +3290,9 @@ cmd_e2e() {
     cmd_terminal_reflow
     cmd_terminal_pages
     cmd_terminal_lease
-    # Opt in with LANE_WSS=1: the step needs an APK built from the transport
-    # sources, and until the NDK link works again the installed APK predates
-    # them, so enabling it by default would only fail on a stale binary.
+    # Opt in with LANE_WSS=1: these steps need an APK built from the transport
+    # sources plus python3 for the fixtures, so a default run against a plain
+    # build would only fail on a binary that predates them.
     if [ "${LANE_WSS:-0}" = "1" ]; then
         cmd_pairing
         cmd_pairing_answers

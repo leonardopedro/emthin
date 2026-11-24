@@ -490,12 +490,19 @@ uninstalled first, `SKIP_BUILD=1`, installed APK md5-matched to the build).
 Run B — two paired test hosts over Tailscale with no SSH — remains a hardware
 and deployment gap and was not attempted.
 
-The WSS device step is wired but opt-in: `LANE_WSS=1 ./device-lane.sh e2e`
-(or `./device-lane.sh gateway-wss` alone). It is off by default because it needs
-an APK built from the transport sources, and this host's NDK link currently
-crashes under box64 (`free(): invalid next size` from `ld.lld` while linking),
-so the installed APK would silently fall back to plain TCP. The transport's own
-checks run on the host instead (`test-java.sh`, `wss-lane-check.sh`).
+The WSS device steps are wired but opt-in: `LANE_WSS=1 ./device-lane.sh e2e`
+adds `pairing`, `pairing-answers`, `paired-lease` and `gateway-wss`, each also
+runnable alone. They stay off by default because they need an APK built from
+the transport sources plus `python3` for the two fixtures, so a default run
+against a plain build would only fail on a binary that predates them.
+Measured 2026-11-24 on this host with such an APK: `LANE_WSS=1
+./device-lane.sh e2e` passed the whole lane, **241 checks, 0 failed** with the
+installed APK reused (`SKIP_BUILD=1`). Building that APK here takes a host
+`cc` on `PATH` (`PATH=<gcc-wrapper>/bin ANDROID_ABI=arm64-v8a ./build-apk.sh`),
+because under box64 the NDK's `ld.lld` crashes while linking (`free(): invalid
+next size`) and `nix develop -c ./build-apk.sh` fails with `can't find crate for
+core`. The transport's own checks also run on the host (`test-java.sh`,
+`wss-lane-check.sh`).
 
 `scripts/check-herdr-inputs` **fails** here (0.2 s): `velysterm` is at
 `00f24a7` against pinned `423a8c4` and `openshell` at `a0a1d2d` against pinned
