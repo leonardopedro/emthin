@@ -699,6 +699,18 @@ the box64 setup remains the local aarch64-host path.
   `wss_fixture.py` serves `/v1/pair` (`POST` pending, `GET` until the admin
   answers), so the fixture stays the one scripted Core.
 
+  Two more steps cover the rest of that screen and its consequence:
+  `pairing-answers` drives a denial (`pair deny`), a lapse (`pair expire`) and
+  a Core mismatch (a link naming another ID, refused 409 at create), and
+  asserts each is reported on screen and stores no row; `paired-lease` approves
+  a row and then launches a figure with no `emthin.fixtureGateway` at all —
+  only `emthin.fixtureConnect` remapping the row's origin to loopback — so the
+  registry lookup, the row's Core ID in `hello` and `sessions.list` generation
+  discovery are the paired path's. A launch fixture names the document to
+  open and therefore outranks a recovery copy (`fixtureText` is set only by the
+  test APK); without that, a relaunch of the same build restored the previous
+  document and the figure never appeared.
+
 ## Device tier — waydroid (measured 2026-10-19)
 
 Operating notes from the first full device verification (built →

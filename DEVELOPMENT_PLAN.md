@@ -1039,6 +1039,43 @@ The pairing screen had only ever been opened by hand, so it gets a lane step
   the lease still runs against the fixture extras rather than the row this
   step creates (no tailnet host exists here).
 
+### Pairing answers and a lease through the paired row (2026-11-24)
+
+Approval was the only answer the screen had ever been driven through, and the
+stored row had never been used. Two steps close both gaps.
+
+- **`pairing-answers`** (`./device-lane.sh pairing-answers`) drives a denial
+  (`pair deny`), a lapse (`pair expire`, which forgets the request so the next
+  poll answers 404) and a Core mismatch (a link naming an ID the host does not
+  own, refused 409 at create). Each must be reported on screen and store
+  nothing. The fixture gained the `expire` admin action for the middle one.
+- **`paired-lease`** approves a row through the screen and then lets a figure
+  lease through it with **no** `emthin.fixtureGateway`: the only extra is
+  `emthin.fixtureConnect`, and `GatewayTarget.remap` rewrites the row's socket
+  origin to loopback while keeping its Core ID, address and generation
+  discovery. That keeps the registry lookup, the Core ID in `hello` and the
+  `sessions.list` step real — the step's whole point — and the assertions are
+  the lease path's (TLS, discover, watch, `80x24` grid, DATA).
+- **A defect the step found.** A launch fixture could be ignored entirely: the
+  recovery copy from the previous launch restored first, so the fixture
+  document never appeared and the figure was absent (`figureMetadata …
+  terminal 0`). A fixture document now outranks recovery (`fixtureText` is set
+  only by the test APK), and the lane waits for `force-stop` to actually end
+  the process, since a start that races the teardown drops its extras.
+- **The menu helper.** `tap_toolbar_menu` now waits for each popup and retries
+  the sequence with Back when one does not appear, which removed the bespoke
+  opener the pairing step needed; the sessions submenu's entry animation is no
+  longer a special case.
+- **Environment.** A fresh (uncached) `build-apk.sh` needs a host `cc`, which
+  this aarch64 host only has inside the emthin devshell; prepend
+  `nix develop -c` or the devshell's gcc-wrapper to `PATH` when cargo actually
+  has to compile.
+- **Result.** Each step alone: `pairing` 11 checks, `pairing-answers` 8,
+  `paired-lease` 6 — all passed. Full `LANE_WSS=1 ./device-lane.sh e2e`:
+  **235 checks, 0 failed**, `device lane: all steps passed`, installed
+  `base.apk` md5 `3b1b88059cad5e7cbfc3b6fa2b638b04`. Host `bash test-java.sh`:
+  `GatewayTargetTest` grew from 51 to 71 checks with the remap cases.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the

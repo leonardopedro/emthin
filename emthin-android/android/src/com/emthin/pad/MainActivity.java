@@ -881,6 +881,14 @@ public class MainActivity extends Activity {
     private void installInitialRecovery(RecoveryStore.Load load, Map<String, Object> view,
                                         Legacy legacy, String bundleDocument, int bundleCaret,
                                         int bundleScroll, int bundleScrollWidth) {
+        // A launch fixture names the document to open, so it outranks whatever
+        // this device had open before: the lane restarts the same build again and
+        // again, and the recovery copy the previous launch left behind is not the
+        // document it asked for. `fixtureText` is only ever set by the test APK.
+        if (fixtureText != null) {
+            installFreshStarter();
+            return;
+        }
         if (load.best != null) {
             long restored = DocBridge.openSnapshotBytes(load.best.snapshot);
             if (restored == 0 && load.older != null) {

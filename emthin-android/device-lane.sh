@@ -80,6 +80,11 @@
 #                fixture's admin socket -> row stored across a relaunch ->
 #                Forget (LANE_WSS=1; requires the disposable test APK, python3
 #                and openssl)
+#   pairing-answers  the same screen's other answers: deny, lapse and a Core
+#                mismatch, none of which may store a row (LANE_WSS=1)
+#   paired-lease   approve a row through the screen, then let a figure lease
+#                through it with only its origin remapped to loopback
+#                (LANE_WSS=1)
 #   gateway-wss  TLS -> upgrade -> watch attach -> grid -> banner, then the
 #                same without a generation so sessions.list supplies it
 #                (LANE_WSS=1; requires the disposable test APK and python3)
@@ -2517,26 +2522,58 @@ cmd_gateway_wss() {
     stop_wss_fixture
 }
 
-# `tap_toolbar_menu` dumps the hierarchy immediately after each tap, which is
-# too fast for the sessions submenu's enter animation; this opener waits for
-# each popup instead and proves the pairing dialog is the next thing on screen.
-pair_open() {
-    local ui="$1" bounds
-    # node_bounds reads the last dump, so there has to be one for this screen.
-    cmd_uidump "$ui" >/dev/null || return 1
-    bounds=$(node_bounds 'content-desc="More actions"') || return 1
+# Cold-start the pad against the TLS fixture with the pairing origin remapped to
+# loopback, then open the pairing screen. The extras are read in onCreate, so a
+# warm activity would ignore them.
+# `am force-stop` returns before the process is gone, and a start that races
+# the teardown can land on the dying activity, which drops the extras.
+cold_stop() {
+    local tries=0
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    while [ "$tries" -lt 25 ]; do
+        D shell pidof "$PKG" >/dev/null 2>&1 || return 0
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    return 0
+}
+
+pair_launch() {
+    local ui="$1"
+    UI_XML="$ui"
+    cold_stop
+    D logcat -c >/dev/null 2>&1 || true
+    D shell am start -W -n "$ACTIVITY" \
+        --es emthin.fixturePairBase "https://127.0.0.1:$WSS_PORT" \
+        --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" >/dev/null 2>&1 || return 1
+    sleep 3
+    tap_toolbar_menu "Sessions and sharing" "Pair gateway" >/dev/null
+}
+
+# Tap PASTE LINK, type LINK into the field, and press PAIR, leaving the pairing
+# screen (which PAIR reopens) as the last dump.
+pair_paste() {
+    local link="$1" ui bounds
+    ui=$UI_XML
+    bounds=$(node_bounds 'text="PASTE LINK"') \
+        || { fail "Paste link is missing"; return 1; }
     tap_center "$bounds"
-    sleep 0.8
     cmd_uidump "$ui" >/dev/null || return 1
-    bounds=$(node_bounds 'text="Sessions and sharing"') || return 1
+    bounds=$(node_bounds 'class="android.widget.EditText"') \
+        || { fail "the link field is missing"; return 1; }
     tap_center "$bounds"
-    sleep 0.8
+    sleep 0.5
+    D shell "input text '$link'" >/dev/null 2>&1 || { fail "type the pairing link"; return 1; }
+    sleep 0.5
     cmd_uidump "$ui" >/dev/null || return 1
-    bounds=$(node_bounds 'text="Pair gateway"') || return 1
+    if ! grep -q 'fleet.leo.ts.net/pair?v=1' "$ui"; then
+        fail "the typed link did not reach the field"
+        return 1
+    fi
+    bounds=$(node_bounds 'text="PAIR"') \
+        || { fail "Pair is missing"; return 1; }
     tap_center "$bounds"
-    sleep 0.8
-    cmd_uidump "$ui" >/dev/null || return 1
-    node_bounds 'text="PASTE LINK"' >/dev/null
+    sleep 0.5
 }
 
 # The pairing screen end to end against the TLS fixture. The link is a real
@@ -2552,19 +2589,7 @@ cmd_pairing() {
     cmd_clear_data || return
     if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
 
-    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
-    D logcat -c >/dev/null 2>&1 || true
-    if ! D shell am start -W -n "$ACTIVITY" \
-            --es emthin.fixturePairBase "https://127.0.0.1:$WSS_PORT" \
-            --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" >/dev/null 2>&1; then
-        fail "launch the pad against the pairing fixture"
-        stop_wss_fixture
-        return 1
-    fi
-    pass "launched the pad against the pairing fixture"
-    sleep 3
-
-    if ! pair_open "$ui"; then
+    if ! pair_launch "$ui"; then
         fail "open the pairing screen"
         stop_wss_fixture
         return 1
@@ -2576,29 +2601,7 @@ cmd_pairing() {
     fi
     pass "the pairing screen starts with an empty registry"
 
-    bounds=$(node_bounds 'text="PASTE LINK"') \
-        || { fail "Paste link is missing"; stop_wss_fixture; return 1; }
-    tap_center "$bounds"
-    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
-    bounds=$(node_bounds 'class="android.widget.EditText"') \
-        || { fail "the link field is missing"; stop_wss_fixture; return 1; }
-    tap_center "$bounds"
-    sleep 0.5
-    if ! D shell "input text '$link'" >/dev/null 2>&1; then
-        fail "type the pairing link"
-        stop_wss_fixture
-        return 1
-    fi
-    sleep 0.5
-    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
-    if ! grep -q 'fleet.leo.ts.net/pair?v=1' "$ui"; then
-        fail "the typed link did not reach the field"
-        stop_wss_fixture
-        return 1
-    fi
-    bounds=$(node_bounds 'text="PAIR"') \
-        || { fail "Pair is missing"; stop_wss_fixture; return 1; }
-    tap_center "$bounds"
+    pair_paste "$link" || { stop_wss_fixture; return 1; }
     if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
         fail "the pasted link did not open a pairing request"
         stop_wss_fixture
@@ -2631,7 +2634,7 @@ cmd_pairing() {
 
     # The registry is SharedPreferences state, so it has to survive a launch
     # with no fixture extras at all.
-    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    cold_stop
     D logcat -c >/dev/null 2>&1 || true
     if ! D shell am start -W -n "$ACTIVITY" >/dev/null 2>&1; then
         fail "relaunch the pad"
@@ -2639,7 +2642,7 @@ cmd_pairing() {
         return 1
     fi
     sleep 3
-    if ! pair_open "$ui"; then
+    if ! tap_toolbar_menu "Sessions and sharing" "Pair gateway"; then
         fail "reopen the pairing screen"
         stop_wss_fixture
         return 1
@@ -2666,6 +2669,180 @@ cmd_pairing() {
         return 1
     fi
     pass "Forget removed the local row"
+    stop_wss_fixture
+}
+
+# The answers the screen has to report besides approval: a denial, a lapse and
+# a Core mismatch. Every round starts from the same empty registry and has to
+# leave it empty, and the mismatch is the one the fixture refuses outright
+# (409) rather than deciding later.
+cmd_pairing_answers() {
+    local ui="$OUTDIR/pairing-answers-ui.xml"
+    local log="$OUTDIR/pairing-answers-logcat.txt"
+    local link="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
+    local other="https://fleet.leo.ts.net/pair?v=1&core=ffffffffffffffffffffffffffffffff"
+    say "==> pairing answers: deny -> expire -> core mismatch"
+    mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
+    cmd_clear_data || return
+    if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
+    if ! pair_launch "$ui"; then
+        fail "open the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "opened the pairing screen against the fixture"
+
+    pair_paste "$link" || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
+        fail "the link to deny did not open a request"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin "pair deny" >/dev/null 2>&1 || true
+    if ! wait_for_log "$log" 'gatewayPair phase denied host fleet.leo.ts.net'; then
+        fail "a denial was not reported"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'text="Denied' "$ui"; then
+        fail "the screen does not say the host refused the device"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="No gateways paired yet."' "$ui"; then
+        fail "a denial stored an endpoint"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a denial is reported and stores nothing"
+
+    # A lapsed request: the fixture forgets it, so the next poll answers 404.
+    pair_paste "$link" || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
+        fail "the link to lapse did not open a request"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin "pair expire" >/dev/null 2>&1 || true
+    if ! wait_for_log "$log" 'gatewayPair phase expired host fleet.leo.ts.net'; then
+        fail "a lapsed request was not reported"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'text="Expired' "$ui"; then
+        fail "the screen does not say the request lapsed"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="No gateways paired yet."' "$ui"; then
+        fail "a lapsed request stored an endpoint"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a lapsed request is reported and stores nothing"
+
+    # A link naming a different Core than the host approved is refused by the
+    # create itself, so no request ever reaches polling.
+    pair_paste "$other" || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase core_mismatch host fleet.leo.ts.net'; then
+        fail "a Core mismatch was not reported"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'text="Mismatched' "$ui"; then
+        fail "the screen does not say the host approved a different Core"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="No gateways paired yet."' "$ui"; then
+        fail "a mismatched Core stored an endpoint"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a Core mismatch is reported and stores nothing"
+    stop_wss_fixture
+}
+
+# A row approved through the screen is then dialled by a figure. Nothing points
+# the lease at the fixture: only the row's origin is remapped to loopback, so
+# the registry lookup, the Core ID in `hello` and the generation discovery are
+# all the paired path's.
+cmd_paired_lease() {
+    local ui="$OUTDIR/paired-lease-ui.xml"
+    local log="$OUTDIR/paired-lease-logcat.txt"
+    local link="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
+    local fixture
+    say "==> paired lease: approve a row -> a figure leases through it"
+    mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
+    cmd_clear_data || return
+    if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
+    if ! pair_launch "$ui"; then
+        fail "open the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    pair_paste "$link" || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
+        fail "the link did not open a pairing request"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin "pair approve" >/dev/null 2>&1 || true
+    if ! wait_for_log "$log" 'gatewayPair phase approved host fleet.leo.ts.net'; then
+        fail "the approval did not arrive"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net"' "$ui"; then
+        fail "the approval did not store a row"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the pairing screen stored an approved row"
+
+    fixture=$(printf '%s\n' \
+        "#1 Build log #2 \\app(#1, #2, 640, 400, terminal: \"hc://$PAIR_CORE/t7\")")
+    cold_stop
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.fixtureVtScene true \
+            --es emthin.fixtureConnect "wss://127.0.0.1:$WSS_PORT" \
+            --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" \
+            --ef emthin.fixtureViewZoom 1.0 \
+            --es emthin.fixtureB64 "$(printf '%s' "$fixture" | base64 -w0)" \
+            >/dev/null 2>&1; then
+        fail "launch the figure against the paired row"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "launched the figure with only the paired row to dial"
+    wait_for_log "$log" 'vtScene phase ready' \
+        || { fail "the paired-lease scene did not start"; stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayLease phase connect .*secure true'; then
+        fail "the paired row did not connect over TLS"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! wait_for_log "$log" 'gatewayLease phase connect .*generation discover'; then
+        fail "the paired row did not discover its generation"
+        stop_wss_fixture
+        return 1
+    fi
+    wait_for_log "$log" 'gatewayLease phase ready mode watch' \
+        || { fail "the paired row did not become a lease"; stop_wss_fixture; return 1; }
+    wait_for_log "$log" 'gatewayLease resize cols 80 rows 24' \
+        || { fail "the paired lease did not publish its grid"; stop_wss_fixture; return 1; }
+    pass "the figure leased through the paired row"
+    if ! wait_for_log "$log" 'gatewayLease data .*gateway lease'; then
+        fail "the paired lease sent no DATA"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "DATA arrived over the paired row"
     stop_wss_fixture
 }
 
@@ -2961,6 +3138,8 @@ cmd_e2e() {
     # them, so enabling it by default would only fail on a stale binary.
     if [ "${LANE_WSS:-0}" = "1" ]; then
         cmd_pairing
+        cmd_pairing_answers
+        cmd_paired_lease
         cmd_gateway_wss
     fi
 
@@ -3211,6 +3390,8 @@ case "$cmd" in
     terminal-lease) cmd_terminal_lease ;;
     gateway-wss) cmd_gateway_wss ;;
     pairing)   cmd_pairing ;;
+    pairing-answers) cmd_pairing_answers ;;
+    paired-lease)    cmd_paired_lease ;;
     austral-rule) cmd_austral_rule ;;
     history-preview) cmd_history_preview ;;
     e2e)       cmd_e2e ;;
