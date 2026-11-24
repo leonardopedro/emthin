@@ -450,40 +450,56 @@ real socket races are still not represented.
   with SSH unavailable, then revoke one node grant. The second host stays
   usable. Network change/airplane mode and camera permission denial
   preserve the document and allow a clear recovery.
-- **Scope (not started, 2026-11-24).** What exists: `GatewayEndpoints`
-  keeps up to 16 rows keyed by tailnet host, finds one by Core ID for the
-  connection path, and revalidates the store on load; the Pairing screen
-  lists rows with name · host and a Forget that removes only this pad's copy
-  (`gatewayPair phase forget`); a figure's `hc://<core>/<address>` resolves
-  through those rows in `GatewayTarget.resolve`. What does not exist: any
-  camera or QR path (the Pairing screen's only entry is Paste link), and any
-  live multi-host catalogue — the Sessions list is `SessionCatalog.fake()`,
-  four hardcoded entries with host labels, so "aggregate verified host
-  catalogues" is currently a static fixture.
+- **Scope (two of three pieces built, 2026-11-24).** What exists:
+  `GatewayEndpoints` keeps up to 16 rows keyed by tailnet host, finds one by
+  Core ID for the connection path, and revalidates the store on load; the
+  Pairing screen lists rows with name · host and a Forget that removes only
+  this pad's copy (`gatewayPair phase forget`); a figure's
+  `hc://<core>/<address>` resolves through those rows in
+  `GatewayTarget.resolve`.
 
-  The smallest usable version is three pieces, none of which needs the
-  tailnet to be testable: (1) a **QR path that reuses the paste path**: an
-  `ImageAnalysis`-driven preview feeding a vendored decoder (ZXing core in
-  `android/libs/`, added to `javac -classpath` and the `d8` inputs in
-  `build-apk.sh`; no gradle), whose decoded string is handed to the existing
-  `PairingLink.parse` → `PairingProtocol` state machine, so scanning grants
-  nothing Paste link would not; `CAMERA` in the manifest with
-  `android.hardware.camera` marked `required="false"`, and a permission
-  refusal that reports and falls back instead of blocking Pairing;
-  (2) a **live `sessions.list` fan-out**: on opening Sessions, one request
-  per paired endpoint on the existing `HttpsGatewayHttp`, merged into one
-  list keyed by Core/address/generation, a host that fails becoming an
-  `UNAVAILABLE` row with a Reconnect action rather than an error dialog, and
-  the figure's own host dialled first when a lease dies; (3) **per-host
-  Reconnect** beside Forget on the Pairing row, re-running `hello` +
-  `sessions.list` for that host alone and showing its last error.
+  - **QR path — built.** `QrScanActivity` is a full-screen camera preview on
+    the platform `android.hardware.Camera` (a `PreviewCallback` NV21 frame),
+    and `QrScan` decodes it with a vendored ZXing core jar
+    (`android/libs/core-3.5.3.jar`, Apache-2.0; `build-apk.sh` puts
+    `android/libs/*.jar` on the `javac -classpath` and in the `d8` inputs —
+    still no gradle). The decoded string is handed to
+    `MainActivity.pairFromText`, which is *the* parse-and-pair path the Paste
+    field's Pair button now also calls, so a scan can only ever do what
+    pasting the same text does: `PairingLink.parse` → `PairingProtocol`.
+    "Scan QR" sits beside "Paste link" on the pairing dialog, which the
+    scanner dismisses for its own lifetime and the result handler reopens.
+    `CAMERA` is declared with `android.hardware.camera`
+    `required="false"` in both manifests. `QrScanTest` (host JVM) renders a
+    real pairing link with ZXing's writer, decodes it through the app's
+    reader — including through the NV21 wrapper — and passes the result to
+    `PairingLink.parse`; a blank frame, a short frame, a null frame and a
+    zero width all decode to nothing.
+  - **live `sessions.list` fan-out — built.** `GatewaySessions` runs one
+    synchronous `hello` + `sessions.list` per paired endpoint over the same
+    `GatewayTransport` a lease uses; `GatewayCatalog` merges them into one
+    list keyed by Core/address/generation, and a host that fails becomes its
+    own row carrying the reason (timed out / not found / unreadable /
+    unreachable) and a Reconnect action instead of an error dialog. The
+    Sessions dialog has a Refresh and says "Refreshing…" while a worker is
+    out. `SessionCatalog.fake()` is gone: the scripted four-row catalogue is
+    now `fixture()` and only the gateway-less lane steps (`session-pin`,
+    `figure-a11y`) use it. `GatewayCatalogTest` drives two one-connection
+    TCP Cores plus a dead port on the host JVM (rows, refusal, malformed
+    frame, pinned marker, lifecycle); the `pairing` step asserts the picker
+    listed "Lease fixture" from the scripted Core's `sessions.list` and that
+    an unreachable host is a row with Reconnect rather than an error.
+  - **Reconnect — built, fleet-wide.** The Sessions row's Reconnect re-runs
+    the whole fan-out (`sessions phase reconnect host <host>`), so a bad host
+    recovers with the others. Per-host-only reconnect (and Forget beside it
+    on the Sessions row rather than the Pairing row) is the piece not done.
 
-  Verifiable here: the decoder gets a host-JVM test (a generated QR image
-  decoded to the expected link) and the fan-out gets a host test against two
-  fixtures on two ports, plus a device step for permission denial and the
-  merged list against two scripted hosts. Not verifiable here: the camera
-  itself, a real tailnet and node-grant revocation, i.e. the physical-phone
-  half of **Done** stays open.
+  Verifiable here: the decoder and the merge have host-JVM tests, and the
+  device lane drives the no-camera path and the merged picker against a
+  scripted Core. Not verifiable here: the camera itself, a real tailnet,
+  node-grant revocation, and a second paired host — the physical-phone half
+  of **Done** stays open, and the second host is what would make the merge
+  span more than one row in a device run.
 
 ### T16. OpenShell enrollment of running sessions
 
@@ -512,13 +528,13 @@ passes, so the local evidence is recorded rather than deferred.
 | T11 | Verified | `cargo test -p herdr-gateway-fixtures` (5 tests) and `validate-herdr-gateway-fixtures` print `validated 32 Herdr gateway v1 fixtures`. |
 | T12 | Fixture-only, paired path included | Two device steps drive the scripted gateway end to end, and both require a retake after the operator revoke to be a new generation — a lease id the fixture names differently — with input that reaches it. `terminal-lease` runs `fixtures/herdr-gateway-v1/lease_fixture.py`: watch attach → authoritative grid → DATA → Take control → controller input round trip → operator revoke → rejected input → retake. `paired-lease` reaches the same lifecycle through the TLS/WebSocket fixture with nothing but the row the pairing screen stored — `emthin.fixtureConnect` remaps that row's origin to loopback, while the registry lookup, the row's Core ID in `hello` and `sessions.list` generation discovery stay the paired path's. Both steps fail fast when the fixture process exits mid-step, naming it and quoting its log instead of waiting out the app trace. `paired-lease` also ends with a raw client on the same transport, because the app's own refusal never crosses the wire: the gateway must answer a revoked controller's bytes with `not_controller`, echo nothing and record nothing. `emthin-collab` (66 + 23 tests) and `emthin-core-client` (1 + 1) cover the local adapters. Gap: no Go gateway, so no credit-preserving relay, writer handoff, denied-target channel reuse or stalled-client isolation. |
 | T13 | Gap | No Tailscale/tsnet identity, approval CLI or pairing service lives in this repository, and no test tailnet was exercised. |
-| T14 | Partly verified (device, scripted Core) | The WSS transport, pairing parser/state machine, endpoint registry and the Paste/approve screen exist. Host JVM: `emthin-android/test-java.sh` adds `GatewayPairingTest` (126 checks), `GatewayTargetTest` (71 checks — the registry lookup and the `emthin.fixtureConnect` remap) and `WebSocketTest` (51 checks — a real TLS round trip plus the plain-HTTP, unknown-certificate and wrong-hostname failures). `emthin-android/wss-lane-check.sh` runs `fixtures/herdr-gateway-v1/wss_fixture.py` (the same scripted Core behind TLS/WebSocket) against `WssTransport` via `WssFixtureProbe` (9 checks: upgrade, hello, control attach, lease, 80×24 grid, banner). On device, the `gateway-wss` step logs `phase connect ... secure true`, `resize cols 80 rows 24`, and the gateway banner reaching the native scene. Two infrastructure fixes were needed: the toolchain shims now link with a native aarch64 `lld` (`--ld-path`), and the fixture CA rides the launch intent (`emthin.fixtureGatewayCaPem`) because `run-as` is refused on the Waydroid image. The lease path now resolves through `GatewayTarget`: the fixture extra is a lane-only override, otherwise a figure's `hc://<core>/<address>` reference is looked up in the registry, and the connection is HTTPS on 443 with the platform trust store, `hello` carrying the paired Core ID and `sessions.list` supplying the generation before `terminal.attach` (a device step drops the generation extra to prove that sequence). The pairing screen is now driven on the device as well: `./device-lane.sh pairing` (part of `LANE_WSS=1`) pastes a real tailnet link, shows pending until the fixture's admin socket approves, lists the stored row, proves it survives a relaunch, and forgets it — `wss_fixture.py` serves `/v1/pair` for that. `./device-lane.sh pairing-answers` covers the other three answers the screen must report (denial, a lapsed request via the fixture's `pair expire`, and a 409 Core mismatch), each storing nothing. `./device-lane.sh paired-lease` then uses the row the screen stored: the figure launches with no gateway extra at all, only `emthin.fixtureConnect` remapping that row's origin to loopback, so the registry lookup, the row's Core ID in `hello` and `sessions.list` generation discovery are the paired path's; it then takes control through the same row, types input the fixture receives, and has the fixture's admin socket revoke it, after which the app rejects input before the transport. A second Take then proves the revoke ended the generation and not the row: it must come back with a lease the gateway names differently, and its input must reach the fixture. Because the app refuses revoked input before the transport, the step ends by running `fixtures/herdr-gateway-v1/stale_lease_probe.py` — a raw TLS/WebSocket client that takes the lease after that retake, is revoked in turn, and then writes on its revoked channel — so the gateway's own `not_controller` refusal, its silence and its empty input log are asserted rather than inferred. With all three steps in it, `LANE_WSS=1 ./device-lane.sh e2e` passes **243 checks, 0 failed** with the installed APK reused (`SKIP_BUILD=1`; the build check is the 244th). Remaining gap: the Core is the Python fixture, not the real Go gateway over a tailnet, and the approval comes from the fixture's admin socket rather than a person on a host. QR scanning is T15. |
-| T15 | Gap | Needs T13–T14 and a physical arm64 phone; this run used the Waydroid container, which is not a pairing target. |
+| T14 | Partly verified (device, scripted Core) | The WSS transport, pairing parser/state machine, endpoint registry and the Paste/approve screen exist. Host JVM: `emthin-android/test-java.sh` adds `GatewayPairingTest` (126 checks), `GatewayTargetTest` (71 checks — the registry lookup and the `emthin.fixtureConnect` remap) and `WebSocketTest` (51 checks — a real TLS round trip plus the plain-HTTP, unknown-certificate and wrong-hostname failures). `emthin-android/wss-lane-check.sh` runs `fixtures/herdr-gateway-v1/wss_fixture.py` (the same scripted Core behind TLS/WebSocket) against `WssTransport` via `WssFixtureProbe` (9 checks: upgrade, hello, control attach, lease, 80×24 grid, banner). On device, the `gateway-wss` step logs `phase connect ... secure true`, `resize cols 80 rows 24`, and the gateway banner reaching the native scene. Two infrastructure fixes were needed: the toolchain shims now link with a native aarch64 `lld` (`--ld-path`), and the fixture CA rides the launch intent (`emthin.fixtureGatewayCaPem`) because `run-as` is refused on the Waydroid image. The lease path now resolves through `GatewayTarget`: the fixture extra is a lane-only override, otherwise a figure's `hc://<core>/<address>` reference is looked up in the registry, and the connection is HTTPS on 443 with the platform trust store, `hello` carrying the paired Core ID and `sessions.list` supplying the generation before `terminal.attach` (a device step drops the generation extra to prove that sequence). The pairing screen is now driven on the device as well: `./device-lane.sh pairing` (part of `LANE_WSS=1`) pastes a real tailnet link, shows pending until the fixture's admin socket approves, lists the stored row, proves it survives a relaunch, and forgets it — `wss_fixture.py` serves `/v1/pair` for that. `./device-lane.sh pairing-answers` covers the other three answers the screen must report (denial, a lapsed request via the fixture's `pair expire`, and a 409 Core mismatch), each storing nothing. `./device-lane.sh paired-lease` then uses the row the screen stored: the figure launches with no gateway extra at all, only `emthin.fixtureConnect` remapping that row's origin to loopback, so the registry lookup, the row's Core ID in `hello` and `sessions.list` generation discovery are the paired path's; it then takes control through the same row, types input the fixture receives, and has the fixture's admin socket revoke it, after which the app rejects input before the transport. A second Take then proves the revoke ended the generation and not the row: it must come back with a lease the gateway names differently, and its input must reach the fixture. Because the app refuses revoked input before the transport, the step ends by running `fixtures/herdr-gateway-v1/stale_lease_probe.py` — a raw TLS/WebSocket client that takes the lease after that retake, is revoked in turn, and then writes on its revoked channel — so the gateway's own `not_controller` refusal, its silence and its empty input log are asserted rather than inferred. With all three steps in it, `LANE_WSS=1 ./device-lane.sh e2e` passes **249 checks, 0 failed** with the installed APK reused (`SKIP_BUILD=1`; the build check is the 250th). The `pairing` step also drives T15's two new surfaces: a scanned QR reported as "Scanner unavailable — no camera" with Paste link still offered (this container has no camera HAL), and the Sessions picker listing the scripted Core's `sessions.list` row (`Lease fixture`) beside a row for an unreachable host carrying its reason and a Reconnect action. Remaining gap: the Core is the Python fixture, not the real Go gateway over a tailnet, the approval comes from the fixture's admin socket rather than a person on a host, and no physical phone has scanned a code. |
+| T15 | Partly verified (device, scripted Core) | Built: a QR path behind the Pair dialog, and a live `sessions.list` fan-out across the paired rows. The `pairing` step asserts the merge and the per-host failure row; the camera half of **Done** still needs a phone (details under T15 below). |
 | T16 | Gap | No OpenShell fleet or gateway host registry is available here, so no real session could be enrolled. |
 
 Run A of the [acceptance run](HERDR_ACCEPTANCE_RUN.md) is exercised by
 `emthin-android/device-lane.sh e2e`: **215 checks, 0 failed** on 2026-11-23 and
-**243, 0 failed** on 2026-11-24 (persistence, sessions pin, figure
+**249, 0 failed** on 2026-11-24 (persistence, sessions pin, figure
 accessibility, terminal scene, reflow, pages, lease and the paired gateway),
 re-run from a clean install (package
 uninstalled first, `SKIP_BUILD=1`, installed APK md5-matched to the build).
@@ -531,7 +547,7 @@ runnable alone. They stay off by default because they need an APK built from
 the transport sources plus `python3` for the two fixtures, so a default run
 against a plain build would only fail on a binary that predates them.
 Measured 2026-11-24 on this host with such an APK: `LANE_WSS=1
-./device-lane.sh e2e` passed the whole lane, **241 checks, 0 failed** with the
+./device-lane.sh e2e` passed the whole lane, **249 checks, 0 failed** with the
 installed APK reused (`SKIP_BUILD=1`). Building that APK here takes a host
 `cc` on `PATH` (`PATH=<gcc-wrapper>/bin ANDROID_ABI=arm64-v8a ./build-apk.sh`),
 because under box64 the NDK's `ld.lld` crashes while linking (`free(): invalid

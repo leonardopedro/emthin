@@ -11,8 +11,9 @@ public final class SessionCatalogTest {
     }
 
     public static void main(String[] args) {
-        SessionCatalog catalog = SessionCatalog.fake();
-        check(catalog.entries().size() == 4, "fake catalogue has four sessions");
+        SessionCatalog catalog = SessionCatalog.fixture();
+        check(catalog.entries().size() == 4, "fixture catalogue has four sessions");
+        check(catalog.hosts().size() == 3, "and the hosts they came from");
         SessionCatalog.Entry live = catalog.byReference(
                 "hc://6ab09a20fd1288983dfbbac2bb349231/t3");
         check(live != null && live.state == SessionCatalog.State.LIVE, "live entry");
@@ -37,6 +38,7 @@ public final class SessionCatalogTest {
         SessionCatalog.Entry unwatched = detached.byReference(watched.reference);
         check(unwatched != null && unwatched.state == SessionCatalog.State.LIVE,
                 "detach releases the watcher but keeps the session");
+        check(SessionCatalog.empty().hosts().isEmpty(), "an empty catalogue has no hosts");
         check(!unwatched.canDetach(), "detached session has no watcher");
         check(detached.pin(watched.reference)
                 .byReference(watched.reference).pinned, "pin updates the live entry");

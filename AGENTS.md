@@ -550,7 +550,11 @@ scripted core; when they are set they win.
 in the workspace's 538** — see the verification lane below.
 - `src/lib.rs` is a `cdylib` (`libemthin_pad.so`, loaded via
   `System.loadLibrary("emthin_pad")`); `android/src/com/emthin/pad/`
-  holds `MainActivity.java` + `DocBridge.java` (the JNI surface).
+  holds `MainActivity.java` + `DocBridge.java` (the JNI surface), the
+  gateway client (`GatewayLeaseClient`, `GatewaySessions`,
+  `GatewayCatalog`, `GatewayEndpoints`, `GatewayTarget`,
+  `HttpsGatewayHttp`/`WssTransport`, `PairingLink`/`PairingProtocol`) and the
+  QR pair (`QrScan`, `QrScanActivity`).
 - Own `rust-toolchain.toml` (1.99.0), independent of the desktop lanes.
 - `debug.keystore` is tracked on purpose — it is a **debug** signing key
   for a debug APK, not a release credential.
@@ -602,7 +606,10 @@ target (`arm64-v8a` →
 `aarch64-linux-android`, `x86_64` → `x86_64-linux-android`, …), and
 cargo cross-compiles the `.so` for that target; `javac` + `d8` produce
 `classes.dex`, `aapt2` links the manifest, then `zipalign` + `apksigner`
-debug-sign.
+debug-sign. Third-party Java is vendored as jars in `android/libs/` — one,
+ZXing core 3.5.3 for the QR reader — which `build-apk.sh` and `test-java.sh`
+put on the classpath and `d8` dexes in; that is why the build still needs no
+gradle.
 
 On an aarch64 host the SDK's `aapt2`/`zipalign` and the NDK's LLVM are
 **x86_64 ELF** and fail with ENOEXEC, so run
@@ -644,7 +651,7 @@ the box64 setup remains the local aarch64-host path.
 
 ## Verification lane
 
-- **module** — `cargo test` inside `emthin-android/` runs **96 host tests
+- **module** — `cargo test` inside `emthin-android/` runs **136 host tests
   against the real `DocModel`** (sync + undo/redo round-trips, UTF-16
   conversion, the Java autosave source assertions, and the mathed page
   seam — the app's actual starter
@@ -656,7 +663,10 @@ the box64 setup remains the local aarch64-host path.
   of making the preview blank, and a cite-label raster pin — a `\cite`
   must rasterise byte-identical to its literal `[1]` label, the wiring
   the 2026-10-19 visual loop found missing), a few seconds, with no NDK
-  and no emulator. This is the cheap lane an LLM can drive.
+  and no emulator. This is the cheap lane an LLM can drive. It does need
+  `zig` 0.16 on `PATH` — `ghostty-vt`'s build script compiles Zig, and it
+  fails with a bare `Zig 0.16 on PATH` message otherwise; the host
+  toolchain is `zig-0.16.0` from nixpkgs plus the devshell's gcc-wrapper.
 - **boundary** — the APK build (after `./setup-box64-toolchain.sh`)
   + `../scripts/waydroid-sudo-fixes.sh` (root-side waydroid checks).
   The `android-apk` CI job builds both APKs (arm64) and runs the Java
@@ -696,10 +706,16 @@ the box64 setup remains the local aarch64-host path.
   host-side equivalent is `emthin-android/wss-lane-check.sh`.
 
   `LANE_WSS=1` also adds `pairing` (`./device-lane.sh pairing` alone): the
-  screen is driven through uiautomator — empty registry, Paste link, type a
+  screen is driven through uiautomator — empty registry, Scan QR (this
+  container has no camera HAL, so it must report that and leave Paste link
+  offered; the decode itself is `QrScanTest`'s), Paste link, type a
   real `https://fleet.leo.ts.net/pair?v=1&core=<id>` link, pending, then
   `pair approve` on the fixture's admin socket, the row listed, a relaunch
-  proving it persisted, and Forget. The link parses as production does; only
+  proving it persisted, and Forget. It also opens Sessions twice: once while
+  a fixture endpoint is unreachable (its row must carry the reason and a
+  Reconnect) and once with the scripted Core answering `sessions.list` (the
+  picker must list "Lease fixture"), which is the only device coverage of the
+  live catalogue merge. The link parses as production does; only
   its origin is remapped to loopback by the `emthin.fixturePairBase` extra.
   `wss_fixture.py` serves `/v1/pair` (`POST` pending, `GET` until the admin
   answers), so the fixture stays the one scripted Core.

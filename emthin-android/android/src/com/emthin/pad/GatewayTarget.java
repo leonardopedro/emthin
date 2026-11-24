@@ -60,6 +60,14 @@ final class GatewayTarget {
                 parsed.address, null, true, false);
     }
 
+    /**
+     * A registry row as an endpoint: that host, no figure address, generation
+     * discovered. Used by the Sessions picker, which has a host but no session.
+     */
+    static GatewayTarget forHost(String host, String coreId) {
+        return new GatewayTarget(host, PAIRED_PORT, coreId, "", null, true, false);
+    }
+
     private static GatewayTarget fromFixture(String extra, String fixtureGeneration,
             Reference parsed, String reference) {
         // The fixture lane offers either `host:port` (plain TCP) or

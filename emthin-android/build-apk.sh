@@ -189,12 +189,18 @@ if [[ -n "$TEST_PACKAGE" ]]; then
     SOURCE_DIRS+=(android/test-src)
     MANIFEST=android/test-manifest.xml
 fi
+# Vendored jars (android/libs/*.jar) are the only third-party code here; they
+# are compiled against and dexed in, so no gradle and no AAR unpacking.
+LIBS=()
+while IFS= read -r jar; do LIBS+=("$jar"); done < <(find android/libs -name '*.jar' 2>/dev/null | sort)
+CLASSPATH="$ANDROID_JAR"
+for lib in ${LIBS[@]+"${LIBS[@]}"}; do CLASSPATH="$CLASSPATH:$lib"; done
 find "${SOURCE_DIRS[@]}" -name '*.java' > "$BUILD/sources.txt"
-javac --release 8 -classpath "$ANDROID_JAR" -d "$BUILD/classes" @"$BUILD/sources.txt"
+javac --release 8 -classpath "$CLASSPATH" -d "$BUILD/classes" @"$BUILD/sources.txt"
 
 echo "==> [3/6] d8"
 d8 --min-api "$API" --output "$BUILD/dex" \
-    $(find "$BUILD/classes" -name '*.class')
+    $(find "$BUILD/classes" -name '*.class') ${LIBS[@]+"${LIBS[@]}"}
 
 echo "==> [4/6] aapt2 link"
 AAPT_LINK=(aapt2 link \

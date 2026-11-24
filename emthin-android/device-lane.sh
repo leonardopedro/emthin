@@ -2609,6 +2609,7 @@ pair_launch() {
     D logcat -c >/dev/null 2>&1 || true
     D shell am start -W -n "$ACTIVITY" \
         --es emthin.fixturePairBase "https://127.0.0.1:$WSS_PORT" \
+        --es emthin.fixtureConnect "https://127.0.0.1:$WSS_PORT" \
         --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" >/dev/null 2>&1 || return 1
     sleep 3
     tap_toolbar_menu "Sessions and sharing" "Pair gateway" >/dev/null
@@ -2665,6 +2666,35 @@ cmd_pairing() {
     fi
     pass "the pairing screen starts with an empty registry"
 
+    # Scanning is the paste path with a camera in front: the decoded text is the
+    # same link. This container exposes no camera, so the check that matters
+    # here is that the scanner says so and leaves pairing usable — the decode
+    # itself is the host suite's (QrScanTest).
+    # Grant what the app would ask for, so the check sees the scanner's own
+    # answer instead of a permission prompt.
+    D shell pm grant "$TEST_PACKAGE" android.permission.CAMERA >/dev/null 2>&1 || true
+    local scan
+    scan=$(node_bounds 'text="SCAN QR"') \
+        || { fail "Scan QR is missing from the pairing screen"; stop_wss_fixture; return 1; }
+    tap_center "$scan"
+    if ! wait_for_log "$log" 'gatewayPair phase scan-failed'; then
+        fail "the scanner neither returned a code nor reported why"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'Scanner unavailable' "$ui"; then
+        fail "the scanner failure is not reported on the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="PASTE LINK"' "$ui"; then
+        fail "a failed scan left no way to pair by link"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a scan with no camera is reported and pairing stays usable"
+
     pair_paste "$link" || { stop_wss_fixture; return 1; }
     if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
         fail "the pasted link did not open a pairing request"
@@ -2696,6 +2726,34 @@ cmd_pairing() {
     fi
     pass "the approved endpoint is listed"
 
+    # The Sessions picker is the live catalogue: one `sessions.list` per paired
+    # host over the same TLS/WebSocket transport a lease uses, reached through
+    # the row the screen just stored (`fixtureConnect` remaps only its origin).
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    sleep 0.5
+    if ! tap_toolbar_menu "Sessions and sharing" "Sessions"; then
+        fail "open the sessions picker"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! wait_for_log "$log" 'sessions phase catalogue'; then
+        fail "the picker never fetched a catalogue"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net, answered"' "$ui"; then
+        fail "the paired host is not shown as answered"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'Lease fixture' "$ui"; then
+        fail "the host's sessions.list row is missing from the picker"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the picker listed the paired host's sessions from sessions.list"
+
     # The registry is SharedPreferences state, so it has to survive a launch
     # with no fixture extras at all.
     cold_stop
@@ -2717,6 +2775,41 @@ cmd_pairing() {
         return 1
     fi
     pass "the paired endpoint survived a relaunch"
+
+    # With no fixture extras the row still points at its tailnet name, which
+    # this host cannot resolve: the picker must show that as a host row with
+    # Reconnect rather than refusing to list anything.
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    sleep 0.5
+    if ! tap_toolbar_menu "Sessions and sharing" "Sessions"; then
+        fail "reopen the sessions picker"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! wait_for_log "$log" 'sessions phase catalogue'; then
+        fail "the picker never answered for the unreachable host"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'content-desc="fleet.leo, fleet.leo.ts.net, ' "$ui"; then
+        fail "the unreachable host has no row"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q 'text="Reconnect"' "$ui"; then
+        fail "the unreachable host offers no Reconnect"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "an unreachable host is a row with Reconnect, not an error"
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    sleep 0.5
+    if ! tap_toolbar_menu "Sessions and sharing" "Pair gateway"; then
+        fail "reopen the pairing screen for Forget"
+        stop_wss_fixture
+        return 1
+    fi
 
     bounds=$(node_bounds 'text="Forget"') \
         || { fail "Forget is missing"; stop_wss_fixture; return 1; }

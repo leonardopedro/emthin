@@ -41,7 +41,11 @@ make_cert() { # <file> <dns-name>
 make_cert "$OUT/localhost.p12" localhost
 make_cert "$OUT/other.p12" other.example
 
-"$JAVAC" -Xlint:all -d "$OUT" \
+# The vendored ZXing jar is the QR reader/writer the scanner uses; the suite
+# compiles and runs against the same jar the APK dexes.
+LIB=android/libs/core-3.5.3.jar
+
+"$JAVAC" -Xlint:all -classpath "$LIB" -d "$OUT" \
     android/src/com/emthin/pad/PadSession.java \
     android/src/com/emthin/pad/RenderController.java \
     android/src/com/emthin/pad/RecoveryCodec.java \
@@ -58,6 +62,9 @@ make_cert "$OUT/other.p12" other.example
     android/src/com/emthin/pad/PairingProtocol.java \
     android/src/com/emthin/pad/GatewayEndpoints.java \
     android/src/com/emthin/pad/GatewayTarget.java \
+    android/src/com/emthin/pad/QrScan.java \
+    android/src/com/emthin/pad/GatewaySessions.java \
+    android/src/com/emthin/pad/GatewayCatalog.java \
     android/src/com/emthin/pad/HttpsGatewayHttp.java \
     android/src/com/emthin/pad/GatewayTransport.java \
     android/src/com/emthin/pad/WebSocketFrame.java \
@@ -65,6 +72,8 @@ make_cert "$OUT/other.p12" other.example
     android/src/com/emthin/pad/WssTransport.java \
     android/test/com/emthin/pad/GatewayPairingTest.java \
     android/test/com/emthin/pad/GatewayTargetTest.java \
+    android/test/com/emthin/pad/GatewayCatalogTest.java \
+    android/test/com/emthin/pad/QrScanTest.java \
     android/test/com/emthin/pad/WebSocketTest.java \
     android/test/com/emthin/pad/OwnershipTest.java \
     android/test/com/emthin/pad/RecoveryCodecTest.java \
@@ -76,17 +85,19 @@ make_cert "$OUT/other.p12" other.example
     android/test/com/emthin/pad/StatusModelTest.java \
     android/test/com/emthin/pad/ActionCatalogTest.java \
     android/test/com/emthin/pad/SessionCatalogTest.java
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.OwnershipTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.RecoveryCodecTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.ProviderIoTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.FindControllerTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.NavigationControllerTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.CitationControllerTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.InspectorViewTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.StatusModelTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.ActionCatalogTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.SessionCatalogTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.GatewayPairingTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.GatewayTargetTest
-"$JAVA" -ea -cp "$OUT" com.emthin.pad.WebSocketTest \
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.OwnershipTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.RecoveryCodecTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.ProviderIoTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.FindControllerTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.NavigationControllerTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.CitationControllerTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.InspectorViewTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.StatusModelTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.ActionCatalogTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.SessionCatalogTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayPairingTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayTargetTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayCatalogTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.QrScanTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.WebSocketTest \
     "$OUT/localhost.p12" "$OUT/other.p12"

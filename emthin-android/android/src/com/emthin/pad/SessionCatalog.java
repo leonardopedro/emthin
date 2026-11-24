@@ -3,15 +3,17 @@ package com.emthin.pad;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 /** The Sessions picker model: public terminal references only.
  *
  * <p>No socket path, endpoint, credential or host registry key belongs here.
- * The fake catalogue lets the pad foundation be tested before a Core transport
- * exists.
+ * Entries come from each paired host's `sessions.list` (see
+ * {@link GatewayCatalog}); {@link #fixture()} is the device lane's scripted
+ * catalogue for the pin step, which runs without a gateway.
  */
 public final class SessionCatalog {
-    public enum State { LIVE, FINISHED, WATCHED, OFFLINE, UNAVAILABLE }
+    public enum State { LIVE, FINISHED, WATCHED, OFFLINE, STARTING, UNAVAILABLE }
 
     public static final class Entry {
         public final String reference;
@@ -35,6 +37,7 @@ public final class SessionCatalog {
                 case FINISHED: return "Finished";
                 case WATCHED: return "Watching";
                 case OFFLINE: return "Offline";
+                case STARTING: return "Starting";
                 case UNAVAILABLE: return "Unavailable";
                 default: throw new IllegalStateException("unhandled " + state);
             }
@@ -49,13 +52,52 @@ public final class SessionCatalog {
         }
     }
 
+    /**
+     * One paired host's last catalogue answer. {@code error} is null when the
+     * host answered and a short reason when it did not, so the picker can show
+     * a host row with Reconnect instead of an error dialog.
+     */
+    public static final class Host {
+        public final String host;
+        public final String label;
+        public final String error;
+
+        public Host(String host, String label, String error) {
+            this.host = host;
+            this.label = label == null || label.isEmpty() ? host : label;
+            this.error = error;
+        }
+
+        public boolean reachable() {
+            return error == null;
+        }
+    }
+
+    private final List<Host> hosts;
     private final List<Entry> entries;
 
-    private SessionCatalog(List<Entry> entries) {
+    private SessionCatalog(List<Host> hosts, List<Entry> entries) {
+        this.hosts = Collections.unmodifiableList(new ArrayList<>(hosts));
         this.entries = Collections.unmodifiableList(new ArrayList<>(entries));
     }
 
-    public static SessionCatalog fake() {
+    /**
+     * The merged catalogue of every paired host: their rows in endpoint order,
+     * with {@code pinned} naming the references the open document holds.
+     */
+    public static SessionCatalog of(List<Host> hosts, List<Entry> entries, Set<String> pinned) {
+        List<Entry> marked = new ArrayList<>(entries.size());
+        for (Entry entry : entries) {
+            boolean held = pinned != null && pinned.contains(entry.reference);
+            marked.add(held == entry.pinned ? entry
+                    : new Entry(entry.reference, entry.caption, entry.hostLabel,
+                            entry.state, held));
+        }
+        return new SessionCatalog(hosts, marked);
+    }
+
+    /** The device lane's scripted catalogue for the pin step. Not live data. */
+    public static SessionCatalog fixture() {
         List<Entry> entries = new ArrayList<>();
         entries.add(new Entry(
                 "hc://6ab09a20fd1288983dfbbac2bb349231/t3",
@@ -69,15 +111,24 @@ public final class SessionCatalog {
         entries.add(new Entry(
                 "herdr-local://fedcba9876543210fedcba9876543210/pane%20one",
                 "Legacy pane", "Herdr 0.9.5", State.UNAVAILABLE, false));
-        return new SessionCatalog(entries);
+        List<Host> hosts = new ArrayList<>();
+        hosts.add(new Host("fixture-core", "local Core", null));
+        hosts.add(new Host("studio", "studio", null));
+        hosts.add(new Host("loft", "loft", null));
+        return new SessionCatalog(hosts, entries);
     }
 
     public static SessionCatalog empty() {
-        return new SessionCatalog(Collections.emptyList());
+        return new SessionCatalog(Collections.<Host>emptyList(), Collections.<Entry>emptyList());
     }
 
     public List<Entry> entries() {
         return entries;
+    }
+
+    /** Every paired host, in registry order, with its last fetch outcome. */
+    public List<Host> hosts() {
+        return hosts;
     }
 
     public List<Entry> pinned() {
@@ -116,7 +167,7 @@ public final class SessionCatalog {
         for (Entry entry : entries) {
             if (!entry.reference.equals(reference)) remaining.add(entry);
         }
-        return new SessionCatalog(remaining);
+        return new SessionCatalog(hosts, remaining);
     }
 
     private SessionCatalog replace(String reference, boolean pinned, State state) {
@@ -129,7 +180,7 @@ public final class SessionCatalog {
                 next.add(entry);
             }
         }
-        return new SessionCatalog(next);
+        return new SessionCatalog(hosts, next);
     }
 
     /** TalkBack description for one document figure and its live state. */

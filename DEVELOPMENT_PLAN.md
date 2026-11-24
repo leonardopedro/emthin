@@ -1102,6 +1102,48 @@ stored row had never been used. Two steps close both gaps.
   byte-identical to the build (md5 `d762f9a7e7923ce3e57d08e67b19dffd`). Host `bash test-java.sh`:
   `GatewayTargetTest` grew from 51 to 71 checks with the remap cases.
 
+### A live Sessions fan-out and a QR pairing path (2026-11-24)
+
+T15's remaining two pieces: the Sessions list was `SessionCatalog.fake()` (four
+hardcoded rows) and the pairing dialog's only entry was Paste link.
+
+- **Fan-out.** `GatewaySessions` opens one connection per paired endpoint and
+  runs the same `hello` + `sessions.list` a lease does; `GatewayCatalog` merges
+  the answers keyed by Core/address/generation. A host that fails is a row of
+  its own with the reason (timed out / not found / unreadable / unreachable) and
+  a Reconnect action — never a dialog over the picker. `SessionCatalog.fake()`
+  became `fixture()` and now serves only the two gateway-less lane steps, so no
+  hardcoded row can reach a user with paired hosts.
+- **QR.** `QrScanActivity` (platform camera, NV21 preview) decodes with a
+  vendored ZXing core jar and hands the string to `pairFromText` — the same
+  method the Paste field's Pair button calls, so scanning cannot grant more
+  than typing the link would. The jar rides `android/libs/*.jar` into both the
+  `javac` classpath and the `d8` inputs of `build-apk.sh`; the app keeps no
+  gradle. `CAMERA` is declared with `android.hardware.camera`
+  `required="false"`, and a device with no camera HAL answers
+  `Camera.open()` with null: that is reported as "Scanner unavailable — no
+  camera" with Paste link still offered rather than an empty black screen.
+- **The step.** `pairing` gained the no-camera scan check and the two Sessions
+  checks (a row from the scripted Core's `sessions.list`, and an unreachable
+  host as a row with Reconnect), and it grants `CAMERA` with `pm grant` before
+  tapping Scan so a runtime prompt cannot stand in for the scanner's answer.
+- **A regression it caused.** With the catalogue no longer a constant, the
+  `figure-a11y` fixture's figure resolved to no row and read "Unavailable";
+  that fixture now sets `SessionCatalog.fixture()` like `session-pin` does,
+  since both run with no gateway.
+- **Result.** Host JVM `bash test-java.sh` green, including the new
+  `GatewayCatalogTest` and `QrScanTest` (7 checks). `./device-lane.sh pairing`
+  alone: 17 checks, all passed. Full `LANE_WSS=1 ./device-lane.sh e2e` with the
+  installed APK reused (`SKIP_BUILD=1`): **249 checks, 0 failed**, `device
+  lane: all steps passed`, installed `base.apk` byte-identical to the build
+  (md5 `26b6b4483c2e38c81c4caf09fd91e7d4`). `cargo test` in `emthin-android/`
+  runs **136** host tests (the docs' 96 was stale); it needs `zig` 0.16 on
+  `PATH` for `ghostty-vt`'s build script.
+- **Gap.** No camera on the Waydroid container, so only the failure path and
+  the host decoder are exercised; a second paired host and node-grant
+  revocation still need a tailnet and a phone, and Reconnect refreshes the
+  whole fleet rather than one host.
+
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 
 - **`scripts/e2e/live-mm0.sh` — passed.** The missing piece was only the

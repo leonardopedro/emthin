@@ -63,8 +63,10 @@ import org.json.JSONObject;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -203,6 +205,7 @@ public class MainActivity extends Activity {
     private static final int EXPORT_RECOVERY = 43;
     private static final int SAVE_COPY_DOCUMENT = 44;
     private static final int REQUEST_PROOF = 45;
+    private static final int REQUEST_QR = 46;
     private Uri documentUri;
     /** Human name of the open source file; survives a source-only Open. */
     private String documentLabel;
@@ -276,7 +279,13 @@ public class MainActivity extends Activity {
     private JSONArray documentModifierLinks = new JSONArray();
     private JSONArray documentCitations = new JSONArray();
     private JSONArray documentSegments = new JSONArray();
-    private SessionCatalog sessionCatalog = SessionCatalog.fake();
+    /** Empty until the first `sessions.list` answer; never a scripted list. */
+    private SessionCatalog sessionCatalog = SessionCatalog.empty();
+    /** Set while the Sessions picker is open so a refresh can re-render it. */
+    private LinearLayout sessionsRows;
+    /** The open pairing dialog, so the scanner can hand back to it. */
+    private AlertDialog pairingDialog;
+    private boolean sessionRefreshInFlight;
     private final CitationController citationController = new CitationController();
     private final java.util.LinkedHashMap<String, String[]> expandedSegments = new java.util.LinkedHashMap<>();
     private final NavigationController navigation = new NavigationController();
@@ -560,6 +569,10 @@ public class MainActivity extends Activity {
         previewBox.post(new Runnable() {
             @Override public void run() { applyViewZoomWidth(); }
         });
+        // A figure resolves against the catalogue, so a pad that already has
+        // paired hosts fills it before the document is first drawn rather than
+        // showing every pinned session as unavailable until the picker opens.
+        if (paired > 0) refreshSessionCatalog();
         // The editor exists so the view hierarchy is complete, but it must
         // not accept an edit that recovery is still loading.
         editor.setEnabled(false);
@@ -1076,6 +1089,10 @@ public class MainActivity extends Activity {
      */
     private void runSessionPinFixture() {
         sessionPinFixturePending = false;
+        // The pin step runs without a gateway, so it is handed the scripted
+        // catalogue; the live one comes from `sessions.list` and would be
+        // empty here.
+        sessionCatalog = SessionCatalog.fixture();
         if (sessionCatalog.entries().isEmpty()) {
             trace("sessionPin", "phase", "failed", "reason", "empty-catalogue");
             return;
@@ -1113,6 +1130,9 @@ public class MainActivity extends Activity {
      */
     private void runFigureA11yFixture(RenderedPage page) {
         figureA11yFixturePending = false;
+        // Like the pin step, this fixture runs with no gateway; the figure has
+        // to resolve to a catalogue row or it would only ever be Unavailable.
+        sessionCatalog = SessionCatalog.fixture();
         int index = -1;
         for (int i = 0; i < page.figures.length(); i++) {
             JSONObject figure = page.figures.optJSONObject(i);
@@ -2267,6 +2287,10 @@ public class MainActivity extends Activity {
         if (requestCode == EXPORT_RECOVERY) {
             if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
             exportRecoveryBytes(data.getData());
+            return;
+        }
+        if (requestCode == REQUEST_QR) {
+            completeQrScan(resultCode, data);
             return;
         }
         if (requestCode == REQUEST_PROOF) {
@@ -5530,14 +5554,83 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Paste link", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) { showPasteLink(); }
                 })
+                .setNeutralButton("Scan QR", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int which) { scanPairingQr(); }
+                })
                 .setNegativeButton("Close", null)
                 .create();
         dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
-            @Override public void onDismiss(DialogInterface d) { pairingRows = null; }
+            @Override public void onDismiss(DialogInterface d) {
+                pairingRows = null;
+                if (pairingDialog == dialog) pairingDialog = null;
+            }
         });
+        pairingDialog = dialog;
         renderPairingRows();
         dialog.show();
         trace("gatewayPair", "phase", "screen");
+    }
+
+    /**
+     * The camera half of Pair: a scan only ever produces the same link text a
+     * paste does, so it lands in {@link #pairFromText} and nothing else.
+     */
+    private void scanPairingQr() {
+        // The scanner is a full activity, so the dialog that launched it goes
+        // away for the duration; the result handler brings the screen back.
+        if (pairingDialog != null) {
+            pairingDialog.dismiss();
+            pairingDialog = null;
+        }
+        try {
+            startActivityForResult(new Intent(this, QrScanActivity.class), REQUEST_QR);
+            trace("gatewayPair", "phase", "scan");
+        } catch (RuntimeException e) {
+            setPairingStatus("Scanner unavailable \u2014 " + e.getMessage());
+            showPairing();
+        }
+    }
+
+    /** The scanner's answer: the same link text, through the same parse. */
+    private void completeQrScan(int resultCode, Intent data) {
+        String text = resultCode == RESULT_OK && data != null
+                ? data.getStringExtra(QrScanActivity.EXTRA_TEXT) : null;
+        if (text == null || text.trim().isEmpty()) {
+            String reason = data == null ? "cancelled"
+                    : data.getStringExtra(QrScanActivity.EXTRA_REASON);
+            trace("gatewayPair", "phase", "scan-failed", "reason", String.valueOf(reason));
+            setPairingStatus("Scanner unavailable \u2014 " + reason);
+            showPairing();
+            return;
+        }
+        showPairing();
+        pairFromText(text, null);
+    }
+
+    /**
+     * One path for a pasted or scanned link: the same parse, the same status on
+     * a rejection and the same request.
+     *
+     * @param error field to put a rejection in, or null to report it on the
+     *     pairing screen
+     * @return the parsed link, or null when the text is not one
+     */
+    private PairingLink pairFromText(String text, TextView error) {
+        PairingLink link;
+        try {
+            link = PairingLink.parse(text);
+        } catch (IllegalArgumentException e) {
+            String reason = String.valueOf(e.getMessage());
+            if (error != null) {
+                error.setText("Link not accepted: " + reason);
+            } else {
+                setPairingStatus("Link not accepted \u2014 " + reason);
+            }
+            trace("gatewayPair", "phase", "rejected", "reason", reason);
+            return null;
+        }
+        startPairing(link);
+        return link;
     }
 
     private void renderPairingRows() {
@@ -5611,16 +5704,8 @@ public class MainActivity extends Activity {
                 // the field open with the reason instead of closing.
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View v) {
-                        PairingLink link;
-                        try {
-                            link = PairingLink.parse(field.getText().toString());
-                        } catch (IllegalArgumentException e) {
-                            error.setText("Link not accepted: " + e.getMessage());
-                            trace("gatewayPair", "phase", "rejected", "reason", e.getMessage());
-                            return;
-                        }
+                        if (pairFromText(field.getText().toString(), error) == null) return;
                         dialog.dismiss();
-                        startPairing(link);
                         // The request's state is reported on the pairing screen,
                         // and showing the paste field dismissed it; bring it
                         // back rather than pairing with nothing on screen.
@@ -5735,9 +5820,58 @@ public class MainActivity extends Activity {
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(12), dp(8), dp(12), dp(12));
-        rows.addView(panelLabel("Sessions are public references; no socket path or credential is shown."));
         scroll.addView(rows);
-        final AlertDialog[] holder = new AlertDialog[1];
+        sessionsRows = rows;
+        AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Sessions")
+                .setView(scroll)
+                .setNegativeButton("Close", null)
+                .setNeutralButton("Refresh", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int which) { refreshSessionCatalog(); }
+                })
+                .create();
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface d) { sessionsRows = null; }
+        });
+        renderSessionRows();
+        dialog.show();
+        refreshSessionCatalog();
+    }
+
+    /**
+     * The open picker's contents: one row per paired host (its last answer or
+     * the reason it had none, with Reconnect), then every host's sessions.
+     */
+    private void renderSessionRows() {
+        LinearLayout rows = sessionsRows;
+        if (rows == null) return;
+        rows.removeAllViews();
+        rows.addView(panelLabel("Sessions are public references; no socket path or credential is shown."));
+        if (sessionRefreshInFlight) rows.addView(panelLabel("Refreshing \u2026"));
+        List<SessionCatalog.Host> hosts = sessionCatalog.hosts();
+        if (hosts.isEmpty()) {
+            rows.addView(panelLabel(gatewayEndpoints == null || gatewayEndpoints.list().isEmpty()
+                    ? "No gateways paired yet \u2014 pair one to list its sessions."
+                    : "No host has answered yet."));
+        }
+        for (final SessionCatalog.Host host : hosts) {
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(0, dp(8), 0, dp(8));
+            String state = host.reachable() ? "answered" : host.error;
+            TextView heading = panelLabel(host.label + " \u00b7 " + host.host + " \u00b7 " + state);
+            heading.setContentDescription(host.label + ", " + host.host + ", " + state);
+            card.addView(heading);
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            TextView reconnect = shortcut("Reconnect", new Runnable() {
+                @Override public void run() { reconnectHost(host); }
+            });
+            reconnect.setEnabled(!sessionRefreshInFlight);
+            actions.addView(reconnect);
+            card.addView(actions);
+            rows.addView(card);
+        }
         for (final SessionCatalog.Entry entry : sessionCatalog.entries()) {
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
@@ -5763,9 +5897,8 @@ public class MainActivity extends Activity {
             TextView detach = shortcut(SessionCatalog.actionLabel("DETACH", entry), new Runnable() {
                 @Override public void run() {
                     sessionCatalog = sessionCatalog.detach(entry.reference);
-                    if (holder[0] != null) holder[0].dismiss();
+                    renderSessionRows();
                     fileMessage("Detached " + entry.caption + "; the session stays on its host");
-                    showSessions();
                 }
             });
             detach.setEnabled(entry.canDetach());
@@ -5773,8 +5906,95 @@ public class MainActivity extends Activity {
             card.addView(actions);
             rows.addView(card);
         }
-        holder[0] = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("Sessions").setView(scroll).setNegativeButton("Close", null).show();
+    }
+
+    /**
+     * Retry one host. A failed gateway is retried from its row instead of the
+     * whole picker being an error, and every host's rows are rebuilt together
+     * because a refresh is one merge, not per-host patching.
+     */
+    private void reconnectHost(SessionCatalog.Host host) {
+        trace("sessions", "phase", "reconnect", "host", host.host);
+        refreshSessionCatalog();
+    }
+
+    /**
+     * Rebuild the picker from every paired host. Runs on a worker thread: each
+     * host is one connect + hello + `sessions.list`, and a dead one costs its
+     * own timeout rather than the picker's.
+     */
+    private void refreshSessionCatalog() {
+        if (gatewayEndpoints == null || sessionRefreshInFlight) return;
+        final List<GatewayEndpoints.Endpoint> endpoints = gatewayEndpoints.list();
+        final Set<String> pinned = pinnedReferences();
+        sessionRefreshInFlight = true;
+        if (sessionsRows != null) renderSessionRows();
+        Thread worker = new Thread(new Runnable() {
+            @Override public void run() {
+                final SessionCatalog fetched = GatewayCatalog.build(endpoints,
+                        new GatewayCatalog.Fetcher() {
+                            @Override public List<SessionCatalog.Entry> fetch(
+                                    GatewayEndpoints.Endpoint endpoint) throws java.io.IOException {
+                                try {
+                                    List<SessionCatalog.Entry> rows = fetchHostCatalogue(endpoint);
+                                    trace("sessions", "phase", "host", endpoint.host,
+                                            "rows", String.valueOf(rows.size()));
+                                    return rows;
+                                } catch (java.io.IOException e) {
+                                    trace("sessions", "phase", "host", endpoint.host,
+                                            "failed", String.valueOf(e.getMessage()));
+                                    throw e;
+                                }
+                            }
+                        }, pinned);
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        sessionRefreshInFlight = false;
+                        sessionCatalog = fetched;
+                        if (sessionsRows != null) renderSessionRows();
+                        trace("sessions", "phase", "catalogue",
+                                "hosts", String.valueOf(fetched.hosts().size()),
+                                "rows", String.valueOf(fetched.entries().size()));
+                    }
+                });
+            }
+        }, "emthin-sessions");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /**
+     * One registry row's catalogue, over the same transport its lease uses.
+     * `emthin.fixtureConnect` remaps the origin exactly as it does for a lease,
+     * so the device lane reaches the scripted Core through a real pair row.
+     */
+    private List<SessionCatalog.Entry> fetchHostCatalogue(GatewayEndpoints.Endpoint endpoint)
+            throws java.io.IOException {
+        GatewayTarget target = GatewayTarget.forHost(endpoint.host, endpoint.coreId)
+                .remap(fixtureConnect);
+        GatewayTransport.Connector connector;
+        if (target.secure) {
+            javax.net.ssl.SSLContext context = target.fixtureCertificate
+                    ? PemTrust.load(fixtureGatewayCa == null ? "" : fixtureGatewayCa.trim())
+                    : PemTrust.system();
+            connector = WssTransport.connector(target.host, target.port, context, 5000, 5000);
+        } else {
+            connector = GatewayLeaseClient.tcpConnector(target.host, target.port);
+        }
+        return GatewaySessions.list(connector, endpoint.coreId, endpoint.name);
+    }
+
+    /** The document's public references; a row they name keeps its Pin row marked. */
+    private Set<String> pinnedReferences() {
+        Set<String> references = new LinkedHashSet<>();
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("hc://[^\\s]+|herdr-local://[^\\s]+")
+                .matcher(editor.getText());
+        while (matcher.find()) {
+            String token = matcher.group();
+            if (GatewayTarget.Reference.parse(token) != null) references.add(token);
+        }
+        return references;
     }
 
     private void pinSession(SessionCatalog.Entry entry) {
