@@ -2409,6 +2409,9 @@ WSS_PORT=${WSS_PORT:-47658}
 WSS_ADMIN_PORT=${WSS_ADMIN_PORT:-47659}
 WSS_DIR=""
 WSS_PID=""
+# The raw client `paired-lease` uses to prove the gateway refuses a revoked
+# controller's bytes; cleared whenever the fixture stops.
+WSS_PROBE_PID=""
 # The scripted Core's ID (lease_fixture.CORE_ID): the fixture only approves a
 # pairing request that names it.
 PAIR_CORE=6ab09a20fd1288983dfbbac2bb349231
@@ -2466,6 +2469,11 @@ start_wss_fixture() {
 
 stop_wss_fixture() {
     D reverse --remove "tcp:$WSS_PORT" >/dev/null 2>&1 || true
+    if [ -n "$WSS_PROBE_PID" ]; then
+        kill "$WSS_PROBE_PID" >/dev/null 2>&1 || true
+        wait "$WSS_PROBE_PID" 2>/dev/null || true
+    fi
+    WSS_PROBE_PID=""
     if [ -n "$WSS_PID" ]; then
         kill "$WSS_PID" >/dev/null 2>&1 || true
         wait "$WSS_PID" 2>/dev/null || true
@@ -3000,6 +3008,76 @@ EOF
         return 1
     fi
     pass "the fresh lease carried input through the paired row"
+
+    # The app refuses revoked input before the transport, so none of the
+    # checks above can say what the gateway does with a controller's bytes.
+    # A raw client that keeps a revoked controller channel can: the gateway
+    # must answer those bytes with not_controller and must not echo them.
+    local probe_log="$OUTDIR/paired-lease-probe.txt" attempts rc
+    if [ ! -f "$WSS_DIR/cert.pem" ]; then
+        fail "the paired-lease probe has no fixture certificate to trust"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin_checked revoke >/dev/null || { stop_wss_fixture; return 1; }
+    python3 "$SCRIPT_DIR/../fixtures/herdr-gateway-v1/stale_lease_probe.py" \
+        --listen "127.0.0.1:$WSS_PORT" --ca "$WSS_DIR/cert.pem" \
+        >"$probe_log" 2>&1 &
+    WSS_PROBE_PID=$!
+    attempts=0
+    while [ "$attempts" -lt 150 ]; do
+        grep -q '^probe: control channel' "$probe_log" 2>/dev/null && break
+        kill -0 "$WSS_PROBE_PID" 2>/dev/null || break
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    if ! grep -q '^probe: control channel' "$probe_log" 2>/dev/null; then
+        say "    probe output: $(tail -5 "$probe_log" 2>/dev/null | tr '\n' ' | ')"
+        fail "the raw client did not get a controller lease"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a raw client took the lease after the operator revoke"
+
+    wss_admin_checked revoke >/dev/null || { stop_wss_fixture; return 1; }
+    attempts=0
+    while [ "$attempts" -lt 200 ]; do
+        kill -0 "$WSS_PROBE_PID" 2>/dev/null || break
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    if kill -0 "$WSS_PROBE_PID" 2>/dev/null; then
+        say "    probe output: $(tail -5 "$probe_log" 2>/dev/null | tr '\n' ' | ')"
+        fail "the raw client hung after the revoke"
+        stop_wss_fixture
+        return 1
+    fi
+    if wait "$WSS_PROBE_PID"; then rc=0; else rc=$?; fi
+    WSS_PROBE_PID=""
+    if [ "$rc" -ne 0 ]; then
+        say "    probe output: $(tail -5 "$probe_log" 2>/dev/null | tr '\n' ' | ')"
+        fail "the gateway did not refuse the revoked controller's bytes"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! grep -q '^probe: stale controller refused not_controller, no echo' "$probe_log"; then
+        say "    probe output: $(tail -5 "$probe_log" 2>/dev/null | tr '\n' ' | ')"
+        fail "the probe did not report the gateway's refusal"
+        stop_wss_fixture
+        return 1
+    fi
+    status=$(wss_admin status)
+    if printf '%s' "$status" | grep -q 'stalecontroller'; then
+        fail "the gateway recorded bytes from the revoked controller"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! printf '%s' "$status" | grep -q '"active":null'; then
+        fail "the gateway still reports an active lease after the raw revoke"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the gateway refused the revoked controller's bytes and kept none"
     stop_wss_fixture
 }
 
