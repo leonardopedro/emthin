@@ -76,6 +76,11 @@
 #   terminal-reflow  streaming scene -> view zoom -> page rebuild -> grid
 #                reflow -> continued animation after a pan
 #                (used by e2e; requires the disposable test APK)
+#   network-change  a live control lease whose host disappears (killed, which
+#                is what an unreachable network looks like through `adb
+#                reverse`), then returns: the pad keeps its document, offers
+#                control again and reaches the restarted host on a fresh take
+#                (used by e2e; requires the disposable test APK and python3)
 #   pairing      paste a tailnet link -> pending -> approve through the TLS
 #                fixture's admin socket -> row stored across a relaunch ->
 #                Forget (LANE_WSS=1; requires the disposable test APK, python3
@@ -85,9 +90,9 @@
 #   sessions-hosts  pair two hosts with two Core IDs, then prove one Sessions
 #                picker merges both catalogues and that Reconnect refreshes
 #                only the host whose row was tapped (LANE_WSS=1)
-#   paired-lease   approve a row through the screen, then let a figure lease
-#                through it with only its origin remapped to loopback
-#                (LANE_WSS=1)
+#   enroll       a paired host's inventory, a proposal refused after its VM
+#                rotated, then the current one enrolled and listed as a session
+#                with the document untouched (LANE_WSS=1)
 #   gateway-wss  TLS -> upgrade -> watch attach -> grid -> banner, then the
 #                same without a generation so sessions.list supplies it
 #                (LANE_WSS=1; requires the disposable test APK and python3)
@@ -96,7 +101,8 @@
 #                scroll-anchor, search-replace, focus-stack, composing-ime,
 #                accessibility, diagnostics, named-document, modifier-inspector,
 #                session-pin, figure-a11y, terminal-scene, terminal-reflow,
-#                terminal-pages, terminal-lease, pull + byte-identity
+#                terminal-pages, terminal-lease, network-change, pull +
+#                byte-identity
 #                (the repeatable device proof)
 #
 # Env overrides:
@@ -424,6 +430,24 @@ cmd_uidump() {
     pass "uiautomator hierarchy -> $out"
 }
 
+# Dump until PATTERN appears — activity transitions and popups animate, so a
+# dump taken right after a tap can still be the previous screen. COUNT is in
+# half-seconds (20 = 10 s). The caller dumps again for the file it asserts on.
+wait_for_ui() {
+    local pattern="$1" count="${2:-20}" out="${3:-$UI_XML}" tries=0
+    UI_XML="$out"
+    while [ "$tries" -lt "$count" ]; do
+        if D shell uiautomator dump "$UI_DUMP_REMOTE" >/dev/null 2>&1 \
+            && D exec-out cat "$UI_DUMP_REMOTE" 2>/dev/null | tr -d '\r' >"$out" \
+            && grep -q "$pattern" "$out"; then
+            return 0
+        fi
+        sleep 0.5
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 # Bounds of the Nth (1-based) node whose opening tag contains PATTERN.
 node_bounds_nth() {
     local pattern="$1" index="$2" node
@@ -597,6 +621,26 @@ wait_for_log() {
                 "gateway lease fixture" "$pattern" \
             || fixture_gone "${WSS_PID:-}" "${WSS_DIR:-}" "WSS fixture" "$pattern"; then
             return 1
+        fi
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# Wait for PATTERN in a line that appears after this call. A step that repeats
+# a phase (take, lose the host, take again) needs this: wait_for_log would match
+# the first one and pass without the second ever happening.
+wait_for_new_log() {
+    local out="$1" pattern="$2" tries=0 mark lines
+    mark=$(D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' | wc -l)
+    mark=${mark:-0}
+    while [ "$tries" -lt 50 ]; do
+        D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$out"
+        lines=$(wc -l <"$out" | tr -d ' ')
+        if [ "${lines:-0}" -gt "$mark" ] \
+            && tail -n "+$((mark + 1))" "$out" | grep -q "$pattern"; then
+            return 0
         fi
         sleep 0.2
         tries=$((tries + 1))
@@ -2632,6 +2676,30 @@ pair_launch() {
     tap_toolbar_menu "Sessions and sharing" "Pair gateway" >/dev/null
 }
 
+# The same cold start, on the Sessions picker instead of the Pair screen.
+sessions_launch() {
+    local ui="$1"
+    UI_XML="$ui"
+    cold_stop
+    D logcat -c >/dev/null 2>&1 || true
+    D shell am start -W -n "$ACTIVITY" \
+        --es emthin.fixturePairBase "https://127.0.0.1:$WSS_PORT" \
+        --es emthin.fixtureConnect "https://127.0.0.1:$WSS_PORT" \
+        --es emthin.fixtureGatewayCaPem "$WSS_CA_B64" >/dev/null 2>&1 || return 1
+    sleep 3
+    tap_toolbar_menu "Sessions and sharing" "Sessions" >/dev/null
+}
+
+# Withdrawing a *granted* runtime permission kills the app (the platform drops
+# the process so nothing keeps using it), so the Pair screen the scan came from
+# is gone with it. Reopen it rather than asserting against a dead screen.
+ensure_pair_screen() {
+    local ui="$1" tries=0
+    wait_for_ui 'text="SCAN QR"' 4 "$ui" && return 0
+    pair_launch "$ui" >/dev/null || return 1
+    wait_for_ui 'text="SCAN QR"' 20 "$ui"
+}
+
 # Tap PASTE LINK, type LINK into the field, and press PAIR, leaving the pairing
 # screen (which PAIR reopens) as the last dump.
 pair_paste() {
@@ -2660,23 +2728,147 @@ pair_paste() {
 
 # Answer the system camera-permission prompt with "Don't allow". The button's
 # resource id is the platform's, so the tap does not depend on the dialog's
-# wording or locale. A package that has already been denied twice is answered
-# without a prompt, so a missing dialog is not a failure by itself.
+# wording or locale; a package the platform has already stopped asking about
+# gets the "don't ask again" variant of the same button. A package that has
+# been denied outright is answered without a prompt, so a missing dialog is not
+# a failure by itself.
 deny_camera_prompt() {
-    local ui="$OUTDIR/pairing-permission.xml" tries=0 bounds
+    local ui="$OUTDIR/pairing-permission.xml" tries=0 bounds pattern
     UI_XML="$ui"
     mkdir -p "$OUTDIR" || return 1
     while [ "$tries" -lt 20 ]; do
         if D shell uiautomator dump "$UI_DUMP_REMOTE" >/dev/null 2>&1 \
-            && D exec-out cat "$UI_DUMP_REMOTE" 2>/dev/null | tr -d '\r' >"$ui" \
-            && bounds=$(node_bounds 'permission_deny_button'); then
-            tap_center "$bounds"
-            return 0
+            && D exec-out cat "$UI_DUMP_REMOTE" 2>/dev/null | tr -d '\r' >"$ui"; then
+            for pattern in permission_deny_button permission_deny_and_dont_ask_again_button; do
+                if bounds=$(node_bounds "$pattern"); then
+                    tap_center "$bounds"
+                    return 0
+                fi
+            done
         fi
         sleep 0.5
         tries=$((tries + 1))
     done
     return 1
+}
+
+# T16's inventory half: a paired host proposes the sessions it already runs, and
+# enrolling one is the operator's explicit act. The host owns the refusal, so a
+# proposal read before its VM was rotated must not become a session.
+cmd_enroll() {
+    local ui="$OUTDIR/enroll-ui.xml"
+    local log="$OUTDIR/enroll-logcat.txt"
+    local link="https://fleet.leo.ts.net/pair?v=1&core=$PAIR_CORE"
+    local bounds status
+    say "==> enrol: inventory -> stale vm refused -> enrol -> listed"
+    mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
+    cmd_clear_data || return
+    if ! start_wss_fixture; then stop_wss_fixture; return 1; fi
+    if ! pair_launch "$ui"; then
+        fail "open the pairing screen"
+        stop_wss_fixture
+        return 1
+    fi
+    pair_paste "$link" || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase request host fleet.leo.ts.net'; then
+        fail "the link did not open a pairing request"
+        stop_wss_fixture
+        return 1
+    fi
+    wss_admin_checked "pair approve" >/dev/null || { stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'gatewayPair phase approved host fleet.leo.ts.net'; then
+        fail "the approval did not arrive"
+        stop_wss_fixture
+        return 1
+    fi
+
+    # The picker lists the host, and its Inventory action reads what runs there.
+    sessions_launch "$ui" || { fail "open Sessions against the paired host"; stop_wss_fixture; return 1; }
+    if ! wait_for_log "$log" 'sessions phase host fleet.leo.ts.net rows'; then
+        fail "the paired host did not answer its catalogue"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    bounds=$(node_bounds 'text="Inventory"') \
+        || { fail "the host row has no Inventory action"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'enrollment phase inventory host fleet.leo.ts.net'; then
+        fail "the inventory was never read"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'fb-7' "$ui" || ! grep -q 'vm-fixture-1' "$ui"; then
+        fail "the proposals are not listed with the VM they run in"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a paired host proposed its running sessions with their VM"
+
+    # The VM the list named is replaced underneath the open dialog: the enrol
+    # the operator started must be refused rather than create a session.
+    wss_admin_checked "enrollment rotate-vm" >/dev/null || { stop_wss_fixture; return 1; }
+    bounds=$(node_bounds 'text="Enrol"') \
+        || { fail "a proposal has no Enrol action"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'enrollment phase enrol host fleet.leo.ts.net address fb-7 failed'; then
+        fail "a stale proposal was not refused by the host"
+        stop_wss_fixture
+        return 1
+    fi
+    status=$(wss_admin status)
+    if printf '%s' "$status" | grep -q '"enrolled":\["'; then
+        fail "a refused enrolment created a session"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a proposal whose VM was rotated is refused and creates nothing"
+
+    # Reading again names the current VM, so the same row now enrols.
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    bounds=$(node_bounds 'text="Inventory"') \
+        || { fail "the host row lost its Inventory action"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'enrollment phase inventory host fleet.leo.ts.net vm vm-fixture-2'; then
+        fail "the second read did not name the current VM"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    bounds=$(node_bounds 'text="Enrol"') \
+        || { fail "the fresh proposal has no Enrol action"; stop_wss_fixture; return 1; }
+    tap_center "$bounds"
+    if ! wait_for_log "$log" 'enrollment phase enrolled host fleet.leo.ts.net address fb-7'; then
+        fail "a current proposal was not enrolled"
+        stop_wss_fixture
+        return 1
+    fi
+    status=$(wss_admin status)
+    if ! printf '%s' "$status" | grep -q '"enrolled":\["fb-7"\]'; then
+        fail "the host does not record the enrolment"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the current proposal was enrolled at the host"
+
+    # The enrolled session is a session now: the picker lists it, with no
+    # document edit and nothing started for it. Enrolling re-reads that host.
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    if ! wait_for_ui 'Fleet build'; then
+        fail "the enrolled session did not join the picker"
+        stop_wss_fixture
+        return 1
+    fi
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'Fleet build' "$ui"; then
+        fail "the enrolled session is not listed by the picker"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the enrolled session appeared in the picker without a document edit"
+    stop_wss_fixture
 }
 
 # The pairing screen end to end against the TLS fixture. The link is a real
@@ -2712,8 +2904,9 @@ cmd_pairing() {
     # A denial is its own answer, and it arrives before the scanner can open
     # anything: the preview surface is laid out while the prompt is still up.
     # Opening there would report the denial as "no camera" and dismiss the
-    # screen underneath the prompt, so the pad must say "camera permission
-    # denied", keep pairing usable and leave the document alone.
+    # screen underneath the prompt. The scanner instead keeps its state — the
+    # permission can still be granted in Settings — and only reports the denial
+    # when the user gives up.
     local scanner
     local doc_before
     D logcat -d -s emthin-pad:D >"$log" 2>/dev/null || true
@@ -2724,6 +2917,58 @@ cmd_pairing() {
         || { fail "Scan QR is missing from the pairing screen"; stop_wss_fixture; return 1; }
     tap_center "$scanner"
     deny_camera_prompt || true
+    wait_for_ui 'text="Open settings"' || { fail "a denial did not leave the scanner waiting"; stop_wss_fixture; return 1; }
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if ! grep -q 'Camera permission denied' "$ui" || ! grep -q 'text="Open settings"' "$ui"; then
+        fail "a denial did not leave the scanner waiting on a grant"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a denied permission keeps the scanner up, with the way to grant it"
+
+    # Granting mid-scan is the user leaving for Settings and coming back. That
+    # delivers no prompt result, so only the resume can pick the grant up.
+    scanner=$(node_bounds 'text="Open settings"') \
+        || { fail "the scanner has no way into Settings"; stop_wss_fixture; return 1; }
+    tap_center "$scanner"
+    sleep 2
+    if ! D shell dumpsys activity activities 2>/dev/null | grep -q 'topResumedActivity=.*com.android.settings'; then
+        fail "Open settings did not reach this app's system settings page"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "the scanner opens this app's settings page"
+    D shell pm grant "$PKG" android.permission.CAMERA >/dev/null 2>&1 \
+        || { fail "grant the camera permission from settings"; stop_wss_fixture; return 1; }
+    D shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+    if ! wait_for_log "$log" 'qr permission granted on return'; then
+        fail "returning with the grant did not reach the waiting scanner"
+        stop_wss_fixture
+        return 1
+    fi
+    if ! wait_for_log "$log" 'gatewayPair phase scan-failed reason no camera'; then
+        fail "the scanner kept the grant but never opened the camera"
+        stop_wss_fixture
+        return 1
+    fi
+    pass "a grant made in settings is picked up by the scanner that was waiting"
+
+    # Giving up instead of granting reports the denial, and pairing stays usable.
+    wait_for_ui 'text="SCAN QR"' || { fail "the Pair screen did not come back after the scan"; stop_wss_fixture; return 1; }
+    D shell pm revoke "$PKG" android.permission.CAMERA >/dev/null 2>&1 || true
+    ensure_pair_screen "$ui" || { fail "the Pair screen did not come back after the permission was withdrawn"; stop_wss_fixture; return 1; }
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    scanner=$(node_bounds 'text="SCAN QR"') \
+        || { fail "Scan QR is gone after the grant round trip"; stop_wss_fixture; return 1; }
+    tap_center "$scanner"
+    deny_camera_prompt || true
+    sleep 1
+    # A package the platform has already denied twice is answered without a
+    # prompt, so the denial can arrive before any screen to cancel from.
+    cmd_uidump "$ui" || { stop_wss_fixture; return 1; }
+    if scanner=$(node_bounds 'text="Cancel"'); then
+        tap_center "$scanner"
+    fi
     if ! wait_for_log "$log" 'gatewayPair phase scan-failed reason camera permission denied'; then
         fail "a denied camera permission was not reported as a denial"
         stop_wss_fixture
@@ -2745,7 +2990,7 @@ cmd_pairing() {
         stop_wss_fixture
         return 1
     fi
-    pass "a denied camera permission is reported, pairing stays usable and the document is untouched"
+    pass "giving up on the permission reports the denial and leaves the document untouched"
 
     # Grant what the app would ask for, so the next check sees the scanner's own
     # answer instead of a permission prompt.
@@ -3397,6 +3642,174 @@ cmd_terminal_lease() {
     stop_lease_fixture
 }
 
+# A network change during a live lease, as the user meets one: the host goes
+# unreachable while the pad is controlling it, and comes back. The scripted
+# gateway is reached through `adb reverse`, so killing its process is what an
+# airplane-mode toggle looks like to the app — established sockets break and
+# new connects are refused — without touching this lane's own adb transport
+# (which rides the same container network, so the real toggle is not drivable
+# here). The pad must keep the document and its figure, report the loss instead
+# of pretending to still control, and reach the host again on a fresh take.
+cmd_network_change() {
+    local log="$OUTDIR/network-change-logcat.txt"
+    local ui="$OUTDIR/network-change-ui.xml"
+    local fixture placed x y w h bounds first_lease status before after
+    say "==> network change: control -> host lost -> host back -> take again"
+    mkdir -p "$OUTDIR" || { fail "create $OUTDIR"; return; }
+    cmd_clear_data || return
+    fixture=$(printf '%s\n' \
+        '#1 Build log #2 \app(#1, #2, 640, 400, terminal: "hc://0123456789abcdef0123456789abcdef/t7")')
+    if ! start_lease_fixture; then
+        stop_lease_fixture
+        return
+    fi
+    if ! lease_launch "$fixture"; then
+        fail "launch the lease fixture for the network change"
+        stop_lease_fixture
+        return
+    fi
+    wait_for_log "$log" 'gatewayLease phase ready mode watch' \
+        || { fail "the lease never became a watch"; stop_lease_fixture; return; }
+    wait_for_log "$log" 'gatewayLease data .*gateway lease' \
+        || { fail "the lease sent no DATA"; stop_lease_fixture; return; }
+    wait_for_log "$log" 'vtScene phase placed' \
+        || { fail "the lease scene published no rect"; stop_lease_fixture; return; }
+    # The first rect arrives while the page is still scrolling to its caption,
+    # so the settled one is read from the same history a moment later.
+    sleep 2
+    D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"
+    placed=$(sed -n 's/.*vtScene phase placed x \([-0-9]*\) y \([-0-9]*\) w \([0-9]*\) h \([0-9]*\).*/\1 \2 \3 \4/p' "$log" | tail -1)
+    read -r x y w h <<EOF
+$placed
+EOF
+    if [ -z "$x" ] || [ -z "$w" ]; then
+        fail "could not parse the lease scene rect from $log"
+        stop_lease_fixture
+        return
+    fi
+    D shell input tap "$((x + w / 2))" "$((y + h / 2))" >/dev/null 2>&1
+    wait_for_log "$log" 'terminalInput phase focus' \
+        || { fail "the lease scene did not focus"; stop_lease_fixture; return; }
+    if ! cmd_uidump "$ui" >/dev/null 2>&1 || ! bounds=$(node_bounds 'text="Take"'); then
+        fail "the lease offers no Take action"
+        stop_lease_fixture
+        return
+    fi
+    tap_center "$bounds"
+    wait_for_log "$log" 'gatewayLease phase ready mode control' \
+        || { fail "Take did not become a controller"; stop_lease_fixture; return; }
+    first_lease=$(sed -n 's/.*gatewayLease phase ready mode control lease \([^ ]*\).*/\1/p' "$log" | tail -1)
+    if [ -z "$first_lease" ] || [ "$first_lease" = none ]; then
+        fail "the controller lease was not named in the log"
+        stop_lease_fixture
+        return
+    fi
+    D shell input text 'netbefore' >/dev/null 2>&1
+    wait_for_log "$log" 'gatewayLease data .*echo:' \
+        || { fail "the controller's input did not come back as DATA"; stop_lease_fixture; return; }
+    status=$(lease_admin status)
+    printf '%s' "$status" | grep -q 'netbefore' \
+        || { fail "the gateway never received the controller input"; stop_lease_fixture; return; }
+    pass "a live control lease carried input before the network changed"
+
+    # wait_for_log rewrites $log from the live buffer, so the length below and
+    # the loss below are read from the same history.
+    D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"
+    before=$(last_text_len "$log")
+    # The host disappears: its process dies, so its sockets break and its port
+    # refuses. The reverse rule stays, exactly as the network would come back.
+    kill "$LEASE_PID" >/dev/null 2>&1 || true
+    wait "$LEASE_PID" 2>/dev/null || true
+    LEASE_PID=""
+    if ! wait_for_log "$log" 'gatewayLease error kind'; then
+        fail "losing the host was not reported to the lease"
+        stop_lease_fixture
+        return
+    fi
+    if ! wait_for_log "$log" 'gatewayLease phase retry host .* failed'; then
+        fail "the lost lease did not consult the registry once"
+        stop_lease_fixture
+        return
+    fi
+    pass "losing the host is reported, after one registry retry"
+
+    if ! D shell pidof "$PKG" >/dev/null 2>&1; then
+        fail "the pad died with the lease instead of reporting it"
+        stop_lease_fixture
+        return
+    fi
+    after=$(last_text_len "$log")
+    if [ -n "$before" ] && [ "$after" != "$before" ]; then
+        fail "the network change altered the document (textLen $before -> $after)"
+        stop_lease_fixture
+        return
+    fi
+    if ! cmd_uidump "$ui" >/dev/null 2>&1 || ! grep -q 'text="Take"' "$ui"; then
+        fail "a lost lease does not offer control again"
+        stop_lease_fixture
+        return
+    fi
+    pass "the pad kept the document and offers control again after the loss"
+
+    # The host comes back, as it does when the network does: a new process with
+    # no memory of the old generation.
+    if ! start_lease_fixture; then
+        stop_lease_fixture
+        return
+    fi
+    if ! cmd_uidump "$ui" >/dev/null 2>&1 || ! bounds=$(node_bounds 'text="Take"'); then
+        fail "no Take action after the host came back"
+        stop_lease_fixture
+        return
+    fi
+    tap_center "$bounds"
+    if ! wait_for_new_log "$log" 'gatewayLease phase ready mode control'; then
+        fail "control did not come back when the host did"
+        stop_lease_fixture
+        return
+    fi
+    # The restarted fixture counts its leases from one again, so a lease name
+    # cannot say whether this generation is new. Only the new process's own
+    # record can: its input log starts empty.
+    status=$(lease_admin status)
+    if printf '%s' "$status" | grep -q 'netbefore'; then
+        fail "the restarted host remembers the old generation's input"
+        stop_lease_fixture
+        return
+    fi
+    pass "control came back against a host with no memory of the old lease"
+    # Losing the lease released the terminal's keyboard focus, so the retaken
+    # scene is tapped again before its input is expected to arrive.
+    D logcat -d -s emthin-pad:D 2>/dev/null | tr -d '\r' >"$log"
+    placed=$(sed -n 's/.*vtScene phase placed x \([-0-9]*\) y \([-0-9]*\) w \([0-9]*\) h \([0-9]*\).*/\1 \2 \3 \4/p' "$log" | tail -1)
+    read -r x y w h <<EOF
+$placed
+EOF
+    D shell input tap "$((x + w / 2))" "$((y + h / 2))" >/dev/null 2>&1
+    sleep 1
+    D shell input text 'netafter' >/dev/null 2>&1
+    status=""
+    local tries=0
+    while [ "$tries" -lt 30 ]; do
+        status=$(lease_admin status)
+        printf '%s' "$status" | grep -q 'netafter' && break
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    if ! printf '%s' "$status" | grep -q 'netafter'; then
+        fail "input did not reach the host once it came back"
+        stop_lease_fixture
+        return
+    fi
+    if printf '%s' "$status" | grep -q 'netbefore'; then
+        fail "the restarted host received the old generation's input"
+        stop_lease_fixture
+        return
+    fi
+    pass "input reached the restarted host and none of the old generation's did"
+    stop_lease_fixture
+}
+
 # T08: view zoom rebuilds the page stack without dropping the stream.
 cmd_terminal_reflow() {
     local log="$OUTDIR/terminal-reflow-logcat.txt"
@@ -3668,6 +4081,7 @@ cmd_e2e() {
     cmd_terminal_reflow
     cmd_terminal_pages
     cmd_terminal_lease
+    cmd_network_change
     # Opt in with LANE_WSS=1: these steps need an APK built from the transport
     # sources plus python3 for the fixtures, so a default run against a plain
     # build would only fail on a binary that predates them.
@@ -3676,6 +4090,7 @@ cmd_e2e() {
         cmd_sessions_hosts
         cmd_pairing_answers
         cmd_paired_lease
+        cmd_enroll
         cmd_gateway_wss
     fi
 
@@ -3924,11 +4339,13 @@ case "$cmd" in
     terminal-reflow) cmd_terminal_reflow ;;
     terminal-pages) cmd_terminal_pages ;;
     terminal-lease) cmd_terminal_lease ;;
+    network-change) cmd_network_change ;;
     gateway-wss) cmd_gateway_wss ;;
     pairing)   cmd_pairing ;;
     sessions-hosts) cmd_sessions_hosts ;;
     pairing-answers) cmd_pairing_answers ;;
     paired-lease)    cmd_paired_lease ;;
+    enroll)          cmd_enroll ;;
     austral-rule) cmd_austral_rule ;;
     history-preview) cmd_history_preview ;;
     e2e)       cmd_e2e ;;

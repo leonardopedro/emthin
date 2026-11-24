@@ -73,6 +73,7 @@ LIB=android/libs/core-3.5.3.jar
     android/test/com/emthin/pad/GatewayPairingTest.java \
     android/test/com/emthin/pad/GatewayTargetTest.java \
     android/test/com/emthin/pad/GatewayCatalogTest.java \
+    android/test/com/emthin/pad/GatewayEnrollmentTest.java \
     android/test/com/emthin/pad/QrScanTest.java \
     android/test/com/emthin/pad/WebSocketTest.java \
     android/test/com/emthin/pad/OwnershipTest.java \
@@ -98,6 +99,7 @@ LIB=android/libs/core-3.5.3.jar
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayPairingTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayTargetTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayCatalogTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayEnrollmentTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.QrScanTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.WebSocketTest \
     "$OUT/localhost.p12" "$OUT/other.p12"

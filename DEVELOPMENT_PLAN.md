@@ -1190,25 +1190,110 @@ permission that did not exist yet. The platform refuses that call, the scanner
 reported the refusal as "no camera", and it finished *underneath* the prompt —
 a denial read as a missing camera, and the Pair screen came back without ever
 saying what had happened. `QrScanActivity` now only remembers the holder on
-`surfaceCreated` and opens once the permission is granted; a denial finishes
-with the reason `camera permission denied`.
+`surfaceCreated` and opens once the permission is granted.
+
+A denial does not end the screen: the camera can still be allowed while the
+scanner is up, which is the flow the user actually has (leave for Settings,
+grant, come back). The scanner keeps the holder, says "Camera permission denied
+— allow it in Settings, then come back", offers **Open settings**, and
+re-asks on every `onResume` — a grant made in settings delivers no prompt
+result, so the resume is the only thing that can pick it up. Cancel returns the
+reason `camera permission denied` to the Pair screen, so giving up still reads
+as a denial rather than as a device without a camera.
+
+That answer is a pure rule (`QrScan.wantsCamera`) so the host suite can pin it:
+no open before the grant, none without a surface, none over a streaming camera
+and none after the screen is finished.
 
 The `pairing` step now revokes `CAMERA`, taps Scan QR, answers the platform
 prompt through its `permission_deny_button` (a resource id, so the tap does not
 depend on the dialog's wording or locale; a package the platform has already
-denied twice answers without a prompt, which the check also accepts), and
-asserts the reported reason, a Pair dialog that still offers Paste link, and an
-unchanged document before it grants the permission and runs the existing
-no-camera check.
+denied twice answers without a prompt, which the check also accepts), asserts
+the scanner stayed up with its Open settings action, opens that page, grants
+`CAMERA` there and returns with Back — the scanner must log `qr permission
+granted on return` and then proceed to the camera. A second round then cancels
+instead, asserting the denial reaches the Pair screen with Paste link still
+offered and the document unchanged. Revoking a *granted* permission kills the
+app, so the step reopens the Pair screen after that revoke rather than
+asserting against a dead one.
 
-- **Result.** `./device-lane.sh pairing` alone: 18 checks, all passed. Full
+- **Result.** `./device-lane.sh pairing` alone: 23 checks, all passed. Full
   `LANE_WSS=1 ./device-lane.sh e2e` with the installed APK reused
-  (`SKIP_BUILD=1`): **260 checks, 0 failed**, `device lane: all steps passed`,
+  (`SKIP_BUILD=1`): **282 checks, 0 failed**, `device lane: all steps passed`,
   installed `base.apk` byte-identical to the build
-  (md5 `3c82dd3570102ac96ff9bda930e0e019`).
+  (md5 `c19877574ae6182f0c222db4750675a0`).
 - **Gap.** The camera itself, a real prompt on a phone and the tailnet remain
-  open; what is device-proven here is the denial path on a container whose
-  prompt comes from the platform's permission controller.
+  open; what is device-proven here is the denial, the settings round trip and
+the no-camera answer, on a container whose prompt comes from the platform's
+permission controller.
+
+### A lease that loses its host, and gets it back (2026-11-24)
+
+The pad had no answer for a network change during a live lease, and the device
+step for it found two reasons why. `network-change` holds a control lease
+against the scripted gateway (reached through `adb reverse`, so killing its
+process is what an unreachable host looks like without touching this lane's own
+adb transport), types into it, kills the host, and then brings it back.
+
+- **A replaced lease still changed the figure.** The dead lease's last error
+  arrives *after* the retry has connected, and it set `watch-only`/`conflict`
+  on the figure — so the new lease was read-only from the moment it was ready,
+  which is what the first run showed (`terminalInput blocked conflict` after a
+  successful takeover). Each lease now guards its callbacks by identity, so only
+  the lease that still owns the figure may change it.
+- **Take could not redial.** Take on a lease whose host was gone logged
+  `phase request-pending control` and returned, because the request went to a
+  closed client. Take now re-dials the figure's own target once
+  (`gatewayLease phase redial for control`), asks for control when the redial
+  comes back as the watch it always starts with, and the rest of the lease
+  path — generation discovery, grid, DATA — is the same code a first attach
+  uses.
+- **The check.** The pad must report the loss after exactly one registry retry
+  (`gatewayLease phase retry … failed unpaired`), stay alive, keep the same
+  document length, and offer control again. After the host returns it must
+  reach it with input the new process records, and none of the old
+  generation's.
+- **Result.** `./device-lane.sh network-change`: 7 checks, all passed; the step
+  is part of the default `e2e` because it needs only the plain fixture.
+- **Gap.** Airplane mode itself cannot be driven here: Waydroid's network is
+  the container bridge and adbd rides it, so disabling the radio would cut the
+  lane rather than the app. What is exercised is the same thing from the app's
+  side — broken sockets and refused connects — plus the recovery.
+
+### Enrolling a host's running sessions (T16, scripted inventory, 2026-11-24)
+
+T16 asks for operator enrolment of sessions that already run on a host, with
+their profile/sandbox provenance, and an explicit enrol separate from the
+read-only listing. Neither OpenShell nor a gateway host registry exists in this
+checkout, so the protocol half is built against a scripted inventory and the
+docs say so instead of implying the fleet was involved.
+
+- **Protocol.** The fixture gained `enrollment.list` (revision, the VM, and the
+  sessions it already runs with `name`/`profile`/`sandbox`) and
+  `enrollment.enroll` (address, VM, profile). An enrol is refused unless the
+  address was proposed, the profile is that proposal's and the VM is the
+  current one — `not_found`, `spoofed` and `stale_vm` respectively — so a pad
+  replaying what it showed the operator cannot create anything the host did not
+  offer. `sessions.list` includes what was enrolled, and the admin socket can
+  rotate the VM so the stale case is reachable.
+- **Pad.** `GatewaySessions` runs each call on the same hello-one-call-close
+  connection a catalogue read uses, so a paired row reaches it over TLS and the
+  plain fixture over TCP. Each host card gained **Inventory**; a proposal shows
+  name · profile · VM with **Enrol**, an enrolment re-reads that host, and the
+  result arrives in the picker as an ordinary session — no `hc run`, no VM
+  creation and no document edit. A refusal is reported as its kind, never as a
+  half-created row.
+- **Checks.** `GatewayEnrollmentTest` (host JVM, real sockets) covers inventory
+  parsing, the exact request an enrol sends and all three refusals;
+  `./device-lane.sh enroll` drives the screen: read, rotate the VM under the
+  open dialog, refused enrol with the host's own state unchanged, re-read, then
+  a successful enrol that appears in the picker.
+- **Result.** `./device-lane.sh enroll`: 9 checks, all passed. Host JVM
+  `bash test-java.sh` green with the new `GatewayEnrollmentTest`.
+- **Gap.** This inventory is the fixture's. OpenShell records, an operator
+  approval by profile, the launcher result contract and real sandbox IDs are
+  deployment work in repositories this checkout does not have; T16's **Done**
+  (a phone attaching an existing `fb-*` session in a real fleet) is not claimed.
 
 ### Live MM0 verifier and Zenodo sandbox (2026-11-23)
 

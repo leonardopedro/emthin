@@ -36,17 +36,23 @@ public final class QrScanActivity extends Activity implements SurfaceHolder.Call
     static final String REASON_NO_CAMERA = "no camera";
     static final String REASON_DENIED = "camera permission denied";
     static final String REASON_FAILED = "camera failed";
+    /** What the screen says while the user is away granting the permission. */
+    static final String DENIED_STATUS =
+            "Camera permission denied \u2014 allow it in Settings, then come back";
 
     private static final int REQUEST_CAMERA = 41;
     private static final String TAG = "emthin-pad";
 
     private SurfaceView preview;
     private TextView status;
+    private Button settings;
     private Camera camera;
     private boolean decoding;
     private boolean finished;
-    /** The preview surface, which arrives before the permission answer does. */
+    /** Kept so a grant that arrives later still has something to preview on. */
     private SurfaceHolder pendingHolder;
+    /** The prompt was answered with a denial and the screen is waiting on it. */
+    private boolean denied;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -64,10 +70,26 @@ public final class QrScanActivity extends Activity implements SurfaceHolder.Call
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
         root.addView(status, statusParams);
+        // A denial does not end the screen: the permission can still be granted
+        // in Settings and this activity is the state that comes back to.
+        settings = new Button(this);
+        settings.setText("Open settings");
+        settings.setVisibility(View.GONE);
+        settings.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.parse("package:" + getPackageName())));
+            }
+        });
+        root.addView(settings, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.END));
         Button cancel = new Button(this);
         cancel.setText("Cancel");
         cancel.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { finishWith(null, null); }
+            @Override public void onClick(View v) {
+                finishWith(null, denied ? REASON_DENIED : null);
+            }
         });
         root.addView(cancel, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -84,10 +106,28 @@ public final class QrScanActivity extends Activity implements SurfaceHolder.Call
         if (request != REQUEST_CAMERA) return;
         boolean granted = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
         if (!granted) {
-            finishWith(null, REASON_DENIED);
+            showDenied();
             return;
         }
-        if (pendingHolder != null) openCamera(pendingHolder);
+        tryOpen();
+    }
+
+    /**
+     * The permission may have been granted while this screen was in the
+     * background (Settings, then back), which delivers no prompt result, so
+     * every resume re-asks the same question the callbacks do.
+     */
+    @Override protected void onResume() {
+        super.onResume();
+        if (denied && granted()) {
+            // Coming back with the grant: say so, and let tryOpen start the
+            // preview instead of leaving the denied message up.
+            Log.i(TAG, "qr permission granted on return");
+            denied = false;
+            settings.setVisibility(View.GONE);
+            status.setText("Point the camera at the pairing QR code");
+        }
+        tryOpen();
     }
 
     // The surface is created as soon as the view is laid out, which is before
@@ -96,17 +136,29 @@ public final class QrScanActivity extends Activity implements SurfaceHolder.Call
     // dialog is still up, so the surface is only remembered until the answer.
     @Override public void surfaceCreated(SurfaceHolder holder) {
         pendingHolder = holder;
-        if (granted()) openCamera(holder);
+        tryOpen();
     }
 
     @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         pendingHolder = holder;
-        if (camera == null && granted()) openCamera(holder);
+        tryOpen();
     }
 
     private boolean granted() {
         return checkSelfPermission(android.Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void tryOpen() {
+        if (!QrScan.wantsCamera(finished, granted(), pendingHolder != null, camera != null)) return;
+        openCamera(pendingHolder);
+    }
+
+    private void showDenied() {
+        denied = true;
+        status.setText(DENIED_STATUS);
+        settings.setVisibility(View.VISIBLE);
+        Log.i(TAG, "qr permission denied");
     }
 
     @Override public void surfaceDestroyed(SurfaceHolder holder) {

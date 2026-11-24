@@ -126,6 +126,19 @@ class Gateway:
         self.peers = set()
         self.input_log = []
         self.handoffs = 0
+        # A scripted host inventory: sessions that already run on the host and
+        # are neither in a figure nor created by this pad.  Enrolment is the
+        # operator's explicit act, so the list is read-only and `enroll` is a
+        # separate call that must name the same profile and the VM that is
+        # current now.
+        self.vm_id = "vm-fixture-1"
+        self.inventory = [
+            {"address": "fb-7", "name": "fb-7", "profile": "fleet",
+             "sandbox": self.vm_id, "label": "Fleet build"},
+            {"address": "inf-3", "name": "inf-3", "profile": "infinity",
+             "sandbox": self.vm_id, "label": "Infinity session"},
+        ]
+        self.enrolled = {}  # address -> profile
 
     # -- admin ---------------------------------------------------------
     def status(self):
@@ -143,6 +156,8 @@ class Gateway:
                 "attachments": sum(len(peer.channels) for peer in self.peers),
                 "input": "".join(self.input_log[-1000:]),
                 "handoffs": self.handoffs,
+                "vm_id": self.vm_id,
+                "enrolled": sorted(self.enrolled),
             }
 
     def revoke(self):
@@ -237,8 +252,19 @@ class Gateway:
                 "core_id": core_id,
                 "features": ["resize_notifications", "automatic_input"],
                 "methods": ["hello", "sessions.list", "terminal.attach",
-                            "control.request", "control.respond"],
+                            "control.request", "control.respond",
+                            "enrollment.list", "enrollment.enroll"],
             })
+            return
+        if method == "enrollment.list":
+            with self.lock:
+                rows = [dict(row, lifecycle="live") for row in self.inventory]
+                vm_id = self.vm_id
+            peer.result(request_id, {"revision": "inv-" + vm_id,
+                                    "vm_id": vm_id, "rows": rows})
+            return
+        if method == "enrollment.enroll":
+            self._enroll(peer, request_id, params)
             return
         if method == "terminal.attach":
             self._attach(peer, request_id, params)
@@ -250,9 +276,18 @@ class Gateway:
             return
         if method == "sessions.list":
             second = self.second_core_id is not None and peer.core_id == self.second_core_id
+            with self.lock:
+                enrolled = [
+                    {"address": address, "generation": "g-enrolled-1",
+                     "label": next((row["label"] for row in self.inventory
+                                    if row["address"] == address), address),
+                     "grid": {"cols": 80, "rows": 24}, "lifecycle": "live",
+                     "status": None, "actions": ["watch", "control"]}
+                    for address in sorted(self.enrolled)
+                ]
             peer.result(request_id, {
                 "revision": "r-fixture-2" if second else "r-fixture-1",
-                "rows": [{
+                "rows": enrolled + [{
                     "address": "t9" if second else "t7",
                     "generation": "g-fixture-2" if second else "g-fixture-1",
                     "label": "Loft fixture" if second else "Lease fixture",
@@ -265,6 +300,41 @@ class Gateway:
             })
             return
         peer.error(request_id, -32601, "method not found")
+
+    def _enroll(self, peer, request_id, params):
+        """Enrol one inventory session, refusing anything the list did not say.
+
+        The pad sends back what it showed the operator, so a name that was
+        never proposed, a profile that does not belong to it and a VM that is
+        no longer current all fail here rather than creating a session.
+        """
+        if not isinstance(params, dict):
+            peer.error(request_id, -32602, "invalid params")
+            return
+        address = params.get("address")
+        vm_id = params.get("vm_id")
+        profile = params.get("profile")
+        if not isinstance(address, str) or not isinstance(vm_id, str) \
+                or not isinstance(profile, str):
+            peer.error(request_id, -32602, "invalid params")
+            return
+        with self.lock:
+            proposed = next((row for row in self.inventory
+                             if row["address"] == address), None)
+            current_vm = self.vm_id
+        if proposed is None:
+            peer.error(request_id, -32000, "no such session", "not_found")
+            return
+        if vm_id != current_vm or proposed["sandbox"] != current_vm:
+            peer.error(request_id, -32000, "stale vm", "stale_vm")
+            return
+        if profile != proposed["profile"]:
+            peer.error(request_id, -32000, "profile mismatch", "spoofed")
+            return
+        with self.lock:
+            self.enrolled[address] = profile
+        peer.result(request_id, {"address": address, "profile": profile,
+                                 "lifecycle": "live", "revision": "r-fixture-1"})
 
     def _attach(self, peer, request_id, params):
         if not isinstance(params, dict):
@@ -344,6 +414,19 @@ def admin_client(gateway, conn):
             reply = gateway.revoke()
         elif command == "status":
             reply = gateway.status()
+        elif command == "enrollment rotate-vm":
+            # The VM a proposal named is gone: the next enrolment that still
+            # carries it must be refused, and the next list names the new one.
+            with gateway.lock:
+                gateway.vm_id = "vm-fixture-2"
+                for row in gateway.inventory:
+                    row["sandbox"] = gateway.vm_id
+                vm_id = gateway.vm_id
+            reply = {"state": "rotated", "vm_id": vm_id}
+        elif command == "enrollment status":
+            with gateway.lock:
+                reply = {"vm_id": gateway.vm_id,
+                         "enrolled": sorted(gateway.enrolled)}
         elif command.startswith("pair "):
             # Pairing lives on the TLS fixture (`wss_fixture.py`); a plain-TCP
             # gateway has none, and says so instead of pretending to approve.

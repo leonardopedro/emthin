@@ -42,6 +42,17 @@ public final class QrScanTest {
         check(QrScan.decodeNv21(null, 240, 240) == null, "a missing frame is refused");
         check(QrScan.decodeLuminance(image, 0, 240) == null, "a zero width is refused");
 
+        check(QrScan.wantsCamera(false, true, true, false),
+                "a granted permission with a surface opens the preview");
+        check(!QrScan.wantsCamera(false, false, true, false),
+                "no open before the grant: the surface is laid out under the prompt");
+        check(!QrScan.wantsCamera(false, true, false, false),
+                "no open without a surface to preview on");
+        check(!QrScan.wantsCamera(false, true, true, true),
+                "a second open would replace the camera already streaming");
+        check(!QrScan.wantsCamera(true, true, true, false),
+                "a finished screen opens nothing, including on resume");
+
         System.out.println("QrScanTest: " + checks + " checks passed");
     }
 

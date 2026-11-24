@@ -316,6 +316,10 @@ public class MainActivity extends Activity {
     private boolean gatewayAttaching;
     /** The figure reference this lease serves, so a failure can re-resolve it. */
     private String gatewayLeaseReference;
+    /** What this figure's lease dials, kept so a dead one can be re-dialled. */
+    private GatewayTarget gatewayLeaseTarget;
+    /** A Take asked for while the lease was down; applied when it is back. */
+    private boolean gatewayTakeOnReady;
     /** One registry retry per lease; a second failure is reported, not looped. */
     private boolean gatewayLeaseRetried;
     private boolean sessionPinFixturePending;
@@ -5873,6 +5877,13 @@ public class MainActivity extends Activity {
             });
             reconnect.setEnabled(!sessionRefreshInFlight);
             actions.addView(reconnect);
+            // The host's own running sessions, read from it and enrolled only
+            // when the operator says so for one of them.
+            TextView inventory = shortcut("Inventory", new Runnable() {
+                @Override public void run() { showHostInventory(host); }
+            });
+            inventory.setEnabled(host.reachable() && !sessionRefreshInFlight);
+            actions.addView(inventory);
             card.addView(actions);
             rows.addView(card);
         }
@@ -5964,6 +5975,126 @@ public class MainActivity extends Activity {
     }
 
     /**
+     * The host's proposed enrolments: running sessions it already has, with the
+     * profile and VM each belongs to. Reading is free — nothing is created
+     * until one row's Enrol is tapped, and the host decides that.
+     */
+    private void showHostInventory(final SessionCatalog.Host host) {
+        final GatewayEndpoints.Endpoint endpoint = gatewayEndpoints == null
+                ? null : gatewayEndpoints.find(host.host);
+        if (endpoint == null) {
+            trace("enrollment", "phase", "inventory", "host", host.host, "failed", "unpaired");
+            return;
+        }
+        Thread worker = new Thread(new Runnable() {
+            @Override public void run() {
+                final GatewaySessions.Inventory inventory;
+                try {
+                    inventory = GatewaySessions.inventory(connectorFor(endpoint), endpoint.coreId);
+                } catch (java.io.IOException e) {
+                    main.post(new Runnable() {
+                        @Override public void run() {
+                            trace("enrollment", "phase", "inventory", "host", host.host,
+                                    "failed", "unreadable");
+                            fileMessage(host.host + " did not list its inventory: " + e.getMessage());
+                        }
+                    });
+                    return;
+                }
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        trace("enrollment", "phase", "inventory", "host", host.host,
+                                "vm", inventory.vmId, "rows",
+                                String.valueOf(inventory.proposals.size()));
+                        showInventoryDialog(host, inventory);
+                    }
+                });
+            }
+        }, "emthin-enrollment-list");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** One proposal per row, with the profile/VM it would be enrolled as. */
+    private void showInventoryDialog(final SessionCatalog.Host host,
+            final GatewaySessions.Inventory inventory) {
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setPadding(dp(12), dp(8), dp(12), dp(12));
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(rows);
+        rows.addView(panelLabel("Running on " + host.host + " in " + inventory.vmId
+                + "; enrolling adds one to the picker, nothing is started."));
+        if (inventory.proposals.isEmpty()) {
+            rows.addView(panelLabel("Nothing to enrol \u2014 the host proposed no session."));
+        }
+        for (final GatewaySessions.Proposal proposal : inventory.proposals) {
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(0, dp(8), 0, dp(8));
+            TextView heading = panelLabel(proposal.describe());
+            heading.setContentDescription("Proposed " + proposal.name + ", " + proposal.profile
+                    + ", in " + proposal.sandbox);
+            card.addView(heading);
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            actions.addView(shortcut("Enrol", new Runnable() {
+                @Override public void run() { enrol(host, proposal, inventory.vmId); }
+            }));
+            card.addView(actions);
+            rows.addView(card);
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Proposed enrolments")
+                .setView(scroll)
+                .setNegativeButton("Close", null)
+                .create();
+        dialog.show();
+    }
+
+    /**
+     * Enrol one proposed session. The host is authoritative: a stale VM or a
+     * profile that is not the proposal's is refused there, and the reason comes
+     * back to the picker instead of a half-created row.
+     */
+    private void enrol(final SessionCatalog.Host host,
+            final GatewaySessions.Proposal proposal, final String vmId) {
+        final GatewayEndpoints.Endpoint endpoint = gatewayEndpoints == null
+                ? null : gatewayEndpoints.find(host.host);
+        if (endpoint == null) return;
+        trace("enrollment", "phase", "enrol", "host", host.host,
+                "address", proposal.address, "profile", proposal.profile);
+        Thread worker = new Thread(new Runnable() {
+            @Override public void run() {
+                String failure = null;
+                try {
+                    GatewaySessions.enroll(connectorFor(endpoint), endpoint.coreId, proposal, vmId);
+                } catch (java.io.IOException e) {
+                    failure = String.valueOf(e.getMessage());
+                }
+                final String reason = failure;
+                main.post(new Runnable() {
+                    @Override public void run() {
+                        if (reason != null) {
+                            trace("enrollment", "phase", "enrol", "host", host.host,
+                                    "address", proposal.address, "failed", reason);
+                            fileMessage("Not enrolled: " + reason);
+                            return;
+                        }
+                        trace("enrollment", "phase", "enrolled", "host", host.host,
+                                "address", proposal.address);
+                        fileMessage("Enrolled " + proposal.name + " on " + host.host
+                                + "; it is a session on that host now");
+                        reconnectHost(host);
+                    }
+                });
+            }
+        }, "emthin-enrollment-enrol");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /**
      * Rebuild the picker from every paired host. Runs on a worker thread: each
      * host is one connect + hello + `sessions.list`, and a dead one costs its
      * own timeout rather than the picker's.
@@ -6015,22 +6146,24 @@ public class MainActivity extends Activity {
      */
     private List<SessionCatalog.Entry> fetchHostCatalogue(GatewayEndpoints.Endpoint endpoint)
             throws java.io.IOException {
-        GatewayTarget target = GatewayTarget.forHost(endpoint.host, endpoint.coreId)
-                .remap(fixtureConnect);
-        GatewayTransport.Connector connector;
-        if (target.secure) {
-            javax.net.ssl.SSLContext context = target.fixtureCertificate
-                    ? PemTrust.load(fixtureGatewayCa == null ? "" : fixtureGatewayCa.trim())
-                    : PemTrust.system();
-            connector = WssTransport.connector(target.host, target.port, context, 5000, 5000);
-        } else {
-            connector = GatewayLeaseClient.tcpConnector(target.host, target.port);
-        }
+        GatewayTransport.Connector connector = connectorFor(endpoint);
         // The row's label and its sessions' labels are the same string, so a
         // picker row and a session under it never disagree about the host.
         String label = endpoint.name == null || endpoint.name.isEmpty()
                 ? endpoint.host : endpoint.name;
         return GatewaySessions.list(connector, endpoint.coreId, endpoint.host, label);
+    }
+
+    /** The transport a registry row is reached over, client side of a lease. */
+    private GatewayTransport.Connector connectorFor(GatewayEndpoints.Endpoint endpoint)
+            throws java.io.IOException {
+        GatewayTarget target = GatewayTarget.forHost(endpoint.host, endpoint.coreId)
+                .remap(fixtureConnect);
+        if (!target.secure) return GatewayLeaseClient.tcpConnector(target.host, target.port);
+        javax.net.ssl.SSLContext context = target.fixtureCertificate
+                ? PemTrust.load(fixtureGatewayCa == null ? "" : fixtureGatewayCa.trim())
+                : PemTrust.system();
+        return WssTransport.connector(target.host, target.port, context, 5000, 5000);
     }
 
     /** The document's public references; a row they name keeps its Pin row marked. */
@@ -8518,6 +8651,7 @@ public class MainActivity extends Activity {
      * flag.
      */
     private void startGatewayLease(final GatewayTarget target, final String reference) {
+        gatewayLeaseTarget = target;
         gatewayLeaseReference = reference;
         gatewayLeaseRetried = false;
         GatewayTransport.Connector connector;
@@ -8543,12 +8677,22 @@ public class MainActivity extends Activity {
         gatewayReady = false;
         gatewayConnected = false;
         gatewayAttaching = false;
+        // A lease that was replaced can still deliver its last error (a dead
+        // host reports after the retry has already connected), and that late
+        // callback would mark the *new* lease read-only. Only the lease that
+        // still owns the figure may change it.
+        final GatewayLeaseClient[] holder = new GatewayLeaseClient[1];
         gatewayLease = new GatewayLeaseClient(connector, target.coreId, target.address,
                 target.generation,
                 new GatewayLeaseClient.Listener() {
+                    private boolean current() {
+                        return gatewayLease != null && gatewayLease == holder[0];
+                    }
+
                     @Override public void onReady(final String mode, final String leaseId) {
                         main.post(new Runnable() {
                             @Override                            public void run() {
+                                if (!current()) return;
                                 gatewayReady = true;
                                 gatewayConnected = true;
                                 gatewayAttaching = false;
@@ -8563,6 +8707,19 @@ public class MainActivity extends Activity {
                                         "lease", leaseId == null ? "none" : leaseId,
                                         "page", page.index, "index", index,
                                         "readOnly", !control);
+                                // A Take that arrived while the lease was down
+                                // asked for control, and the redial came back as
+                                // the watch it always starts with.
+                                if (gatewayTakeOnReady && !control) {
+                                    gatewayTakeOnReady = false;
+                                    gatewayAttaching = true;
+                                    page.terminalWatchOnly[index] = true;
+                                    page.invalidate();
+                                    trace("gatewayLease", "phase", "request", "control",
+                                            "page", page.index, "index", index);
+                                    GatewayLeaseClient lease = gatewayLease;
+                                    if (lease != null) lease.switchMode(false);
+                                }
                             }
                         });
                     }
@@ -8570,6 +8727,7 @@ public class MainActivity extends Activity {
                     @Override public void onClosed(final String reason, final boolean revoked) {
                         main.post(new Runnable() {
                             @Override                            public void run() {
+                                if (!current()) return;
                                 gatewayReady = false;
                                 gatewayAttaching = false;
                                 RenderedPage page = vtScenePage();
@@ -8588,6 +8746,7 @@ public class MainActivity extends Activity {
                     @Override public void onData(final byte[] bytes) {
                         main.post(new Runnable() {
                             @Override public void run() {
+                                if (!current()) return;
                                 RenderedPage page = vtScenePage();
                                 int index = vtSceneIndex(page);
                                 if (page == null || index < 0) return;
@@ -8605,6 +8764,7 @@ public class MainActivity extends Activity {
                     @Override public void onResize(final int cols, final int rows) {
                         main.post(new Runnable() {
                             @Override public void run() {
+                                if (!current()) return;
                                 RenderedPage page = vtScenePage();
                                 int index = vtSceneIndex(page);
                                 if (page == null || index < 0) return;
@@ -8618,6 +8778,7 @@ public class MainActivity extends Activity {
                     @Override public void onError(final String kind) {
                         main.post(new Runnable() {
                             @Override                            public void run() {
+                                if (!current()) return;
                                 gatewayReady = false;
                                 // A lease conflict is retryable; a transport or
                                 // protocol failure is not.
@@ -8647,6 +8808,7 @@ public class MainActivity extends Activity {
                         });
                     }
                 });
+        holder[0] = gatewayLease;
         trace("gatewayLease", "phase", "connect", "host", target.host, "port", target.port,
                 "address", target.address,
                 "generation", target.generation == null ? "discover" : target.generation,
@@ -8879,6 +9041,18 @@ public class MainActivity extends Activity {
                 || page.terminalFocus >= page.terminalWatchOnly.length) return;
         if (gatewayLease != null) {
             if (!gatewayConnected || gatewayAttaching) {
+                // Take on a lease whose host went away re-dials the figure's own
+                // target and asks for control once the lease is back; leaving
+                // the request pending on a dead client would strand the figure
+                // read-only for the rest of the session.
+                if (!watchOnly && !gatewayAttaching && gatewayLeaseTarget != null) {
+                    gatewayTakeOnReady = true;
+                    trace("gatewayLease", "phase", "redial", "for", "control",
+                            "host", gatewayLeaseTarget.host, "port", gatewayLeaseTarget.port);
+                    closeGatewayLease();
+                    startGatewayLease(gatewayLeaseTarget, gatewayLeaseReference);
+                    return;
+                }
                 trace("gatewayLease", "phase", "request-pending",
                         watchOnly ? "watch" : "control");
                 return;

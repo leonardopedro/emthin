@@ -29,6 +29,20 @@ final class QrScan {
         return decodeLuminance(luminance, width, height);
     }
 
+    /**
+     * Whether the preview may be opened yet.
+     *
+     * <p>The surface exists before the permission answer, and the user may
+     * leave for Settings and come back with the grant, so "now" is not the
+     * only moment to decide: the same rule runs on the surface callback, after
+     * the prompt and on every resume. Opening early reports a denial as a
+     * missing camera, so nothing is opened until the grant is real.
+     */
+    static boolean wantsCamera(boolean finished, boolean granted, boolean hasSurface,
+            boolean cameraOpen) {
+        return !finished && granted && hasSurface && !cameraOpen;
+    }
+
     /** The payload of the first QR code in a grey frame, or null. */
     static String decodeLuminance(byte[] luminance, int width, int height) {
         if (luminance == null || width <= 0 || height <= 0) return null;

@@ -46,12 +46,100 @@ final class GatewaySessions {
      */
     static List<SessionCatalog.Entry> list(GatewayTransport.Connector connector, String coreId,
             String host, String hostLabel) throws IOException {
+        Map<String, Object> result = call(connector, coreId, "sessions.list",
+                "{\"limit\":" + MAX_ROWS + "}");
+        try {
+            return rows(result, coreId, host, hostLabel);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("protocol", e);
+        }
+    }
+
+    /**
+     * The host's scripted inventory: sessions that already run there and are
+     * not in any figure yet. Reading it changes nothing at the host; enrolling
+     * one is a separate, explicit call.
+     */
+    static Inventory inventory(GatewayTransport.Connector connector, String coreId)
+            throws IOException {
+        Map<String, Object> result = call(connector, coreId, "enrollment.list", "{}");
+        Object vmIdValue = result.get("vm_id");
+        String vmId = vmIdValue instanceof String ? (String) vmIdValue : null;
+        Object rowsValue = result.get("rows");
+        List<Proposal> proposals = new ArrayList<>();
+        if (rowsValue instanceof List) {
+            for (Object rowValue : (List<?>) rowsValue) {
+                if (!(rowValue instanceof Map)) continue;
+                Map<?, ?> row = (Map<?, ?>) rowValue;
+                Object address = row.get("address");
+                Object profile = row.get("profile");
+                if (!(address instanceof String) || !(profile instanceof String)) continue;
+                Object name = row.get("name");
+                Object sandbox = row.get("sandbox");
+                if (proposals.size() >= MAX_ROWS) break;
+                proposals.add(new Proposal((String) address,
+                        name instanceof String ? (String) name : (String) address,
+                        (String) profile,
+                        sandbox instanceof String ? (String) sandbox : ""));
+            }
+        }
+        if (vmId == null) throw new IOException("protocol");
+        return new Inventory(vmId, proposals);
+    }
+
+    /**
+     * Enrol one proposal. The host owns the refusal: a name it never proposed,
+     * a profile that does not belong to it or a VM that is no longer current
+     * comes back as an error kind, and nothing is created.
+     */
+    static void enroll(GatewayTransport.Connector connector, String coreId, Proposal proposal,
+            String vmId) throws IOException {
+        String params = "{\"address\":" + GatewayJson.quote(proposal.address)
+                + ",\"vm_id\":" + GatewayJson.quote(vmId)
+                + ",\"profile\":" + GatewayJson.quote(proposal.profile) + "}";
+        call(connector, coreId, "enrollment.enroll", params);
+    }
+
+    /** One inventory proposal, exactly as the host described it. */
+    static final class Proposal {
+        final String address;
+        final String name;
+        final String profile;
+        final String sandbox;
+
+        Proposal(String address, String name, String profile, String sandbox) {
+            this.address = address;
+            this.name = name;
+            this.profile = profile;
+            this.sandbox = sandbox;
+        }
+
+        /** Name, profile and the VM it runs in — what the operator decides on. */
+        String describe() {
+            return name + " \u00b7 " + profile + " \u00b7 " + sandbox;
+        }
+    }
+
+    /** The inventory as read, with the VM it was read against. */
+    static final class Inventory {
+        final String vmId;
+        final List<Proposal> proposals;
+
+        Inventory(String vmId, List<Proposal> proposals) {
+            this.vmId = vmId;
+            this.proposals = proposals;
+        }
+    }
+
+    /** hello + one call + close, with the same deadline and frame bounds. */
+    private static Map<String, Object> call(GatewayTransport.Connector connector, String coreId,
+            String method, String paramsJson) throws IOException {
         GatewayTransport transport = connector.open();
         long deadline = System.currentTimeMillis() + DEADLINE_MS;
         try {
             InputStream input = transport.input();
             send(transport, hello(coreId));
-            boolean listed = false;
+            boolean called = false;
             while (true) {
                 if (System.currentTimeMillis() > deadline) throw new IOException("no answer");
                 int[] header = readHeader(input);
@@ -63,17 +151,17 @@ final class GatewaySessions {
                 long at = (Long) id;
                 if (reply.containsKey("error")) throw new IOException(errorKind(reply, at));
                 if (at == 1) {
-                    if (listed) throw new IOException("repeated hello");
-                    listed = true;
-                    send(transport, listRequest());
+                    if (called) throw new IOException("repeated hello");
+                    called = true;
+                    send(transport, request(method, paramsJson));
                     continue;
                 }
                 if (at == 2) {
-                    try {
-                        return rows(reply.get("result"), coreId, host, hostLabel);
-                    } catch (IllegalArgumentException e) {
-                        throw new IOException("protocol", e);
-                    }
+                    Object result = reply.get("result");
+                    if (!(result instanceof Map)) throw new IOException("protocol");
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> typed = (Map<String, Object>) result;
+                    return typed;
                 }
             }
         } catch (EOFException e) {
@@ -151,9 +239,9 @@ final class GatewaySessions {
         return request.getBytes(StandardCharsets.UTF_8);
     }
 
-    private static byte[] listRequest() {
-        String request = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"sessions.list\","
-                + "\"params\":{\"limit\":" + MAX_ROWS + "}}";
+    private static byte[] request(String method, String paramsJson) {
+        String request = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":"
+                + GatewayJson.quote(method) + ",\"params\":" + paramsJson + "}";
         return request.getBytes(StandardCharsets.UTF_8);
     }
 

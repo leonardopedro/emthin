@@ -708,12 +708,16 @@ the box64 setup remains the local aarch64-host path.
   `LANE_WSS=1` also adds `pairing` (`./device-lane.sh pairing` alone): the
   screen is driven through uiautomator — empty registry, Scan QR with the
   camera permission denied (the prompt is answered by the platform's
-  `permission_deny_button`, and the scanner must report "camera permission
-  denied", not "no camera"; the preview surface is laid out before the answer
-  arrives, so it is remembered rather than opened), Scan QR with the
-  permission granted (this container has no camera HAL, so it must report
-  that and leave Paste link offered; the decode itself is `QrScanTest`'s),
-  then Paste link with a real
+  `permission_deny_button`; the scanner must stay up saying "Camera permission
+  denied — allow it in Settings, then come back", because the preview surface
+  is laid out before the answer and opening there reported a denial as "no
+  camera" and dismissed the screen under the prompt), then the grant made in
+  settings (`Open settings` must reach this app's system page, `pm grant`
+  stands in for the toggle, and returning must log `qr permission granted on
+  return` and start the camera), then Cancel reporting the denial to the Pair
+  screen. Scan QR with the permission granted follows (this container has no
+  camera HAL, so it must report that and leave Paste link offered; the decode
+  itself is `QrScanTest`'s), then Paste link with a real
   `https://fleet.leo.ts.net/pair?v=1&core=<id>` link, pending, then
   `pair approve` on the fixture's admin socket, the row listed, a relaunch
   proving it persisted, and Forget. It also opens Sessions twice: once while
@@ -749,7 +753,18 @@ the box64 setup remains the local aarch64-host path.
   `fixtures/herdr-gateway-v1/stale_lease_probe.py`: a raw TLS/WebSocket client
   that takes the lease itself, is revoked and writes on its revoked controller
   channel, so the gateway's own `not_controller` refusal, its silence and its
-  empty input log are asserted rather than assumed. Admin commands the steps cannot
+  empty input log are asserted rather than assumed. `enroll`
+  (`./device-lane.sh enroll`) reads a paired host's inventory — the sessions
+  it already runs, each with its profile and VM sandbox — taps Enrol on one,
+  and asserts the host's `stale_vm` refusal after its admin socket rotates the
+  VM under the open dialog, then a fresh read and an enrol that the picker
+  lists as a session. `network-change` (default e2e) holds a control lease and
+  kills the fixture process, which is what an unreachable network looks like
+  through `adb reverse`: the pad must report the loss after exactly one
+  registry retry, keep its document, offer control again, and reach the
+  restarted host on a fresh take — the airplane-mode toggle itself is not
+  drivable here because adbd rides the same container network. Admin commands
+  the steps cannot
   continue without go through `wss_admin_checked`, which fails naming the silent
   socket instead of waiting out the request's pending timeout, and every
   `wait_for_log` checks the running fixture's process and log tail, so a
