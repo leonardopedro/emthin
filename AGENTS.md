@@ -673,15 +673,20 @@ the box64 setup remains the local aarch64-host path.
   from SharedPreferences. It then runs `new-reset`: types the 90-byte
   probe, opens New, captures the confirmation, asserts the reset rendered
   89 bytes with Undo enabled, taps Undo, and asserts the 90-byte document
-  returned. Finally it cold-launches the starter and runs
-  `scroll-anchor`: scrolls to page 2, focuses the editor, adds a trailing
-  space (two pages -> one), and taps Undo, asserting the logged
-  `restoreScroll` target is clamped by the collapse and restored exactly
-  by Undo. The check finds the editor, New, the dialog's positive button,
-  and Undo bounds with `uiautomator dump`, so its taps do not depend on
+  returned. It then runs `enter`, `scroll-anchor` (scrolls to page 2,
+  focuses the editor, adds a trailing space so two pages become one, and taps
+  Undo, asserting the logged `restoreScroll` target is clamped by the collapse
+  and restored exactly by Undo), `search-replace`, `accessibility`,
+  `diagnostics`, `named-document`, `focus-stack`, `composing-ime`,
+  `modifier-inspector`, `session-pin`, `figure-a11y`, and the four terminal
+  steps `terminal-scene`, `terminal-reflow`, `terminal-pages` and
+  `terminal-lease`; each is also runnable alone as `./device-lane.sh <step>`.
+  The checks find the editor, New, the dialog's positive button, Take, Undo and
+  the rest with `uiautomator dump`, so their taps do not depend on
   pixel constants. The preview drag is sized from `wm size` unless `SWIPE_*`
-  is set. `SKIP_BUILD=1` reuses the current APK for a capture-only visual
-  rerun; `DEVICE`/`ADB` override the target. `LANE_WSS=1` adds
+  is set. `SKIP_BUILD=1` reuses the current APK and drops the build check, for a
+  rerun against a binary that is already installed; `DEVICE`/`ADB` override the
+  target. `LANE_WSS=1` adds
   `gateway-wss` (TLS handshake with the fixture CA, `/v1/stream` upgrade,
   watch attach, 80×24 grid, gateway DATA) and can also be run alone as
   `./device-lane.sh gateway-wss`. Its certificate names both `localhost`
@@ -711,7 +716,12 @@ the box64 setup remains the local aarch64-host path.
   returns as DATA, and the fixture's admin `revoke` closes it and makes the
   app reject further input before the transport. A second Take then has to come
   back with a lease the gateway names differently, so the revoke demonstrably
-  ended the generation rather than the row. Admin commands the steps cannot
+  ended the generation rather than the row. Because that app-side refusal
+  happens before the wire, the step ends by running
+  `fixtures/herdr-gateway-v1/stale_lease_probe.py`: a raw TLS/WebSocket client
+  that takes the lease itself, is revoked and writes on its revoked controller
+  channel, so the gateway's own `not_controller` refusal, its silence and its
+  empty input log are asserted rather than assumed. Admin commands the steps cannot
   continue without go through `wss_admin_checked`, which fails naming the silent
   socket instead of waiting out the request's pending timeout, and every
   `wait_for_log` checks the running fixture's process and log tail, so a

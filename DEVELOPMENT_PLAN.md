@@ -1062,6 +1062,14 @@ stored row had never been used. Two steps close both gaps.
   terminal 0`). A fixture document now outranks recovery (`fixtureText` is set
   only by the test APK), and the lane waits for `force-stop` to actually end
   the process, since a start that races the teardown drops its extras.
+- **The gateway's own refusal.** The app rejects revoked input before the
+  transport, so no check above can say what the gateway does with a controller's
+  bytes — nothing ever crosses the wire. `fixtures/herdr-gateway-v1/stale_lease_probe.py`
+  is that sender: once the retake has proved the fresh lease, the step has a raw
+  TLS/WebSocket client take the lease itself, revokes it in turn, and makes it
+  write on its revoked controller channel. The gateway must answer `not_controller`, must not
+  echo the bytes, and must record none of them; the step asserts all three and
+  the probe exits non-zero with a `probe:` line when any is missing.
 - **The rest of the lifecycle.** Watch is only half the row: `paired-lease`
   taps the scene, takes control, types input that the fixture sees, then has
   the fixture's admin socket `revoke` it and proves the app rejects further
@@ -1069,8 +1077,8 @@ stored row had never been used. Two steps close both gaps.
   back with a lease id the fixture names differently — a reused generation
   would keep the old one — and that fresh lease's input must reach the
   fixture. `terminal-lease` makes the same assertion, so both gateway steps
-  prove the retake is a new generation rather than a surviving one. Admin commands a step cannot continue without use
-  `wss_admin_checked`, which names a silent admin socket rather than letting the
+  prove the retake is a new generation rather than a surviving one. Admin
+  commands a step cannot continue without use `wss_admin_checked`, which names a silent admin socket rather than letting the
   step wait out the pending timeout and blame the answer that never came, and
   `wait_for_log` now checks the running fixture's process and log tail, so a
   fixture that dies mid-step fails immediately with the reason instead of a
@@ -1080,14 +1088,16 @@ stored row had never been used. Two steps close both gaps.
   opener the pairing step needed; the sessions submenu's entry animation is no
   longer a special case.
 - **Environment.** A fresh (uncached) `build-apk.sh` needs a host `cc`, which
-  this aarch64 host only has inside the emthin devshell; prepend
-  `nix develop -c` or the devshell's gcc-wrapper to `PATH` when cargo actually
-  has to compile.
+  this aarch64 host only has inside the emthin devshell. `nix develop -c
+  ./build-apk.sh` does not work (the cross compile fails with `can't find crate
+  for core`); prepend the devshell's gcc-wrapper `bin` to `PATH` instead:
+  `PATH=<gcc-wrapper>/bin ANDROID_ABI=arm64-v8a ./build-apk.sh`.
 - **Result.** Each step alone: `pairing` 11 checks, `pairing-answers` 8,
-  `paired-lease` 12 (approve → lease → Take → controller input → revoke →
-  rejected input → retake with a distinct lease → input) — all passed. Full
+  `paired-lease` 14 (approve → lease → Take → controller input → revoke →
+  rejected input → retake with a distinct lease → input → raw client takes the
+  lease → gateway refuses its revoked bytes) — all passed. Full
   `LANE_WSS=1 ./device-lane.sh e2e` with the installed APK reused
-  (`SKIP_BUILD=1`, which omits the build check): **241 checks, 0 failed**,
+  (`SKIP_BUILD=1`, which omits the build check): **243 checks, 0 failed**,
   `device lane: all steps passed`, and the installed `base.apk` still
   byte-identical to the build (md5 `d762f9a7e7923ce3e57d08e67b19dffd`). Host `bash test-java.sh`:
   `GatewayTargetTest` grew from 51 to 71 checks with the remap cases.
