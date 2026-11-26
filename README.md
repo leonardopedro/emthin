@@ -58,7 +58,7 @@ path (the `emthin-dbus` crate links `gio`) — outside it every one of these
 dies at `glib-sys`. See
 [`docs/build-notes.md`](docs/build-notes.md).
 
-<!-- status: verified | tests: 734 cargo passed, 2 ignored (workspace, nix develop, one build job, measured 2026-11-22) + 28/28 wtype (headless sway) and 36/36 xdotool (sway on Xvfb) run.sh E2E, including multi-page navigation and embedded-client fcitx5 composition + 134 emthin-pad Rust host tests and 236 Java host checks (measured 2026-11-22) + Waydroid math preview pixel check and live-session timing in docs/measurement-surfaces.md | last_verified: 2026-11-22 -->
+<!-- status: verified | tests: 734 cargo passed, 2 ignored (workspace, nix develop, one build job, measured 2026-11-22) + 28/28 wtype (headless sway) and 36/36 xdotool (sway on Xvfb) run.sh E2E, including multi-page navigation and embedded-client fcitx5 composition + 136 emthin-pad Rust host tests and 17 Java host suites (583 counted checks) + 302 Waydroid device-lane E2E checks, 360 dp portrait/landscape phone-layout, proof-zenodo (mock + live sandbox.zenodo.org), and release v1->v2 upgrade/security check (measured 2026-11-25) | last_verified: 2026-11-25 -->
 
 ## Verification
 
@@ -87,6 +87,125 @@ can and cannot see — and how to classify the next seam regression — is
 What the count does not cover: `xwayland_satellite` supervisor tests are timing
 sensitive and occasionally flake; the doc/ model is shared with the sibling
 `velysterm` checkout, which must be verified separately when it changes.
+
+### Testing the Android app locally
+
+The Android pad (`emthin-android/`) has its own host tests, APK builder, and
+ADB/Waydroid device lane:
+
+```sh
+# 1. Host Rust & Java tests (needs zig 0.16 + host cc + JDK on PATH)
+(cd emthin-android && cargo test --locked --offline && bash test-java.sh)
+
+# 2. Build APKs (shipping APK enforces manifest hygiene automatically)
+(cd emthin-android && ./build-apk.sh)                                       # debug-signed shipping APK
+(cd emthin-android && EMTHIN_TEST_PACKAGE=com.emthin.pad.test ./build-apk.sh) # disposable test APK
+
+# Release-signed shipping build
+(cd emthin-android && EMTHIN_RELEASE=1 \
+  EMTHIN_RELEASE_KEYSTORE=/path/to/release.jks \
+  EMTHIN_RELEASE_KEY_ALIAS=emthin \
+  EMTHIN_RELEASE_KS_PASS='...' \
+  ./build-apk.sh)
+
+# 3. Device checks on Waydroid or a connected Android device (com.emthin.pad.test)
+(cd emthin-android && ./device-lane.sh math-preview)  # equation ink + tap-to-edit + Undo (needs Pillow)
+(cd emthin-android && ./device-lane.sh phone-layout)  # 360 dp portrait & landscape phone checks
+(cd emthin-android && ./device-lane.sh proof-zenodo)  # MM0 verify/reject + mock Zenodo DOI + Undo
+(cd emthin-android && LANE_WSS=1 ./device-lane.sh e2e) # full device suite
+```
+
+For manual testing against `mm0web` + `https://sandbox.zenodo.org/api` via
+`adb reverse` (and details on `DEVICE` / `ADB` / `TALKBACK_APK` overrides), see
+[emthin-android/README.md](emthin-android/README.md#testing-locally).
+
+## Installing on Android for a teenager (F-Droid + parental lockdown)
+
+This step-by-step guide walks a parent and teenager through setting up the app
+from a standard Android phone/tablet (assuming the app is published on
+F-Droid), turning on automatic updates, password-protecting both app stores,
+and blocking sideloading of any extra `.apk` files outside Google Play Store and
+F-Droid.
+
+> [!NOTE]
+> The parent should set the PINs/passwords below and keep them private.
+
+### Before you start
+
+- Start with a standard Android phone or tablet signed in to the teenager's
+  account and Google Play Store.
+- If a test/debug build of the app is already installed, uninstall it first (an
+  F-Droid build uses F-Droid's signing key, so Android will reject updating a
+  differently signed APK over it).
+
+### Step 1 — Switch to Developer mode (Developer options)
+
+1. Open **Settings → About phone** (on Samsung: **Settings → About phone → Software information**).
+2. Find **Build number** and tap it **7 times** in a row until Android prompts for the device lock screen PIN, pattern, or password.
+3. Enter the screen lock PIN to confirm. You will see **"You are now a developer!"**.
+4. Open **Settings → System → Developer options** (on Samsung/some phones: **Settings → Developer options**):
+   - **Android 14+ stability tip (optional):** if **Disable child process restrictions** appears, toggle it **ON** so Android's phantom process killer does not terminate background shells inside the terminal.
+   - Keep **USB debugging** turned **OFF** unless you explicitly need `adb` from a computer (leaving USB debugging OFF prevents bypassing store locks via a PC later).
+
+### Step 2 — Install F-Droid
+
+1. Open the phone's web browser (for example Chrome) and go to `https://f-droid.org`.
+2. Tap **Download F-Droid** to download `F-Droid.apk`.
+3. Open the downloaded `F-Droid.apk` (from the browser notification or the **Files / Downloads** app).
+4. Android will warn that your browser is not allowed to install unknown apps. Tap **Settings** on that prompt, temporarily switch **Allow from this source** **ON**, press **Back**, and tap **Install**.
+5. Open **F-Droid**, wait ~30 seconds for its package index to update, and when prompted to allow F-Droid to install apps, grant **Allow from this source** for **F-Droid**.
+
+### Step 3 — Install this app from F-Droid
+
+1. Open **F-Droid** and tap the **Search** button.
+2. Search for **emthin** (once published in the F-Droid repository), open its app page, and tap **Install**.
+3. Wait for the download and tap **Install** when Android asks to confirm.
+4. Tap **Open** once to let initial setup/bootstrap complete cleanly.
+
+### Step 4 — Turn on automatic updates on Google Play Store and F-Droid
+
+1. **Google Play Store auto-updates:**
+   - Open **Google Play Store** → tap the profile icon (top-right) → **Settings → Network preferences → Auto-update apps**.
+   - Choose **Over Wi-Fi only** (or **Over any network** if unlimited mobile data is preferred).
+2. **F-Droid auto-updates:**
+   - Open **F-Droid → Settings → Updates**.
+   - Set **Automatic update interval** (for example **Daily** or **Every 12 hours**).
+   - Enable **Automatically fetch updates** (under **Over Wi-Fi**).
+   - Enable **Automatically install updates** (supported unattended on Android 12+).
+   - Also open **Settings → Apps → F-Droid → Battery** and choose **Unrestricted** so Android does not put F-Droid to sleep before scheduled update checks run.
+
+### Step 5 — Block installing `.apk` files outside Google Play Store and F-Droid
+
+1. Open **Settings → Apps → Special app access → Install unknown apps** (or search `Install unknown apps` in the Settings search bar).
+2. Check **every** app in the list (especially browsers such as Chrome, file managers such as Files, messaging apps such as WhatsApp/Telegram/Messages, email apps, and cloud drives) and set **Allow from this source** to **OFF**.
+3. Leave **F-Droid** set to **ON** so F-Droid can keep downloading and installing updates automatically. *(Google Play Store does not appear/need this toggle because Android treats it as a built-in store.)*
+4. Open the **Files / Downloads** folder and delete `F-Droid.apk` (and any other downloaded `.apk` files).
+5. Return to **Settings → System → Developer options** and verify **USB debugging** is **OFF**. Unless you need Android 14+'s *Disable child process restrictions*, you can also switch **Use developer options** **OFF** completely now.
+
+### Step 6 — Password-protect Google Play Store, F-Droid, and Settings
+
+> [!IMPORTANT]
+> F-Droid does **not** have a built-in launch password, and anyone who can open **Settings** can turn *Install unknown apps* back on. Password-locking **Settings** alongside **Google Play Store** and **F-Droid** is what keeps Step 5 locked in.
+
+1. **Turn on Google Play Store parental controls & purchase lock:**
+   - Open **Google Play Store** → profile icon → **Settings → Family → Parental controls**.
+   - Toggle **Parental controls** **ON**, create a **parent-only PIN**, and filter **Apps & games** / **Movies** to the teenager's age rating.
+   - Under **Settings → Authentication → Require authentication for purchases**, select **For all purchases through Google Play on this device** (or **Require biometrics/password**).
+   - If the phone is supervised by **Google Family Link**, open the parent's **Family Link** app → **Controls → Google Play → Require approval for → All content** (so every new Play Store install requires parent approval, while auto-updates still run automatically).
+2. **Password-lock Google Play Store, F-Droid, and Settings:**
+   - **Option A — Built-in Phone App Lock (Samsung Secure Folder / Xiaomi, OnePlus, Oppo, Realme, Huawei App Lock):**
+     1. Open **Settings → Security / Privacy / Apps → App Lock**.
+     2. Set a **parent-only PIN/password** (do **not** enroll the teenager's fingerprint or face into App Lock).
+     3. Lock **Google Play Store**, **F-Droid**, and **Settings** (plus any pre-installed manufacturer app store if your device has one, e.g. Galaxy Store).
+   - **Option B — Google Family Link + App Locker (stock Android / Pixel without built-in App Lock):**
+     - **With Family Link alone:** turn **Apps from unknown sources** **OFF** in the Family Link parent app, require approval for **All content** in Google Play, and set an app limit / block on **F-Droid** between parent check-ins *(note: when F-Droid is blocked or unknown sources is disabled by Family Link, F-Droid background auto-updates pause until the parent temporarily re-enables them)*.
+     - **With a PIN App Locker (if not using built-in App Lock):** install a reputable **App Lock** app from Google Play Store *before* locking Play Store, grant it **Usage access** and **Display over other apps**, disable battery optimization for it, give it a **parent-only PIN**, and lock **Google Play Store**, **F-Droid**, and **Settings** (and prevent uninstalling the locker via **Device admin** if offered).
+
+### Final check
+
+- Try opening an `.apk` link in the browser or **Files** — Android must refuse installation unless enabled in locked **Settings**.
+- Tap **F-Droid**, **Google Play Store**, and **Settings** — each should ask for the parent PIN/approval.
+- Open **emthin** — it should launch normally for everyday use without prompting for any parent PIN.
 
 ## Usage
 

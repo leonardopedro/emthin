@@ -1322,6 +1322,90 @@ docs say so instead of implying the fleet was involved.
   versioning coverage remain on the mock; this lane verifies and uploads one
   draft only.
 
+### App-wide GPU runtime & embedded Wayland compositor in Android (2026-11-26)
+
+Added a process-wide GPU runtime (`emthin-android/src/gpu.rs`, `GpuContract.java`,
+`GpuRuntime.java`, `DocBridge.gpu*`) and embedded Wayland compositor
+(`emthin-android/src/wayland.rs`, `WaylandSurfaceView.java`, `DocBridge.wayland*`)
+so both `\app` Wayland figures and any non-Wayland app subsystem can use:
+
+- **EGL 1.4 / GLES3 surface compositing with automatic CPU fallback**
+  (`gpuRenderRgba`, `gpuRenderPlaceholder`, `waylandRenderFigure`,
+  `zwp_linux_dmabuf_v1` / `AHardwareBuffer` / `wl_shm`, falling back to
+  `ANativeWindow_lock` -> `cpu_blit_rgba`/`cpu_fill_placeholder` `"cpu-software"`
+  and `TerminalSurface` Canvas repaint when GPU/EGL is unusable or forced off).
+- **Vulkan 1.1 compute & AHardwareBuffer interop** (`gpuComputeF32` for
+  built-in `square_plus_one`/`relu` kernels with CPU fallback, plus
+  `gpuDispatchSpirv` for arbitrary validated SPIR-V 1.0 compute shaders).
+- **Verified (2026-11-26):** `emthin-android` `cargo test --locked --offline`
+  (**145 passed, 0 failed**), `bash test-java.sh` (**18 suites passed**),
+  shipping `arm64-v8a` APK manifest hygiene gate pass, and Waydroid
+  (`192.168.240.112:5555`, Adreno X1-85 GLES 3.2 + Vulkan 1.4.335)
+  `./device-lane.sh wayland-gpu` (including live CPU fallback + GPU recovery),
+  `terminal-scene`, `math-preview`, and `proof-zenodo` all passed.
+
+### Android proof client and release-gate readiness (2026-11-25)
+
+Hardened `emthin-android` so both the math editor and the native MM0/Zenodo
+proof workflow meet shipping readiness gates (see the
+[Android development plan](emthin-android/DEVELOPMENT_PLAN.md#android-production-readiness-2026-11-25)
+for full details):
+
+- **Protocol and client hardening.** `ProofProtocol` classifies every `mm0web`
+  HTTP status and JSON field (400 checker rejections extract the failing stage's
+  diagnostic line skipping `$ <cmd>` headers, 429 rate limits, 502 missing
+  `ZENODO_API_KEY`, and 503 queue-full responses are reported honestly and never
+  treated as verified); requires `https://` in shipping builds (cleartext
+  `http://` is restricted to `deviceTest`); normalizes project/base inputs
+  before submit; confirms before publishing to Zenodo; polls `/proof` to a
+  settled DOI and refreshes on resume; binds results to file pair, server,
+  Activity generation, and invoking document ID (`MainActivity` flushes IME
+  composition and queues results if recovery is still loading).
+- **Manifest and release-signing gates.** `android/AndroidManifest.xml` disables
+  cleartext traffic (`usesCleartextTraffic="false"`), sets
+  `ProofClientActivity` `exported="false"`, and keeps `windowSoftInputMode="stateHidden"`
+  on both manifests. `build-apk.sh` enforces a shipping manifest hygiene gate
+  via `aapt2 dump xmltree` (handling both build-tools 35 hex and 37 text
+  booleans), supports `EMTHIN_VERSION_CODE`/`EMTHIN_VERSION_NAME` overrides via
+  `--replace-version`, and adds `EMTHIN_RELEASE=1` release-keystore signing via
+  `apksigner` env-var passwords.
+- **Verification (2026-11-25).** `emthin-android`: `cargo test --locked --offline`
+  **136 passed, 0 failed**, `cargo fmt --check` exit 0, `bash test-java.sh` green
+  across all 17 suites (583 counted checks including `ProofProtocolTest` 71, plus
+  `GatewayCatalogTest` and `GatewayEnrollmentTest`). Shipping APK built and
+  verified under both a disposable release keystore and debug keystore
+  (`build/emthin-pad.apk` md5 `4c5ff16bea72ae0d8901b83a1a409b5e`, manifest gate
+  green); test APK (`build/test/emthin-pad-test.apk` md5
+  `a32e6d36c12abf004ebff2697c2bef92`) passed `device-lane.sh proof-zenodo` (14
+  ok against real `mm0web` + `mock_zenodo.py` over `adb reverse`, confirming the
+  stripped checker diagnostic), `device-lane.sh phone-layout` (360 dp portrait
+  `1080x2340` and 360 dp landscape `2340x1080` @ `480 dpi` math-preview +
+  toolbar bounds + display reset), and full `LANE_WSS=1 SKIP_BUILD=1
+  ./device-lane.sh e2e` (**302 ok, 0 failed** on the prior `bc589c327704306f103bf95f6bdb3da6`
+  build before the `ProofProtocol` log-header tweak, 1 explicit TalkBack skip).
+  A release-signed shipping-manifest `v1` → `v2` (`0.1.0` → `0.1.1`) in-place
+  upgrade on Waydroid (`com.emthin.pad.reltest`) preserved a live note edit
+  (`89 -> 90`), ignored `emthin.fixture` at runtime, and refused external
+  `ProofClientActivity` launches (`SecurityException`).
+- **Live Android + Zenodo sandbox run (2026-11-25).** Using the local
+  sandbox token from `~/.config/mm0web/mm0web.env` (never printed/logged) and
+  `MM0WEB_ZENODO_BASE=https://sandbox.zenodo.org/api` over `adb reverse`,
+  `com.emthin.pad.test` (`bc589c327704306f103bf95f6bdb3da6`) verified the
+  synthetic 11-byte `sort Prop;` pair (`sha256 acd539decfd1992b…`), published via
+  `Sessions and sharing -> MM0 proof`, polled to `state: published` (`id
+  fixture-5a720607`, DOI `10.5072/zenodo.648647`, URL
+  `https://sandbox.zenodo.org/records/648647`), inserted the proof ID and DOI
+  into the rendered math note (`44 -> 123` chars), returned byte-identical
+  `mm0`/`mm1` from `/proof`, and returned HTTP 200 with archived files
+  `['snapshot_0.bin', 'manifest.json']` from
+  `https://sandbox.zenodo.org/api/records/648647`.
+- **Remaining external gaps.** Physical arm64 phone hardware & human TalkBack
+  walkthrough (no physical phone/TalkBack APK attached; 360 dp portrait and
+  landscape phone geometry was exercised on Waydroid), live Android SAF
+  Downloads picker (broken media provider on this Waydroid image), external
+  production release signing keystore, and live production `zenodo.org` (mock +
+  `sandbox.zenodo.org` verified).
+
 ## Implementation handoff
 
 Use the cheaper model for one card at a time. Give it the card's files,

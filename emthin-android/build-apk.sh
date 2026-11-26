@@ -9,8 +9,36 @@
 # Set EMTHIN_TEST_PACKAGE=com.emthin.pad.test to build a separate test APK
 # (build/test/emthin-pad-test.apk) with a distinct application id, so
 # device-lane `pm clear` never touches the normal install.
+#
+# Set EMTHIN_RELEASE=1 with EMTHIN_RELEASE_KEYSTORE, EMTHIN_RELEASE_KEY_ALIAS,
+# EMTHIN_RELEASE_KS_PASS (and optional EMTHIN_RELEASE_KEY_PASS) to sign the
+# shipping APK with a release certificate.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+RELEASE_MODE=${EMTHIN_RELEASE:-0}
+RELEASE_KEYSTORE=${EMTHIN_RELEASE_KEYSTORE:-}
+RELEASE_KEY_ALIAS=${EMTHIN_RELEASE_KEY_ALIAS:-}
+RELEASE_KS_PASS=${EMTHIN_RELEASE_KS_PASS:-}
+RELEASE_KEY_PASS=${EMTHIN_RELEASE_KEY_PASS:-$RELEASE_KS_PASS}
+if [[ "$RELEASE_MODE" == 1 ]]; then
+    if [[ -n "${EMTHIN_TEST_PACKAGE:-}" ]]; then
+        echo "error: EMTHIN_RELEASE=1 cannot be combined with EMTHIN_TEST_PACKAGE" >&2
+        exit 2
+    fi
+    if [[ -z "$RELEASE_KEYSTORE" || ! -r "$RELEASE_KEYSTORE" ]]; then
+        echo "error: EMTHIN_RELEASE=1 requires readable EMTHIN_RELEASE_KEYSTORE" >&2
+        exit 2
+    fi
+    if [[ -z "$RELEASE_KEY_ALIAS" ]]; then
+        echo "error: EMTHIN_RELEASE=1 requires EMTHIN_RELEASE_KEY_ALIAS" >&2
+        exit 2
+    fi
+    if [[ -z "$RELEASE_KS_PASS" ]]; then
+        echo "error: EMTHIN_RELEASE=1 requires EMTHIN_RELEASE_KS_PASS" >&2
+        exit 2
+    fi
+fi
 
 # Toolchain resolution: environment → .toolchain/env.sh (written by
 # setup-box64-toolchain.sh) → the pinned Nix store paths below. The pins
@@ -209,11 +237,89 @@ AAPT_LINK=(aapt2 link \
     --min-sdk-version "$API" \
     --target-sdk-version "$API" \
     -o "$BUILD/$ARTIFACT-unsigned.apk")
+if [[ -n "${EMTHIN_VERSION_CODE:-}" || -n "${EMTHIN_VERSION_NAME:-}" ]]; then
+    AAPT_LINK+=(--replace-version)
+fi
+if [[ -n "${EMTHIN_VERSION_CODE:-}" ]]; then
+    AAPT_LINK+=(--version-code "$EMTHIN_VERSION_CODE")
+fi
+if [[ -n "${EMTHIN_VERSION_NAME:-}" ]]; then
+    AAPT_LINK+=(--version-name "$EMTHIN_VERSION_NAME")
+fi
 if [[ -n "$TEST_PACKAGE" ]]; then
     aapt2 compile --dir android/test-res -o "$BUILD/res.zip"
     AAPT_LINK+=(-R "$BUILD/res.zip" --rename-manifest-package "$TEST_PACKAGE")
 fi
 "${AAPT_LINK[@]}"
+
+if [[ -z "$TEST_PACKAGE" ]]; then
+    echo "==> verify shipping manifest hygiene"
+    aapt2 dump xmltree "$BUILD/$ARTIFACT-unsigned.apk" --file AndroidManifest.xml > "$BUILD/manifest-xmltree.txt"
+    python3 - "$BUILD/manifest-xmltree.txt" <<'PY'
+import sys
+
+tree = open(sys.argv[1]).read()
+stack = []
+elements = []
+for raw in tree.splitlines():
+    stripped = raw.lstrip()
+    if not stripped:
+        continue
+    indent = len(raw) - len(stripped)
+    if stripped.startswith("E: "):
+        tag = stripped[3:].split(" ", 1)[0]
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        elem = {"tag": tag, "attrs": {}}
+        elements.append(elem)
+        stack.append((indent, elem))
+    elif stripped.startswith("A: ") and stack:
+        body = stripped[3:]
+        if "=" in body:
+            lhs, val = body.split("=", 1)
+            key = lhs.split("(", 1)[0].rsplit(":", 1)[-1].strip()
+            if val.startswith('"'):
+                val = val.split('"', 2)[1]
+            stack[-1][1]["attrs"][key] = val.strip()
+
+def as_bool(v, default=None):
+    if v is None:
+        return default
+    low = v.strip().lower()
+    if low in ("false", "0x0", "(type 0x12)0x0"):
+        return False
+    if low in ("true", "0xffffffff", "(type 0x12)0xffffffff", "0x1", "(type 0x12)0x1"):
+        return True
+    raise AssertionError(f"unrecognized boolean manifest value: {v!r}")
+
+manifest = next((e for e in elements if e["tag"] == "manifest"), None)
+assert manifest and manifest["attrs"].get("package") == "com.emthin.pad", f"bad package: {manifest}"
+app = next((e for e in elements if e["tag"] == "application"), None)
+assert app, "missing application element"
+assert as_bool(app["attrs"].get("debuggable"), False) is False, f"shipping APK is debuggable: {app}"
+assert as_bool(app["attrs"].get("usesCleartextTraffic")) is False, f"cleartext traffic enabled: {app}"
+assert as_bool(app["attrs"].get("allowBackup")) is False, f"allowBackup must be false: {app}"
+
+for e in elements:
+    name = e["attrs"].get("name", "")
+    assert name != "com.emthin.pad.deviceTest", "test metadata present in shipping APK"
+    assert "TestComposingIme" not in name and "TestImeControlProvider" not in name, f"test component in shipping APK: {name}"
+
+activities = {}
+for e in elements:
+    if e["tag"] == "activity":
+        n = e["attrs"].get("name", "")
+        if n.startswith("com.emthin.pad."):
+            n = n[len("com.emthin.pad"):]
+        activities[n] = e["attrs"]
+for internal in (".ProofClientActivity", ".QrScanActivity"):
+    assert internal in activities, f"missing activity {internal}"
+    assert as_bool(activities[internal].get("exported")) is False, f"{internal} must not be exported: {activities[internal]}"
+assert ".MainActivity" in activities and as_bool(activities[".MainActivity"].get("exported")) is True, \
+    f"MainActivity must be exported: {activities.get('.MainActivity')}"
+print("manifest gate: OK (shipping invariants verified)")
+PY
+fi
 
 echo "==> [5/6] add dex + native lib"
 cp "target/$TARGET/release/libemthin_pad.so" "$BUILD/stage/lib/$ABI/"
@@ -223,22 +329,38 @@ jar --update --file "$BUILD/$ARTIFACT-unsigned.apk" \
     -C "$BUILD/stage" "lib/$ABI/libemthin_pad.so"
 zipalign -f 4 "$BUILD/$ARTIFACT-unsigned.apk" "$BUILD/$ARTIFACT-aligned.apk"
 
-echo "==> [6/6] sign (debug keystore)"
-if [[ ! -f debug.keystore ]]; then
-    keytool -genkeypair -keystore debug.keystore \
-        -storepass android -keypass android \
-        -alias androiddebugkey -keyalg RSA -keysize 2048 \
-        -validity 10000 \
-        -dname "CN=Android Debug,O=Android,C=US"
+if [[ -z "$TEST_PACKAGE" && -n "$RELEASE_KEYSTORE" ]]; then
+    [[ -r "$RELEASE_KEYSTORE" ]] || { echo "error: unreadable EMTHIN_RELEASE_KEYSTORE=$RELEASE_KEYSTORE" >&2; exit 2; }
+    [[ -n "$RELEASE_KEY_ALIAS" ]] || { echo "error: EMTHIN_RELEASE_KEY_ALIAS is required" >&2; exit 2; }
+    [[ -n "$RELEASE_KS_PASS" ]] || { echo "error: EMTHIN_RELEASE_KS_PASS is required" >&2; exit 2; }
+    echo "==> [6/6] sign (release keystore)"
+    EMTHIN_RELEASE_KS_PASS="$RELEASE_KS_PASS" \
+    EMTHIN_RELEASE_KEY_PASS="$RELEASE_KEY_PASS" \
+    apksigner sign \
+        --ks "$RELEASE_KEYSTORE" \
+        --ks-key-alias "$RELEASE_KEY_ALIAS" \
+        --ks-pass env:EMTHIN_RELEASE_KS_PASS \
+        --key-pass env:EMTHIN_RELEASE_KEY_PASS \
+        --out "$BUILD/$ARTIFACT.apk" \
+        "$BUILD/$ARTIFACT-aligned.apk"
+else
+    echo "==> [6/6] sign (debug keystore)"
+    if [[ ! -f debug.keystore ]]; then
+        keytool -genkeypair -keystore debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+    fi
+    apksigner sign \
+        --ks debug.keystore \
+        --ks-key-alias androiddebugkey \
+        --ks-pass pass:android \
+        --key-pass pass:android \
+        --out "$BUILD/$ARTIFACT.apk" \
+        "$BUILD/$ARTIFACT-aligned.apk"
 fi
-apksigner sign \
-    --ks debug.keystore \
-    --ks-key-alias androiddebugkey \
-    --ks-pass pass:android \
-    --key-pass pass:android \
-    --out "$BUILD/$ARTIFACT.apk" \
-    "$BUILD/$ARTIFACT-aligned.apk"
-apksigner verify "$BUILD/$ARTIFACT.apk"
+apksigner verify --print-certs "$BUILD/$ARTIFACT.apk"
 
 echo
 echo "OK: $BUILD/$ARTIFACT.apk"

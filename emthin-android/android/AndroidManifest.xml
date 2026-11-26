@@ -8,15 +8,23 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Pairing by QR code is optional: a pad with no camera pairs by link. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- Optional GPU capabilities for Vulkan 1.1 compute and GLES3 surface compositing. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="false" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />
 
     <application
         android:label="emthin pad"
         android:allowBackup="false"
         android:extractNativeLibs="true"
-        android:usesCleartextTraffic="true">
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="false">
+        <!-- Launched only by MainActivity's MM0 proof action; another app must
+             not be able to drive a submission. Its server must be https://. -->
         <activity
             android:name=".ProofClientActivity"
-            android:exported="true"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:windowSoftInputMode="stateHidden"
             android:label="MM0 proof client" />
         <activity
             android:name=".QrScanActivity"

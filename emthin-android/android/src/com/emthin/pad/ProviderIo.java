@@ -29,7 +29,9 @@ final class ProviderIo {
         byte[] buffer = new byte[16384];
         for (int n; (n = input.read(buffer)) != -1; ) {
             if (n == 0) continue;
-            if (out.size() + n > max) throw new IOException("Document exceeds 32 MB");
+            if (out.size() + n > max) {
+                throw new IOException("Document exceeds " + (max >> 20) + " MiB");
+            }
             out.write(buffer, 0, n);
         }
         return out.toByteArray();

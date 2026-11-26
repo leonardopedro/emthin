@@ -121,6 +121,122 @@ frontend, and their source remains editable.
 The Android pad does not yet expose every mathed feature; in particular, this
 interface does not implement its kernel execution and notebook workflows.
 
+## App-wide GPU runtime and embedded Wayland compositor
+
+`emthin-android` provides a process-wide GPU runtime (`src/gpu.rs`,
+`GpuContract.java`, `GpuRuntime.get()`, and `DocBridge.gpu*`) shared by both the
+embedded Wayland compositor (`src/wayland.rs`, `WaylandSurfaceView.java`,
+`DocBridge.wayland*`) and any other Android `Surface` or background compute job:
+
+- **Graphics / surface compositing (`EGL 1.4` / `OpenGL ES 3.x`, with CPU fallback):**
+  `GpuRuntime.renderRgba`, `renderPlaceholder`, `releaseSurface`, and
+  `renderWaylandFigure` share one thread-safe EGL/GLES3 context over
+  `ANativeWindow` surfaces (releasing `eglMakeCurrent` after every draw so any
+  worker thread can drive GPU rendering safely). Zero-copy `zwp_linux_dmabuf_v1`
+  (`EGL_LINUX_DMA_BUF_EXT` when advertised) and `AHardwareBuffer`
+  (`EGL_ANDROID_image_native_buffer`) sit alongside `wl_shm` GPU texture
+  compositing with UV viewport cropping. If EGL init, `eglCreateWindowSurface`,
+  `eglMakeCurrent`, `eglSwapBuffers`, or `EGLImage` fails—or `gpuSetForceCpu(true)`
+  is set—rendering falls back automatically via `ANativeWindow_lock` ->
+  `cpu_blit_rgba` / `cpu_fill_placeholder` -> `ANativeWindow_unlockAndPost`
+  (`"cpu-software"`), and `TerminalSurface` falls back to Canvas CPU painting.
+- **Vulkan 1.1 compute & AHardwareBuffer interop:**
+  `GpuRuntime.computeF32` exposes built-in SPIR-V 1.0 compute kernels
+  (`square_plus_one`, `relu`) with deterministic CPU fallback when Vulkan is
+  absent, while `GpuRuntime.dispatchSpirv` executes arbitrary caller-supplied
+  SPIR-V binaries (`GpuContract.buildDoubleSpirvBytes()` demonstrates end-to-end
+  custom SPIR-V dispatch from Java). Both manifests declare optional
+  `glEsVersion="0x00030000"` and `vulkan.version="0x401000"` features plus
+  `hardwareAccelerated="true"`.
+
+## Testing locally
+
+Run all commands below from `emthin-android/` (except where noted).
+
+### 1. Host tests (no device required)
+
+`ghostty-vt`'s build script needs `zig` 0.16 and a host C compiler (`cc`) on
+`PATH`, and `test-java.sh` uses a JDK (`javac`, `java`, `keytool`):
+
+```sh
+cargo test --locked --offline
+cargo fmt --check
+bash test-java.sh
+```
+
+### 2. Building the APKs
+
+On an `aarch64` Linux host, run `./setup-box64-toolchain.sh` once to provision
+`.toolchain/`. Ensure the host `cc`, `zig` 0.16, and a Rust toolchain with the
+`aarch64-linux-android` target (`rustup target add aarch64-linux-android`) are
+on `PATH`. Do not invoke `./build-apk.sh` inside `nix develop -c`.
+
+```sh
+# Shipping APK (build/emthin-pad.apk) — runs the shipping manifest hygiene gate
+ANDROID_ABI=arm64-v8a ./build-apk.sh
+
+# Disposable test APK (build/test/emthin-pad-test.apk, id: com.emthin.pad.test)
+EMTHIN_TEST_PACKAGE=com.emthin.pad.test ANDROID_ABI=arm64-v8a ./build-apk.sh
+
+# Release-signed shipping APK (with optional version overrides)
+EMTHIN_RELEASE=1 \
+EMTHIN_RELEASE_KEYSTORE=/path/to/release.jks \
+EMTHIN_RELEASE_KEY_ALIAS=emthin \
+EMTHIN_RELEASE_KS_PASS='...' \
+EMTHIN_VERSION_CODE=2 EMTHIN_VERSION_NAME=0.1.1 \
+ANDROID_ABI=arm64-v8a ./build-apk.sh
+```
+
+### 3. Device lane (Waydroid or physical Android device)
+
+`device-lane.sh` defaults to Waydroid (`waydroid session start`) and targets
+the disposable `com.emthin.pad.test` package so app data clears never touch a
+personal `com.emthin.pad` install. For a physical device or custom `adb` binary,
+set `DEVICE=<serial>` and/or `ADB=/path/to/adb`.
+
+```sh
+# Focused checks
+./device-lane.sh math-preview   # math prose/equation ink + tap-to-edit + Undo (needs Python Pillow)
+./device-lane.sh phone-layout   # 360 dp portrait & landscape phone math + toolbar bounds
+./device-lane.sh wayland-gpu    # app-wide GLES3/Vulkan compute, custom SPIR-V, AHB interop & Wayland compositor
+./device-lane.sh proof-zenodo   # real mm0web + mock_zenodo.py over adb reverse
+
+# Full end-to-end device suite (set SKIP_BUILD=1 if the test APK is already built)
+LANE_WSS=1 ./device-lane.sh e2e
+# Optional TalkBack automated utterance check:
+# TALKBACK_APK=/path/to/talkback.apk LANE_WSS=1 ./device-lane.sh e2e
+```
+
+### 4. Manual testing with `mm0web` and `sandbox.zenodo.org`
+
+The shipping APK (`com.emthin.pad`) enforces `https://` for the proof backend
+and sets `ProofClientActivity` non-exported. When testing locally over loopback
+`adb reverse` with `http://127.0.0.1:18919`, use the disposable test APK
+(`com.emthin.pad.test`) or place an HTTPS reverse proxy in front of `mm0web`.
+
+1. Start `mm0web` against `https://sandbox.zenodo.org/api` with your sandbox token
+   in `ZENODO_API_KEY` (never commit or log the token) and `mm0-rs`/`mm0-c` on
+   `PATH`:
+
+   ```sh
+   MM0WEB_ZENODO_BASE=https://sandbox.zenodo.org/api \
+   ZENODO_API_KEY="$(cat ~/.config/mm0web/sandbox-token)" \
+   ../unfer/target/debug/mm0web --bind 127.0.0.1:18919 --state /tmp/mm0web-state
+   ```
+
+2. Forward the port to the device and launch `com.emthin.pad.test`:
+
+   ```sh
+   adb reverse tcp:18919 tcp:18919
+   adb shell am start -W -n com.emthin.pad.test/com.emthin.pad.MainActivity
+   ```
+
+3. In the pad, open **More → Sessions and sharing → MM0 proof**, pick a
+   `.mm0`/`.mm1` pair (or set the server URL to `http://127.0.0.1:18919`), tap
+   **Verify**, then **Publish to Zenodo** and confirm. Once the poll settles to a
+   `10.5072/zenodo.*` DOI, tap **Insert into note** to insert the proof ID and
+   DOI link at the caret.
+
 The [Android development plan](DEVELOPMENT_PLAN.md) records the current review,
 priorities, and scoped implementation tasks. The [feature specification](FEATURE_SPEC.md)
 defines the selected future behavior; the [sibling study](SIBLING_STUDY.md)

@@ -96,13 +96,21 @@
 #   gateway-wss  TLS -> upgrade -> watch attach -> grid -> banner, then the
 #                same without a generation so sessions.list supplies it
 #                (LANE_WSS=1; requires the disposable test APK and python3)
+#   proof-zenodo  real mm0web + mock_zenodo.py over adb reverse: invalid proof
+#                rejected, publish confirm/cancel, DOI poll, note insert + Undo,
+#                and missing-Zenodo-key refusal (used by e2e when mm0web exists)
+#   phone-layout  360 dp portrait (1080x2340 @ 480 dpi) and landscape (2340x1080)
+#                math-preview + compact two-row toolbar bounds check, then reset
+#   wayland-gpu  app-wide GPU (GLES3 + Vulkan 1.1 compute + custom SPIR-V +
+#                AHardwareBuffer interop + RGBA surface) & embedded Wayland
+#                compositor smoke proof (used by e2e)
 #   e2e          authorize, connect, build, install, launch, screencap,
 #                swipe, screencap, logcat, persistence, new-reset,
 #                scroll-anchor, search-replace, focus-stack, composing-ime,
 #                accessibility, diagnostics, named-document, modifier-inspector,
 #                session-pin, figure-a11y, terminal-scene, terminal-reflow,
-#                terminal-pages, terminal-lease, network-change, pull +
-#                byte-identity
+#                terminal-pages, terminal-lease, network-change, math-preview,
+#                proof-zenodo, pull + byte-identity
 #                (the repeatable device proof)
 #
 # Env overrides:
@@ -4081,7 +4089,24 @@ cmd_e2e() {
     cmd_terminal_reflow
     cmd_terminal_pages
     cmd_terminal_lease
+    cmd_wayland_gpu
     cmd_network_change
+    if python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+        cmd_math_preview
+    else
+        say "info math-preview: Python Pillow unavailable; skipped"
+    fi
+    local default_mm0web="$SCRIPT_DIR/../../unfer/target/debug/mm0web"
+    local default_mock="$SCRIPT_DIR/../../unfer/mm0web/tests/mock_zenodo.py"
+    if [ "${LANE_PROOF:-0}" = "1" ] \
+        || { [ -x "${MM0WEB_BIN:-$default_mm0web}" ] \
+             && [ -r "${MOCK_ZENODO:-$default_mock}" ] \
+             && command -v mm0-rs >/dev/null 2>&1 \
+             && command -v mm0-c >/dev/null 2>&1; }; then
+        cmd_proof_zenodo
+    else
+        say "info proof-zenodo: mm0web/mock_zenodo/mm0 checkers unavailable; skipped"
+    fi
     # Opt in with LANE_WSS=1: these steps need an APK built from the transport
     # sources plus python3 for the fixtures, so a default run against a plain
     # build would only fail on a binary that predates them.
@@ -4300,6 +4325,562 @@ cmd_austral_rule() {
     pass "native Austral rule returned complete/2 off the UI thread on arm64"
 }
 
+cmd_wayland_gpu() {
+    local log="$OUTDIR/wayland-gpu-logcat.txt"
+    say "==> wayland-gpu: app-wide GLES3/Vulkan compute & embedded Wayland compositor"
+    if [ "$PKG" != "$TEST_PACKAGE" ]; then
+        fail "wayland-gpu requires $TEST_PACKAGE"
+        return
+    fi
+    mkdir -p "$OUTDIR" || { fail "create wayland-gpu output directory"; return; }
+    D shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    D logcat -c >/dev/null 2>&1 || true
+    local fixture_b64
+    fixture_b64=$(printf '#1 GPU demo #2 \\app(#1, #2, 320, 200, "gpu-demo")' | base64 -w0)
+    if D shell am start -W -n "$ACTIVITY" \
+            --ez emthin.waylandGpuSmoke true \
+            --es emthin.fixtureB64 "$fixture_b64" >/dev/null 2>&1; then
+        pass "launched wayland-gpu smoke fixture"
+    else
+        fail "launch wayland-gpu smoke fixture"
+        return
+    fi
+    wait_for_log "$log" 'waylandGpu gpuRecovered: ' \
+        || { fail "wayland-gpu smoke did not finish CPU fallback / GPU recovery"; return; }
+    if grep -q 'waylandGpu smoke failed' "$log"; then
+        fail "wayland-gpu smoke reported an exception"
+        return
+    fi
+    if python3 - "$log" <<'PY'
+import sys
+log = open(sys.argv[1]).read()
+checks = [
+    ("capabilities", "waylandGpu capabilities:", ['"hasGles3":true', '"hasEglAndroidImageNativeBuffer":true', '"hasVulkan":true']),
+    ("compute", "waylandGpu compute:", ['"ok":true', '"sampleOk":true', '"ahbEglOk":true', '"ahbVulkanOk":true']),
+    ("appCompute", "waylandGpu appCompute:", ['"ok":true', '"usedGpu":true', '"reluOk":true', '"spirvOk":true']),
+    ("appRender", "waylandGpu appRender:", ['"rendered":true', '"backend":"egl-gles3"']),
+    ("client", "waylandGpu client:", ['"ok":true']),
+    ("frame", "waylandGpu frame:", ['"rendered":true']),
+    ("cpuFallbackRender", "waylandGpu cpuFallbackRender:", ['"rendered":true', '"mode":"cpu-shm"', '"backend":"cpu-software"']),
+    ("cpuFallbackWayland", "waylandGpu cpuFallbackWayland:", ['"rendered":true', '"backend":"cpu-software"']),
+    ("cpuFallbackCompute", "waylandGpu cpuFallbackCompute:", ['"ok":true', '"usedGpu":false', '"backend":"cpu-fallback"']),
+    ("gpuRecovered", "waylandGpu gpuRecovered:", ['"rendered":true', '"backend":"egl-gles3"']),
+]
+missing = []
+for name, prefix, needles in checks:
+    line = next((l for l in log.splitlines() if prefix in l), None)
+    if not line:
+        missing.append(f"{name}: line not found")
+        continue
+    for needle in needles:
+        if needle not in line:
+            missing.append(f"{name}: missing {needle} in {line}")
+if missing:
+    sys.exit("\n".join(missing))
+PY
+    then
+        pass "app-wide GPU compute/render, CPU fallback, and GPU recovery verified on device"
+    else
+        fail "wayland-gpu assertions failed (see $log)"
+    fi
+}
+
+cmd_proof_zenodo() {
+    say "==> proof-zenodo: MM0 verify/reject, Zenodo DOI poll, insert + Undo, no-key refusal"
+    if [ "$PKG" != "$TEST_PACKAGE" ]; then
+        fail "proof-zenodo requires $TEST_PACKAGE"
+        return
+    fi
+    local mm0web="${MM0WEB_BIN:-$SCRIPT_DIR/../../unfer/target/debug/mm0web}"
+    local mock="${MOCK_ZENODO:-$SCRIPT_DIR/../../unfer/mm0web/tests/mock_zenodo.py}"
+    if [ ! -x "$mm0web" ]; then
+        fail "mm0web binary not executable at $mm0web"
+        return
+    fi
+    if [ ! -r "$mock" ]; then
+        fail "mock_zenodo.py not readable at $mock"
+        return
+    fi
+    if ! command -v mm0-rs >/dev/null 2>&1 || ! command -v mm0-c >/dev/null 2>&1; then
+        fail "mm0-rs and mm0-c must be on PATH for proof-zenodo"
+        return
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        fail "curl is required for proof-zenodo"
+        return
+    fi
+    mkdir -p "$OUTDIR" || { fail "create proof-zenodo output directory"; return; }
+
+    local work mock_port=18931 web_port=18932
+    work=$(mktemp -d "${TMPDIR:-/tmp}/emthin-proof-zenodo.XXXXXX")
+    local mock_pid="" web_pid=""
+    local log="$OUTDIR/proof-zenodo-logcat.txt"
+    local ui="$OUTDIR/proof-zenodo-ui.xml"
+
+    cleanup_proof_zenodo() {
+        [ -n "${web_pid:-}" ] && kill "$web_pid" 2>/dev/null || true
+        [ -n "${mock_pid:-}" ] && kill "$mock_pid" 2>/dev/null || true
+        wait "${web_pid:-}" 2>/dev/null || true
+        wait "${mock_pid:-}" 2>/dev/null || true
+        D reverse --remove "tcp:$web_port" >/dev/null 2>&1 || true
+        rm -rf "$work"
+    }
+
+    start_mm0web_for_proof() {
+        local api_key="$1"
+        [ -n "${web_pid:-}" ] && kill "$web_pid" 2>/dev/null || true
+        [ -n "${web_pid:-}" ] && wait "$web_pid" 2>/dev/null || true
+        web_pid=""
+        env \
+            MM0WEB_ZENODO_BASE="http://127.0.0.1:$mock_port/api" \
+            ZENODO_API_KEY="$api_key" \
+            MM0WEB_PUBLIC_URL="http://127.0.0.1:$web_port" \
+            MM0WEB_RATE=200 \
+            MM0WEB_DAILY_CAP=50 \
+            "$mm0web" --bind "127.0.0.1:$web_port" --state "$work/state" >"$work/web.log" 2>&1 &
+        web_pid=$!
+        local i=0
+        while [ "$i" -lt 40 ]; do
+            if curl -sS -m 2 "http://127.0.0.1:$web_port/healthz" 2>/dev/null \
+                    | grep -q 'checker: ready'; then
+                return 0
+            fi
+            sleep 0.25
+            i=$((i + 1))
+        done
+        return 1
+    }
+
+    mock_stat() {
+        python3 - "$mock_port" "$1" <<'PY'
+import json, sys, urllib.request
+with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/__stats", timeout=3) as r:
+    data = json.load(r)
+print(data.get(sys.argv[2], ""))
+PY
+    }
+
+    env MOCK_PORT="$mock_port" python3 "$mock" >"$work/mock.log" 2>&1 &
+    mock_pid=$!
+    local tries=0
+    while [ "$tries" -lt 30 ]; do
+        if curl -sS -m 2 -o /dev/null "http://127.0.0.1:$mock_port/__stats" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    if [ "$tries" -ge 30 ]; then
+        fail "mock_zenodo.py did not come up"
+        cleanup_proof_zenodo
+        return
+    fi
+    if ! start_mm0web_for_proof "mock-key"; then
+        fail "mm0web did not become ready (/healthz)"
+        cleanup_proof_zenodo
+        return
+    fi
+    if ! D reverse "tcp:$web_port" "tcp:$web_port" >/dev/null 2>&1; then
+        fail "adb reverse tcp:$web_port failed"
+        cleanup_proof_zenodo
+        return
+    fi
+    pass "started mock_zenodo + mm0web over adb reverse"
+
+    # Case 1: launch a math note, then reject an invalid MM0 pair in ProofClientActivity.
+    cmd_clear_data || { cleanup_proof_zenodo; return; }
+    local note_b64 spec_b64 bad_b64 nat_b64 before_len after_len bounds
+    note_b64=$(printf 'Proof note\n\n$x^2 + y^2 = z^2$\n\nStatus below:\n' | base64 -w0)
+    spec_b64=$(printf 'sort Prop;\n' | base64 -w0)
+    bad_b64=$(printf 'sort Prop;\nsort Nope;\n' | base64 -w0)
+    nat_b64=$(printf 'sort Nat;\n' | base64 -w0)
+
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" --es emthin.fixtureB64 "$note_b64" >/dev/null 2>&1; then
+        fail "launch math+proof note"
+        cleanup_proof_zenodo
+        return
+    fi
+    wait_for_log "$log" 'applyChunk total 1 pages 1 start 0' \
+        || { fail "math+proof note did not render"; cleanup_proof_zenodo; return; }
+    before_len=$(last_text_len "$log")
+    if [ -z "$before_len" ] || [ "$before_len" -le 0 ]; then
+        fail "could not read initial note length"
+        cleanup_proof_zenodo
+        return
+    fi
+    pass "rendered math note (textLen $before_len)"
+
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$PKG/com.emthin.pad.ProofClientActivity" \
+        --ez emthin.proof_reset true \
+        --es emthin.proof_base "http://127.0.0.1:$web_port" \
+        --es emthin.proof_spec_b64 "$spec_b64" \
+        --es emthin.proof_text_b64 "$bad_b64" >/dev/null 2>&1; then
+        fail "launch ProofClientActivity with invalid pair"
+        cleanup_proof_zenodo
+        return
+    fi
+    wait_for_ui 'text="Verify"' 20 "$ui" \
+        || { fail "Verify button did not appear"; cleanup_proof_zenodo; return; }
+    bounds=$(node_bounds 'text="Verify"')
+    tap_center "$bounds"
+    wait_for_log "$log" 'proof phase result kind REJECTED verified false' \
+        || { fail "invalid pair was not rejected"; cleanup_proof_zenodo; return; }
+    pass "invalid MM0 pair rejected with verified=false"
+    cmd_uidump "$ui" >/dev/null || { cleanup_proof_zenodo; return; }
+    if grep -q 'rejected at stage mm0-' "$ui" \
+        && ! grep -q '\$ mm0-rs compile' "$ui" \
+        && grep -o '<node[^>]*text="Insert into note"[^>]*>' "$ui" | grep -q 'enabled="false"'; then
+        pass "rejection diagnostic shown (without command banner) and Insert stays disabled"
+    else
+        fail "rejection UI state or disabled Insert button missing"
+        cleanup_proof_zenodo
+        return
+    fi
+    if [ "$(mock_stat deposits)" = "0" ] && [ "$(mock_stat publishes)" = "0" ]; then
+        pass "rejected proof made zero Zenodo deposits"
+    else
+        fail "rejected proof touched mock Zenodo"
+        cleanup_proof_zenodo
+        return
+    fi
+
+    # Case 2: valid pair verify, cancel confirmation, confirm via MainActivity toolbar launch,
+    # poll to published + DOI, insert into math note, and Undo back to exact before_len.
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$PKG/com.emthin.pad.ProofClientActivity" \
+        --ez emthin.proof_reset true \
+        --es emthin.proof_base "http://127.0.0.1:$web_port" \
+        --es emthin.proof_spec_b64 "$spec_b64" \
+        --es emthin.proof_text_b64 "$spec_b64" >/dev/null 2>&1; then
+        fail "launch ProofClientActivity with valid pair"
+        cleanup_proof_zenodo
+        return
+    fi
+    wait_for_ui 'text="Verify"' 20 "$ui" \
+        || { fail "Verify button did not appear for valid pair"; cleanup_proof_zenodo; return; }
+    bounds=$(node_bounds 'text="Verify"')
+    tap_center "$bounds"
+    wait_for_log "$log" 'proof phase result kind ACCEPTED verified true' \
+        || { fail "valid pair did not verify"; cleanup_proof_zenodo; return; }
+    pass "valid MM0 pair verified"
+
+    bounds=$(node_bounds 'text="Publish to Zenodo"') \
+        || { fail "Publish to Zenodo button missing"; cleanup_proof_zenodo; return; }
+    tap_center "$bounds"
+    wait_for_ui 'text="Publish to Zenodo?"' 20 "$ui" \
+        || { fail "publish confirmation dialog did not appear"; cleanup_proof_zenodo; return; }
+    bounds=$(node_bounds 'text="Cancel"')
+    tap_center "$bounds"
+    wait_for_log "$log" 'proof phase publish-cancelled' \
+        || { fail "cancelling publish was not logged"; cleanup_proof_zenodo; return; }
+    if [ "$(mock_stat deposits)" = "0" ]; then
+        pass "cancelled publish left mock Zenodo untouched"
+    else
+        fail "cancelled publish created a Zenodo deposit"
+        cleanup_proof_zenodo
+        return
+    fi
+
+    # Return to the existing MainActivity and re-open ProofClientActivity from
+    # the toolbar so startActivityForResult + document binding + persisted
+    # fixture pair are exercised.
+    D shell am start -W --activity-clear-top --activity-single-top -n "$ACTIVITY" >/dev/null 2>&1 || true
+    wait_for_ui 'content-desc="More actions"' 20 "$ui" \
+        || { fail "did not return to MainActivity"; cleanup_proof_zenodo; return; }
+    if ! tap_toolbar_menu "Sessions and sharing" "MM0 proof"; then
+        fail "could not open MM0 proof from Sessions and sharing menu"
+        cleanup_proof_zenodo
+        return
+    fi
+    wait_for_ui 'text="Publish to Zenodo"' 20 "$ui" \
+        || { fail "ProofClientActivity did not open from menu"; cleanup_proof_zenodo; return; }
+    D logcat -c >/dev/null 2>&1 || true
+    bounds=$(node_bounds 'text="Publish to Zenodo"')
+    tap_center "$bounds"
+    wait_for_ui 'text="Publish to Zenodo?"' 20 "$ui" \
+        || { fail "publish confirmation dialog missing from toolbar launch"; cleanup_proof_zenodo; return; }
+    bounds=$(node_bounds 'text="Publish"')
+    tap_center "$bounds"
+    wait_for_log "$log" 'proof phase result kind QUEUED' \
+        || { fail "publish did not queue on mm0web"; cleanup_proof_zenodo; return; }
+    wait_for_log "$log" 'proof phase status id .* state published doi 10\.[0-9][0-9]*/zenodo\.' \
+        || { fail "background poll did not reach published DOI"; cleanup_proof_zenodo; return; }
+    pass "published to mock Zenodo and polled to settled DOI"
+    if [ "$(mock_stat deposits)" = "1" ] && [ "$(mock_stat publishes)" = "1" ]; then
+        pass "mock Zenodo recorded exactly 1 deposit and 1 publish"
+    else
+        fail "unexpected mock Zenodo stats after publish"
+        cleanup_proof_zenodo
+        return
+    fi
+
+    cmd_uidump "$ui" >/dev/null || { cleanup_proof_zenodo; return; }
+    if grep -Eq 'https://doi\.org/10\.[0-9]+/zenodo\.' "$ui"; then
+        pass "DOI link visible in ProofClientActivity"
+    else
+        fail "DOI link missing from ProofClientActivity UI"
+        cleanup_proof_zenodo
+        return
+    fi
+
+    D logcat -c >/dev/null 2>&1 || true
+    bounds=$(node_bounds 'text="Insert into note"') \
+        || { fail "Insert into note button missing"; cleanup_proof_zenodo; return; }
+    tap_center "$bounds"
+    wait_for_log "$log" 'proof inserted .* state published' \
+        || { fail "MainActivity did not insert proof result"; cleanup_proof_zenodo; return; }
+    wait_for_log "$log" 'applyState .*textLen ' \
+        || { fail "MainActivity did not sync inserted proof result"; cleanup_proof_zenodo; return; }
+    after_len=$(last_text_len "$log")
+    if [ -n "$after_len" ] && [ "$after_len" -gt "$before_len" ]; then
+        pass "proof ID and DOI link inserted into math note ($before_len -> $after_len)"
+    else
+        fail "note length did not increase after proof insertion"
+        cleanup_proof_zenodo
+        return
+    fi
+
+    wait_for_ui 'text="Undo"' 20 "$ui" \
+        || { fail "Undo button did not reappear on MainActivity"; cleanup_proof_zenodo; return; }
+    if ! grep -o '<node[^>]*text="Undo"[^>]*>' "$ui" | grep -q 'enabled="true"'; then
+        fail "Undo button is not enabled after proof insertion"
+        cleanup_proof_zenodo
+        return
+    fi
+    D logcat -c >/dev/null 2>&1 || true
+    bounds=$(node_bounds 'text="Undo"') \
+        || { fail "Undo button bounds missing"; cleanup_proof_zenodo; return; }
+    tap_center "$bounds"
+    wait_for_log "$log" "applyState .*textLen $before_len" \
+        || { fail "Undo did not restore note length $before_len"; cleanup_proof_zenodo; return; }
+    pass "Undo restored the math note to textLen $before_len"
+
+    # Case 3: missing Zenodo key on backend is reported honestly (NOT_PUBLISHED).
+    if ! start_mm0web_for_proof ""; then
+        fail "mm0web restart without ZENODO_API_KEY failed"
+        cleanup_proof_zenodo
+        return
+    fi
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$PKG/com.emthin.pad.ProofClientActivity" \
+        --ez emthin.proof_reset true \
+        --es emthin.proof_base "http://127.0.0.1:$web_port" \
+        --es emthin.proof_spec_b64 "$nat_b64" \
+        --es emthin.proof_text_b64 "$nat_b64" >/dev/null 2>&1; then
+        fail "launch ProofClientActivity for no-key test"
+        cleanup_proof_zenodo
+        return
+    fi
+    wait_for_ui 'text="Publish to Zenodo"' 20 "$ui" \
+        || { fail "Publish button missing in no-key test"; cleanup_proof_zenodo; return; }
+    bounds=$(node_bounds 'text="Publish to Zenodo"')
+    tap_center "$bounds"
+    wait_for_ui 'text="Publish to Zenodo?"' 20 "$ui" \
+        || { fail "Publish confirm missing in no-key test"; cleanup_proof_zenodo; return; }
+    bounds=$(node_bounds 'text="Publish"')
+    tap_center "$bounds"
+    wait_for_log "$log" 'proof phase result kind NOT_PUBLISHED verified true' \
+        || { fail "missing Zenodo key was not reported as NOT_PUBLISHED"; cleanup_proof_zenodo; return; }
+    cmd_uidump "$ui" >/dev/null || { cleanup_proof_zenodo; return; }
+    if grep -q 'ZENODO_API_KEY' "$ui" && [ "$(mock_stat deposits)" = "1" ]; then
+        pass "unconfigured Zenodo refused honestly without touching mock Zenodo"
+    else
+        fail "no-key error message missing or mock stats changed"
+    fi
+
+    cleanup_proof_zenodo
+}
+
+cmd_phone_layout() {
+    say "==> phone-layout: 360 dp portrait and landscape math-preview + toolbar bounds"
+    if [ "$PKG" != "$TEST_PACKAGE" ]; then
+        fail "phone-layout requires $TEST_PACKAGE"
+        return
+    fi
+    if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+        fail "phone-layout requires Python Pillow"
+        return
+    fi
+    mkdir -p "$OUTDIR" || { fail "create phone-layout output directory"; return; }
+
+    restore_display() {
+        D shell wm size reset >/dev/null 2>&1 || true
+        D shell wm density reset >/dev/null 2>&1 || true
+    }
+    trap restore_display RETURN
+
+    # 360 x 780 dp portrait phone (1080x2340 at 480 dpi)
+    if ! D shell wm size 1080x2340 >/dev/null 2>&1 \
+        || ! D shell wm density 480 >/dev/null 2>&1; then
+        fail "set 360 dp portrait phone size/density"
+        return
+    fi
+    sleep 1
+    local before_fails=$FAILURES
+    cmd_math_preview
+    if [ "$FAILURES" -eq "$before_fails" ]; then
+        pass "360 dp portrait math-preview passed"
+    fi
+
+    # Verify compact toolbar controls sit inside the 1080 px portrait width.
+    local ui="$OUTDIR/phone-portrait-ui.xml"
+    cmd_uidump "$ui" || return
+    if python3 - "$ui" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+want = {
+    "Open": 'text="Open"',
+    "Save": 'text="Save"',
+    "Undo": 'text="Undo"',
+    "Find": 'text="Find"',
+    "Edit": 'text="Edit"',
+    "More actions": 'content-desc="More actions"',
+}
+nodes = list(root.iter("node"))
+for label in ("Open", "Save", "Undo", "Find", "Edit"):
+    node = next((n for n in nodes if n.get("text") == label), None)
+    assert node is not None, f"missing toolbar button {label}"
+    x1, y1, x2, y2 = map(int, re.findall(r"\d+", node.get("bounds", "")))
+    assert 0 <= x1 < x2 <= 1080 and y1 < y2, f"out-of-bounds {label}: {(x1, y1, x2, y2)}"
+more = next((n for n in nodes if n.get("content-desc") == "More actions"), None)
+assert more is not None, "missing More actions button"
+x1, y1, x2, y2 = map(int, re.findall(r"\d+", more.get("bounds", "")))
+assert 0 <= x1 < x2 <= 1080 and y1 < y2, f"out-of-bounds More actions: {(x1, y1, x2, y2)}"
+PY
+    then
+        pass "compact toolbar buttons fit inside 360 dp portrait width"
+    else
+        fail "compact toolbar clipped or missing at 360 dp portrait"
+    fi
+
+    # 780 x 360 dp landscape phone (2340x1080 at 480 dpi): scroll past the
+    # scaled A4 top margin inside the 148 dp viewport so the equation is visible.
+    if ! D shell wm size 2340x1080 >/dev/null 2>&1 \
+        || ! D shell wm density 480 >/dev/null 2>&1; then
+        fail "set 360 dp landscape phone size/density"
+        return
+    fi
+    sleep 1
+    cmd_clear_data || return
+    local llog="$OUTDIR/phone-landscape-logcat.txt"
+    local lui="$OUTDIR/phone-landscape-ui.xml"
+    local lshot="$OUTDIR/phone-landscape.png"
+    local ledited="$OUTDIR/phone-landscape-edit.xml"
+    local lundone="$OUTDIR/phone-landscape-undo.xml"
+    local lfixture
+    lfixture=$(printf 'Preview ink\n\n$x^2 + y^2 = z^2$\n\nAfter equation\n' | base64 -w0)
+    D logcat -c >/dev/null 2>&1 || true
+    if ! D shell am start -W -n "$ACTIVITY" --es emthin.fixtureB64 "$lfixture" >/dev/null 2>&1; then
+        fail "launch math fixture in 360 dp landscape"
+        return
+    fi
+    wait_for_log "$llog" 'applyChunk total 1 pages 1 start 0' \
+        || { fail "360 dp landscape math preview did not apply its page"; return; }
+    wait_for_log "$llog" 'diagnostics .*count 0 errors 0 warnings 0 notes [1-9]' \
+        || { fail "360 dp landscape math variables triggered non-note diagnostics"; return; }
+    D shell input swipe 1170 760 1170 580 300 >/dev/null 2>&1 || true
+    sleep 0.5
+    cmd_uidump "$lui" || return
+    cmd_screencap "$lshot" >/dev/null || return
+
+    local lglyph
+    if lglyph=$(python3 - "$lui" "$lshot" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+from PIL import Image
+
+nodes = list(ET.parse(sys.argv[1]).iter("node"))
+for label in ("Open", "Save", "Undo", "Find", "Edit"):
+    node = next((n for n in nodes if n.get("text") == label), None)
+    assert node is not None, f"missing toolbar button {label}"
+    x1, y1, x2, y2 = map(int, re.findall(r"\d+", node.get("bounds", "")))
+    assert 0 <= x1 < x2 <= 2340 and y1 < y2, f"out-of-bounds {label}: {(x1, y1, x2, y2)}"
+more = next((n for n in nodes if n.get("content-desc") == "More actions"), None)
+assert more is not None, "missing More actions button"
+mx1, my1, mx2, my2 = map(int, re.findall(r"\d+", more.get("bounds", "")))
+assert 0 <= mx1 < mx2 <= 2340 and my1 < my2, f"out-of-bounds More actions"
+
+scroll = next((n for n in nodes if n.get("class") == "android.widget.ScrollView"), None)
+assert scroll is not None, "missing ScrollView"
+sx1, sy1, sx2, sy2 = map(int, re.findall(r"\d+", scroll.get("bounds", "")))
+block = next((n for n in nodes if n.get("text", "").startswith("Preview ink")), None)
+assert block is not None, "math preview accessibility bounds are absent"
+bx1, by1, bx2, by2 = map(int, re.findall(r"\d+", block.get("bounds", "")))
+crop_box = (max(sx1, bx1), max(sy1, by1), min(sx2, bx2), min(sy2, by2))
+assert crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1], f"empty visible crop: {crop_box}"
+
+image = Image.open(sys.argv[2]).convert("RGB").crop(crop_box)
+width, height = image.size
+bands = []
+for y in range(height):
+    if sum(min(image.getpixel((x, y))) > 160 for x in range(width)) < 3:
+        continue
+    if not bands or y - bands[-1][-1] > max(2, height // 40):
+        bands.append([])
+    bands[-1].append(y)
+bands = [b for b in bands if len(b) >= 3]
+if len(bands) < 2:
+    sys.exit(f"expected prose + equation bands inside visible ScrollView, got {len(bands)}")
+equation = bands[1]
+ey = equation[2 * len(equation) // 3]
+ex = next(x for x in range(width) if min(image.getpixel((x, ey))) > 160)
+print(ex + crop_box[0], ey + crop_box[1])
+PY
+    )
+    then
+        pass "360 dp landscape toolbar fits and equation is visible after scrolling"
+    else
+        fail "360 dp landscape math preview bitmap or toolbar check failed ($lshot)"
+        return
+    fi
+
+    local lx ly
+    read -r lx ly <<<"$lglyph"
+    if ! D shell input tap "$lx" "$ly" >/dev/null 2>&1 ||
+            ! D shell input text q >/dev/null 2>&1; then
+        fail "tap and edit displayed equation in 360 dp landscape"
+        return
+    fi
+    cmd_uidump "$ledited" || return
+    if ! D shell input keycombination 113 54 >/dev/null 2>&1; then
+        fail "send Ctrl+Z in 360 dp landscape"
+        return
+    fi
+    cmd_uidump "$lundone" || return
+    if python3 - "$ledited" "$lundone" <<'PY'
+import sys, xml.etree.ElementTree as ET
+
+def focused_source(path):
+    for node in ET.parse(path).iter("node"):
+        if (node.get("content-desc") == "Editable text without modifiers"
+                and node.get("focused") == "true"):
+            return node.get("text", "")
+    return ""
+
+original = "$x^2 + y^2 = z^2$"
+edited = focused_source(sys.argv[1])
+if not edited.startswith("$") or edited.count("q") != 1 or edited.replace("q", "") != original:
+    sys.exit(f"360 dp landscape edit mismatch: {edited!r}")
+if focused_source(sys.argv[2]) != original:
+    sys.exit("360 dp landscape Undo did not restore equation with focus")
+PY
+    then
+        pass "360 dp landscape equation tap-to-edit and Undo passed"
+    else
+        fail "360 dp landscape equation edit or Undo failed"
+    fi
+
+    restore_display
+    trap - RETURN
+    if D shell wm size 2>/dev/null | tr -d '\r' | grep -q 'Override size'; then
+        fail "wm size override did not reset cleanly"
+    else
+        pass "restored native display size and density"
+    fi
+}
+
 # ---- dispatch ---------------------------------------------------------
 
 cmd="${1:-e2e}"
@@ -4347,7 +4928,10 @@ case "$cmd" in
     paired-lease)    cmd_paired_lease ;;
     enroll)          cmd_enroll ;;
     austral-rule) cmd_austral_rule ;;
+    wayland-gpu) cmd_wayland_gpu ;;
     history-preview) cmd_history_preview ;;
+    proof-zenodo) cmd_proof_zenodo ;;
+    phone-layout) cmd_phone_layout ;;
     e2e)       cmd_e2e ;;
     *) say "unknown command: $cmd"; usage >&2; exit 2 ;;
 esac

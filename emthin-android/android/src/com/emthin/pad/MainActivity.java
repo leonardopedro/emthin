@@ -153,6 +153,20 @@ public class MainActivity extends Activity {
     /** Touch selection state; the long-press timeout may be pending. */
     private LinearLayout selectionBar;
     private RenderedPage touchSelectionPage;
+    private long waylandCompositor;
+    private String waylandSocketPath = "";
+    private final Runnable waylandFramePump = new Runnable() {
+        @Override public void run() {
+            if (waylandCompositor == 0) return;
+            boolean active = false;
+            for (RenderedPage p : renderedPages) {
+                if (p.requestWaylandFrames()) active = true;
+            }
+            if (active) {
+                main.postDelayed(this, 66);
+            }
+        }
+    };
     private int touchSelectionAnchor = -1;
     private int touchSelectionHandle = -1;
     private float touchDownX, touchDownY;
@@ -219,6 +233,8 @@ public class MainActivity extends Activity {
     /** Provider identity remembered at Open or successful Save. */
     private ProviderIo.Stamp fileStamp;
     private PendingPicker pendingPicker;
+    private String pendingProofDocId;
+    private PendingProofInsert pendingProofInsert;
     private FileOperation activeFile;
     private FileOperation owedFileSave;
     private FileOperation waitingFile;
@@ -595,6 +611,8 @@ public class MainActivity extends Activity {
                 ? savedInstanceState.getInt(PREF_SCROLL_WIDTH, 0) : 0;
         final String bundleDocument = savedInstanceState != null
                 ? savedInstanceState.getString("recovery_document_id") : null;
+        pendingProofDocId = savedInstanceState != null
+                ? savedInstanceState.getString("pending_proof_doc_id") : null;
         bundleShowMarkers = savedInstanceState != null && savedInstanceState.containsKey(PREF_SHOW_MARKERS)
                 ? savedInstanceState.getBoolean(PREF_SHOW_MARKERS) : null;
         bundleInspectorOpen = savedInstanceState != null && savedInstanceState.containsKey("inspectorOpen")
@@ -635,6 +653,242 @@ public class MainActivity extends Activity {
                 }
             }, "emthin-austral-rule").start();
         }
+
+        waylandSocketPath = new java.io.File(getFilesDir(), "wayland-0").getAbsolutePath();
+        waylandCompositor = DocBridge.waylandStart(waylandSocketPath);
+        GpuRuntime.get().execute(new Runnable() {
+            @Override public void run() {
+                GpuContract.Capabilities caps = GpuRuntime.get().refreshCapabilities();
+                trace("gpu", "summary", caps.summary(),
+                        "gles3", caps.hasGles3, "vulkan", caps.hasVulkan);
+            }
+        });
+
+        if (testIntent.getBooleanExtra("emthin.waylandGpuSmoke", false)) {
+            runWaylandGpuSmoke();
+        }
+    }
+
+    private void runWaylandGpuSmoke() {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    Log.i("emthin-pad", "waylandGpu capabilities: " + GpuRuntime.get().capabilitiesJson());
+                    Log.i("emthin-pad", "waylandGpu compute: " + GpuRuntime.get().computeSmokeJson());
+
+                    float[] reluIn = new float[] {-2.0f, -0.5f, 0.0f, 1.5f, 4.0f};
+                    GpuContract.ComputeResult relu = GpuRuntime.get().computeF32("relu", reluIn);
+                    boolean reluOk = relu.ok && relu.floatValues.length == 5
+                            && Math.abs(relu.floatValues[0]) < 1e-4f
+                            && Math.abs(relu.floatValues[1]) < 1e-4f
+                            && Math.abs(relu.floatValues[2]) < 1e-4f
+                            && Math.abs(relu.floatValues[3] - 1.5f) < 1e-4f
+                            && Math.abs(relu.floatValues[4] - 4.0f) < 1e-4f;
+
+                    float[] dblIn = new float[] {1.25f, -3.0f, 4.5f};
+                    GpuContract.ComputeResult dbl = GpuRuntime.get().dispatchSpirv(
+                            GpuContract.buildDoubleSpirvBytes(),
+                            GpuContract.floatsToLeBytes(dblIn),
+                            dblIn.length * 4,
+                            dblIn.length, 1, 1);
+                    float[] dblOut = dbl.bytesAsFloatsLe();
+                    boolean spirvOk = dbl.ok && dblOut.length == 3
+                            && Math.abs(dblOut[0] - 2.5f) < 1e-4f
+                            && Math.abs(dblOut[1] + 6.0f) < 1e-4f
+                            && Math.abs(dblOut[2] - 9.0f) < 1e-4f;
+
+                    JSONObject appCompute = new JSONObject();
+                    appCompute.put("ok", reluOk && spirvOk);
+                    appCompute.put("usedGpu", relu.usedGpu && dbl.usedGpu);
+                    appCompute.put("reluOk", reluOk);
+                    appCompute.put("spirvOk", spirvOk);
+                    appCompute.put("reluBackend", relu.backend);
+                    appCompute.put("spirvBackend", dbl.backend);
+                    appCompute.put("device", dbl.device);
+                    Log.i("emthin-pad", "waylandGpu appCompute: " + appCompute.toString());
+
+                    android.graphics.SurfaceTexture appTex = new android.graphics.SurfaceTexture(0);
+                    appTex.setDefaultBufferSize(64, 64);
+                    Surface appSurf = new Surface(appTex);
+                    byte[] rgba = new byte[64 * 64 * 4];
+                    for (int i = 0; i < rgba.length; i += 4) {
+                        rgba[i] = 0x20;
+                        rgba[i + 1] = (byte) 0x96;
+                        rgba[i + 2] = (byte) 0xf3;
+                        rgba[i + 3] = (byte) 0xff;
+                    }
+                    String appRenderJson = GpuRuntime.get().submit(
+                            new java.util.concurrent.Callable<String>() {
+                                @Override public String call() {
+                                    return DocBridge.gpuRenderRgba(
+                                            "app:smoke-rgba", appSurf, rgba, 64, 64, 64 * 4,
+                                            0f, 0f, 1f, 1f);
+                                }
+                            }).get();
+                    GpuRuntime.get().submit(new java.util.concurrent.Callable<Void>() {
+                        @Override public Void call() {
+                            GpuRuntime.get().releaseSurface("app", "smoke-rgba");
+                            return null;
+                        }
+                    }).get();
+                    appSurf.release();
+                    appTex.release();
+                    Log.i("emthin-pad", "waylandGpu appRender: " + appRenderJson);
+
+                    // Wait briefly for the first rendered \app figure view before connecting the client.
+                    String targetKey = "f0";
+                    Surface viewSurface = null;
+                    long deadline = System.currentTimeMillis() + 8000L;
+                    while (System.currentTimeMillis() < deadline && viewSurface == null) {
+                        final String[] foundKey = new String[1];
+                        final Surface[] foundSurf = new Surface[1];
+                        final java.util.concurrent.CountDownLatch latch =
+                                new java.util.concurrent.CountDownLatch(1);
+                        main.post(new Runnable() {
+                            @Override public void run() {
+                                for (RenderedPage page : renderedPages) {
+                                    if (page.waylandSurfaces == null) continue;
+                                    for (WaylandSurfaceView view : page.waylandSurfaces) {
+                                        if (view != null && view.hasValidSurface()) {
+                                            foundKey[0] = view.getFigureKey();
+                                            foundSurf[0] = view.getCurrentSurface();
+                                            break;
+                                        }
+                                    }
+                                    if (foundSurf[0] != null) break;
+                                }
+                                latch.countDown();
+                            }
+                        });
+                        latch.await(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (foundSurf[0] != null) {
+                            targetKey = foundKey[0];
+                            viewSurface = foundSurf[0];
+                            break;
+                        }
+                        Thread.sleep(100);
+                    }
+
+                    String clientJson = DocBridge.waylandSmokeClient(waylandSocketPath, "gpu-demo");
+                    Log.i("emthin-pad", "waylandGpu client: " + clientJson);
+
+                    final String renderKey = targetKey;
+                    final Surface finalSurf = viewSurface;
+                    android.graphics.SurfaceTexture fallbackTex = null;
+                    Surface fallbackSurf = null;
+                    final Surface targetSurface;
+                    if (finalSurf != null && finalSurf.isValid()) {
+                        targetSurface = finalSurf;
+                    } else {
+                        fallbackTex = new android.graphics.SurfaceTexture(0);
+                        fallbackTex.setDefaultBufferSize(320, 200);
+                        fallbackSurf = new Surface(fallbackTex);
+                        targetSurface = fallbackSurf;
+                    }
+                    String frameJson = GpuRuntime.get().submit(
+                            new java.util.concurrent.Callable<String>() {
+                                @Override public String call() {
+                                    return DocBridge.waylandRenderFigure(
+                                            waylandCompositor, renderKey, targetSurface,
+                                            0f, 0f, 1f, 1f);
+                                }
+                            }).get();
+                    if (fallbackSurf != null) {
+                        GpuRuntime.get().submit(new java.util.concurrent.Callable<Void>() {
+                            @Override public Void call() {
+                                GpuRuntime.get().releaseSurface("wayland", renderKey);
+                                return null;
+                            }
+                        }).get();
+                        fallbackSurf.release();
+                        fallbackTex.release();
+                    }
+                    Log.i("emthin-pad", "waylandGpu frame: " + frameJson);
+
+                    // Verify live CPU software rendering & compute fallback and GPU recovery.
+                    GpuRuntime.get().setForceCpu(true);
+
+                    android.graphics.SurfaceTexture cpuAppTex = new android.graphics.SurfaceTexture(0);
+                    cpuAppTex.setDefaultBufferSize(64, 64);
+                    final Surface cpuAppSurf = new Surface(cpuAppTex);
+                    String cpuAppRenderJson = GpuRuntime.get().submit(
+                            new java.util.concurrent.Callable<String>() {
+                                @Override public String call() {
+                                    return DocBridge.gpuRenderRgba(
+                                            "app:smoke-cpu-rgba", cpuAppSurf, rgba, 64, 64, 64 * 4,
+                                            0f, 0f, 1f, 1f);
+                                }
+                            }).get();
+                    GpuRuntime.get().submit(new java.util.concurrent.Callable<Void>() {
+                        @Override public Void call() {
+                            GpuRuntime.get().releaseSurface("app", "smoke-cpu-rgba");
+                            return null;
+                        }
+                    }).get();
+                    cpuAppSurf.release();
+                    cpuAppTex.release();
+                    Log.i("emthin-pad", "waylandGpu cpuFallbackRender: " + cpuAppRenderJson);
+
+                    android.graphics.SurfaceTexture cpuWlTex = new android.graphics.SurfaceTexture(0);
+                    cpuWlTex.setDefaultBufferSize(320, 200);
+                    final Surface cpuWlSurf = new Surface(cpuWlTex);
+                    String cpuWlJson = GpuRuntime.get().submit(
+                            new java.util.concurrent.Callable<String>() {
+                                @Override public String call() {
+                                    return DocBridge.waylandRenderFigure(
+                                            waylandCompositor, renderKey, cpuWlSurf,
+                                            0f, 0f, 1f, 1f);
+                                }
+                            }).get();
+                    GpuRuntime.get().submit(new java.util.concurrent.Callable<Void>() {
+                        @Override public Void call() {
+                            GpuRuntime.get().releaseSurface("wayland", renderKey);
+                            return null;
+                        }
+                    }).get();
+                    cpuWlSurf.release();
+                    cpuWlTex.release();
+                    Log.i("emthin-pad", "waylandGpu cpuFallbackWayland: " + cpuWlJson);
+
+                    GpuContract.ComputeResult cpuRelu = GpuRuntime.get().computeF32("relu", reluIn);
+                    boolean cpuReluOk = cpuRelu.ok && !cpuRelu.usedGpu
+                            && "cpu-fallback".equals(cpuRelu.backend)
+                            && cpuRelu.floatValues.length == 5
+                            && Math.abs(cpuRelu.floatValues[0]) < 1e-4f
+                            && Math.abs(cpuRelu.floatValues[3] - 1.5f) < 1e-4f
+                            && Math.abs(cpuRelu.floatValues[4] - 4.0f) < 1e-4f;
+                    JSONObject cpuComputeObj = new JSONObject();
+                    cpuComputeObj.put("ok", cpuReluOk);
+                    cpuComputeObj.put("usedGpu", cpuRelu.usedGpu);
+                    cpuComputeObj.put("backend", cpuRelu.backend);
+                    Log.i("emthin-pad", "waylandGpu cpuFallbackCompute: " + cpuComputeObj.toString());
+
+                    GpuRuntime.get().setForceCpu(false);
+                    android.graphics.SurfaceTexture recAppTex = new android.graphics.SurfaceTexture(0);
+                    recAppTex.setDefaultBufferSize(64, 64);
+                    final Surface recAppSurf = new Surface(recAppTex);
+                    String recJson = GpuRuntime.get().submit(
+                            new java.util.concurrent.Callable<String>() {
+                                @Override public String call() {
+                                    return DocBridge.gpuRenderRgba(
+                                            "app:smoke-recover-rgba", recAppSurf, rgba, 64, 64, 64 * 4,
+                                            0f, 0f, 1f, 1f);
+                                }
+                            }).get();
+                    GpuRuntime.get().submit(new java.util.concurrent.Callable<Void>() {
+                        @Override public Void call() {
+                            GpuRuntime.get().releaseSurface("app", "smoke-recover-rgba");
+                            return null;
+                        }
+                    }).get();
+                    recAppSurf.release();
+                    recAppTex.release();
+                    Log.i("emthin-pad", "waylandGpu gpuRecovered: " + recJson);
+                } catch (Throwable t) {
+                    Log.e("emthin-pad", "waylandGpu smoke failed: " + t, t);
+                }
+            }
+        }, "emthin-wayland-gpu-smoke").start();
     }
 
     private boolean deviceTestEnabled() {
@@ -857,6 +1111,21 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** A proof result that arrived before recovery finished loading the document. */
+    private static final class PendingProofInsert {
+        final String docId;
+        final String proofId;
+        final String proofLink;
+        final String proofState;
+
+        PendingProofInsert(String docId, String proofId, String proofLink, String proofState) {
+            this.docId = docId;
+            this.proofId = proofId;
+            this.proofLink = proofLink;
+            this.proofState = proofState;
+        }
+    }
+
     /** One active provider read/write; a newer same-URI save may wait. */
     private static final class FileOperation {
         final String kind;
@@ -1051,6 +1320,16 @@ public class MainActivity extends Activity {
         requestViewWrite(true);
         if (legacyPending) captureRecoveryNow();
         resetNavigation();
+        if (pendingProofInsert != null) {
+            PendingProofInsert insert = pendingProofInsert;
+            pendingProofInsert = null;
+            if (insert.docId == null || insert.docId.isEmpty()
+                    || insert.docId.equals(session.documentId())) {
+                insertProofResult(insert.proofId, insert.proofLink, insert.proofState);
+            } else {
+                fileMessage("The document changed; that proof result was ignored.");
+            }
+        }
     }
 
     private void installFreshStarter() {
@@ -1482,6 +1761,7 @@ public class MainActivity extends Activity {
         super.onSaveInstanceState(outState);
         if (editor != null) {
             outState.putString("recovery_document_id", session.documentId());
+            if (pendingProofDocId != null) outState.putString("pending_proof_doc_id", pendingProofDocId);
             outState.putBoolean(PREF_SHOW_MARKERS, showMarkers);
             outState.putBoolean("inspectorOpen", inspectorOpen);
             outState.putInt(PREF_CARET, Math.max(0, editor.getSelectionStart()));
@@ -1786,14 +2066,22 @@ public class MainActivity extends Activity {
         main.removeCallbacks(updateModifierComparisons);
         main.removeCallbacks(recoveryNow);
         main.removeCallbacks(viewNow);
+        main.removeCallbacks(waylandFramePump);
         fileWorker.shutdown();
         // Already-captured bytes may finish; they never touch this view.
         recoveryWorker.shutdown();
+        for (RenderedPage p : renderedPages) {
+            p.releaseWaylandSurfaces();
+        }
         releasePageBitmaps();
         for (TerminalTransfer transfer : pendingTerminalTransfers) {
             transfer.scene.close();
         }
         pendingTerminalTransfers.clear();
+        if (waylandCompositor != 0) {
+            DocBridge.waylandStop(waylandCompositor);
+            waylandCompositor = 0;
+        }
         if (handle != 0) {
             DocBridge.free(handle);
             handle = 0;
@@ -2015,7 +2303,10 @@ public class MainActivity extends Activity {
                 }
                 ensureVisiblePages();
                 trimPageBitmaps();
-                for (RenderedPage page : renderedPages) page.clipTerminalSurfaces();
+                for (RenderedPage page : renderedPages) {
+                    page.clipTerminalSurfaces();
+                    page.clipWaylandSurfaces();
+                }
                 rememberReadingAnchor();
             }
         });
@@ -2027,7 +2318,10 @@ public class MainActivity extends Activity {
                     int oldLeft, int oldTop, int oldRight, int oldBottom) {
                 if (right - left == oldRight - oldLeft
                         && bottom - top == oldBottom - oldTop) return;
-                for (RenderedPage page : renderedPages) page.clipTerminalSurfaces();
+                for (RenderedPage page : renderedPages) {
+                    page.clipTerminalSurfaces();
+                    page.clipWaylandSurfaces();
+                }
             }
         });
         // The window's available height can change around the IME without
@@ -2042,7 +2336,10 @@ public class MainActivity extends Activity {
                 if (width == lastViewport[0] && height == lastViewport[1]) return;
                 lastViewport[0] = width;
                 lastViewport[1] = height;
-                for (RenderedPage page : renderedPages) page.clipTerminalSurfaces();
+                for (RenderedPage page : renderedPages) {
+                    page.clipTerminalSurfaces();
+                    page.clipWaylandSurfaces();
+                }
             }
         });
         // A touch means the user owns the reading position now. Drop a
@@ -2302,11 +2599,28 @@ public class MainActivity extends Activity {
             return;
         }
         if (requestCode == REQUEST_PROOF) {
+            String expectedDoc = pendingProofDocId;
+            pendingProofDocId = null;
             if (resultCode != RESULT_OK || data == null) return;
             String proofId = data.getStringExtra("emthin.proof_id");
             String proofLink = data.getStringExtra("emthin.proof_link");
-            if (proofId == null || proofId.isEmpty()) return;
-            insertProofResult(proofId, proofLink == null ? "" : proofLink);
+            String proofState = data.getStringExtra("emthin.proof_state");
+            String resultDoc = data.getStringExtra("emthin.proof_doc_id");
+            String targetDoc = (resultDoc != null && !resultDoc.isEmpty()) ? resultDoc : expectedDoc;
+            if (!ProofProtocol.validId(proofId)) return;
+            boolean allowedLink = proofLink != null && (proofLink.startsWith("https://")
+                    || (deviceTest && proofLink.startsWith("http://")));
+            if (!allowedLink) proofLink = "";
+            String state = proofState == null ? "" : proofState;
+            if (handle == 0) {
+                pendingProofInsert = new PendingProofInsert(targetDoc, proofId, proofLink, state);
+                return;
+            }
+            if (targetDoc != null && !targetDoc.isEmpty() && !targetDoc.equals(session.documentId())) {
+                fileMessage("The document changed; that proof result was ignored.");
+                return;
+            }
+            insertProofResult(proofId, proofLink, state);
             return;
         }
         PendingPicker picker = pendingPicker;
@@ -2339,16 +2653,21 @@ public class MainActivity extends Activity {
      * editor watcher funnels the change through DocBridge.sync, so this is one
      * grouped edit and follows the same undo/recovery path as typing.
      */
-    private void insertProofResult(String proofId, String proofLink) {
+    private void insertProofResult(String proofId, String proofLink, String proofState) {
+        finishActiveComposition();
+        // A record that is not archived yet says so, so the note never implies
+        // a DOI that the backend has not minted.
+        String pending = proofState.isEmpty() || ProofProtocol.STATE_PUBLISHED.equals(proofState)
+                ? "" : "\nProof status: " + ProofProtocol.describeState(proofState, "");
         String line = "\nProof ID: " + proofId
-                + (proofLink.isEmpty() ? "" : "\nResult link: " + proofLink) + "\n";
+                + (proofLink.isEmpty() ? "" : "\nResult link: " + proofLink) + pending + "\n";
         Editable text = editor.getText();
         int at = editor.getSelectionStart();
         if (at < 0 || at > text.length()) at = text.length();
         text.insert(at, line);
         editor.setSelection(at + line.length());
         setStatus("Proof " + proofId + " inserted");
-        trace("proof", "inserted", proofId);
+        trace("proof", "inserted", proofId, "state", proofState.isEmpty() ? "-" : proofState);
     }
 
     private void exportRecoveryBytes(final Uri uri) {
@@ -3153,8 +3472,22 @@ public class MainActivity extends Activity {
 
         void recreateContext() {
             if (!surfaceReady()) return;
+            failed = false;
             releaseGl();
-            if (setupGl(eglWindow)) requestFrame();
+            if (setupGl(eglWindow)) {
+                if (getVisibility() != View.VISIBLE) setVisibility(View.VISIBLE);
+                requestFrame();
+            }
+        }
+
+        private void failToCpuFallback(String reason) {
+            failed = true;
+            releaseGl();
+            setVisibility(View.GONE);
+            if (getParent() instanceof View) {
+                ((View) getParent()).postInvalidate();
+            }
+            trace("vtScene", "gl", "cpuFallback", "page", pageIndex, "reason", reason);
         }
 
         void release() {
@@ -3189,6 +3522,10 @@ public class MainActivity extends Activity {
 
         private boolean setupGl(Surface target) {
             if (failed) return false;
+            if (GpuRuntime.get().isCpuFallback()) {
+                failToCpuFallback("gpu-cpu-fallback");
+                return false;
+            }
             releaseGl();
             try {
                 eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
@@ -3267,7 +3604,7 @@ public class MainActivity extends Activity {
             } catch (RuntimeException error) {
                 trace("vtScene", "gl", "failed", "page", pageIndex,
                         "reason", error.getMessage());
-                releaseGl();
+                failToCpuFallback(error.getMessage() == null ? "egl-error" : error.getMessage());
                 return false;
             }
         }
@@ -3292,13 +3629,17 @@ public class MainActivity extends Activity {
 
         private void renderFrame() {
             if (!glReady || failed || !surfaceReady() || scene == null) return;
+            if (GpuRuntime.get().isCpuFallback()) {
+                failToCpuFallback("gpu-cpu-fallback");
+                return;
+            }
             Bitmap bitmap = scene.bitmap();
             if (bitmap == null || bitmap.isRecycled()) return;
             int width = bitmap.getWidth();
             int height = bitmap.getHeight();
             if (width <= 0 || height <= 0) return;
             if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
-                releaseGl();
+                failToCpuFallback("eglMakeCurrent");
                 return;
             }
             try {
@@ -3345,7 +3686,7 @@ public class MainActivity extends Activity {
                 }
                 int glError = GLES20.glGetError();
                 if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) {
-                    releaseGl();
+                    failToCpuFallback("eglSwapBuffers");
                     return;
                 }
                 if (firstFrame) {
@@ -3419,6 +3760,7 @@ public class MainActivity extends Activity {
         JSONArray figures = new JSONArray();
         NativeTerminal[] terminalScenes;
         TerminalSurface[] terminalSurfaces;
+        WaylandSurfaceView[] waylandSurfaces;
         int terminalFocus = -1;
         int[] terminalGridWidths;
         int[] terminalGridHeights;
@@ -3940,9 +4282,148 @@ public class MainActivity extends Activity {
                 }
             }
             releaseTerminalSurfaces();
+            releaseWaylandSurfaces();
             terminalWatchOnly = null;
             terminalConflict = null;
             terminalFocus = -1;
+        }
+
+        void releaseWaylandSurfaces() {
+            if (waylandSurfaces != null) {
+                for (int i = 0; i < waylandSurfaces.length; i++) {
+                    WaylandSurfaceView view = waylandSurfaces[i];
+                    if (view == null) continue;
+                    view.release();
+                    removeView(view);
+                    waylandSurfaces[i] = null;
+                }
+            }
+            waylandSurfaces = null;
+        }
+
+        void syncWaylandSurfaces() {
+            if (waylandCompositor == 0 || figures == null || figures.length() == 0) {
+                releaseWaylandSurfaces();
+                return;
+            }
+            WaylandSurfaceView[] next = new WaylandSurfaceView[figures.length()];
+            boolean any = false;
+            for (int i = 0; i < figures.length(); i++) {
+                JSONObject figure = figures.optJSONObject(i);
+                if (figure == null) continue;
+                if (!jsonString(figure, "bindingError").isEmpty()
+                        || !jsonString(figure, "reference").isEmpty()) {
+                    continue;
+                }
+                String key = jsonString(figure, "key");
+                if (key.isEmpty()) continue;
+                any = true;
+                WaylandSurfaceView reused = null;
+                if (waylandSurfaces != null) {
+                    for (int j = 0; j < waylandSurfaces.length; j++) {
+                        WaylandSurfaceView cand = waylandSurfaces[j];
+                        if (cand != null && key.equals(cand.getFigureKey())) {
+                            reused = cand;
+                            waylandSurfaces[j] = null;
+                            break;
+                        }
+                    }
+                }
+                if (reused == null) {
+                    reused = new WaylandSurfaceView(getContext(), waylandCompositor, key);
+                    addView(reused);
+                }
+                next[i] = reused;
+            }
+            releaseWaylandSurfaces();
+            waylandSurfaces = any ? next : null;
+            clipWaylandSurfaces();
+            if (any) {
+                main.removeCallbacks(waylandFramePump);
+                main.post(waylandFramePump);
+            }
+        }
+
+        void clipWaylandSurfaces() {
+            if (waylandSurfaces == null || figures == null) return;
+            if (getWidth() <= 0 || getHeight() <= 0) return;
+            boolean useViewport = previewScroll != null
+                    && previewScroll.getWidth() > 0 && previewScroll.getHeight() > 0;
+            float viewLeft = 0f, viewTop = 0f, viewRight = getWidth(), viewBottom = getHeight();
+            if (useViewport) {
+                int[] pagePos = new int[2];
+                int[] scrollPos = new int[2];
+                getLocationOnScreen(pagePos);
+                previewScroll.getLocationOnScreen(scrollPos);
+                viewLeft = Math.max(0f, scrollPos[0] - pagePos[0]);
+                viewTop = Math.max(0f, scrollPos[1] - pagePos[1]);
+                viewRight = Math.min(getWidth(), (scrollPos[0] - pagePos[0]) + previewScroll.getWidth());
+                viewBottom = Math.min(getHeight(), (scrollPos[1] - pagePos[1]) + previewScroll.getHeight());
+            }
+            for (int i = 0; i < waylandSurfaces.length; i++) {
+                WaylandSurfaceView view = waylandSurfaces[i];
+                if (view == null) continue;
+                android.graphics.RectF rect = terminalRect(i);
+                if (rect == null || waylandCompositor == 0) {
+                    view.setVisibility(View.GONE);
+                    continue;
+                }
+                android.graphics.RectF visible = new android.graphics.RectF(
+                        Math.max(rect.left, viewLeft),
+                        Math.max(rect.top, viewTop),
+                        Math.min(rect.right, viewRight),
+                        Math.min(rect.bottom, viewBottom));
+                int w = Math.round(visible.width());
+                int h = Math.round(visible.height());
+                if (w <= 0 || h <= 0) {
+                    view.setVisibility(View.GONE);
+                    continue;
+                }
+                if (view.getVisibility() != View.VISIBLE) view.setVisibility(View.VISIBLE);
+                int left = Math.round(visible.left);
+                int top = Math.round(visible.top);
+                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) view.getLayoutParams();
+                if (lp == null) {
+                    lp = new FrameLayout.LayoutParams(w, h);
+                    lp.gravity = Gravity.TOP | Gravity.LEFT;
+                }
+                if (lp.width != w || lp.height != h || lp.leftMargin != left || lp.topMargin != top) {
+                    lp.width = w;
+                    lp.height = h;
+                    lp.leftMargin = left;
+                    lp.topMargin = top;
+                    lp.gravity = Gravity.TOP | Gravity.LEFT;
+                    view.setLayoutParams(lp);
+                }
+                view.setCrop(
+                        (visible.left - rect.left) / Math.max(1f, rect.width()),
+                        (visible.top - rect.top) / Math.max(1f, rect.height()),
+                        (visible.right - rect.left) / Math.max(1f, rect.width()),
+                        (visible.bottom - rect.top) / Math.max(1f, rect.height()));
+                view.requestFrame();
+            }
+        }
+
+        boolean requestWaylandFrames() {
+            if (waylandSurfaces == null) return false;
+            boolean any = false;
+            for (WaylandSurfaceView view : waylandSurfaces) {
+                if (view != null && view.getVisibility() == View.VISIBLE) {
+                    view.requestFrame();
+                    any = true;
+                }
+            }
+            return any;
+        }
+
+        int waylandFigureIndexAt(float x, float y) {
+            if (waylandSurfaces == null) return -1;
+            for (int i = 0; i < waylandSurfaces.length; i++) {
+                if (waylandSurfaces[i] == null) continue;
+                android.graphics.RectF rect = terminalRect(i);
+                if (rect != null && rect.contains(x, y)) return i;
+            }
+            return -1;
         }
 
         private void releaseTerminalSurfaces() {
@@ -3987,7 +4468,9 @@ public class MainActivity extends Activity {
                     viewportLeft + previewScroll.getWidth(),
                     viewportTop + previewScroll.getHeight());
             if (visible.width() <= 0 || visible.height() <= 0
-                    || !visible.intersect(viewport)) {
+                    || !visible.intersect(viewport)
+                    || surface.failed
+                    || GpuRuntime.get().isCpuFallback()) {
                 surface.setVisibility(View.GONE);
                 return surface;
             }
@@ -4221,9 +4704,15 @@ public class MainActivity extends Activity {
             }
         }
 
+        @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+            super.onLayout(changed, left, top, right, bottom);
+            clipWaylandSurfaces();
+        }
+
         @Override protected void dispatchDraw(Canvas canvas) {
             super.dispatchDraw(canvas);
             drawTerminalScenes(canvas);
+            clipWaylandSurfaces();
             drawPageOverlays(canvas);
             drawFigureStates(canvas);
         }
@@ -4535,8 +5024,13 @@ public class MainActivity extends Activity {
             case SHARE_JOIN: shareJoin(); break;
             case SHARE_LEAVE: shareLeave(); break;
             case SHARE_WATCH: shareToggleWatch(); break;
-            case PROOF: startActivityForResult(
-                    new Intent(this, ProofClientActivity.class), REQUEST_PROOF); break;
+            case PROOF: {
+                pendingProofDocId = session.documentId();
+                Intent proofIntent = new Intent(this, ProofClientActivity.class);
+                proofIntent.putExtra("emthin.proof_doc_id", pendingProofDocId);
+                startActivityForResult(proofIntent, REQUEST_PROOF);
+                break;
+            }
             case HISTORY: showHistory(); break;
             case DIAGNOSTICS: showDiagnostics(); break;
             default: return false;
@@ -8491,10 +8985,40 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void syncAllWaylandFiguresToCompositor() {
+        if (waylandCompositor == 0) return;
+        try {
+            JSONArray slots = new JSONArray();
+            for (RenderedPage p : renderedPages) {
+                if (p.figures == null) continue;
+                for (int i = 0; i < p.figures.length(); i++) {
+                    JSONObject figure = p.figures.optJSONObject(i);
+                    if (figure == null) continue;
+                    if (!jsonString(figure, "bindingError").isEmpty()
+                            || !jsonString(figure, "reference").isEmpty()) {
+                        continue;
+                    }
+                    String key = jsonString(figure, "key");
+                    if (key.isEmpty()) continue;
+                    JSONObject slot = new JSONObject();
+                    slot.put("key", key);
+                    slot.put("appId", jsonString(figure, "appId"));
+                    slot.put("width", Math.max(1, (int) Math.round(figure.optDouble("w", 320.0))));
+                    slot.put("height", Math.max(1, (int) Math.round(figure.optDouble("h", 200.0))));
+                    slots.put(slot);
+                }
+            }
+            DocBridge.waylandSyncFigures(waylandCompositor, slots.toString());
+        } catch (org.json.JSONException ignored) {
+        }
+    }
+
     /** Create one full-height placeholder per page, then materialize on demand. */
     private void resetPageStack(int total, JSONArray sizes) {
         boolean preserve = session.documentId().equals(pageStackDocumentId);
         collectTerminalScenesForRebuild(preserve);
+        for (RenderedPage p : renderedPages) p.releaseWaylandSurfaces();
+        syncAllWaylandFiguresToCompositor();
         pageStackDocumentId = session.documentId();
         releasePageBitmaps();
         totalPages = total;
@@ -9307,9 +9831,11 @@ public class MainActivity extends Activity {
             private final int slop = android.view.ViewConfiguration.get(MainActivity.this)
                     .getScaledTouchSlop();
             private boolean moved;
+            private int waylandTouchIndex = -1;
             @Override public boolean onTouch(View view, MotionEvent event) {
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
+                        waylandTouchIndex = -1;
                         if (pagesStale) return true;
                         clearTerminalSelection();
                         touchSelectionPage = page;
@@ -9351,6 +9877,19 @@ public class MainActivity extends Activity {
                                     sendTerminalMouse(page, terminal, cell[0], cell[1],
                                             0, true, 0);
                                 }
+                            } else if (terminal < 0 && waylandCompositor != 0) {
+                                int wf = page.waylandFigureIndexAt(event.getX(), event.getY());
+                                if (wf >= 0) {
+                                    android.graphics.RectF wrect = page.terminalRect(wf);
+                                    String wkey = page.waylandSurfaces[wf].getFigureKey();
+                                    if (wrect != null && DocBridge.waylandSendTouch(
+                                            waylandCompositor, wkey, 0,
+                                            event.getX() - wrect.left,
+                                            event.getY() - wrect.top)) {
+                                        waylandTouchIndex = wf;
+                                        return true;
+                                    }
+                                }
                             }
                             main.postDelayed(touchLongPress,
                                     android.view.ViewConfiguration.getLongPressTimeout());
@@ -9362,6 +9901,18 @@ public class MainActivity extends Activity {
                                     || Math.abs(event.getY() - touchDownY) > slop)) {
                             moved = true;
                             main.removeCallbacks(touchLongPress);
+                        }
+                        if (waylandTouchIndex >= 0 && page.waylandSurfaces != null
+                                && waylandTouchIndex < page.waylandSurfaces.length
+                                && page.waylandSurfaces[waylandTouchIndex] != null
+                                && waylandCompositor != 0) {
+                            android.graphics.RectF wrect = page.terminalRect(waylandTouchIndex);
+                            String wkey = page.waylandSurfaces[waylandTouchIndex].getFigureKey();
+                            if (wrect != null) {
+                                DocBridge.waylandSendTouch(waylandCompositor, wkey, 2,
+                                        event.getX() - wrect.left, event.getY() - wrect.top);
+                            }
+                            return true;
                         }
                         if (terminalSelecting && !pagesStale) {
                             updateTerminalSelectionEnd(page, event.getX(), event.getY());
@@ -9385,6 +9936,20 @@ public class MainActivity extends Activity {
                         return true;
                     case MotionEvent.ACTION_UP:
                         main.removeCallbacks(touchLongPress);
+                        if (waylandTouchIndex >= 0 && page.waylandSurfaces != null
+                                && waylandTouchIndex < page.waylandSurfaces.length
+                                && page.waylandSurfaces[waylandTouchIndex] != null
+                                && waylandCompositor != 0) {
+                            android.graphics.RectF wrect = page.terminalRect(waylandTouchIndex);
+                            String wkey = page.waylandSurfaces[waylandTouchIndex].getFigureKey();
+                            if (wrect != null) {
+                                DocBridge.waylandSendTouch(waylandCompositor, wkey, 1,
+                                        event.getX() - wrect.left, event.getY() - wrect.top);
+                            }
+                            waylandTouchIndex = -1;
+                            touchSelectionPage = null;
+                            return true;
+                        }
                         if (terminalSelecting) {
                             updateTerminalSelectionEnd(page, event.getX(), event.getY());
                             terminalSelecting = false;
@@ -9423,6 +9988,18 @@ public class MainActivity extends Activity {
                         return true;
                     case MotionEvent.ACTION_CANCEL:
                         main.removeCallbacks(touchLongPress);
+                        if (waylandTouchIndex >= 0 && page.waylandSurfaces != null
+                                && waylandTouchIndex < page.waylandSurfaces.length
+                                && page.waylandSurfaces[waylandTouchIndex] != null
+                                && waylandCompositor != 0) {
+                            android.graphics.RectF wrect = page.terminalRect(waylandTouchIndex);
+                            String wkey = page.waylandSurfaces[waylandTouchIndex].getFigureKey();
+                            if (wrect != null) {
+                                DocBridge.waylandSendTouch(waylandCompositor, wkey, 1,
+                                        event.getX() - wrect.left, event.getY() - wrect.top);
+                            }
+                        }
+                        waylandTouchIndex = -1;
                         if (terminalMousePressed && terminalMousePage == page) {
                             int[] cell = page.terminalCellAt(terminalMouseIndex,
                                     event.getX(), event.getY());
@@ -9557,6 +10134,8 @@ public class MainActivity extends Activity {
         page.hasFigures = p.hasFigures;
         page.figures = p.figures;
         attachTransferredScenes(page, p.figures);
+        page.syncWaylandSurfaces();
+        syncAllWaylandFiguresToCompositor();
         int terminalFigures = 0;
         for (int i = 0; i < p.figures.length(); i++) {
             JSONObject figure = p.figures.optJSONObject(i);

@@ -57,6 +57,7 @@ LIB=android/libs/core-3.5.3.jar
     android/src/com/emthin/pad/StatusModel.java \
     android/src/com/emthin/pad/ActionCatalog.java \
     android/src/com/emthin/pad/SessionCatalog.java \
+    android/src/com/emthin/pad/GpuContract.java \
     android/src/com/emthin/pad/GatewayJson.java \
     android/src/com/emthin/pad/PairingLink.java \
     android/src/com/emthin/pad/PairingProtocol.java \
@@ -70,6 +71,8 @@ LIB=android/libs/core-3.5.3.jar
     android/src/com/emthin/pad/WebSocketFrame.java \
     android/src/com/emthin/pad/WebSocketHandshake.java \
     android/src/com/emthin/pad/WssTransport.java \
+    android/src/com/emthin/pad/ProofProtocol.java \
+    android/test/com/emthin/pad/ProofProtocolTest.java \
     android/test/com/emthin/pad/GatewayPairingTest.java \
     android/test/com/emthin/pad/GatewayTargetTest.java \
     android/test/com/emthin/pad/GatewayCatalogTest.java \
@@ -85,7 +88,9 @@ LIB=android/libs/core-3.5.3.jar
     android/test/com/emthin/pad/InspectorViewTest.java \
     android/test/com/emthin/pad/StatusModelTest.java \
     android/test/com/emthin/pad/ActionCatalogTest.java \
-    android/test/com/emthin/pad/SessionCatalogTest.java
+    android/test/com/emthin/pad/SessionCatalogTest.java \
+    android/test/com/emthin/pad/GpuContractTest.java
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GpuContractTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.OwnershipTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.RecoveryCodecTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.ProviderIoTest
@@ -101,5 +106,6 @@ LIB=android/libs/core-3.5.3.jar
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayCatalogTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.GatewayEnrollmentTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.QrScanTest
+"$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.ProofProtocolTest
 "$JAVA" -ea -cp "$OUT:$LIB" com.emthin.pad.WebSocketTest \
     "$OUT/localhost.p12" "$OUT/other.p12"

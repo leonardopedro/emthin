@@ -278,4 +278,33 @@ public final class DocBridge {
 
     /** K5: read-only preview of one frontier; never changes the live model. */
     public static native String historyPreview(long handle, String frontierHex);
+
+    // ----- App-wide GPU runtime & embedded Wayland compositor ----------
+
+    public static native String gpuCapabilities();
+    public static native void gpuSetForceCpu(boolean force);
+    public static native boolean gpuIsCpuFallback();
+    public static native String gpuComputeSmoke();
+    public static native String gpuComputeF32(String kernel, float[] input);
+    public static native String gpuDispatchSpirv(
+            byte[] spirv, byte[] input, int outputBytes, int gx, int gy, int gz);
+    public static native String gpuRenderRgba(
+            String surfaceKey, android.view.Surface surface, byte[] rgba,
+            int width, int height, int stride, float u0, float v0, float u1, float v1);
+    public static native String gpuRenderPlaceholder(
+            String surfaceKey, android.view.Surface surface);
+    public static native void gpuReleaseSurface(String surfaceKey);
+
+    public static native long waylandStart(String socketPath);
+    public static native void waylandStop(long handle);
+    public static native String waylandSyncFigures(long handle, String figuresJson);
+    public static native String waylandTakePendingToplevels(long handle);
+    public static native String appendAppFigure(
+            long handle, String caption, int width, int height, String appId);
+    public static native String waylandRenderFigure(
+            long handle, String figureKey, android.view.Surface surface,
+            float u0, float v0, float u1, float v1);
+    public static native boolean waylandSendTouch(
+            long handle, String figureKey, int action, double x, double y);
+    public static native String waylandSmokeClient(String socketPath, String appId);
 }

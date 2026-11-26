@@ -82,18 +82,20 @@ pub mod model;
 
 pub mod austral_rule;
 pub mod diagnostics;
+pub mod gpu;
 pub mod jit;
 pub mod layout;
 pub mod modifiers;
 pub mod scene;
 pub mod semantics;
 pub mod sharing;
+pub mod wayland;
 
 #[path = "../../crates/emthin/src/docui/citations.rs"]
 pub mod citations;
 
-use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jboolean, jbyte, jfloat, jint, jlong};
+use jni::objects::{JByteArray, JClass, JFloatArray, JObject, JString};
+use jni::sys::{jboolean, jbyte, jdouble, jfloat, jint, jlong};
 use jni::{errors, EnvUnowned};
 use serde_json::{json, Value};
 use unicode_segmentation::UnicodeSegmentation;
@@ -577,6 +579,44 @@ fn append_terminal_figure(
     let mut statement = format!(
         "{start} {caption} {end} \\app({start}, {end}, 640, 400, terminal: \"{terminal}\")\n"
     );
+    let at = model.text().len();
+    if at > 0 && !model.text().ends_with('\n') {
+        statement.insert(0, '\n');
+    }
+    model.insert(at, &statement);
+    Ok(())
+}
+
+fn append_app_figure_to_model(
+    model: &mut DocModel,
+    caption: &str,
+    w: i32,
+    h: i32,
+    app_id: &str,
+) -> Result<(), String> {
+    let ids = {
+        let scan = model.scan();
+        mathed_core::markers::lowest_free_marker_numbers(scan, 2)
+    };
+    let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
+        return Err("Could not allocate figure markers".to_string());
+    };
+    let start = format!("#{}", mathed_core::markers::auto_marker_id(a));
+    let end = format!("#{}", mathed_core::markers::auto_marker_id(b));
+    let caption = escape_caption(caption.trim());
+    let caption = if caption.is_empty() {
+        "Wayland App"
+    } else {
+        caption.as_str()
+    };
+    let clean_id = escape_arg(app_id.trim());
+    let w = w.clamp(64, 4096);
+    let h = h.clamp(64, 4096);
+    let mut statement = if clean_id.is_empty() {
+        format!("{start} {caption} {end} \\app({start}, {end}, {w}, {h})\n")
+    } else {
+        format!("{start} {caption} {end} \\app({start}, {end}, {w}, {h}, \"{clean_id}\")\n")
+    };
     let at = model.text().len();
     if at > 0 && !model.text().ends_with('\n') {
         statement.insert(0, '\n');
@@ -2447,8 +2487,10 @@ fn render_pages_with_options_expanded(
                 .figures
                 .iter()
                 .map(|figure| {
-                    let (reference, binding_error) =
-                        bindings.get(&figure.key).cloned().unwrap_or((None, None));
+                    let (reference, app_id, binding_error) = bindings
+                        .get(&figure.key)
+                        .cloned()
+                        .unwrap_or((None, None, None));
                     json!({
                         "key": figure.key,
                         "x": figure.rect.x0,
@@ -2456,6 +2498,7 @@ fn render_pages_with_options_expanded(
                         "w": figure.rect.x1 - figure.rect.x0,
                         "h": figure.rect.y1 - figure.rect.y0,
                         "reference": reference,
+                        "appId": app_id,
                         "bindingError": binding_error,
                     })
                 })
@@ -3132,6 +3175,579 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_shareApply<'local>(
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
+// ----- app-wide GPU runtime + embedded Wayland compositor --------------
+
+fn gpu_hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn gpu_render_json(result: Result<gpu::RenderResult, String>) -> String {
+    match result {
+        Ok(r) => serde_json::json!({
+            "rendered": r.rendered,
+            "mode": r.mode,
+            "backend": r.backend,
+            "width": r.width,
+            "height": r.height,
+            "glRenderer": r.gl_renderer,
+            "fallbackReason": r.fallback_reason,
+            "error": Value::Null,
+        })
+        .to_string(),
+        Err(error) => serde_json::json!({
+            "rendered": false,
+            "mode": "error",
+            "backend": "error",
+            "width": 0,
+            "height": 0,
+            "glRenderer": "",
+            "fallbackReason": Value::Null,
+            "error": error,
+        })
+        .to_string(),
+    }
+}
+
+/// Enable or disable forced CPU fallback across the app-wide GPU runtime.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuSetForceCpu<'local>(
+    _unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    force: jboolean,
+) {
+    gpu::runtime().set_force_cpu(force);
+}
+
+/// Return true if GPU rendering/compute is currently routed through CPU fallback.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuIsCpuFallback<'local>(
+    _unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    gpu::runtime().is_cpu_fallback_active()
+}
+
+/// Probe host-or-Android EGL/GLES3/Vulkan/AHB GPU capabilities for the app.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuCapabilities<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let caps = gpu::runtime().capabilities();
+            let json = serde_json::to_string(&caps).unwrap_or_else(|_| "{}".into());
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Run the Vulkan 1.1 compute + AHardwareBuffer EGL/Vulkan interop smoke check.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuComputeSmoke<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let res = gpu::runtime().compute_smoke();
+            let json = serde_json::to_string(&res).unwrap_or_else(|_| "{}".into());
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Execute a built-in float32 GPU compute kernel (`square_plus_one`, `relu`)
+/// for any app subsystem, falling back deterministically on hosts without Vulkan.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuComputeF32<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    kernel: JString<'local>,
+    input: JFloatArray<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let kernel = kernel.to_string();
+            let vals = if input.is_null() {
+                Vec::new()
+            } else {
+                let len = input.len(env)?.max(0) as usize;
+                let mut buf = vec![0.0f32; len];
+                if len > 0 {
+                    input.get_region(env, 0, &mut buf)?;
+                }
+                buf
+            };
+            let (res, output) = gpu::runtime().dispatch_f32_kernel(&kernel, &vals);
+            let json = serde_json::json!({
+                "ok": res.ok,
+                "usedGpu": res.used_gpu,
+                "backend": res.backend,
+                "device": res.device,
+                "elapsedUs": res.elapsed_us,
+                "outputLen": res.output_len,
+                "output": output,
+                "error": res.error,
+            })
+            .to_string();
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Dispatch an arbitrary SPIR-V compute binary onto Android Vulkan 1.1 compute.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuDispatchSpirv<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    spirv: JByteArray<'local>,
+    input: JByteArray<'local>,
+    output_bytes: jint,
+    gx: jint,
+    gy: jint,
+    gz: jint,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let spirv_bytes = if spirv.is_null() {
+                Vec::new()
+            } else {
+                env.convert_byte_array(&spirv)?
+            };
+            let input_bytes = if input.is_null() {
+                Vec::new()
+            } else {
+                env.convert_byte_array(&input)?
+            };
+            let (res, out_bytes) = if output_bytes < 0 || gx <= 0 || gy <= 0 || gz <= 0 {
+                (
+                    gpu::ComputeDispatchResult {
+                        ok: false,
+                        used_gpu: false,
+                        backend: "invalid-args".into(),
+                        device: String::new(),
+                        elapsed_us: 0,
+                        output_len: 0,
+                        error: Some(
+                            "outputBytes must be >= 0 and workgroups must all be >= 1".into(),
+                        ),
+                    },
+                    Vec::new(),
+                )
+            } else {
+                gpu::runtime().dispatch_spirv(
+                    &spirv_bytes,
+                    &input_bytes,
+                    output_bytes as usize,
+                    [gx as u32, gy as u32, gz as u32],
+                )
+            };
+            let json = serde_json::json!({
+                "ok": res.ok,
+                "usedGpu": res.used_gpu,
+                "backend": res.backend,
+                "device": res.device,
+                "elapsedUs": res.elapsed_us,
+                "outputLen": out_bytes.len(),
+                "outputHex": gpu_hex_encode(&out_bytes),
+                "error": res.error,
+            })
+            .to_string();
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Composite an RGBA8888 pixel buffer onto any Android `Surface` using the
+/// shared app-wide EGL/GLES3 renderer.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuRenderRgba<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    surface_key: JString<'local>,
+    surface: JObject<'local>,
+    rgba: JByteArray<'local>,
+    width: jint,
+    height: jint,
+    stride: jint,
+    u0: jfloat,
+    v0: jfloat,
+    u1: jfloat,
+    v1: jfloat,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let key = surface_key.to_string();
+            let pixels = if rgba.is_null() {
+                Vec::new()
+            } else {
+                env.convert_byte_array(&rgba)?
+            };
+            #[cfg(target_os = "android")]
+            let result = {
+                if surface.is_null() {
+                    Err("null Surface".to_string())
+                } else if width <= 0 || height <= 0 || stride < width * 4 {
+                    Err("invalid RGBA buffer dimensions".to_string())
+                } else {
+                    let win = unsafe {
+                        gpu::android_impl::ANativeWindow_fromSurface(
+                            env.get_raw().cast(),
+                            surface.as_raw().cast(),
+                        )
+                    };
+                    if win.is_null() {
+                        Err("ANativeWindow_fromSurface returned null".to_string())
+                    } else {
+                        let res = unsafe {
+                            gpu::runtime().render_shm(
+                                &key,
+                                win,
+                                gpu::ShmFrameRef {
+                                    width: width as u32,
+                                    height: height as u32,
+                                    stride: stride as u32,
+                                    wl_format: gpu::WL_SHM_FORMAT_ABGR8888,
+                                    pixels: &pixels,
+                                },
+                                [u0, v0, u1, v1],
+                            )
+                        };
+                        unsafe { gpu::android_impl::ANativeWindow_release(win) };
+                        res
+                    }
+                }
+            };
+            #[cfg(not(target_os = "android"))]
+            let result = {
+                let _ = (
+                    &key, &surface, &pixels, width, height, stride, u0, v0, u1, v1,
+                );
+                Err("Android Surface unavailable on host".to_string())
+            };
+            JString::from_str(env, gpu_render_json(result))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Clear/render a dormant placeholder frame onto any Android `Surface`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuRenderPlaceholder<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    surface_key: JString<'local>,
+    surface: JObject<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let key = surface_key.to_string();
+            #[cfg(target_os = "android")]
+            let result = {
+                if surface.is_null() {
+                    Err("null Surface".to_string())
+                } else {
+                    let win = unsafe {
+                        gpu::android_impl::ANativeWindow_fromSurface(
+                            env.get_raw().cast(),
+                            surface.as_raw().cast(),
+                        )
+                    };
+                    if win.is_null() {
+                        Err("ANativeWindow_fromSurface returned null".to_string())
+                    } else {
+                        let res = unsafe { gpu::runtime().render_placeholder(&key, win) };
+                        unsafe { gpu::android_impl::ANativeWindow_release(win) };
+                        res
+                    }
+                }
+            };
+            #[cfg(not(target_os = "android"))]
+            let result = {
+                let _ = (&key, &surface);
+                Err("Android Surface unavailable on host".to_string())
+            };
+            JString::from_str(env, gpu_render_json(result))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Release any cached EGL window surface associated with `surface_key`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_gpuReleaseSurface<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    surface_key: JString<'local>,
+) {
+    unowned_env
+        .with_env(|_env| -> errors::Result<()> {
+            let key = surface_key.to_string();
+            gpu::runtime().release_surface(&key);
+            Ok(())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Start the embedded Wayland compositor listening on `socket_path`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandStart<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    socket_path: JString<'local>,
+) -> jlong {
+    unowned_env
+        .with_env(|_env| -> errors::Result<jlong> {
+            let path = socket_path.to_string();
+            match wayland::WaylandCompositor::start(&path) {
+                Ok(comp) => Ok(Box::into_raw(Box::new(comp)) as jlong),
+                Err(_) => Ok(0),
+            }
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Stop and free an embedded Wayland compositor started by `waylandStart`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandStop<'local>(
+    _unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    if handle != 0 {
+        unsafe {
+            drop(Box::from_raw(handle as *mut wayland::WaylandCompositor));
+        }
+    }
+}
+
+/// Sync the document's active `\app` figure slots to the Wayland compositor.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandSyncFigures<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    figures_json: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            if handle == 0 {
+                return JString::from_str(env, "[]");
+            }
+            let raw = figures_json.to_string();
+            let parsed: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+            let slots: Vec<wayland::FigureSlot> = parsed
+                .into_iter()
+                .filter_map(|item| {
+                    let key = item.get("key")?.as_str()?.to_string();
+                    let app_id = item
+                        .get("appId")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let width = item
+                        .get("width")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(320)
+                        .clamp(1, 16_384) as i32;
+                    let height = item
+                        .get("height")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(200)
+                        .clamp(1, 16_384) as i32;
+                    Some(wayland::FigureSlot {
+                        key,
+                        app_id,
+                        width,
+                        height,
+                    })
+                })
+                .collect();
+            let comp = unsafe { &*(handle as *const wayland::WaylandCompositor) };
+            let status = comp.sync_figures(slots);
+            JString::from_str(env, status.to_string())
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Composite the latest committed Wayland frame for `figure_key` onto an
+/// Android `Surface` using the shared app-wide `GpuRuntime`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandRenderFigure<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    figure_key: JString<'local>,
+    surface: JObject<'local>,
+    u0: jfloat,
+    v0: jfloat,
+    u1: jfloat,
+    v1: jfloat,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            if handle == 0 {
+                return JString::from_str(
+                    env,
+                    gpu_render_json(Err("Wayland compositor handle is null".into())),
+                );
+            }
+            let key = figure_key.to_string();
+            let comp = unsafe { &*(handle as *const wayland::WaylandCompositor) };
+            let latest = comp.latest_frame(&key);
+            let surface_key = format!("wayland:{key}");
+            #[cfg(target_os = "android")]
+            let result = {
+                if surface.is_null() {
+                    Err("null Surface".to_string())
+                } else {
+                    let win = unsafe {
+                        gpu::android_impl::ANativeWindow_fromSurface(
+                            env.get_raw().cast(),
+                            surface.as_raw().cast(),
+                        )
+                    };
+                    if win.is_null() {
+                        Err("ANativeWindow_fromSurface returned null".to_string())
+                    } else {
+                        let crop = [u0, v0, u1, v1];
+                        let res = match latest.as_deref() {
+                            Some(wayland::CommittedFrame::Dmabuf(desc)) => unsafe {
+                                gpu::runtime().render_dmabuf(&surface_key, win, desc, crop)
+                            },
+                            Some(wayland::CommittedFrame::Shm {
+                                width,
+                                height,
+                                stride,
+                                wl_format,
+                                pixels,
+                            }) => unsafe {
+                                gpu::runtime().render_shm(
+                                    &surface_key,
+                                    win,
+                                    gpu::ShmFrameRef {
+                                        width: *width,
+                                        height: *height,
+                                        stride: *stride,
+                                        wl_format: *wl_format,
+                                        pixels,
+                                    },
+                                    crop,
+                                )
+                            },
+                            None => unsafe { gpu::runtime().render_placeholder(&surface_key, win) },
+                        };
+                        unsafe { gpu::android_impl::ANativeWindow_release(win) };
+                        res
+                    }
+                }
+            };
+            #[cfg(not(target_os = "android"))]
+            let result = {
+                let _ = (&latest, &surface_key, &surface, u0, v0, u1, v1);
+                Err("Android Surface unavailable on host".to_string())
+            };
+            JString::from_str(env, gpu_render_json(result))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Forward an Android touch event into a bound Wayland figure's `wl_touch`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandSendTouch<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    figure_key: JString<'local>,
+    action: jint,
+    x: jdouble,
+    y: jdouble,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> errors::Result<jboolean> {
+            if handle == 0 {
+                return Ok(false);
+            }
+            let key = figure_key.to_string();
+            let comp = unsafe { &*(handle as *const wayland::WaylandCompositor) };
+            Ok(comp.send_touch(&key, action, x, y))
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Append a new `\app(#a, #b, width, height, "appId")` figure to the document.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_appendAppFigure<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    caption: JString<'local>,
+    width: jint,
+    height: jint,
+    app_id: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let caption = caption.to_string();
+            let app_id = app_id.to_string();
+            let json = unsafe {
+                let m = model_mut(handle);
+                match append_app_figure_to_model(m, &caption, width, height, &app_id) {
+                    Ok(()) => state_json(m),
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Return newly connected unbound `xdg_toplevel` windows needing auto-slotted `\app` figures.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandTakePendingToplevels<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            if handle == 0 {
+                return JString::from_str(env, "[]");
+            }
+            let comp = unsafe { &*(handle as *const wayland::WaylandCompositor) };
+            let pending = comp.take_pending_toplevels();
+            let json = serde_json::to_string(&pending).unwrap_or_else(|_| "[]".into());
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
+/// Run an in-process Wayland client against `socket_path` for smoke testing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandSmokeClient<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    socket_path: JString<'local>,
+    app_id: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let sock = socket_path.to_string();
+            let app = app_id.to_string();
+            let json = match wayland::run_smoke_client(&sock, &app) {
+                Ok(v) => v.to_string(),
+                Err(error) => serde_json::json!({ "ok": false, "error": error }).to_string(),
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 // ----- tests ----------------------------------------------------------
 //
 // These run the *emthin* `DocModel` tests too (they live inside the
@@ -3219,8 +3835,9 @@ mod tests {
         let text = format!("#a Figure #b \\app(#a, #b, 100, 100, terminal: \"{reference}\")\n");
         let bindings = layout::figure_bindings(&text);
         assert_eq!(bindings.len(), 1);
-        let (terminal, error) = bindings.values().next().unwrap();
+        let (terminal, app_id, error) = bindings.values().next().unwrap();
         assert_eq!(terminal.as_deref(), Some(reference));
+        assert!(app_id.is_none());
         assert!(error.is_none());
     }
 

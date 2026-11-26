@@ -321,12 +321,12 @@ fn text_top(layout: &RetainedLayout, page: usize) -> Option<f32> {
     glyphs.bands.get(entry.band as usize).map(|band| band.top)
 }
 
-/// Resolve the terminal binding for each figure key in one document pass.
-/// The page frame only carries the key, so the pad needs this side table to
-/// tell a native terminal slot from an ordinary dormant/Wayland figure.
+/// Resolve the terminal or Wayland app_id binding for each figure key in one
+/// document pass. The page frame only carries the key, so the pad needs this
+/// side table to tell a native terminal slot from a Wayland client slot.
 pub(crate) fn figure_bindings(
     doc_text: &str,
-) -> std::collections::HashMap<String, (Option<String>, Option<String>)> {
+) -> std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>)> {
     let scan = mathed_core::markers::scan(doc_text);
     let mut bindings = std::collections::HashMap::new();
     for segment in mathed_core::markers::resolve_segments(&scan) {
@@ -341,6 +341,7 @@ pub(crate) fn figure_bindings(
                     .terminal
                     .as_ref()
                     .map(|reference| reference.canonical()),
+                figure.spec.id,
                 figure.spec.binding_error,
             ),
         );
@@ -414,8 +415,10 @@ pub fn render_page(
         let figures: Vec<Value> = mathed_core::figures::figures_in_frame(frame)
             .into_iter()
             .map(|figure| {
-                let (reference, binding_error) =
-                    bindings.get(&figure.key).cloned().unwrap_or((None, None));
+                let (reference, app_id, binding_error) = bindings
+                    .get(&figure.key)
+                    .cloned()
+                    .unwrap_or((None, None, None));
                 json!({
                     "key": figure.key,
                     "x": figure.rect.x0,
@@ -423,6 +426,7 @@ pub fn render_page(
                     "w": figure.rect.x1 - figure.rect.x0,
                     "h": figure.rect.y1 - figure.rect.y0,
                     "reference": reference,
+                    "appId": app_id,
                     "bindingError": binding_error,
                 })
             })
