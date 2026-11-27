@@ -625,6 +625,42 @@ fn append_app_figure_to_model(
     Ok(())
 }
 
+fn append_inline_app_figure_to_model(
+    model: &mut DocModel,
+    w: i32,
+    h: i32,
+    app_id: &str,
+    align: &str,
+) -> Result<(), String> {
+    let ids = {
+        let scan = model.scan();
+        mathed_core::markers::lowest_free_marker_numbers(scan, 2)
+    };
+    let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
+        return Err("Could not allocate figure markers".to_string());
+    };
+    let start = format!("#{}", mathed_core::markers::auto_marker_id(a));
+    let end = format!("#{}", mathed_core::markers::auto_marker_id(b));
+    let clean_id = escape_arg(app_id.trim());
+    let w = w.clamp(16, 4096);
+    let h = h.clamp(16, 4096);
+    let clean_align = match align.trim().to_ascii_lowercase().as_str() {
+        "top" => "top",
+        "middle" | "center" => "middle",
+        _ => "bottom",
+    };
+    let id_part = if clean_id.is_empty() {
+        String::new()
+    } else {
+        format!(", \"{clean_id}\"")
+    };
+    let statement =
+        format!("{start}{end} \\app({start}, {end}, {w}, {h}{id_part}, inline: true, align: \"{clean_align}\")");
+    let at = model.text().len();
+    model.insert(at, &statement);
+    Ok(())
+}
+
 // ----- JNI entry points -----------------------------------------------
 //
 // Names follow the JNI spec: `Java_com_emthin_pad_DocBridge_<method>`.
@@ -2487,16 +2523,17 @@ fn render_pages_with_options_expanded(
                 .figures
                 .iter()
                 .map(|figure| {
-                    let (reference, app_id, binding_error) = bindings
+                    let (reference, app_id, binding_error, is_inline) = bindings
                         .get(&figure.key)
                         .cloned()
-                        .unwrap_or((None, None, None));
+                        .unwrap_or((None, None, None, false));
                     json!({
                         "key": figure.key,
                         "x": figure.rect.x0,
                         "y": figure.rect.y0,
                         "w": figure.rect.x1 - figure.rect.x0,
                         "h": figure.rect.y1 - figure.rect.y0,
+                        "inline": is_inline,
                         "reference": reference,
                         "appId": app_id,
                         "bindingError": binding_error,
@@ -3707,6 +3744,33 @@ pub extern "system" fn Java_com_emthin_pad_DocBridge_appendAppFigure<'local>(
         .resolve::<errors::ThrowRuntimeExAndDefault>()
 }
 
+/// Append an inline `\app(#a, #b, width, height, "appId", inline: true, align: "...")` figure.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_emthin_pad_DocBridge_appendInlineAppFigure<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    width: jint,
+    height: jint,
+    app_id: JString<'local>,
+    align: JString<'local>,
+) -> JString<'local> {
+    unowned_env
+        .with_env(|env| -> errors::Result<JString<'local>> {
+            let app_id = app_id.to_string();
+            let align = align.to_string();
+            let json = unsafe {
+                let m = model_mut(handle);
+                match append_inline_app_figure_to_model(m, width, height, &app_id, &align) {
+                    Ok(()) => state_json(m),
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
+            };
+            JString::from_str(env, json)
+        })
+        .resolve::<errors::ThrowRuntimeExAndDefault>()
+}
+
 /// Return newly connected unbound `xdg_toplevel` windows needing auto-slotted `\app` figures.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_emthin_pad_DocBridge_waylandTakePendingToplevels<'local>(
@@ -3835,7 +3899,7 @@ mod tests {
         let text = format!("#a Figure #b \\app(#a, #b, 100, 100, terminal: \"{reference}\")\n");
         let bindings = layout::figure_bindings(&text);
         assert_eq!(bindings.len(), 1);
-        let (terminal, app_id, error) = bindings.values().next().unwrap();
+        let (terminal, app_id, error, _inline) = bindings.values().next().unwrap();
         assert_eq!(terminal.as_deref(), Some(reference));
         assert!(app_id.is_none());
         assert!(error.is_none());

@@ -1560,6 +1560,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_figure_reflows_and_wraps_with_surrounding_prose() {
+        let rect_of = |doc: &str| {
+            let mut cache = DocLayoutCache::new();
+            cache.set_viewport(Size::from((260, 600)));
+            cache
+                .rebuild(doc, &mathed_core::TransformOptions::default())
+                .expect("layout");
+            cache.place_figure("f0").expect("inline figure").rect
+        };
+        let short = rect_of("Hi #1#2 \\app(#1, #2, 60, 24, \"pill\", inline: true) end");
+        let pushed_right =
+            rect_of("Hi there my #1#2 \\app(#1, #2, 60, 24, \"pill\", inline: true) end");
+        let wrapped = rect_of(
+            "Hi there my friend this paragraph is long enough to wrap #1#2 \\app(#1, #2, 60, 24, \"pill\", inline: true) end",
+        );
+        assert!(
+            pushed_right.loc.x > short.loc.x,
+            "inline figure slides right with preceding words"
+        );
+        assert_eq!(pushed_right.loc.y, short.loc.y);
+        assert!(
+            wrapped.loc.y > pushed_right.loc.y,
+            "inline figure wraps onto next line automatically"
+        );
+    }
+
     /// `page_scale` must not divide by zero on a degenerate page.
     #[test]
     fn a_degenerate_page_scales_by_one() {

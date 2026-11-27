@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use mathed_core::figures::{resolve_figure, FigureSpec, TerminalRef};
+use mathed_core::figures::{resolve_figure, FigureSpec, InlineAlign, TerminalRef};
 use mathed_core::markers::{
     auto_marker_id, auto_marker_token, lowest_free_marker_numbers, Arg, Segment,
 };
@@ -76,10 +76,12 @@ fn literal_range(arg: &Arg) -> Option<Range<usize>> {
 /// Returns `false` when the new size equals the old one (nothing to
 /// commit — an unnecessary CRDT op would still invalidate the layout).
 pub fn set_figure_size(model: &mut DocModel, figure: &Figure, w: i32, h: i32) -> bool {
-    let (w, h) = (
-        w.clamp(MIN_FIGURE, MAX_FIGURE),
-        h.clamp(MIN_FIGURE, MAX_FIGURE),
-    );
+    let min_side = if figure.spec.inline {
+        MIN_INLINE_FIGURE
+    } else {
+        MIN_FIGURE
+    };
+    let (w, h) = (w.clamp(min_side, MAX_FIGURE), h.clamp(min_side, MAX_FIGURE));
     if figure.spec.w == w && figure.spec.h == h {
         return false;
     }
@@ -97,9 +99,11 @@ pub fn set_figure_size(model: &mut DocModel, figure: &Figure, w: i32, h: i32) ->
     true
 }
 
-/// Smallest figure side we allow, so a drag can never collapse a figure
+/// Smallest block figure side we allow, so a drag can never collapse a figure
 /// to nothing (which would leave the bound app with no rect to draw in).
 pub const MIN_FIGURE: i32 = 64;
+/// Smallest inline `\app(..., inline: true)` widget side (pixels/pt).
+pub const MIN_INLINE_FIGURE: i32 = 16;
 /// Largest figure side, bounding pathological drags.
 pub const MAX_FIGURE: i32 = 8192;
 
@@ -219,6 +223,7 @@ pub fn append_figure(
         h,
         id.map(escape_arg).as_deref(),
         None,
+        None,
     )
 }
 
@@ -233,6 +238,18 @@ pub fn append_figure(
 /// seconds. The id was worse: `app_figure_spec` unquotes the literal but never
 /// unescapes it, so `spec.id` still holds the escaped form and re-escaping made
 /// the clone's binding id differ from the original's, leaving the mirror dormant.
+fn inline_args(inline: Option<InlineAlign>) -> String {
+    let Some(align) = inline else {
+        return String::new();
+    };
+    match align {
+        InlineAlign::Bottom => ", inline: true".to_string(),
+        InlineAlign::Middle => ", inline: true, align: \"middle\"".to_string(),
+        InlineAlign::Top => ", inline: true, align: \"top\"".to_string(),
+        InlineAlign::Baseline(pt) => format!(", inline: true, baseline: {pt}"),
+    }
+}
+
 fn append_figure_source(
     model: &mut DocModel,
     caption_source: &str,
@@ -240,6 +257,7 @@ fn append_figure_source(
     h: i32,
     id_source: Option<&str>,
     terminal: Option<&TerminalRef>,
+    inline: Option<InlineAlign>,
 ) -> String {
     let ids = lowest_free_marker_numbers(model.scan(), 2);
     let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
@@ -255,8 +273,9 @@ fn append_figure_source(
     let terminal_arg = terminal.map_or_else(String::new, |reference| {
         format!(", terminal: \"{}\"", escape_arg(&reference.canonical()))
     });
+    let inline_arg = inline_args(inline);
     let statement = format!(
-        "{start} {caption_source} {end} \\app({start}, {end}, {w}, {h}{id_arg}{terminal_arg})\n"
+        "{start} {caption_source} {end} \\app({start}, {end}, {w}, {h}{id_arg}{terminal_arg}{inline_arg})\n"
     );
     // A statement is a block: never glue it onto the tail of the last
     // line, or it lands inside the previous statement's argument list.
@@ -267,6 +286,32 @@ fn append_figure_source(
     } else {
         statement
     };
+    model.insert(at, &statement);
+    statement
+}
+
+/// Insert an inline `\app(..., inline: true)` figure at byte offset `at` inside
+/// a paragraph without inserting surrounding line breaks.
+pub fn insert_inline_figure(
+    model: &mut DocModel,
+    at: usize,
+    w: i32,
+    h: i32,
+    id: Option<&str>,
+    align: InlineAlign,
+) -> String {
+    let ids = lowest_free_marker_numbers(model.scan(), 2);
+    let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
+        return String::new();
+    };
+    let start = format!("#{}", auto_marker_id(a));
+    let end = format!("#{}", auto_marker_id(b));
+    let w = w.clamp(MIN_INLINE_FIGURE, MAX_FIGURE);
+    let h = h.clamp(MIN_INLINE_FIGURE, MAX_FIGURE);
+    let id_arg = id.map_or_else(String::new, |id| format!(", \"{}\"", escape_arg(id)));
+    let inline_arg = inline_args(Some(align));
+    let statement = format!("{start}{end} \\app({start}, {end}, {w}, {h}{id_arg}{inline_arg})");
+    let at = at.min(model.text().len());
     model.insert(at, &statement);
     statement
 }
@@ -288,6 +333,7 @@ pub fn clone_figure(model: &mut DocModel, figure: &Figure) -> String {
         figure.spec.h,
         id.as_deref(),
         figure.spec.terminal.as_ref(),
+        figure.spec.inline.then_some(figure.spec.inline_align),
     )
 }
 
@@ -307,6 +353,8 @@ pub fn spec_of(w: i32, h: i32) -> FigureSpec {
         launch: None,
         dx: None,
         dy: None,
+        inline: false,
+        inline_align: InlineAlign::Bottom,
         terminal: None,
         binding_error: None,
     }
@@ -405,6 +453,30 @@ mod tests {
         assert!(set_figure_size(&mut model, &figs[0], 1, 1));
         let after = figures(&model);
         assert_eq!(after[0].spec.size(), (MIN_FIGURE, MIN_FIGURE));
+    }
+
+    #[test]
+    fn inline_figures_insert_without_linebreaks_and_resize_to_compact_minimum() {
+        let mut model = DocModel::new("Start  end");
+        let stmt = insert_inline_figure(
+            &mut model,
+            "Start ".len(),
+            80,
+            24,
+            Some("pill"),
+            InlineAlign::Middle,
+        );
+        assert!(
+            !stmt.contains('\n'),
+            "inline statement has no newline: {stmt}"
+        );
+        let figs = figures(&model);
+        assert_eq!(figs.len(), 1);
+        assert!(figs[0].spec.inline);
+        assert_eq!(figs[0].spec.inline_align, InlineAlign::Middle);
+        assert!(set_figure_size(&mut model, &figs[0], 10, 18));
+        let resized = figures(&model);
+        assert_eq!(resized[0].spec.size(), (MIN_INLINE_FIGURE, 18));
     }
 
     #[test]

@@ -670,6 +670,8 @@ pub struct StateFigure {
     pub key: String,
     /// The app binding id from the statement's 3rd argument.
     pub id: Option<String>,
+    /// True when embedded inline inside a paragraph (`inline: true`).
+    pub inline: bool,
     /// The figure's caption text.
     pub caption: String,
     /// Placed rect in output-local logical px (zero when off-page).

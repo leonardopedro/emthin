@@ -1011,6 +1011,7 @@ fn ipc_list_state(state: &mut EmthinState) {
         .map(|f| StateFigure {
             key: f.key.clone(),
             id: f.spec.id.clone(),
+            inline: f.spec.inline,
             caption: state.doc.model().text()[f.span.clone()].trim().to_string(),
             // `docs/ipc.md`: "rect is zero-sized for a figure that isn't on the
             // visible page". It was not: an off-page figure keeps the `(0, 0)`

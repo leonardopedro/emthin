@@ -176,6 +176,8 @@ mod tests {
             launch: None,
             dx: None,
             dy: None,
+            inline: false,
+            inline_align: mathed_core::figures::InlineAlign::Bottom,
             terminal: None,
             binding_error: None,
         }

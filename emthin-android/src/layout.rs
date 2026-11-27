@@ -326,7 +326,7 @@ fn text_top(layout: &RetainedLayout, page: usize) -> Option<f32> {
 /// side table to tell a native terminal slot from a Wayland client slot.
 pub(crate) fn figure_bindings(
     doc_text: &str,
-) -> std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>)> {
+) -> std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>, bool)> {
     let scan = mathed_core::markers::scan(doc_text);
     let mut bindings = std::collections::HashMap::new();
     for segment in mathed_core::markers::resolve_segments(&scan) {
@@ -343,6 +343,7 @@ pub(crate) fn figure_bindings(
                     .map(|reference| reference.canonical()),
                 figure.spec.id,
                 figure.spec.binding_error,
+                figure.spec.inline,
             ),
         );
     }
@@ -415,16 +416,17 @@ pub fn render_page(
         let figures: Vec<Value> = mathed_core::figures::figures_in_frame(frame)
             .into_iter()
             .map(|figure| {
-                let (reference, app_id, binding_error) = bindings
+                let (reference, app_id, binding_error, is_inline) = bindings
                     .get(&figure.key)
                     .cloned()
-                    .unwrap_or((None, None, None));
+                    .unwrap_or((None, None, None, false));
                 json!({
                     "key": figure.key,
                     "x": figure.rect.x0,
                     "y": figure.rect.y0,
                     "w": figure.rect.x1 - figure.rect.x0,
                     "h": figure.rect.y1 - figure.rect.y0,
+                    "inline": is_inline,
                     "reference": reference,
                     "appId": app_id,
                     "bindingError": binding_error,
@@ -505,4 +507,37 @@ pub fn locate_range(
             "end": end_utf16.max(start_utf16),
         }))
     })
+}
+
+#[cfg(test)]
+mod inline_figure_tests {
+    use super::*;
+
+    #[test]
+    fn render_page_reports_inline_figure_mid_line_and_reflows() {
+        let short_doc =
+            r#"Alpha #1#2 \app(#1, #2, 60, 22, "pill", inline: true, align: "middle") omega"#;
+        let long_doc = r#"Alpha beta gamma delta epsilon #1#2 \app(#1, #2, 60, 22, "pill", inline: true, align: "middle") omega"#;
+        let m1 = DocModel::new(short_doc);
+        let snap1 = m1.math_doc().snapshot();
+        let prep1 = prepare(&snap1, short_doc, "inline-test-1", false, &[], 11.0).unwrap();
+        assert_eq!(prep1["total"], 1);
+        let page1 = render_page("inline-test-1", short_doc, 0, 1.0, 2_000_000, 0, 0).unwrap();
+        let fig1 = &page1["figures"][0];
+        assert_eq!(fig1["inline"], true);
+        assert_eq!(fig1["appId"], "pill");
+        let x1 = fig1["x"].as_f64().unwrap();
+
+        let m2 = DocModel::new(long_doc);
+        let snap2 = m2.math_doc().snapshot();
+        let prep2 = prepare(&snap2, long_doc, "inline-test-2", false, &[], 11.0).unwrap();
+        assert_eq!(prep2["total"], 1);
+        let page2 = render_page("inline-test-2", long_doc, 0, 1.0, 2_000_000, 0, 0).unwrap();
+        let fig2 = &page2["figures"][0];
+        let x2 = fig2["x"].as_f64().unwrap();
+        assert!(
+            x2 > x1 + 20.0,
+            "expected inline figure to flow right ({x1} -> {x2})"
+        );
+    }
 }

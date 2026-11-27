@@ -827,7 +827,12 @@ impl EmthinState {
             edge,
             self.doc.document_instance(),
             self.doc.model().content_generation(),
-        );
+        )
+        .with_min_side(if figure.spec.inline {
+            crate::docui::edit::MIN_INLINE_FIGURE
+        } else {
+            crate::docui::edit::MIN_FIGURE
+        });
         // `Focus::Clear`: a figure resize manipulates the page, not a
         // client surface, so nothing should take pointer focus mid-drag.
         pointer.set_grab(self, grab, serial, Focus::Clear);

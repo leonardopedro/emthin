@@ -283,7 +283,14 @@ edits.
 
 - **Click** a figure to focus its app; **drag its edge** (within 6px) to
   resize it — the `\app` arguments are rewritten and the app is
-  reconfigured. Sizes snap to an 8px grid.
+  reconfigured. Block figures snap to an 8px grid (`min 64px`), and
+  inline figures can shrink down to `16px`.
+- **Inline Wayland windows (`inline: true`)** embed directly inside a
+  reflowable paragraph (like Flutter `WidgetSpan`), wrapping cleanly with
+  surrounding text, expanding line height automatically, and supporting
+  vertical alignment via `align: "bottom" | "middle" | "top"` or
+  `baseline: <pt>`:
+  `Before #1#2 \app(#1, #2, 96, 28, "pill", inline: true, align: "middle") after.`
 - **Mirrors** are two `\app` statements sharing one binding id; the same
   app renders in both. `Ctrl+Shift+M` clones a figure's statement.
 - Figures on other pages keep their apps running but idle — they stop

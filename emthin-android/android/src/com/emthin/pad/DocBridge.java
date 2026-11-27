@@ -301,6 +301,8 @@ public final class DocBridge {
     public static native String waylandTakePendingToplevels(long handle);
     public static native String appendAppFigure(
             long handle, String caption, int width, int height, String appId);
+    public static native String appendInlineAppFigure(
+            long handle, int width, int height, String appId, String align);
     public static native String waylandRenderFigure(
             long handle, String figureKey, android.view.Surface surface,
             float u0, float v0, float u1, float v1);

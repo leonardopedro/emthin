@@ -593,6 +593,7 @@ A `rule` is `{id, priority, destination?, interface?, method?, target}`, where
 {
   "key": "f0",
   "id": "term",
+  "inline": false,
   "caption": "Terminal demo",
   "rect": {"x": 300, "y": 50, "w": 640, "h": 400},
   "page": 0,

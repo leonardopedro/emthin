@@ -424,8 +424,12 @@ pub fn build_overlay_elements(
     }
 
     // The label goes inside the frame, centred near the top so it reads as a
-    // caption for the slot rather than floating over the page.
+    // caption for the slot rather than floating over the page. Compact inline
+    // slots omit the caption text when too small so text never bleeds outside.
     for (key, rect) in state.doc.dormant_rects_on_current_page() {
+        if rect.size.w < 48 || rect.size.h < 28 {
+            continue;
+        }
         let Some(text) = state.doc.dormant_label(&key) else {
             continue;
         };

@@ -428,6 +428,8 @@ pub struct FigureResizeGrab {
     /// Live preview rect during the drag.
     pub current_rect: Rectangle<i32, Logical>,
     pub edges: ResizeEdge,
+    /// Minimum edge size (`MIN_INLINE_FIGURE` for inline figures, `MIN_FIGURE` otherwise).
+    min_side: i32,
     /// Document incarnation and source generation captured at press time.
     /// A delayed commit against a replaced/edited document is discarded.
     document_instance: u64,
@@ -454,14 +456,21 @@ impl FigureResizeGrab {
             initial_rect,
             current_rect: initial_rect,
             edges,
+            min_side: crate::docui::edit::MIN_FIGURE,
             document_instance,
             content_generation,
             committed: false,
         }
     }
 
-    /// Which figure edge (if any) a point is within [`FIGURE_EDGE_PX`]
-    /// of. Corners win over edges so a corner drag resizes both axes.
+    pub fn with_min_side(mut self, min_side: i32) -> Self {
+        self.min_side = min_side;
+        self
+    }
+
+    /// Which figure edge (if any) a point is within the border threshold
+    /// of. Corners win over edges so a corner drag resizes both axes. For
+    /// compact inline widgets the edge scales down so the interior stays clickable.
     pub fn edge_at(rect: &Rectangle<i32, Logical>, pos: Point<f64, Logical>) -> ResizeEdge {
         let (w, h) = (f64::from(rect.size.w), f64::from(rect.size.h));
         if w <= 0.0 || h <= 0.0 {
@@ -472,10 +481,11 @@ impl FigureResizeGrab {
         if x < 0.0 || y < 0.0 || x > w || y > h {
             return ResizeEdge::None;
         }
-        let near_left = x <= FIGURE_EDGE_PX;
-        let near_right = w - x <= FIGURE_EDGE_PX;
-        let near_top = y <= FIGURE_EDGE_PX;
-        let near_bottom = h - y <= FIGURE_EDGE_PX;
+        let edge = FIGURE_EDGE_PX.min((w.min(h) * 0.2).max(2.0));
+        let near_left = x <= edge;
+        let near_right = w - x <= edge;
+        let near_top = y <= edge;
+        let near_bottom = h - y <= edge;
         match (near_left, near_right, near_top, near_bottom) {
             (true, _, true, _) => ResizeEdge::TopLeft,
             (_, true, true, _) => ResizeEdge::TopRight,
@@ -495,7 +505,7 @@ impl FigureResizeGrab {
     /// Round-to-nearest, not floor: a drag that lands on 647 should snap
     /// up to 648, not down to 640 and then feel "sticky" as the user
     /// pushes past the halfway point.
-    fn snap(value: i32) -> i32 {
+    fn snap_with_min(value: i32, min_side: i32) -> i32 {
         let half = FIGURE_SNAP_PX / 2;
         let snapped = value.div_euclid(FIGURE_SNAP_PX) * FIGURE_SNAP_PX
             + if value.rem_euclid(FIGURE_SNAP_PX) >= half {
@@ -503,10 +513,12 @@ impl FigureResizeGrab {
             } else {
                 0
             };
-        snapped.clamp(
-            crate::docui::edit::MIN_FIGURE,
-            crate::docui::edit::MAX_FIGURE,
-        )
+        snapped.clamp(min_side, crate::docui::edit::MAX_FIGURE)
+    }
+
+    #[cfg(test)]
+    fn snap(value: i32) -> i32 {
+        Self::snap_with_min(value, crate::docui::edit::MIN_FIGURE)
     }
 
     fn compute_rect(&mut self, delta: Point<i32, Logical>) {
@@ -521,25 +533,25 @@ impl FigureResizeGrab {
             self.edges,
             ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight
         ) {
-            size.w = Self::snap(self.initial_rect.size.w + delta.x);
+            size.w = Self::snap_with_min(self.initial_rect.size.w + delta.x, self.min_side);
         }
         if matches!(
             self.edges,
             ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight
         ) {
-            size.h = Self::snap(self.initial_rect.size.h + delta.y);
+            size.h = Self::snap_with_min(self.initial_rect.size.h + delta.y, self.min_side);
         }
         if matches!(
             self.edges,
             ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
         ) {
-            size.w = Self::snap(self.initial_rect.size.w - delta.x);
+            size.w = Self::snap_with_min(self.initial_rect.size.w - delta.x, self.min_side);
         }
         if matches!(
             self.edges,
             ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight
         ) {
-            size.h = Self::snap(self.initial_rect.size.h - delta.y);
+            size.h = Self::snap_with_min(self.initial_rect.size.h - delta.y, self.min_side);
         }
 
         // Location never moves: the flow owns it. Kept explicit so the
@@ -802,6 +814,23 @@ mod figure_resize_tests {
         assert_eq!(
             FigureResizeGrab::edge_at(&r, (0.0, 0.0).into()),
             ResizeEdge::None
+        );
+    }
+
+    #[test]
+    fn compact_inline_widget_keeps_interior_clickable() {
+        let r = rect(100, 100, 80, 24);
+        assert_eq!(
+            FigureResizeGrab::edge_at(&r, (140.0, 112.0).into()),
+            ResizeEdge::None
+        );
+        assert_eq!(
+            FigureResizeGrab::edge_at(&r, (101.0, 112.0).into()),
+            ResizeEdge::Left
+        );
+        assert_eq!(
+            FigureResizeGrab::snap_with_min(18, crate::docui::edit::MIN_INLINE_FIGURE),
+            16
         );
     }
 
